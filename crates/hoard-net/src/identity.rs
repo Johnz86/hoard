@@ -4,8 +4,10 @@
 //! plus the `_hoard._tcp` TXT record those three travel in. Nothing here touches the
 //! network or the index.
 
+use std::net::IpAddr;
+
 use hoard_core::NodeId;
-use url::Url;
+use url::{Host, Url};
 
 use crate::error::{NetError, Result};
 
@@ -24,6 +26,10 @@ pub const TXT_VERSION: &str = "ver";
 /// The version this node advertises, so a peer can refuse a digest it cannot read.
 pub const PROTOCOL_VERSION: &str = "1";
 
+/// The longest node name accepted from the network, since a name becomes a row in the NODES
+/// tab and a value of the `node:` facet.
+pub const MAX_NAME: usize = 64;
+
 /// The identity one node advertises to the LAN.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeIdentity {
@@ -37,16 +43,16 @@ impl NodeIdentity {
     /// Builds an identity from the `[node]` section and the resolved public URL.
     ///
     /// The URL is normalized the way a peer address is, so `rig-02`, `rig-02:7099` and
-    /// `http://rig-02:7099/` are one node rather than three.
+    /// `http://rig-02:7099/` are one node rather than three, and a bind address that names
+    /// no interface is replaced by this machine's host name: `http://0.0.0.0:7099` tells a
+    /// peer to connect to itself.
     pub fn new(id: NodeId, name: impl Into<String>, url: &str) -> Result<Self> {
-        let name = name.into();
-        if name.trim().is_empty() {
-            return Err(NetError::Config("a node needs a name".to_owned()));
-        }
+        let name = clean_name(&name.into())
+            .ok_or_else(|| NetError::Config("a node needs a name".to_owned()))?;
         Ok(Self {
             id,
-            name: name.trim().to_owned(),
-            url: normalize_address(url)?,
+            name,
+            url: routable(normalize_address(url)?)?,
             version: PROTOCOL_VERSION.to_owned(),
         })
     }
@@ -101,7 +107,8 @@ impl NodeIdentity {
     /// Reads an identity back out of a TXT record.
     ///
     /// `fallback_url` is what the browser resolved the instance to, used when the peer
-    /// advertised no URL of its own; without either there is nothing to connect to.
+    /// advertised no URL of its own or advertised one that leads back to the reader;
+    /// without either there is nothing to connect to.
     pub fn from_txt(records: &[(String, String)], fallback_url: Option<&str>) -> Result<Self> {
         let value = |wanted: &str| {
             records
@@ -110,12 +117,18 @@ impl NodeIdentity {
                 .map(|(_, value)| value.trim())
                 .filter(|value| !value.is_empty())
         };
-        let address = value(TXT_URL)
-            .or(fallback_url)
-            .ok_or_else(|| NetError::Discovery("a peer advertised no address".to_owned()))?;
-        let url = normalize_address(address)?;
+        let advertised = value(TXT_URL)
+            .map(normalize_address)
+            .transpose()?
+            .filter(|url| !reaches_the_reader(url));
+        let url = match advertised {
+            Some(url) => url,
+            None => normalize_address(fallback_url.ok_or_else(|| {
+                NetError::Discovery("a peer advertised no address of its own".to_owned())
+            })?)?,
+        };
         let name = value(TXT_NAME)
-            .map(str::to_owned)
+            .and_then(clean_name)
             .unwrap_or_else(|| url.host_str().unwrap_or("peer").to_owned());
         let id = match value(TXT_ID) {
             Some(raw) => {
@@ -134,7 +147,8 @@ impl NodeIdentity {
     /// The identity a statically configured peer starts with, before it answers for itself.
     pub fn from_address(address: &str) -> Result<Self> {
         let url = normalize_address(address)?;
-        let name = url.host_str().unwrap_or("peer").to_owned();
+        let name =
+            clean_name(url.host_str().unwrap_or("peer")).unwrap_or_else(|| "peer".to_owned());
         Ok(Self {
             id: address_identity(&url)?,
             name,
@@ -179,6 +193,59 @@ pub fn normalize_address(address: &str) -> Result<Url> {
     url.set_query(None);
     url.set_fragment(None);
     Ok(url)
+}
+
+/// The same URL with a host a peer can dial, which an unspecified bind address is not.
+fn routable(mut url: Url) -> Result<Url> {
+    if !is_unspecified(&url) {
+        return Ok(url);
+    }
+    let host = local_host_name();
+    url.set_host(Some(&host))
+        .map_err(|error| NetError::Config(format!("host {host:?}: {error}")))?;
+    Ok(url)
+}
+
+/// Whether an advertised URL points back at whoever reads it rather than at its author.
+fn reaches_the_reader(url: &Url) -> bool {
+    is_unspecified(url)
+        || matches!(
+            url.host(),
+            Some(Host::Ipv4(address)) if address.is_loopback())
+        || matches!(
+            url.host(),
+            Some(Host::Ipv6(address)) if address.is_loopback())
+        || url.host_str() == Some("localhost")
+}
+
+fn is_unspecified(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(address)) => address.is_unspecified(),
+        Some(Host::Ipv6(address)) => address.is_unspecified(),
+        Some(Host::Domain(_)) | None => false,
+    }
+}
+
+/// What this machine calls itself, for the node that binds every interface.
+fn local_host_name() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .map(|raw| raw.trim().to_owned())
+        .filter(|name| !name.is_empty() && name.parse::<IpAddr>().is_err())
+        .unwrap_or_else(|| "localhost".to_owned())
+}
+
+/// A name fit to become a row in the NODES tab: no control characters, no runaway length.
+pub fn clean_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|letter| !letter.is_control())
+        .take(MAX_NAME)
+        .collect();
+    let cleaned = cleaned.trim().to_owned();
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 /// A stable identity for a peer known only by where it answers.
@@ -297,6 +364,71 @@ mod tests {
         )
         .expect("identity builds");
         assert_eq!(awkward.instance_name(), "rig-02--attic-7099");
+    }
+
+    #[test]
+    fn a_node_that_binds_every_interface_advertises_a_host_a_peer_can_dial() {
+        let bound = NodeIdentity::new(
+            NodeId::new("workstation-1").expect("node id"),
+            "workstation",
+            "http://0.0.0.0:7099",
+        )
+        .expect("identity builds");
+        assert_ne!(bound.host(), "0.0.0.0");
+        assert_eq!(bound.host(), local_host_name());
+        assert_eq!(bound.port(), 7099);
+
+        let six = NodeIdentity::new(
+            NodeId::new("workstation-1").expect("node id"),
+            "workstation",
+            "http://[::]:7099",
+        )
+        .expect("identity builds");
+        assert_eq!(six.host(), local_host_name());
+    }
+
+    #[test]
+    fn an_advertised_url_that_leads_back_to_the_reader_is_not_an_address() {
+        let records = vec![
+            (TXT_NAME.to_owned(), "laptop".to_owned()),
+            (TXT_URL.to_owned(), "http://0.0.0.0:7099/".to_owned()),
+        ];
+        let read = NodeIdentity::from_txt(&records, Some("192.168.1.9:7099"))
+            .expect("the resolved address stands in");
+        assert_eq!(read.url().as_str(), "http://192.168.1.9:7099/");
+
+        let loopback = vec![(TXT_URL.to_owned(), "http://127.0.0.1:7099/".to_owned())];
+        assert_eq!(
+            NodeIdentity::from_txt(&loopback, Some("192.168.1.9:7099"))
+                .expect("the resolved address stands in")
+                .url()
+                .as_str(),
+            "http://192.168.1.9:7099/"
+        );
+        assert!(NodeIdentity::from_txt(&loopback, None).is_err());
+        assert!(
+            NodeIdentity::from_txt(
+                &[(TXT_URL.to_owned(), "http://localhost:7099".to_owned())],
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_name_from_the_network_is_trimmed_of_control_characters_and_bounded() {
+        let records = vec![
+            (
+                TXT_NAME.to_owned(),
+                format!("  a\u{1}b{}  ", "x".repeat(200)),
+            ),
+            (TXT_URL.to_owned(), "http://192.168.1.9:7099".to_owned()),
+        ];
+        let read = NodeIdentity::from_txt(&records, None).expect("txt reads");
+        assert_eq!(read.name().chars().count(), MAX_NAME);
+        assert!(read.name().starts_with("ab"));
+        assert!(!read.name().chars().any(char::is_control));
+        assert_eq!(clean_name("  \u{7}  "), None);
     }
 
     #[test]

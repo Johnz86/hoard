@@ -38,6 +38,9 @@ pub enum NetError {
         actual: String,
     },
 
+    #[error("{path} from {peer} was served with no content hash to check it against")]
+    Unverifiable { peer: String, path: String },
+
     #[error("config error: {0}")]
     Config(String),
 }

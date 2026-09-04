@@ -10,10 +10,11 @@ use std::net::{IpAddr, SocketAddr};
 
 use hoard_core::NodeId;
 use hoard_index::store::Store;
-use hoard_index::store::node::{NewNode, node_by_name, set_node_online, upsert_node};
+use hoard_index::store::node::{NewNode, list_nodes, node_by_name, set_node_online, upsert_node};
 use jiff::Timestamp;
 use mdns_sd::{ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
 use crate::error::{NetError, Result};
@@ -46,6 +47,15 @@ impl DiscoveryMode {
     }
 }
 
+/// How many peer events wait to be recorded before the oldest are refused.
+///
+/// Anything on the LAN can register a `_hoard._tcp` instance, so the queue in front of the
+/// gossip loop is bounded like every other input from the network.
+pub const ARRIVALS: usize = 256;
+
+/// How many spellings of one name are tried before a peer is named after its node id.
+const NAME_ATTEMPTS: u32 = 16;
+
 /// A peer appearing or disappearing, whatever found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerEvent {
@@ -63,7 +73,7 @@ pub struct Discovery {
     browser: Option<JoinHandle<()>>,
     /// Held so the arrivals channel stays open for as long as discovery does, whether or
     /// not multicast is available to send anything down it.
-    _sender: UnboundedSender<PeerEvent>,
+    _sender: Sender<PeerEvent>,
 }
 
 impl std::fmt::Debug for Discovery {
@@ -85,8 +95,8 @@ impl Discovery {
         identity: &NodeIdentity,
         mode: DiscoveryMode,
         statics: &[String],
-    ) -> (Self, UnboundedReceiver<PeerEvent>) {
-        let (sender, receiver) = mpsc::unbounded_channel();
+    ) -> (Self, Receiver<PeerEvent>) {
+        let (sender, receiver) = mpsc::channel(ARRIVALS);
         announce_statics(&sender, identity, statics);
         let mut discovery = Self {
             daemon: None,
@@ -137,23 +147,41 @@ impl Drop for Discovery {
 }
 
 /// Sends every statically configured peer as an arrival.
-fn announce_statics(sender: &UnboundedSender<PeerEvent>, local: &NodeIdentity, statics: &[String]) {
+fn announce_statics(sender: &Sender<PeerEvent>, local: &NodeIdentity, statics: &[String]) {
     for address in statics {
         match NodeIdentity::from_address(address) {
             Ok(peer) if peer.url() == local.url() => {
                 tracing::debug!(peer = %address, "the configured peer is this node");
             }
             Ok(peer) => {
-                let _ = sender.send(PeerEvent::Arrived(peer));
+                offer(sender, PeerEvent::Arrived(peer));
             }
             Err(error) => tracing::warn!(peer = %address, %error, "peer address is unusable"),
         }
     }
 }
 
+/// Offers one event to the gossip loop, and says whether anyone is still listening.
+///
+/// A full queue drops the event rather than waiting on it: discovery answers the network and
+/// must not stall behind a loop that is busy pulling.
+fn offer(sender: &Sender<PeerEvent>, event: PeerEvent) -> bool {
+    match sender.try_send(event) {
+        Ok(()) => true,
+        Err(TrySendError::Full(dropped)) => {
+            tracing::warn!(
+                ?dropped,
+                "the arrivals queue is full; a peer event was dropped"
+            );
+            true
+        }
+        Err(TrySendError::Closed(_)) => false,
+    }
+}
+
 fn start_mdns(
     identity: &NodeIdentity,
-    sender: UnboundedSender<PeerEvent>,
+    sender: Sender<PeerEvent>,
 ) -> Result<(ServiceDaemon, String, JoinHandle<()>)> {
     let daemon = ServiceDaemon::new().map_err(|error| NetError::Discovery(error.to_string()))?;
     let service = ServiceInfo::new(
@@ -185,7 +213,7 @@ fn start_mdns(
                     match peer_of(&resolved, &local) {
                         Ok(peer) => {
                             seen.insert(resolved.fullname.clone(), peer.id().clone());
-                            if sender.send(PeerEvent::Arrived(peer)).is_err() {
+                            if !offer(&sender, PeerEvent::Arrived(peer)) {
                                 return;
                             }
                         }
@@ -196,7 +224,7 @@ fn start_mdns(
                 }
                 ServiceEvent::ServiceRemoved(_, fullname) => {
                     if let Some(id) = seen.remove(&fullname)
-                        && sender.send(PeerEvent::Departed(id)).is_err()
+                        && !offer(&sender, PeerEvent::Departed(id))
                     {
                         return;
                     }
@@ -259,15 +287,11 @@ pub async fn forget_peer(store: &Store, id: &NodeId) -> Result<()> {
     let id = id.clone();
     store
         .call_mut(move |conn| {
-            let row: Option<i64> = conn
-                .query_row(
-                    "SELECT id FROM node WHERE node_id = ?1 AND is_self = 0",
-                    [id.as_str()],
-                    |row| row.get(0),
-                )
-                .ok();
-            match row {
-                Some(row) => set_node_online(conn, row, false),
+            let peer = list_nodes(conn)?
+                .into_iter()
+                .find(|node| !node.is_self && node.node_id == id);
+            match peer {
+                Some(node) => set_node_online(conn, node.id, false),
                 None => Ok(()),
             }
         })
@@ -294,14 +318,26 @@ async fn unique_name(store: &Store, peer: &NodeIdentity) -> Result<String> {
     let host = peer.host().to_owned();
     let name = store
         .call(move |conn| {
-            let taken = match node_by_name(conn, &wanted)? {
-                Some(row) => row.node_id != id,
-                None => false,
+            let taken = |candidate: &str| -> hoard_index::Result<bool> {
+                Ok(match node_by_name(conn, candidate)? {
+                    Some(row) => row.node_id != id,
+                    None => false,
+                })
             };
-            Ok(match taken {
-                true => format!("{wanted} ({host})"),
-                false => wanted,
-            })
+            if !taken(&wanted)? {
+                return Ok(wanted);
+            }
+            let qualified = format!("{wanted} ({host})");
+            if !taken(&qualified)? {
+                return Ok(qualified);
+            }
+            for ordinal in 2..=NAME_ATTEMPTS {
+                let candidate = format!("{qualified} {ordinal}");
+                if !taken(&candidate)? {
+                    return Ok(candidate);
+                }
+            }
+            Ok(format!("{wanted} ({})", id.as_str()))
         })
         .await?;
     Ok(name)
@@ -413,6 +449,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peers_colliding_on_name_and_host_are_still_told_apart() {
+        let store = store_with_local().await;
+        for (id, port) in [("laptop-1", 7099), ("laptop-2", 7100), ("laptop-3", 7101)] {
+            let twin = NodeIdentity::new(
+                NodeId::new(id).expect("id"),
+                "workstation",
+                &format!("http://laptop.lan:{port}"),
+            )
+            .expect("identity builds");
+            record_peer(&store, &twin).await.expect("peer records");
+        }
+        let mut names: Vec<String> = store
+            .call(list_nodes)
+            .await
+            .expect("nodes read")
+            .into_iter()
+            .map(|node| node.name)
+            .collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 4, "no two nodes answer to one name");
+    }
+
+    #[tokio::test]
     async fn forgetting_an_unknown_peer_is_not_an_error() {
         let store = store_with_local().await;
         forget_peer(&store, &NodeId::new("nobody").expect("id"))
@@ -427,8 +487,15 @@ mod tests {
     async fn mdns_advertises_and_browses_the_hoard_service() {
         let (mut discovery, mut events) = Discovery::start(&local(), DiscoveryMode::Mdns, &[]);
         assert!(discovery.is_advertising());
-        let peer = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await;
+        let found = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await;
         discovery.stop();
-        assert!(peer.is_ok() || peer.is_err());
+        match found {
+            Ok(Some(PeerEvent::Arrived(peer))) => {
+                assert_ne!(peer.url(), local().url(), "a node never browses itself");
+            }
+            Ok(Some(PeerEvent::Departed(_))) => unreachable!("nothing had arrived to depart"),
+            Ok(None) => unreachable!("discovery holds the channel open"),
+            Err(_) => {}
+        }
     }
 }

@@ -19,6 +19,13 @@ pub const DEFAULT_LIMIT: u32 = 100;
 /// The most rows one digest page ever carries, whatever a peer asks for.
 pub const MAX_LIMIT: u32 = 500;
 
+/// The longest repository path a peer may name, matching what a filesystem accepts.
+pub const MAX_PATH: usize = 1024;
+/// The longest qualified repository name a peer may name.
+pub const MAX_REPO: usize = 256;
+/// The longest base family key a peer may name.
+pub const MAX_BASE: usize = 64;
+
 const CURSOR_PREFIX: &str = "d1";
 
 pub use hoard_index::store::digest::{DigestApplied, RemoteEntry};
@@ -166,20 +173,24 @@ pub fn validate(peer: &str, row: &DigestRow) -> Result<RemoteEntry> {
         reason,
     };
     let path = row.path.trim().trim_start_matches('/');
-    if path.is_empty() || path.split('/').any(|segment| segment == "..") {
+    if path.is_empty() || path.len() > MAX_PATH || traverses(path) {
         return Err(bad(format!("path {:?} is not a repository path", row.path)));
     }
-    if row.repo.trim().is_empty() {
-        return Err(bad("a row names no repository".to_owned()));
+    let named = row.repo.trim();
+    if named.is_empty() || named.len() > MAX_REPO || traverses(named) {
+        return Err(bad(format!("repo {:?} is not a repository", row.repo)));
     }
-    let repo = RepoId::parse_qualified(&row.repo)
+    if row.base.as_str().len() > MAX_BASE {
+        return Err(bad(format!("base {:?} is not a family", row.base.as_str())));
+    }
+    let repo = RepoId::parse_qualified(named)
         .map_err(|error| bad(format!("repo {:?}: {error}", row.repo)))?;
     let name = path.rsplit('/').next().unwrap_or(path);
     Ok(RemoteEntry {
         sha256: row.sha256,
         size: row.size,
         role: row.role,
-        base: row.base.clone(),
+        base: Base::new(row.base.as_str()),
         revision_sha: row
             .revision_sha
             .unwrap_or_else(|| synthetic_sha(&row.sha256)),
@@ -187,6 +198,14 @@ pub fn validate(peer: &str, row: &DigestRow) -> Result<RemoteEntry> {
         path: path.to_owned(),
         repo,
     })
+}
+
+/// Whether a peer's path or repository name walks out of the directory it names, which is
+/// how bytes a pull materializes would land outside the pull root.
+fn traverses(value: &str) -> bool {
+    value
+        .split('/')
+        .any(|segment| segment == ".." || segment == ".")
 }
 
 /// The revision a row without one is filed under: the leading bytes of its content hash, so
@@ -384,6 +403,71 @@ mod tests {
             .await
             .expect("count reads");
         assert_eq!(counted, 0);
+    }
+
+    #[tokio::test]
+    async fn a_repository_that_walks_out_of_the_pull_root_is_refused() {
+        for named in [
+            "models/../..",
+            "models/kohya/..",
+            "models/./film-grain",
+            "../../etc",
+        ] {
+            let mut escaping = row(24, "a.safetensors");
+            escaping.repo = named.to_owned();
+            assert!(
+                matches!(
+                    validate("laptop", &escaping),
+                    Err(NetError::BadDigest { .. })
+                ),
+                "repo {named:?} is refused"
+            );
+        }
+
+        let (store, peer) = seeded(1).await;
+        let mut escaping = row(25, "a.safetensors");
+        escaping.repo = "models/../..".to_owned();
+        let page = DigestPage {
+            rows: vec![escaping],
+            next_cursor: None,
+            total: 1,
+        };
+        assert!(apply(&store, "laptop", peer, &page).await.is_err());
+        let counted = store
+            .call(|conn| search_exec::count_rows(conn, "node = ?", &["laptop".into()]))
+            .await
+            .expect("count reads");
+        assert_eq!(counted, 0);
+    }
+
+    #[test]
+    fn a_row_carrying_runaway_strings_is_refused_and_its_base_is_renormalized() {
+        let mut long = row(26, &format!("loras/{}.safetensors", "a".repeat(MAX_PATH)));
+        assert!(matches!(
+            validate("laptop", &long),
+            Err(NetError::BadDigest { .. })
+        ));
+
+        long = row(27, "loras/a.safetensors");
+        long.repo = format!("models/kohya/{}", "a".repeat(MAX_REPO));
+        assert!(matches!(
+            validate("laptop", &long),
+            Err(NetError::BadDigest { .. })
+        ));
+
+        let mut based = row(28, "loras/a.safetensors");
+        based.base = serde_json::from_str(&format!("\"{}\"", "b".repeat(MAX_BASE + 1)))
+            .expect("a wire base is any string");
+        assert!(matches!(
+            validate("laptop", &based),
+            Err(NetError::BadDigest { .. })
+        ));
+
+        based.base = serde_json::from_str("\"SDXL 1.0\"").expect("a wire base is any string");
+        assert_eq!(
+            validate("laptop", &based).expect("row validates").base,
+            Base::new("sdxl10")
+        );
     }
 
     #[test]
