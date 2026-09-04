@@ -30,7 +30,7 @@ pub(crate) const MAX_PREFIXES: usize = 32;
 /// How many tensor samples a summary keeps.
 pub(crate) const MAX_SAMPLES: usize = 64;
 /// Key fragments that always earn a sample slot because inference reads them.
-const SAMPLE_KEYWORDS: [&str; 9] = [
+const SAMPLE_KEYWORDS: [&str; 21] = [
     "lora_down",
     "lora_up",
     "alpha",
@@ -40,7 +40,26 @@ const SAMPLE_KEYWORDS: [&str; 9] = [
     "context_embedder",
     "img_in",
     "time_embed",
+    "t_embedder",
+    "adaLN",
+    "model.diffusion_model",
+    "first_stage_model",
+    "double_blocks",
+    "single_blocks",
+    "joint_blocks",
+    "noise_refiner",
+    "conv_first",
+    "conv_body",
+    "RRDB_trunk",
+    "conv_before_upsample",
 ];
+
+/// How many sample slots the keyword pass may claim.
+///
+/// The remainder is reserved for the even spread below. Without a reserve, a large model
+/// whose keys all contain a keyword fills every slot from one region of the key list, and
+/// the structural keys the role and base rules read are never sampled at all.
+const KEYWORD_BUDGET: usize = MAX_SAMPLES / 2;
 
 const ZIP_MAGIC: &[u8; 4] = b"PK\x03\x04";
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
@@ -356,8 +375,8 @@ fn select_samples(tensors: &[TensorSample]) -> BTreeSet<usize> {
         selected.insert(index);
     }
     for (index, tensor) in tensors.iter().enumerate() {
-        if selected.len() >= MAX_SAMPLES {
-            return selected;
+        if selected.len() >= KEYWORD_BUDGET {
+            break;
         }
         if SAMPLE_KEYWORDS
             .iter()
@@ -384,6 +403,39 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn keyword_matches_cannot_starve_the_structural_spread() {
+        let mut tensors: Vec<TensorSample> = (0..600)
+            .map(|index| sample(&format!("blocks.{index}.attn.to_k.weight"), "F16", &[8, 8]))
+            .collect();
+        tensors.push(sample(
+            "model.diffusion_model.final_layer.weight",
+            "F16",
+            &[8, 8],
+        ));
+        tensors.push(sample("zzz_last_marker.weight", "F16", &[8, 8]));
+
+        let selected = select_samples(&tensors);
+        assert!(selected.len() <= MAX_SAMPLES);
+        let last = tensors.len() - 1;
+        assert!(
+            selected.iter().any(|index| *index > last / 2),
+            "the spread must reach the far end of the key list, got {selected:?}"
+        );
+        assert!(
+            selected.len() > KEYWORD_BUDGET,
+            "the reserved slots must actually be filled by the spread"
+        );
+    }
+
+    #[test]
+    fn a_short_key_list_is_sampled_whole() {
+        let tensors: Vec<TensorSample> = (0..8)
+            .map(|index| sample(&format!("layer.{index}.weight"), "F16", &[8, 8]))
+            .collect();
+        assert_eq!(select_samples(&tensors).len(), tensors.len());
+    }
 
     pub(crate) fn write(dir: &TempDir, name: &str, bytes: &[u8]) -> PathBuf {
         let path = dir.path().join(name);

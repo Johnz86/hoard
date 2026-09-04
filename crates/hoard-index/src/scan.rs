@@ -834,7 +834,7 @@ fn read_header(path: &Path, size: u64) -> Result<(String, SniffResult)> {
 /// The documents of a revision that describe the weights beside them.
 #[derive(Debug, Default)]
 struct InferenceContext {
-    config: Option<serde_json::Value>,
+    configs: Vec<(String, serde_json::Value)>,
     frontmatter: Option<Vec<(String, String)>>,
     card: Option<String>,
 }
@@ -842,7 +842,6 @@ struct InferenceContext {
 impl InferenceContext {
     fn collect(entries: &[DiscoveredEntry], sniffed: &[Sniffed]) -> Self {
         let mut context = InferenceContext::default();
-        let mut config_depth = usize::MAX;
         let mut card_depth = usize::MAX;
         for (entry, found) in entries.iter().zip(sniffed) {
             let Some(result) = found.result() else {
@@ -850,9 +849,12 @@ impl InferenceContext {
             };
             let depth = entry.rel_path.matches('/').count();
             let name = file_name(&entry.rel_path).to_ascii_lowercase();
-            if result.config.is_some() && is_model_config(&name) && depth < config_depth {
-                config_depth = depth;
-                context.config = result.config.clone();
+            if let Some(config) = &result.config
+                && is_model_config(&name)
+            {
+                context
+                    .configs
+                    .push((directory_of(&entry.rel_path).to_owned(), config.clone()));
             }
             if let Some(readme) = &result.readme
                 && name == "readme.md"
@@ -864,7 +866,37 @@ impl InferenceContext {
             }
         }
         context
+            .configs
+            .sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
+        context
     }
+
+    /// The config that describes a file is the nearest one at or above its own directory,
+    /// never simply the shallowest in the revision. A text encoder's `config.json` sitting
+    /// beside it must not speak for unrelated weights in a sibling directory, which is how
+    /// one gemma-3 encoder came to label every other model in a ComfyUI tree.
+    fn config_for(&self, rel_path: &str) -> Option<&serde_json::Value> {
+        let directory = directory_of(rel_path);
+        self.configs
+            .iter()
+            .find(|(prefix, _)| covers(prefix, directory))
+            .map(|(_, config)| config)
+    }
+}
+
+/// True when a config living in `prefix` governs a file in `directory`.
+fn covers(prefix: &str, directory: &str) -> bool {
+    prefix.is_empty()
+        || directory == prefix
+        || directory
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn directory_of(rel_path: &str) -> &str {
+    rel_path
+        .rsplit_once('/')
+        .map_or("", |(directory, _)| directory)
 }
 
 fn is_model_config(name: &str) -> bool {
@@ -970,7 +1002,10 @@ fn fresh_facts(
         if let Some(tensors) = &tensors {
             input = input.with_tensors(tensors);
         }
-        if let Some(config) = config.as_ref().or(context.config.as_ref()) {
+        if let Some(config) = config
+            .as_ref()
+            .or_else(|| context.config_for(&plan.rel_path))
+        {
             input = input.with_config(config);
         }
         if let Some(frontmatter) = &context.frontmatter {
@@ -2106,6 +2141,47 @@ mod tests {
             Some("style.safetensors")
         );
         assert!(source_for_path(&config, Path::new("/elsewhere/x.bin")).is_none());
+    }
+
+    #[test]
+    fn a_config_only_governs_its_own_directory_subtree() {
+        let context = InferenceContext {
+            configs: vec![
+                (
+                    "text_encoders/gemma".to_owned(),
+                    serde_json::json!({"model_type": "gemma3"}),
+                ),
+                (String::new(), serde_json::json!({"model_type": "root"})),
+            ],
+            frontmatter: None,
+            card: None,
+        };
+
+        assert_eq!(
+            context.config_for("text_encoders/gemma/model.safetensors"),
+            Some(&serde_json::json!({"model_type": "gemma3"}))
+        );
+        assert_eq!(
+            context.config_for("loras/clip_l.safetensors"),
+            Some(&serde_json::json!({"model_type": "root"})),
+            "a sibling directory must fall back to the root config, not the encoder's"
+        );
+        assert_eq!(
+            context.config_for("text_encoders/gemma-other/x.safetensors"),
+            Some(&serde_json::json!({"model_type": "root"})),
+            "a shared name prefix is not a parent directory"
+        );
+    }
+
+    #[test]
+    fn config_scoping_prefers_the_nearest_ancestor() {
+        assert!(covers("", "anything/at/all"));
+        assert!(covers("unet", "unet"));
+        assert!(covers("unet", "unet/deeper"));
+        assert!(!covers("unet", "unet2"));
+        assert!(!covers("unet/a", "unet"));
+        assert_eq!(directory_of("a/b/c.safetensors"), "a/b");
+        assert_eq!(directory_of("c.safetensors"), "");
     }
 
     #[test]
