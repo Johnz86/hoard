@@ -73,6 +73,10 @@ impl RepoId {
     }
 
     /// Parses `org/name` or a bare `name` in the given namespace.
+    ///
+    /// A segment of `.` or `..` is refused. A repo identity is joined onto a directory in
+    /// several places -- a projection root, a peer's pull root, the cache layout -- so a
+    /// relative segment here becomes a path escape there.
     pub fn parse_ref(repo_type: RepoType, reference: &str) -> Result<Self, HoardError> {
         let trimmed = reference.trim_matches('/');
         if trimmed.is_empty() {
@@ -80,12 +84,17 @@ impl RepoId {
         }
         let mut parts = trimmed.splitn(2, '/');
         let first = parts.next().unwrap_or_default();
-        match parts.next() {
-            Some(name) if !name.is_empty() && !name.contains('/') => {
-                Ok(Self::new(repo_type, Some(first.to_owned()), name))
-            }
-            Some(_) => Err(HoardError::InvalidRepoRef(reference.to_owned())),
-            None => Ok(Self::new(repo_type, None, first)),
+        let segments = match parts.next() {
+            Some(name) if !name.is_empty() && !name.contains('/') => (first, Some(name)),
+            Some(_) => return Err(HoardError::InvalidRepoRef(reference.to_owned())),
+            None => (first, None),
+        };
+        if is_relative_segment(segments.0) || segments.1.is_some_and(is_relative_segment) {
+            return Err(HoardError::InvalidRepoRef(reference.to_owned()));
+        }
+        match segments.1 {
+            Some(name) => Ok(Self::new(repo_type, Some(segments.0.to_owned()), name)),
+            None => Ok(Self::new(repo_type, None, segments.0)),
         }
     }
 
@@ -151,6 +160,10 @@ impl<'de> Deserialize<'de> for RepoId {
         let raw = String::deserialize(deserializer)?;
         RepoId::parse_qualified(&raw).map_err(serde::de::Error::custom)
     }
+}
+
+fn is_relative_segment(segment: &str) -> bool {
+    segment == "." || segment == ".."
 }
 
 /// A 40 hex character git object name. Synthetic revisions of loose folders use the
@@ -366,6 +379,12 @@ mod tests {
         assert_eq!(bare.cache_dir_name(), "models--gpt2");
 
         assert!(RepoId::parse_ref(RepoType::Models, "a/b/c").is_err());
+        for escape in ["..", "../..", "models/..", "../name", "org/..", "."] {
+            assert!(
+                RepoId::parse_ref(RepoType::Models, escape).is_err(),
+                "{escape} would join onto a directory as a step out of it"
+            );
+        }
         assert!(RepoId::parse_ref(RepoType::Models, "").is_err());
     }
 

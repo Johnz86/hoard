@@ -67,12 +67,13 @@ and serving are per file.
 
 ## Repos and README
 
-- `GET /api/v1/repos?q=&type=&cursor=`.
+- `GET /api/v1/repos?q=&type=&cursor=`: `{ rows, next_cursor, total }`, paged by an
+  opaque row cursor.
 - `GET /api/v1/repos/{type}/{org}/{name}`: header fields (`role_full`, `state_full`,
   `meta`), `refs` (`name`, `sha`, `when`, `kind`, `current`), `revision_summary`
   (`14 files · 3 branches · 2 tags`), `facts`, `paths`, `pull` commands.
 - `GET /api/v1/repos/{type}/{org}/{name}/files?revision=`: rows `path`, `kind` (config,
-  weights, single-file, card, git, group), `size`, `state` (present, deduped, lfs_ptr),
+  weights, single-file, card, git, group), `size`, `state` (present, deduped, lfs_ptr, absent),
   `artifact_id`.
 - `GET /api/v1/repos/{type}/{org}/{name}/readme?revision=`: `{ "frontmatter": [{ "key",
   "value" }], "html": "<rendered>", "generated": false, "meta": "4.1 KB · 118 lines" }`.
@@ -101,6 +102,11 @@ shelves carry `"builtin": true`.
 `POST /api/v1/link { "query" | "shelf_id", "profile": "comfyui|a1111|llama", "dir" }`
 writes symlinks and returns the list written; the CLI `hoard link` calls this.
 
+`dir` is optional and, when relative, resolves under `<data-dir>/profiles/<profile>`. An
+absolute path is accepted only when it lies under that root or under a directory named in
+`[server] projection_roots`, so a caller cannot choose where a node writes. `apply` takes
+no `dir` at all and always uses the configured root.
+
 ## Sources, scans, jobs
 
 - `GET /api/v1/sources`: kind, files, blobs, bytes, last scan, pending hashes.
@@ -120,8 +126,11 @@ writes symlinks and returns the list written; the CLI `hoard link` calls this.
 
 ## System
 
-- `GET /healthz`: `{ "status": "ok", "index": "ok", "upstream": "ok" | "offline" | "unreachable", "peers": 3 }`.
+- `GET /healthz`: `{ "status": "ok" | "degraded", "index": "ok" | "error",
+  "upstream": "ok" | "offline" | "unreachable", "peers": 3 }`. It answers 200 even when
+  degraded: a health route that fails to respond tells a watchdog nothing.
 - `GET /api/v1/stats`: totals by role, format, node; indexed bytes; cache size and limit;
   triage count.
-- `GET /api/v1/settings` and `PUT`: density, role color mode, inspector visibility (also
-  mirrored in `localStorage` by the UI).
+- `GET /api/v1/settings` and `PUT`: density (`Condensed|Roomy`), role color mode
+  (`Color-coded|Monochrome`), inspector visibility and theme (`system|dark|light`), also
+  mirrored in `localStorage` by the UI. A value outside its vocabulary is a 400.

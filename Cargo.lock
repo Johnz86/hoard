@@ -1843,7 +1843,6 @@ dependencies = [
 name = "hoard-mirror"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "bytes",
  "crc32fast",
  "futures",
@@ -1852,9 +1851,7 @@ dependencies = [
  "hex",
  "hoard-core",
  "hoard-index",
- "http",
  "http-range-header",
- "humansize",
  "jiff",
  "mime_guess",
  "moka",
@@ -1868,7 +1865,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-util",
  "tracing",
  "url",
  "wiremock",

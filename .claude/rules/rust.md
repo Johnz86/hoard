@@ -13,7 +13,6 @@ paths:
   `NodeId`. Never pass a bare `String` where one of these exists.
 - Handlers: `async fn(State<AppState>, ...) -> Result<Response, AppError>`. No `unwrap`.
 - Blocking work (SQLite, hashing, header parsing) runs in `spawn_blocking` or `rayon`.
-- Streaming bodies: never buffer a file; use `tokio_util::io::ReaderStream` or the block
-  cache stream.
+- Streaming bodies: never buffer a file; stream from the block cache.
 - Header names in Hub responses are lower-case and must match `docs/api/hub-compat.md`.
 - Every new module is listed in `docs/architecture.md` under the crate tree.

@@ -2,6 +2,9 @@
 bind = "0.0.0.0:7099"
 public_url = "http://hoard.lan:7099"
 data_dir = "./data"
+# Directories outside <data_dir>/profiles that `hoard link` may write symlinks into.
+# Empty means projections stay under the data directory.
+projection_roots = []
 
 [node]
 name = "workstation"

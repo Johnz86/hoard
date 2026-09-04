@@ -13,10 +13,8 @@ hoard-index.workspace = true
 gix.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
 futures.workspace = true
 bytes.workspace = true
-http.workspace = true
 url.workspace = true
 percent-encoding.workspace = true
 globset.workspace = true
@@ -24,7 +22,6 @@ regex.workspace = true
 sha2.workspace = true
 hex.workspace = true
 moka.workspace = true
-arc-swap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -32,7 +29,6 @@ jiff.workspace = true
 tracing.workspace = true
 http-range-header.workspace = true
 mime_guess.workspace = true
-humansize.workspace = true
 crc32fast.workspace = true
 
 [dev-dependencies]

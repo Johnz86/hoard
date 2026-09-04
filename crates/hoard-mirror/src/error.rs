@@ -31,9 +31,6 @@ pub enum MirrorError {
     #[error("entry not found: {0}")]
     EntryNotFound(String),
 
-    #[error("range not satisfiable for a file of {size} bytes")]
-    RangeNotSatisfiable { size: u64 },
-
     #[error("upstream timed out or was rate limited")]
     ProxyTimeout,
 

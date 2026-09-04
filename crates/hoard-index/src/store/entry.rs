@@ -135,7 +135,8 @@ pub fn upsert_entry(conn: &Connection, input: &NewEntry, seen: Timestamp) -> Res
          VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
          ON CONFLICT(revision_id, path, node_id) DO UPDATE SET \
              blob_id = excluded.blob_id, artifact_id = excluded.artifact_id, \
-             source_id = excluded.source_id, abs_path = excluded.abs_path, \
+             source_id = excluded.source_id, \
+             abs_path = COALESCE(excluded.abs_path, entry.abs_path), \
              size = excluded.size, is_symlink = excluded.is_symlink, \
              lfs_pointer = excluded.lfs_pointer, state = excluded.state, \
              pull_progress = excluded.pull_progress, present = excluded.present, \
@@ -254,6 +255,37 @@ mod tests {
                 .expect("entries list")
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn a_writer_that_names_no_path_keeps_the_one_already_recorded() {
+        let store = Store::open_in_memory().expect("store opens");
+        let conn = store.write().expect("writer");
+        let world = Fixture::build(&conn);
+
+        let placed = NewEntry {
+            blob: Some(world.shared_blob),
+            abs_path: Some("/srv/pulled/pulled.safetensors".to_owned()),
+            ..NewEntry::new(world.first_revision, "pulled.safetensors", world.node_row)
+        };
+        upsert_entry(&conn, &placed, at()).expect("the pull records where it put the file");
+
+        let ingested = NewEntry {
+            blob: Some(world.shared_blob),
+            ..NewEntry::new(world.first_revision, "pulled.safetensors", world.node_row)
+        };
+        upsert_entry(&conn, &ingested, at()).expect("a later ingest writes the same row");
+
+        let rows = entries_for_revision(&conn, world.first_revision).expect("entries read");
+        let row = rows
+            .iter()
+            .find(|row| row.path == "pulled.safetensors")
+            .expect("the entry is there");
+        assert_eq!(
+            row.abs_path.as_deref(),
+            Some("/srv/pulled/pulled.safetensors"),
+            "an ingest that knows no path must not erase the path a pull materialised"
         );
     }
 
