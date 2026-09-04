@@ -191,8 +191,13 @@ pub struct TensorSample {
 }
 
 impl TensorSample {
+    /// How many elements the tensor holds, saturating rather than overflowing.
+    ///
+    /// The shape is read from a file header hoard does not control, so the product of its
+    /// dimensions is attacker-chosen: an unchecked multiply panics in a debug build and
+    /// wraps to a plausible-looking parameter count in a release one.
     pub fn element_count(&self) -> u64 {
-        self.shape.iter().copied().product::<u64>()
+        self.shape.iter().copied().fold(1, u64::saturating_mul)
     }
 }
 
@@ -411,6 +416,23 @@ mod tests {
             scaled.precision().map(|value| value.as_str().to_owned()),
             Some("fp8".to_owned())
         );
+    }
+
+    #[test]
+    fn an_absurd_shape_saturates_rather_than_overflowing() {
+        let sample = TensorSample {
+            name: "blk.0.weight".to_owned(),
+            dtype: "F16".to_owned(),
+            shape: vec![u64::MAX, u64::MAX],
+        };
+        assert_eq!(sample.element_count(), u64::MAX);
+
+        let empty = TensorSample {
+            name: "scalar".to_owned(),
+            dtype: "F32".to_owned(),
+            shape: Vec::new(),
+        };
+        assert_eq!(empty.element_count(), 1);
     }
 
     #[test]

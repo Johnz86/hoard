@@ -22,6 +22,10 @@ use crate::store::revision::RefKind;
 const REFS_DIR: &str = "refs";
 const SNAPSHOTS_DIR: &str = "snapshots";
 
+/// How deep `refs/` is read. Names nest at most a level or two (`refs/pr/1`), and a
+/// directory symlink pointing at an ancestor would otherwise loop until the stack is gone.
+const REFS_DEPTH: usize = 4;
+
 /// The repository a cache directory name encodes, or `None` when the name is not one.
 pub fn repo_dir_name(path: &Path) -> Option<RepoId> {
     let name = path.file_name()?.to_str()?;
@@ -130,19 +134,33 @@ fn default_ref(repo: &DiscoveredRepo) -> String {
 /// Every `refs/<name>` file with the commit it holds, nested names joined with `/`.
 fn read_refs(root: &Path) -> Result<Vec<(String, CommitSha)>> {
     let mut refs = Vec::new();
-    collect_refs(root, root, &mut refs)?;
+    collect_refs(root, root, REFS_DEPTH, &mut refs)?;
     refs.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(refs)
 }
 
-fn collect_refs(root: &Path, dir: &Path, refs: &mut Vec<(String, CommitSha)>) -> Result<()> {
+fn collect_refs(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    refs: &mut Vec<(String, CommitSha)>,
+) -> Result<()> {
     let Ok(children) = std::fs::read_dir(dir) else {
         return Ok(());
     };
     for child in children.flatten() {
         let path = child.path();
-        if path.is_dir() {
-            collect_refs(root, &path, refs)?;
+        let Ok(file_type) = child.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if depth > 0 {
+                collect_refs(root, &path, depth - 1, refs)?;
+            }
+            continue;
+        }
+        if file_type.is_symlink() {
+            tracing::debug!(path = %path.display(), "ref is a symlink and is not followed");
             continue;
         }
         let Some(name) = walker::relative(root, &path) else {
@@ -342,6 +360,26 @@ mod tests {
         assert_eq!(repos[0].revisions.len(), 1);
         assert!(repos[0].revisions[0].entries.is_empty());
         assert_eq!(repos[0].refs[0].revision, 0);
+    }
+
+    #[test]
+    fn a_directory_loop_under_refs_terminates_instead_of_overflowing_the_stack() {
+        let dir = TempDir::new().expect("temp dir");
+        let repo = dir.path().join("models--org--name");
+        let refs = repo.join("refs");
+        std::fs::create_dir_all(refs.join("pr")).expect("refs dir is creatable");
+        std::fs::write(refs.join("main"), SNAPSHOT).expect("ref is writable");
+        std::fs::write(refs.join("pr/1"), SNAPSHOT).expect("ref is writable");
+        std::os::unix::fs::symlink(&refs, refs.join("pr/loop")).expect("symlink is creatable");
+
+        let repos = discover(dir.path(), &WalkOptions::default(), &NoiseFilter::default())
+            .expect("cache is readable");
+        let names: Vec<&str> = repos[0]
+            .refs
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
+        assert_eq!(names, ["main", "pr/1"]);
     }
 
     #[test]

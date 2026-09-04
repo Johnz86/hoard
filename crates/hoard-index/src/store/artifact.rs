@@ -216,21 +216,67 @@ pub fn artifact_by_blob(
     ))
 }
 
-/// The artifacts waiting in the triage queue, oldest first.
-/// How many artifacts are waiting in the triage queue.
-///
-/// Counted in SQL: the queue is unbounded in principle, and the badge only needs a number.
 /// Removes artifacts produced by a superseded sniff version that nothing points at any more.
 ///
 /// Bumping the sniff version writes a second artifact for the same blob rather than editing
 /// the first, because the pair `(blob, sniff version)` is the identity. Once the scan has
 /// re-pointed every entry at the new row, the old one is unreachable, and leaving it behind
-/// would double every count the UI shows.
+/// would double every count the UI shows. Call [`adopt_superseded`] first: everything that
+/// hangs off the old row cascades away with it.
 pub fn delete_superseded(conn: &Connection, current: u32) -> Result<u64> {
     let removed = conn.execute(
         "DELETE FROM artifact WHERE sniff_version <> ?1 \
          AND NOT EXISTS (SELECT 1 FROM entry e WHERE e.artifact_id = artifact.id)",
         [i64::from(current)],
+    )?;
+    delete_orphan_fts(conn)?;
+    Ok(to_u64(removed as i64))
+}
+
+/// Moves user decisions and projections from a superseded artifact onto the one that now
+/// stands for the same bytes.
+///
+/// `artifact_override` and `projection` reference `artifact(id)` with `ON DELETE CASCADE`,
+/// so a sniff version bump would otherwise let [`delete_superseded`] take every triage
+/// decision the operator ever made with it. Returns how many rows were carried across.
+pub fn adopt_superseded(conn: &Connection, current: u32) -> Result<u64> {
+    let mut carried = 0u64;
+    for (superseded, surviving) in superseded_pairs(conn, current)? {
+        carried += to_u64(conn.execute(
+            "INSERT INTO artifact_override(artifact_id, role, sub_role, base, decided_at) \
+             SELECT ?2, role, sub_role, base, decided_at FROM artifact_override \
+             WHERE artifact_id = ?1 \
+             ON CONFLICT(artifact_id) DO NOTHING",
+            (superseded, surviving),
+        )? as i64);
+        carried += to_u64(conn.execute(
+            "UPDATE projection SET artifact_id = ?2 WHERE artifact_id = ?1",
+            (superseded, surviving),
+        )? as i64);
+    }
+    Ok(carried)
+}
+
+/// Every artifact of an older sniff version paired with the current one for the same blob,
+/// newest superseded version first so the most recent decision wins a collision.
+fn superseded_pairs(conn: &Connection, current: u32) -> Result<Vec<(i64, i64)>> {
+    let mut statement = conn.prepare(
+        "SELECT old.id, new.id FROM artifact old \
+         JOIN artifact new ON new.blob_id = old.blob_id AND new.sniff_version = ?1 \
+         WHERE old.sniff_version <> ?1 ORDER BY old.sniff_version DESC",
+    )?;
+    let rows = statement.query_map([i64::from(current)], |row| {
+        Ok(Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+    })?;
+    collect_rows(rows)
+}
+
+/// Drops full-text rows for artifacts that no longer exist. `artifact_fts` is a virtual
+/// table, so no foreign key removes them with the artifact they described.
+pub fn delete_orphan_fts(conn: &Connection) -> Result<u64> {
+    let removed = conn.execute(
+        "DELETE FROM artifact_fts WHERE artifact_id NOT IN (SELECT id FROM artifact)",
+        [],
     )?;
     Ok(to_u64(removed as i64))
 }
@@ -259,9 +305,13 @@ pub fn delete_describing(conn: &Connection) -> Result<u64> {
         &format!("DELETE FROM artifact WHERE format NOT IN ({placeholders})"),
         params,
     )?;
+    delete_orphan_fts(conn)?;
     Ok(to_u64(removed as i64))
 }
 
+/// How many artifacts are waiting in the triage queue.
+///
+/// Counted in SQL: the queue is unbounded in principle, and the badge only needs a number.
 pub fn triage_count(conn: &Connection) -> Result<u64> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM artifact WHERE triage = 1",
@@ -271,6 +321,7 @@ pub fn triage_count(conn: &Connection) -> Result<u64> {
     Ok(to_u64(count))
 }
 
+/// The artifacts waiting in the triage queue, oldest first.
 pub fn triage_queue(conn: &Connection, limit: u32) -> Result<Vec<ArtifactRow>> {
     let mut statement = conn.prepare(&format!(
         "SELECT {ARTIFACT_COLUMNS} {ARTIFACT_FROM} WHERE a.triage = 1 ORDER BY a.id LIMIT ?1"
@@ -653,6 +704,72 @@ mod tests {
                 .get::<_, i64>(0))
                 .expect("count"),
             1
+        );
+    }
+
+    #[test]
+    fn a_sniff_version_bump_carries_the_users_decision_onto_the_surviving_row() {
+        use crate::store::overrides::{apply_overrides, artifact_override, put_override};
+
+        let store = Store::open_in_memory().expect("store opens");
+        let conn = store.write().expect("writer");
+        let blob = upsert_blob(&conn, "xxh3:bump", 64, at()).expect("blob inserts");
+        let old = upsert_artifact(&conn, &lora(blob), at()).expect("artifact inserts");
+        put_override(&conn, old, Some(Role::Ctrl), None, Some(Base::new("sdxl")))
+            .expect("decision records");
+
+        let new = upsert_artifact(
+            &conn,
+            &NewArtifact {
+                sniff_version: 2,
+                ..lora(blob)
+            },
+            at(),
+        )
+        .expect("the bump writes a second row");
+        assert_ne!(new, old);
+
+        assert_eq!(adopt_superseded(&conn, 2).expect("decisions move"), 1);
+        apply_overrides(&conn).expect("overrides re-apply");
+        delete_superseded(&conn, 2).expect("the old row is swept");
+
+        let carried = artifact_override(&conn, new)
+            .expect("override reads")
+            .expect("the decision survived the bump");
+        assert_eq!(carried.role, Some(Role::Ctrl));
+        assert_eq!(carried.base, Some(Base::new("sdxl")));
+        let row = artifact(&conn, new).expect("artifact reads");
+        assert_eq!(row.artifact.role, Role::Ctrl);
+        assert!(!row.triage);
+        assert!(artifact(&conn, old).is_err());
+    }
+
+    #[test]
+    fn a_sweep_leaves_no_full_text_row_behind() {
+        let store = Store::open_in_memory().expect("store opens");
+        let conn = store.write().expect("writer");
+        let blob = upsert_blob(&conn, "xxh3:fts", 64, at()).expect("blob inserts");
+        upsert_artifact(&conn, &lora(blob), at()).expect("artifact inserts");
+        upsert_artifact(
+            &conn,
+            &NewArtifact {
+                sniff_version: 2,
+                ..lora(blob)
+            },
+            at(),
+        )
+        .expect("the bump writes a second row");
+
+        let indexed = || -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM artifact_fts", [], |row| row.get(0))
+                .expect("count")
+        };
+        assert_eq!(indexed(), 2);
+        assert_eq!(delete_superseded(&conn, 2).expect("sweep runs"), 1);
+        assert_eq!(
+            indexed(),
+            1,
+            "a virtual table has no foreign key, so the sweep must clear it itself"
         );
     }
 

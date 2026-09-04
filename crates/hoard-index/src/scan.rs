@@ -37,11 +37,12 @@ use crate::shard::{self, ShardCandidate, ShardSet, directory_of, file_name};
 use crate::sniff::{self, SniffResult};
 use crate::store::Store;
 use crate::store::artifact::{
-    NewArtifact, artifact_by_blob, delete_describing, delete_superseded, replace_evidence,
-    set_card, set_tensor_summary, set_triage, upsert_artifact,
+    NewArtifact, adopt_superseded, artifact as artifact_row, artifact_by_blob, delete_describing,
+    delete_superseded, replace_evidence, set_card, set_tensor_summary, set_triage, upsert_artifact,
 };
 use crate::store::blob::{
-    blob, blob_by_fingerprint, blob_by_sha256, set_sha256, unhashed_blobs, upsert_blob,
+    blob, blob_by_fingerprint, blob_by_sha256, delete_orphan_blobs, set_sha256,
+    unhashed_blobs_after, upsert_blob,
 };
 use crate::store::entry::{
     NewEntry, entries_for_blob, entries_for_revision, mark_absent, upsert_entry,
@@ -181,7 +182,12 @@ impl ScanReport {
 ///
 /// Discovery, header sniffing, fingerprinting and inference run on the rayon pool; every
 /// database write happens in batched transactions on a blocking thread. User overrides are
-/// re-applied at the end, so a rescan never undoes a triage decision.
+/// carried onto the current sniff version and re-applied at the end, so neither a rescan
+/// nor a rules bump ever undoes a triage decision.
+///
+/// The recorded sniff version is the whole index's, so only a scan of every source writes
+/// it: one source alone cannot vouch for the rest, and claiming it did would leave the
+/// others frozen on rules they were never read with.
 pub async fn scan(
     store: &Store,
     config: &IndexConfig,
@@ -190,6 +196,7 @@ pub async fn scan(
 ) -> Result<ScanReport> {
     let started = Instant::now();
     let sources = select_sources(config, options.source.as_deref())?;
+    let every_source = options.source.is_none();
     let node_row = ensure_local_node(store).await?;
     let subject = options.source.clone();
     let job = store
@@ -212,6 +219,10 @@ pub async fn scan(
     }
     store
         .call_mut(move |conn| {
+            let carried = adopt_superseded(conn, SNIFF_VERSION)?;
+            if carried > 0 {
+                tracing::info!(carried, "decisions carried onto the current sniff version");
+            }
             apply_overrides(conn)?;
             let described = delete_describing(conn)?;
             if described > 0 {
@@ -224,7 +235,13 @@ pub async fn scan(
             if dropped > 0 {
                 tracing::info!(dropped, "artifacts from a superseded sniff version removed");
             }
-            put_setting(conn, SNIFF_VERSION_KEY, &SNIFF_VERSION.to_string())?;
+            let orphaned = delete_orphan_blobs(conn)?;
+            if orphaned > 0 {
+                tracing::info!(orphaned, "blobs no path reaches any more removed");
+            }
+            if every_source {
+                put_setting(conn, SNIFF_VERSION_KEY, &SNIFF_VERSION.to_string())?;
+            }
             finish_job(conn, job)
         })
         .await?;
@@ -263,23 +280,18 @@ pub async fn hash_pending(
 
 async fn hash_queue(store: &Store, config: &IndexConfig, reporter: &Reporter<'_>) -> Result<u64> {
     let threshold = config.lfs_threshold;
-    let mut attempted: HashSet<i64> = HashSet::new();
+    let limit = u32::try_from(HASH_BATCH).unwrap_or(u32::MAX);
+    let mut cursor: Option<BlobId> = None;
     let mut hashed = 0u64;
     loop {
-        let limit = u32::try_from(attempted.len() + HASH_BATCH).unwrap_or(u32::MAX);
-        let waiting = store.call(move |conn| unhashed_blobs(conn, limit)).await?;
-        let batch: Vec<(BlobId, u64)> = waiting
-            .iter()
-            .filter(|row| !attempted.contains(&row.id.get()))
-            .take(HASH_BATCH)
-            .map(|row| (row.id, row.size))
-            .collect();
-        if batch.is_empty() {
+        let waiting = store
+            .call(move |conn| unhashed_blobs_after(conn, cursor, limit))
+            .await?;
+        let batch: Vec<(BlobId, u64)> = waiting.iter().map(|row| (row.id, row.size)).collect();
+        let Some((last, _)) = batch.last() else {
             return Ok(hashed);
-        }
-        for (id, _) in &batch {
-            attempted.insert(id.get());
-        }
+        };
+        cursor = Some(*last);
 
         let ids: Vec<BlobId> = batch.iter().map(|(id, _)| *id).collect();
         let located = store.call(move |conn| locate_blobs(conn, &ids)).await?;
@@ -516,6 +528,9 @@ struct Cached {
     artifact: Option<ArtifactId>,
     fingerprint: String,
     state: State,
+    /// How many files the artifact at this path was last recorded as spanning. A shard set
+    /// that lost a member is only noticed by comparing this against what is on disk now.
+    shard_count: Option<u32>,
 }
 
 type StampCache = HashMap<PathBuf, Cached>;
@@ -536,6 +551,7 @@ async fn load_stamp_cache(store: &Store, node_row: i64, source: SourceId) -> Res
         .call(move |conn| {
             let mut cache = StampCache::new();
             let mut fingerprints: HashMap<i64, String> = HashMap::new();
+            let mut shard_counts: HashMap<i64, u32> = HashMap::new();
             let filter = RepoFilter {
                 node_row: Some(node_row),
                 ..RepoFilter::default()
@@ -563,6 +579,17 @@ async fn load_stamp_cache(store: &Store, node_row: i64, source: SourceId) -> Res
                                     found
                                 }
                             };
+                            let shard_count = match row.artifact {
+                                Some(artifact) => match shard_counts.get(&artifact.get()) {
+                                    Some(known) => Some(*known),
+                                    None => {
+                                        let found = artifact_row(conn, artifact)?.shard_count;
+                                        shard_counts.insert(artifact.get(), found);
+                                        Some(found)
+                                    }
+                                },
+                                None => None,
+                            };
                             cache.insert(
                                 PathBuf::from(abs_path),
                                 Cached {
@@ -575,6 +602,7 @@ async fn load_stamp_cache(store: &Store, node_row: i64, source: SourceId) -> Res
                                     artifact: row.artifact,
                                     fingerprint,
                                     state: row.state,
+                                    shard_count,
                                 },
                             );
                         }
@@ -823,6 +851,9 @@ fn content_revision(entries: &[EntryPlan]) -> CommitSha {
 struct Sniffed {
     stamp: Option<FileStamp>,
     outcome: Outcome,
+    /// How many files the artifact at this path already spans, when a previous scan
+    /// recorded one. A shard set only proves it is still whole by matching this.
+    known_shards: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -870,6 +901,7 @@ fn sniff_entry(entry: &DiscoveredEntry, setup: &Preparation, counters: &Counters
         return Sniffed {
             stamp: None,
             outcome: Outcome::Absent,
+            known_shards: None,
         };
     };
     let stamp = entry.stamp.or_else(|| hash::stamp(abs_path).ok());
@@ -884,6 +916,7 @@ fn sniff_entry(entry: &DiscoveredEntry, setup: &Preparation, counters: &Counters
                 fingerprint: cached.fingerprint.clone(),
                 state: cached.state,
             },
+            known_shards: cached.shard_count,
         };
     }
 
@@ -901,7 +934,11 @@ fn sniff_entry(entry: &DiscoveredEntry, setup: &Preparation, counters: &Counters
             Outcome::Absent
         }
     };
-    Sniffed { stamp, outcome }
+    Sniffed {
+        stamp,
+        outcome,
+        known_shards: None,
+    }
 }
 
 fn read_header(path: &Path, size: u64) -> Result<(String, SniffResult)> {
@@ -920,6 +957,11 @@ fn plan_size(entry: &DiscoveredEntry, sniffed: &Sniffed) -> u64 {
 /// A set describes itself from the union of its shard headers, so a member the stamp cache
 /// answered for is read again as soon as any other member changed. A set nothing touched is
 /// left out entirely: its entries still point at the artifact the last scan gave them.
+///
+/// "Nothing touched" means every member answered from its stamp *and* the set still holds
+/// as many files as the artifact was recorded with. Deleting one shard of forty changes no
+/// stamp at all, so without the second half the row would go on claiming a complete model
+/// that cannot be served.
 fn regroup(
     entries: &[DiscoveredEntry],
     sniffed: &mut [Sniffed],
@@ -948,9 +990,14 @@ fn regroup(
             .iter()
             .map(|candidate| positions[*candidate])
             .collect();
-        if members
-            .iter()
-            .all(|member| matches!(sniffed[*member].outcome, Outcome::Known { .. }))
+        let still_whole = members
+            .first()
+            .and_then(|anchor| sniffed[*anchor].known_shards)
+            == u32::try_from(members.len()).ok();
+        if still_whole
+            && members
+                .iter()
+                .all(|member| matches!(sniffed[*member].outcome, Outcome::Known { .. }))
         {
             continue;
         }
@@ -1229,7 +1276,7 @@ impl RevisionFacts<'_> {
             stem: set.stem.clone(),
             bytes,
             tensors,
-            triage: needs_triage(&inference, self.triage_confidence),
+            triage: needs_triage(&inference, self.triage_confidence) || set.is_incomplete(),
             inference,
             anchor_key: AnchorKey {
                 fingerprint: fingerprint.clone(),
@@ -1987,7 +2034,7 @@ mod tests {
     use super::*;
     use crate::hash::{git_blob_sha1_bytes, sha256_bytes};
     use crate::store::artifact::{artifact_by_blob, triage_queue};
-    use crate::store::blob::{blob_by_fingerprint, blob_by_sha256, disk_pressure};
+    use crate::store::blob::{blob_by_fingerprint, blob_by_sha256, disk_pressure, unhashed_blobs};
     use crate::store::entry::entries_for_revision;
     use crate::store::overrides::put_override;
     use crate::store::repo::repo_by_qualified;
@@ -2653,6 +2700,144 @@ mod tests {
         assert_eq!(listed[0].shard_count, 2, "only what is on disk counts");
         assert_eq!(listed[0].size, present);
         assert_eq!(listed[0].role, Role::Llm);
+        assert!(
+            listed[0].triage,
+            "two of the five files the names declare cannot be served as a model"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shard_set_that_lost_a_member_is_revisited_on_the_next_scan() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("hub");
+        fs::create_dir_all(&root).expect("cache root is creatable");
+        let shards = llm_shards();
+        let commit = hf_cache(
+            &root,
+            "org/shrinking",
+            &[
+                ("model-00001-of-00003.safetensors", shards[0].clone()),
+                ("model-00002-of-00003.safetensors", shards[1].clone()),
+                ("model-00003-of-00003.safetensors", shards[2].clone()),
+            ],
+        );
+
+        let store = Store::open_in_memory().expect("store opens");
+        let config = config(
+            dir.path(),
+            vec![source("cache", &root, SourceKind::HfCache)],
+        );
+        let recorder = Recorder::default();
+        run(&store, &config, &recorder).await;
+        let before = rows(&store);
+        assert_eq!(before[0].shard_count, 3);
+        assert!(!before[0].triage);
+
+        let snapshot = root
+            .join("models--org--shrinking")
+            .join("snapshots")
+            .join(&commit);
+        fs::remove_file(snapshot.join("model-00002-of-00003.safetensors"))
+            .expect("shard is removable");
+
+        run(&store, &config, &recorder).await;
+        let after = rows(&store);
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].shard_count, 2,
+            "no stamp changed, but the set is no longer the model it claimed to be"
+        );
+        assert_eq!(
+            after[0].size,
+            shards[0].len() as u64 + shards[2].len() as u64
+        );
+        assert!(after[0].triage, "a set missing a shard cannot be served");
+    }
+
+    #[tokio::test]
+    async fn replacing_a_files_contents_leaves_no_phantom_duplicate_behind() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("scratch");
+        let first = lora_bytes(768);
+        let second = lora_bytes(512);
+        let original = first.len() as u64;
+        let replacement = second.len() as u64;
+        write(&root, "loras/style.safetensors", &first);
+
+        let store = Store::open_in_memory().expect("store opens");
+        let config = config(
+            dir.path(),
+            vec![source("scratch", &root, SourceKind::Loose)],
+        );
+        let recorder = Recorder::default();
+        run(&store, &config, &recorder).await;
+
+        write(&root, "loras/style.safetensors", &second);
+        run(&store, &config, &recorder).await;
+
+        let listed = rows(&store);
+        let current = listed
+            .iter()
+            .find(|row| row.size == replacement)
+            .expect("the bytes on disk now are indexed");
+        assert_eq!(current.path_count, 1);
+        assert!(!current.dupe);
+        let stale = listed
+            .iter()
+            .find(|row| row.size == original)
+            .expect("what the disk used to hold is remembered");
+        assert_eq!(
+            stale.path_count, 0,
+            "the bytes the path left behind must stop counting it"
+        );
+        assert!(
+            !stale.dupe,
+            "one file at one path is not a duplicate of the bytes it used to hold"
+        );
+
+        let conn = store.read().expect("reader");
+        let pressure = disk_pressure(&conn).expect("pressure reads");
+        assert_eq!(pressure.duplicate_blobs, 0);
+        assert_eq!(pressure.reclaimable_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn scanning_one_source_does_not_vouch_for_the_rules_of_the_others() {
+        let dir = TempDir::new().expect("temp dir");
+        let comfy = dir.path().join("comfy");
+        let vault = dir.path().join("vault");
+        write(&comfy, "loras/a.safetensors", &lora_bytes(768));
+        write(&vault, "loras/b.safetensors", &lora_bytes(512));
+
+        let store = Store::open_in_memory().expect("store opens");
+        let config = config(
+            dir.path(),
+            vec![
+                source("comfy", &comfy, SourceKind::Loose),
+                source("vault", &vault, SourceKind::Loose),
+            ],
+        );
+        let recorder = Recorder::default();
+        let options = ScanOptions::default().for_source("comfy".to_owned());
+        scan(&store, &config, options, &recorder.record())
+            .await
+            .expect("scan succeeds");
+
+        let recorded = {
+            let conn = store.read().expect("reader");
+            get_setting(&conn, SNIFF_VERSION_KEY).expect("setting reads")
+        };
+        assert_eq!(
+            recorded, None,
+            "one source cannot record that every source was read with these rules"
+        );
+
+        run(&store, &config, &recorder).await;
+        let recorded = {
+            let conn = store.read().expect("reader");
+            get_setting(&conn, SNIFF_VERSION_KEY).expect("setting reads")
+        };
+        assert_eq!(recorded, Some(SNIFF_VERSION.to_string()));
     }
 
     #[tokio::test]
@@ -2712,8 +2897,12 @@ mod tests {
         };
         {
             let conn = store.write().expect("writer");
-            put_override(&conn, id, Some(Role::Vae), Some(SubRole::Ipa), None)
+            put_override(&conn, id, Some(Role::Lora), Some(SubRole::Ipa), None)
                 .expect("override records");
+            assert!(
+                put_override(&conn, id, Some(Role::Vae), Some(SubRole::Ipa), None).is_err(),
+                "an ip-adapter is not a vae, and the index must not record that it is"
+            );
         }
 
         age(&file);
@@ -2727,7 +2916,7 @@ mod tests {
 
         let conn = store.read().expect("reader");
         let found = crate::store::artifact::artifact(&conn, id).expect("artifact reads");
-        assert_eq!(found.artifact.role, Role::Vae);
+        assert_eq!(found.artifact.role, Role::Lora);
         assert_eq!(found.artifact.sub_role, Some(SubRole::Ipa));
         assert!(!found.triage, "a confirmed artifact leaves the queue");
     }

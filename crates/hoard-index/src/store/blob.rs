@@ -119,10 +119,24 @@ pub fn blob_by_fingerprint(
 
 /// The oldest blobs still waiting for a sha256, which is the hashing queue.
 pub fn unhashed_blobs(conn: &Connection, limit: u32) -> Result<Vec<BlobRow>> {
+    unhashed_blobs_after(conn, None, limit)
+}
+
+/// The blobs still waiting for a sha256, in id order, starting past `after`.
+///
+/// The cursor is what keeps a run linear: a blob that cannot be hashed stays in the set,
+/// so a queue re-read from the start would fetch every failure again on every batch.
+pub fn unhashed_blobs_after(
+    conn: &Connection,
+    after: Option<BlobId>,
+    limit: u32,
+) -> Result<Vec<BlobRow>> {
     let mut statement = conn.prepare(&format!(
-        "SELECT {BLOB_COLUMNS} FROM blob WHERE sha256 IS NULL ORDER BY id LIMIT ?1"
+        "SELECT {BLOB_COLUMNS} FROM blob WHERE sha256 IS NULL AND id > ?1 ORDER BY id LIMIT ?2"
     ))?;
-    let rows = statement.query_map([limit], |row| Ok(BlobRow::from_row(row)))?;
+    let rows = statement.query_map((after.map_or(0, BlobId::get), limit), |row| {
+        Ok(BlobRow::from_row(row))
+    })?;
     collect_rows(rows)
 }
 
@@ -138,6 +152,20 @@ pub fn refresh_path_count(conn: &Connection, id: BlobId) -> Result<u32> {
         |row| row.get(0),
     )?;
     Ok(to_u32(count))
+}
+
+/// Removes blobs no path and no artifact reaches any more.
+///
+/// A file whose contents changed leaves its old blob behind: the entry is re-pointed at the
+/// new bytes and nothing ever names the old row again. Left in place it keeps counting
+/// towards DISK PRESSURE and towards the duplicate totals for bytes that are gone.
+pub fn delete_orphan_blobs(conn: &Connection) -> Result<u64> {
+    let removed = conn.execute(
+        "DELETE FROM blob WHERE NOT EXISTS (SELECT 1 FROM entry e WHERE e.blob_id = blob.id) \
+         AND NOT EXISTS (SELECT 1 FROM artifact a WHERE a.blob_id = blob.id)",
+        [],
+    )?;
+    Ok(to_u64(removed as i64))
 }
 
 /// Recounts every blob, after a scan marked entries absent.
@@ -244,6 +272,23 @@ mod tests {
                 .expect("lookup")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_blob_no_path_and_no_artifact_reaches_is_swept_away() {
+        let store = Store::open_in_memory().expect("store opens");
+        let conn = store.write().expect("writer");
+        let world = crate::store::fixture::Fixture::build(&conn);
+        let stranded = upsert_blob(&conn, "xxh3:stranded", 4096, at()).expect("blob inserts");
+
+        assert_eq!(delete_orphan_blobs(&conn).expect("sweep runs"), 1);
+        assert!(blob(&conn, stranded).is_err());
+        assert_eq!(
+            blob(&conn, world.shared_blob).expect("blob reads").id,
+            world.shared_blob,
+            "a blob paths still reach survives the sweep"
+        );
+        assert_eq!(delete_orphan_blobs(&conn).expect("sweep runs"), 0);
     }
 
     #[test]

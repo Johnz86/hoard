@@ -4,7 +4,7 @@
 //! git LFS pointer resolves to `<git dir>/lfs/objects/<a>/<b>/<oid>`; when that object is
 //! not on this disk the path is still indexed, as an entry with no bytes behind it.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use gix::bstr::ByteSlice;
 use gix::objs::tree::EntryKind;
@@ -12,7 +12,7 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use hoard_core::{CommitSha, RepoId, RepoType};
 
-use crate::discover::walker::{self, NoiseFilter};
+use crate::discover::walker::{self, NoiseFilter, WalkOptions};
 use crate::discover::{
     DEFAULT_REF, DiscoveredEntry, DiscoveredRef, DiscoveredRepo, DiscoveredRevision, RevisionName,
 };
@@ -37,14 +37,23 @@ pub fn is_git_repo(path: &Path) -> bool {
 }
 
 /// Reads every clone at or below `root`.
-pub fn discover(root: &Path, noise: &NoiseFilter) -> Result<Vec<DiscoveredRepo>> {
+///
+/// `options` carries the symlink policy: a working tree file that resolves outside the
+/// source root is left out, exactly as the loose walk leaves one out, because every
+/// indexed file is servable.
+pub fn discover(
+    root: &Path,
+    options: &WalkOptions,
+    noise: &NoiseFilter,
+) -> Result<Vec<DiscoveredRepo>> {
+    let options = &options.with_default_boundary(root);
     let mut clones = Vec::new();
     collect_clones(root, CLONE_DEPTH, noise, &mut clones)?;
     clones.sort();
 
     let mut repos: Vec<DiscoveredRepo> = clones
         .par_iter()
-        .filter_map(|path| match read_clone(root, path) {
+        .filter_map(|path| match read_clone(root, path, options) {
             Ok(repo) => Some(repo),
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "clone skipped");
@@ -82,7 +91,7 @@ fn collect_clones(
     Ok(())
 }
 
-fn read_clone(root: &Path, path: &Path) -> Result<DiscoveredRepo> {
+fn read_clone(root: &Path, path: &Path, options: &WalkOptions) -> Result<DiscoveredRepo> {
     let repository = gix::open(path)
         .map_err(|error| IndexError::Git(format!("{} does not open: {error}", path.display())))?;
     let git_dir = repository.git_dir().to_path_buf();
@@ -97,7 +106,13 @@ fn read_clone(root: &Path, path: &Path) -> Result<DiscoveredRepo> {
         let index = match shas.iter().position(|known| known == &sha) {
             Some(index) => index,
             None => {
-                let entries = read_tree(&repository, sha, &git_dir, work_dir.as_deref())?;
+                let location = TreeLocation {
+                    git_dir: &git_dir,
+                    work_dir: work_dir.as_deref(),
+                    root,
+                    options,
+                };
+                let entries = read_tree(&repository, sha, &location)?;
                 let mut revision = DiscoveredRevision::new(RevisionName::Commit(sha), entries);
                 revision.title = commit_title(&repository, sha);
                 shas.push(sha);
@@ -228,11 +243,35 @@ fn default_ref(repository: &gix::Repository, discovered: &DiscoveredRepo) -> Str
         .unwrap_or_else(|| DEFAULT_REF.to_owned())
 }
 
+/// Where the bytes of one revision may live, and whether a link out of the source root
+/// counts as one of them.
+struct TreeLocation<'a> {
+    git_dir: &'a Path,
+    work_dir: Option<&'a Path>,
+    root: &'a Path,
+    options: &'a WalkOptions,
+}
+
+impl TreeLocation<'_> {
+    /// The file at `path`, when it exists and the symlink policy allows serving it.
+    fn present(&self, path: PathBuf) -> Option<(PathBuf, bool)> {
+        let is_symlink = std::fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink());
+        if is_symlink && !self.options.permits_link(self.root, &path) {
+            tracing::debug!(
+                path = %path.display(),
+                "symlink leaves the source root; set follow_symlinks to index it"
+            );
+            return None;
+        }
+        path.is_file().then_some((path, is_symlink))
+    }
+}
+
 fn read_tree(
     repository: &gix::Repository,
     sha: CommitSha,
-    git_dir: &Path,
-    work_dir: Option<&Path>,
+    location: &TreeLocation<'_>,
 ) -> Result<Vec<DiscoveredEntry>> {
     let object_id = gix::ObjectId::try_from(sha.as_bytes().as_slice())
         .map_err(|error| IndexError::Git(format!("bad object name: {error}")))?;
@@ -250,24 +289,37 @@ fn read_tree(
 
     let mut entries = Vec::with_capacity(records.len());
     for record in records {
-        if matches!(record.mode.kind(), EntryKind::Tree | EntryKind::Commit) {
+        if matches!(
+            record.mode.kind(),
+            EntryKind::Tree | EntryKind::Commit | EntryKind::Link
+        ) {
             continue;
         }
         let rel_path = record.filepath.to_str_lossy().into_owned();
-        entries.push(tree_entry(
-            repository, rel_path, record.oid, git_dir, work_dir,
-        ));
+        if !stays_below_the_work_tree(&rel_path) {
+            tracing::debug!(path = rel_path, "tree path climbs out of the work tree");
+            continue;
+        }
+        entries.push(tree_entry(repository, rel_path, record.oid, location));
     }
     entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
     Ok(entries)
+}
+
+/// True when a tree path names something under the work tree rather than beside it. A
+/// hand-built tree may spell `..`, which `work_dir.join` would follow out of the source.
+fn stays_below_the_work_tree(rel_path: &str) -> bool {
+    !rel_path.is_empty()
+        && Path::new(rel_path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 fn tree_entry(
     repository: &gix::Repository,
     rel_path: String,
     oid: gix::ObjectId,
-    git_dir: &Path,
-    work_dir: Option<&Path>,
+    location: &TreeLocation<'_>,
 ) -> DiscoveredEntry {
     let size = repository
         .find_header(oid)
@@ -288,38 +340,36 @@ fn tree_entry(
         git_sha1: commit_sha(oid.as_ref()),
         lfs_pointer: pointer.is_some(),
     };
-    match pointer {
+    let resolved = match pointer {
         Some(pointer) => {
             entry.size = pointer.size;
             entry.sha256 = Some(pointer.sha256);
             entry.git_sha1 = None;
-            entry.abs_path = present(lfs_object_path(git_dir, &pointer.sha256.to_hex()));
+            location.present(lfs_object_path(location.git_dir, &pointer.sha256.to_hex()))
         }
-        None => {
-            entry.abs_path = work_dir.and_then(|dir| present(dir.join(&entry.rel_path)));
+        None => location
+            .work_dir
+            .and_then(|dir| location.present(dir.join(&entry.rel_path))),
+    };
+    if let Some((path, is_symlink)) = resolved {
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            entry.size = metadata.len();
+            entry.stamp = Some(walker::stamp_of(&metadata));
         }
-    }
-    if let Some(path) = entry.abs_path.as_ref()
-        && let Ok(metadata) = std::fs::metadata(path)
-    {
-        entry.size = metadata.len();
-        entry.stamp = Some(walker::stamp_of(&metadata));
+        entry.is_symlink = is_symlink;
+        entry.abs_path = Some(path);
     }
     entry
 }
 
-fn present(path: PathBuf) -> Option<PathBuf> {
-    path.is_file().then_some(path)
-}
-
-/// `<git dir>/lfs/objects/<a>/<b>/<oid>`, the layout `git lfs` writes.
+/// `<git dir>/lfs/objects/<a>/<b>/<oid>`, the layout `git lfs` writes. An object name too
+/// short to fan out lands directly in `objects`, which is where it would not be found.
 pub fn lfs_object_path(git_dir: &Path, oid_hex: &str) -> PathBuf {
-    git_dir
-        .join("lfs")
-        .join("objects")
-        .join(&oid_hex[0..2])
-        .join(&oid_hex[2..4])
-        .join(oid_hex)
+    let objects = git_dir.join("lfs").join("objects");
+    match (oid_hex.get(0..2), oid_hex.get(2..4)) {
+        (Some(first), Some(second)) => objects.join(first).join(second).join(oid_hex),
+        (Some(_) | None, _) => objects.join(oid_hex),
+    }
 }
 
 fn commit_title(repository: &gix::Repository, sha: CommitSha) -> Option<String> {
@@ -336,6 +386,7 @@ fn commit_sha(id: &gix::hash::oid) -> Option<CommitSha> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs as unix_fs;
     use std::process::Command;
 
     use tempfile::TempDir;
@@ -420,7 +471,8 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let (clone, media) = build_clone(dir.path());
 
-        let repos = discover(dir.path(), &NoiseFilter::default()).expect("clones are readable");
+        let repos = discover(dir.path(), &WalkOptions::default(), &NoiseFilter::default())
+            .expect("clones are readable");
         assert_eq!(repos.len(), 1);
         let repo = &repos[0];
         assert_eq!(repo.repo.qualified(), "models/org/repo");
@@ -464,11 +516,102 @@ mod tests {
     }
 
     #[test]
+    fn a_tracked_symlink_out_of_the_root_is_not_indexed_unless_it_is_opted_into() {
+        let dir = TempDir::new().expect("temp dir");
+        let outside = dir.path().join("outside.safetensors");
+        fs::write(&outside, b"outside the source").expect("file writes");
+
+        let clone = dir.path().join("clones").join("org").join("repo");
+        fs::create_dir_all(&clone).expect("clone dir is creatable");
+        git(&clone, &["init", "--initial-branch=main", "--quiet"]);
+        fs::write(clone.join("real.safetensors"), b"inside").expect("file writes");
+        unix_fs::symlink(&outside, clone.join("escaped.safetensors"))
+            .expect("symlink is creatable");
+        unix_fs::symlink(
+            clone.join("real.safetensors"),
+            clone.join("beside.safetensors"),
+        )
+        .expect("symlink is creatable");
+        git(&clone, &["add", "."]);
+        git(&clone, &["commit", "-m", "links", "--quiet"]);
+
+        let root = dir.path().join("clones");
+        let guarded = WalkOptions::new(&[], &[], false).expect("options compile");
+        let repos = discover(&root, &guarded, &NoiseFilter::default()).expect("clones read");
+        let entries = &repos[0].revisions[0].entries;
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.rel_path.as_str())
+            .collect();
+        assert_eq!(names, ["real.safetensors"], "git records links as links");
+        assert!(entries[0].present());
+
+        let followed = WalkOptions::new(&[], &[], true).expect("options compile");
+        let repos = discover(&root, &followed, &NoiseFilter::default()).expect("clones read");
+        assert_eq!(repos[0].revisions[0].entries.len(), 1);
+    }
+
+    #[test]
+    fn a_worktree_file_replaced_by_an_escaping_symlink_is_dropped() {
+        let dir = TempDir::new().expect("temp dir");
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, b"outside the source").expect("file writes");
+
+        let clone = dir.path().join("clones").join("org").join("repo");
+        fs::create_dir_all(&clone).expect("clone dir is creatable");
+        git(&clone, &["init", "--initial-branch=main", "--quiet"]);
+        fs::write(clone.join("model.safetensors"), b"weights").expect("file writes");
+        git(&clone, &["add", "."]);
+        git(&clone, &["commit", "-m", "weights", "--quiet"]);
+        fs::remove_file(clone.join("model.safetensors")).expect("file is removable");
+        unix_fs::symlink(&outside, clone.join("model.safetensors")).expect("symlink is creatable");
+
+        let root = dir.path().join("clones");
+        let guarded = WalkOptions::new(&[], &[], false).expect("options compile");
+        let repos = discover(&root, &guarded, &NoiseFilter::default()).expect("clones read");
+        let entry = &repos[0].revisions[0].entries[0];
+        assert_eq!(entry.rel_path, "model.safetensors");
+        assert!(
+            !entry.present(),
+            "the path is known but its bytes are outside what the operator nominated"
+        );
+
+        let followed = WalkOptions::new(&[], &[], true).expect("options compile");
+        let repos = discover(&root, &followed, &NoiseFilter::default()).expect("clones read");
+        let entry = &repos[0].revisions[0].entries[0];
+        assert!(entry.present());
+        assert!(entry.is_symlink);
+    }
+
+    #[test]
+    fn an_lfs_object_name_too_short_to_fan_out_does_not_panic() {
+        let path = lfs_object_path(Path::new("/repo/.git"), "ab");
+        assert_eq!(path, Path::new("/repo/.git/lfs/objects/ab"));
+        assert_eq!(
+            lfs_object_path(Path::new("/repo/.git"), "abcd"),
+            Path::new("/repo/.git/lfs/objects/ab/cd/abcd")
+        );
+        assert_eq!(
+            lfs_object_path(Path::new("/repo/.git"), ""),
+            Path::new("/repo/.git/lfs/objects")
+        );
+    }
+
+    #[test]
+    fn a_tree_path_that_climbs_out_of_the_work_tree_is_refused() {
+        assert!(stays_below_the_work_tree("unet/model.safetensors"));
+        assert!(!stays_below_the_work_tree("../outside.safetensors"));
+        assert!(!stays_below_the_work_tree("a/../../b"));
+        assert!(!stays_below_the_work_tree("/etc/hostname"));
+        assert!(!stays_below_the_work_tree(""));
+    }
+
+    #[test]
     fn a_directory_with_no_clones_yields_nothing() {
         let dir = TempDir::new().expect("temp dir");
         fs::create_dir_all(dir.path().join("plain")).expect("dir is creatable");
         assert!(
-            discover(dir.path(), &NoiseFilter::default())
+            discover(dir.path(), &WalkOptions::default(), &NoiseFilter::default())
                 .expect("root is readable")
                 .is_empty()
         );

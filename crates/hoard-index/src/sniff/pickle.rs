@@ -827,4 +827,118 @@ mod tests {
         assert_eq!(summary.tensor_count, 0);
         assert!(summary.samples.is_empty());
     }
+
+    /// Reads a fixture whose bytes were tampered with, asserting only that nothing panics.
+    fn sniff(dir: &TempDir, name: &str, bytes: &[u8]) -> Option<TensorSummary> {
+        let path = write(dir, name, bytes);
+        summarize(&path, bytes.len() as u64).ok()
+    }
+
+    #[test]
+    fn every_truncation_of_an_archive_fails_instead_of_panicking() {
+        let dir = TempDir::new().expect("temp dir");
+        let full = checkpoint();
+        for cut in 1..full.len() {
+            sniff(&dir, "cut.ckpt", &full[..cut]);
+        }
+    }
+
+    #[test]
+    fn an_eocd_pointing_outside_the_file_is_refused() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut bytes = checkpoint();
+        let eocd = rfind(&bytes, &EOCD_SIGNATURE).expect("the fixture has an eocd");
+        bytes[eocd + 16..eocd + 20].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(sniff(&dir, "far.ckpt", &bytes).is_none());
+
+        let mut bytes = checkpoint();
+        let eocd = rfind(&bytes, &EOCD_SIGNATURE).expect("the fixture has an eocd");
+        bytes[eocd + 12..eocd + 16]
+            .copy_from_slice(&(MAX_CENTRAL_DIRECTORY as u32 + 1).to_le_bytes());
+        assert!(sniff(&dir, "huge.ckpt", &bytes).is_none());
+    }
+
+    #[test]
+    fn a_zip_without_an_end_record_is_refused() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut bytes = LOCAL_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&[0u8; 512]);
+        assert!(sniff(&dir, "headless.ckpt", &bytes).is_none());
+    }
+
+    #[test]
+    fn a_zip64_marker_without_its_record_is_refused() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut bytes = checkpoint();
+        let eocd = rfind(&bytes, &EOCD_SIGNATURE).expect("the fixture has an eocd");
+        bytes[eocd + 8..eocd + 10].copy_from_slice(&u16::MAX.to_le_bytes());
+        bytes[eocd + 10..eocd + 12].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(sniff(&dir, "zip64.ckpt", &bytes).is_none());
+    }
+
+    #[test]
+    fn a_central_entry_pointing_at_no_local_header_is_refused() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut bytes = checkpoint();
+        let directory = bytes
+            .windows(4)
+            .position(|window| window == CENTRAL_SIGNATURE)
+            .expect("the fixture has a central directory");
+        bytes[directory + 42..directory + 46].copy_from_slice(&7u32.to_le_bytes());
+        assert!(sniff(&dir, "orphan.ckpt", &bytes).is_none());
+    }
+
+    #[test]
+    fn a_central_record_whose_lengths_run_past_it_stops_the_listing() {
+        let entries = parse_central_directory(&[], 4);
+        assert!(entries.is_empty());
+
+        let mut record = CENTRAL_SIGNATURE.to_vec();
+        record.extend_from_slice(&[0u8; CENTRAL_FIXED - 4]);
+        record[28..30].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(
+            parse_central_directory(&record, 1).is_empty(),
+            "a name longer than the record leaves the listing where it was"
+        );
+
+        let mut record = CENTRAL_SIGNATURE.to_vec();
+        record.extend_from_slice(&[0u8; CENTRAL_FIXED - 4]);
+        record[30..32].copy_from_slice(&u16::MAX.to_le_bytes());
+        record[32..34].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(
+            parse_central_directory(&record, 1).len(),
+            1,
+            "a record with no name is still a record; the oversized tail ends the walk"
+        );
+    }
+
+    #[test]
+    fn a_zip64_extra_field_cannot_walk_past_its_own_bytes() {
+        let record = [0xffu8; CENTRAL_FIXED];
+        let mut size = 0u64;
+        let mut offset = 0u64;
+        apply_zip64_extra(&[1, 0, 0xff, 0xff], &record, &mut size, &mut offset);
+        assert_eq!((size, offset), (0, 0));
+
+        let mut extra = vec![1u8, 0, 8, 0];
+        extra.extend_from_slice(&99u64.to_le_bytes());
+        apply_zip64_extra(&extra, &record, &mut size, &mut offset);
+        assert_eq!(
+            size, 99,
+            "the first overflowed field is the compressed size"
+        );
+
+        apply_zip64_extra(&[9, 0, 0, 0], &record, &mut size, &mut offset);
+        assert_eq!(offset, 0, "an extra field of another tag is skipped");
+    }
+
+    #[test]
+    fn bytes_that_only_end_like_a_zip_are_refused() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut bytes = LOCAL_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&[0x5au8; 128]);
+        bytes.extend_from_slice(&EOCD_SIGNATURE);
+        bytes.extend_from_slice(&[0xffu8; 18]);
+        sniff(&dir, "shaped.ckpt", &bytes);
+    }
 }

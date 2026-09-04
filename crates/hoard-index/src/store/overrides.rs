@@ -9,6 +9,7 @@ use crate::store::artifact::reindex;
 use crate::store::convert::{
     collect_rows, now, optional_row, parse_opt_enum, parse_timestamp, timestamp_text,
 };
+use crate::triage::check_verdict;
 
 const APPLY_OVERRIDE: &str = "UPDATE artifact SET \
      role = COALESCE((SELECT o.role FROM artifact_override o WHERE o.artifact_id = artifact.id), \
@@ -65,7 +66,8 @@ impl NoiseRow {
     }
 }
 
-/// Records a decision and applies it to the artifact at once.
+/// Records a decision and applies it to the artifact at once. A role and a sub-role that
+/// disagree are refused rather than stored; see [`crate::triage::check_verdict`].
 pub fn put_override(
     conn: &Connection,
     id: ArtifactId,
@@ -73,6 +75,7 @@ pub fn put_override(
     sub_role: Option<SubRole>,
     base: Option<Base>,
 ) -> Result<()> {
+    check_verdict(role, sub_role)?;
     conn.execute(
         "INSERT INTO artifact_override(artifact_id, role, sub_role, base, decided_at) \
          VALUES(?1, ?2, ?3, ?4, ?5) \

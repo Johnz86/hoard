@@ -108,6 +108,13 @@ impl WalkOptions {
         }
     }
 
+    /// Whether a symlink found at `path` may be indexed: either the source opted into
+    /// following links, or the link resolves inside the boundary the source nominated.
+    /// `root` stands in for a source that never pinned one.
+    pub(crate) fn permits_link(&self, root: &Path, path: &Path) -> bool {
+        self.follow_symlinks || resolves_inside(self.boundary.as_deref().unwrap_or(root), path)
+    }
+
     fn accepts(&self, rel_path: &str) -> bool {
         if let Some(exclude) = &self.exclude
             && exclude.is_match(rel_path)
@@ -257,8 +264,7 @@ fn visit(
         return WalkState::Continue;
     }
     let is_symlink = file_type.is_symlink();
-    let boundary = options.boundary.as_deref().unwrap_or(root);
-    if is_symlink && !options.follow_symlinks && !resolves_inside(boundary, path) {
+    if is_symlink && !options.permits_link(root, path) {
         tracing::debug!(
             path = %path.display(),
             "symlink leaves the source root; set follow_symlinks to index it"
@@ -283,7 +289,7 @@ fn visit(
 /// operator never nominated, so by default one is skipped; `follow_symlinks` opts in.
 /// Targets inside the root are unaffected, which is what the HuggingFace cache relies on
 /// when a snapshot links to a blob beside it.
-fn resolves_inside(boundary: &Path, path: &Path) -> bool {
+pub(crate) fn resolves_inside(boundary: &Path, path: &Path) -> bool {
     let (Ok(target), Ok(root)) = (path.canonicalize(), boundary.canonicalize()) else {
         return false;
     };

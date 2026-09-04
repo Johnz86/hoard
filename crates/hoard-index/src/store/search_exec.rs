@@ -20,7 +20,9 @@ pub const FACET_COLUMNS: [&str; 8] = [
 const DEFAULT_ORDER: &str = "size DESC, artifact_id";
 
 /// Runs a compiled query, collapsing the entries of one artifact to the row the reader
-/// should see: this node first, then the state with the most bytes behind it.
+/// should see: this node first, then the state with the most bytes behind it, and the
+/// lowest entry id when those tie, so one blob at two paths of a repo always reports the
+/// same path rather than a different one each run.
 pub fn query_rows(
     conn: &Connection,
     where_sql: &str,
@@ -34,9 +36,10 @@ pub fn query_rows(
     values.push(SqlValue::Int(i64::from(offset)));
     let sql = format!(
         "SELECT {SEARCH_COLUMNS} FROM ( \
-             SELECT {SEARCH_COLUMNS}, MAX(preference) AS preference FROM search_row \
-             WHERE {} GROUP BY artifact_id \
-         ) ORDER BY {} LIMIT ?{} OFFSET ?{}",
+             SELECT {SEARCH_COLUMNS}, ROW_NUMBER() OVER ( \
+                 PARTITION BY artifact_id ORDER BY preference DESC, entry_id \
+             ) AS pick FROM search_row WHERE {} \
+         ) WHERE pick = 1 ORDER BY {} LIMIT ?{} OFFSET ?{}",
         filter(where_sql),
         order(order_sql),
         values.len() - 1,
@@ -167,6 +170,29 @@ mod tests {
             rows.len() as u64
         );
         assert_eq!(distinct_node_count(&conn, "", &[]).expect("nodes"), 2);
+    }
+
+    #[test]
+    fn entries_of_equal_preference_always_collapse_to_the_same_one() {
+        let store = Store::open_in_memory().expect("store opens");
+        let conn = store.write().expect("writer");
+        let world = Fixture::build(&conn);
+
+        let first = query_rows(&conn, "", &[], "", 50, 0).expect("rows read");
+        let shared = first
+            .iter()
+            .find(|row| row.artifact_id == world.shared_artifact)
+            .expect("the shared artifact is listed");
+        assert_eq!(shared.revision, "main");
+        for _ in 0..8 {
+            let again = query_rows(&conn, "", &[], "", 50, 0).expect("rows read");
+            let repeat = again
+                .iter()
+                .find(|row| row.artifact_id == world.shared_artifact)
+                .expect("the shared artifact is listed");
+            assert_eq!(repeat.entry_id, shared.entry_id);
+            assert_eq!(repeat.path, shared.path);
+        }
     }
 
     #[test]

@@ -23,6 +23,12 @@ const MAX_DIMENSIONS: u32 = 8;
 /// Arrays longer than this are summarized rather than rendered: a 128k entry tokenizer
 /// vocabulary is not metadata anyone reads in a table cell.
 const MAX_ARRAY_ELEMENTS: u64 = 16;
+/// How deep an array may nest before the header is rejected.
+///
+/// Every level costs a stack frame and twelve bytes of file, so an unbounded walk turns a
+/// small hostile file into a stack overflow, which aborts the process rather than failing
+/// the sniff. No GGUF a tool writes nests at all.
+const MAX_ARRAY_DEPTH: u32 = 2;
 const MAX_VALUE_CHARS: usize = 512;
 const READ_BUFFER: usize = 64 * 1024;
 
@@ -168,6 +174,9 @@ impl<'a, R: Read> Header<'a, R> {
     }
 
     fn array_value(&mut self, depth: u32) -> Result<Value> {
+        if depth > MAX_ARRAY_DEPTH {
+            return Err(self.reject(format!("arrays nest deeper than {MAX_ARRAY_DEPTH}")));
+        }
         let element_type = self.u32()?;
         let count = self.bounded_count("array")?;
         if depth > 0 || count > MAX_ARRAY_ELEMENTS {
@@ -524,6 +533,62 @@ mod tests {
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
         bytes.extend_from_slice(&0u64.to_le_bytes());
         let path = write(&dir, "huge.gguf", &bytes);
+        assert!(summarize(&path).is_err());
+    }
+
+    /// One metadata key holding `levels` arrays, each the single element of the one above.
+    fn nested_arrays(levels: usize) -> Vec<u8> {
+        let mut kvs = Vec::with_capacity(levels * 12 + 16);
+        push_string(&mut kvs, "nest");
+        kvs.extend_from_slice(&9u32.to_le_bytes());
+        for _ in 0..levels {
+            kvs.extend_from_slice(&9u32.to_le_bytes());
+            kvs.extend_from_slice(&1u64.to_le_bytes());
+        }
+        kvs.extend_from_slice(&4u32.to_le_bytes());
+        kvs.extend_from_slice(&0u64.to_le_bytes());
+
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&kvs);
+        bytes
+    }
+
+    #[test]
+    fn arrays_nested_past_the_limit_are_rejected_rather_than_overflowing_the_stack() {
+        let dir = TempDir::new().expect("temp dir");
+        let shallow = write(&dir, "shallow.gguf", &nested_arrays(1));
+        assert!(summarize(&shallow).is_ok());
+
+        for levels in [4, 64, 20_000] {
+            let path = write(&dir, &format!("deep{levels}.gguf"), &nested_arrays(levels));
+            assert!(
+                summarize(&path).is_err(),
+                "{levels} levels of nesting must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_header_fails_instead_of_reading_past_the_end() {
+        let dir = TempDir::new().expect("temp dir");
+        let full = llama_fixture();
+        for cut in [12, 24, 40, full.len() / 2] {
+            let path = write(&dir, &format!("cut{cut}.gguf"), &full[..cut]);
+            assert!(summarize(&path).is_err(), "a {cut} byte header must fail");
+        }
+    }
+
+    #[test]
+    fn a_tensor_claiming_too_many_dimensions_is_rejected() {
+        let dir = TempDir::new().expect("temp dir");
+        let bytes = Builder::default()
+            .text("general.architecture", "llama")
+            .tensor("blk.0.attn_q.weight", &[2; 9], 0)
+            .build(3);
+        let path = write(&dir, "wide.gguf", &bytes);
         assert!(summarize(&path).is_err());
     }
 }

@@ -67,12 +67,22 @@ pub struct ShardSet {
     pub directory: String,
     /// What the set would be called without its shard suffix.
     pub stem: String,
+    /// How many files the set says it has: the `-of-<total>` its names spell, or the count
+    /// of distinct files its `weight_map` points at. `None` when nothing declared one.
+    pub declared_total: Option<u32>,
 }
 
 impl ShardSet {
     /// The member whose blob the artifact is identified by.
     pub fn anchor(&self) -> usize {
         self.members.first().copied().unwrap_or_default()
+    }
+
+    /// True when fewer files were found than the set declares, which is what a partial
+    /// download looks like: the row must not read as a model that can be served.
+    pub fn is_incomplete(&self) -> bool {
+        self.declared_total
+            .is_some_and(|total| u32::try_from(self.members.len()).unwrap_or(u32::MAX) < total)
     }
 }
 
@@ -145,7 +155,9 @@ fn declared_set(
         return None;
     }
     let directory = directory_of(candidate.rel_path);
-    let mut members: Vec<usize> = weight_map_files(document)
+    let named = weight_map_files(document);
+    let declared_total = u32::try_from(named.len()).ok();
+    let mut members: Vec<usize> = named
         .into_iter()
         .filter_map(|name| positions.get(join_path(directory, name).as_str()).copied())
         .filter(|position| !claimed[*position])
@@ -163,6 +175,7 @@ fn declared_set(
         members,
         directory: directory.to_owned(),
         stem: index_stem(file).to_owned(),
+        declared_total,
     })
 }
 
@@ -212,6 +225,7 @@ fn named_sets<'a>(candidates: &[ShardCandidate<'a>], claimed: &mut [bool]) -> Ve
                 members,
                 directory: key.directory.to_owned(),
                 stem: key.stem.to_owned(),
+                declared_total: Some(key.total),
             })
         })
         .collect()
@@ -413,6 +427,49 @@ mod tests {
         assert_eq!(sets[0].stem, "model");
         assert_eq!(sets[1].members, vec![3, 4]);
         assert_eq!(sets[1].directory, "encoder");
+    }
+
+    #[test]
+    fn a_set_missing_members_reports_the_total_it_declared() {
+        let paths = [
+            "model-00001-of-00005.safetensors",
+            "model-00002-of-00005.safetensors",
+        ];
+        let sets = group_shards(&candidates(&paths));
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].declared_total, Some(5));
+        assert!(
+            sets[0].is_incomplete(),
+            "two of five on disk is a half-finished download, not a two shard model"
+        );
+
+        let whole = [
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ];
+        assert!(!group_shards(&candidates(&whole))[0].is_incomplete());
+    }
+
+    #[test]
+    fn a_weight_map_counts_the_files_it_names_even_when_one_is_missing() {
+        let document = json!({
+            "weight_map": {
+                "a.weight": "piece-one.safetensors",
+                "b.weight": "piece-two.safetensors",
+                "c.weight": "piece-three.safetensors",
+            }
+        });
+        let paths = [
+            "model.safetensors.index.json",
+            "piece-one.safetensors",
+            "piece-two.safetensors",
+        ];
+        let mut found = candidates(&paths);
+        found[0] = found[0].with_index_document(&document);
+
+        let sets = group_shards(&found);
+        assert_eq!(sets[0].declared_total, Some(3));
+        assert!(sets[0].is_incomplete());
     }
 
     #[test]

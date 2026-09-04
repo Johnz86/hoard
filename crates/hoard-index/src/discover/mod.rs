@@ -176,7 +176,7 @@ pub fn discover(source: &SourceConfig, noise: &NoiseFilter) -> Result<Discovered
         SourceKind::HfCache => Ok(Discovered::HfCache(hf_cache::discover(
             root, &options, noise,
         )?)),
-        SourceKind::Git => Ok(Discovered::Git(git_clone::discover(root, noise)?)),
+        SourceKind::Git => Ok(Discovered::Git(git_clone::discover(root, &options, noise)?)),
         SourceKind::Loose | SourceKind::Auto => Ok(Discovered::Loose(loose::discover(
             root,
             &source.name,

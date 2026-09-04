@@ -122,7 +122,12 @@ impl NewEntry {
 }
 
 /// Inserts or refreshes a path, then recounts the paths reaching its bytes.
+///
+/// When the bytes at a path changed, the blob it used to point at loses a path and is
+/// recounted too; leaving that count behind is what made `dupe:` flag files that are not
+/// duplicates and DISK PRESSURE report bytes nothing holds any more.
 pub fn upsert_entry(conn: &Connection, input: &NewEntry, seen: Timestamp) -> Result<EntryId> {
+    let previous = previous_blob(conn, input)?;
     let id: i64 = conn.query_row(
         "INSERT INTO entry(revision_id, path, blob_id, artifact_id, node_id, source_id, \
              abs_path, size, is_symlink, lfs_pointer, state, pull_progress, present, mtime, \
@@ -156,10 +161,24 @@ pub fn upsert_entry(conn: &Connection, input: &NewEntry, seen: Timestamp) -> Res
         ],
         |row| row.get(0),
     )?;
-    if let Some(blob) = input.blob {
+    for blob in [input.blob, previous].into_iter().flatten() {
         refresh_path_count(conn, blob)?;
     }
     Ok(EntryId::new(id))
+}
+
+/// The blob this path pointed at before the upsert, when that is not the one it points at
+/// now.
+fn previous_blob(conn: &Connection, input: &NewEntry) -> Result<Option<BlobId>> {
+    let found: Option<i64> = optional_row(conn.query_row(
+        "SELECT blob_id FROM entry WHERE revision_id = ?1 AND path = ?2 AND node_id = ?3",
+        params![input.revision.get(), input.path, input.node_row],
+        |row| Ok(row.get::<_, Option<i64>>(0).map_err(Into::into)),
+    ))?
+    .flatten();
+    Ok(found
+        .map(BlobId::new)
+        .filter(|blob| Some(*blob) != input.blob))
 }
 
 pub fn entry(conn: &Connection, id: EntryId) -> Result<Option<EntryRow>> {
@@ -270,6 +289,18 @@ mod tests {
                 .expect("list")
                 .len(),
             2
+        );
+        assert_eq!(
+            blob(&conn, replacement).expect("blob reads").path_count,
+            1,
+            "the new bytes are reached by exactly the path that moved onto them"
+        );
+        assert_eq!(
+            blob(&conn, world.shared_blob)
+                .expect("blob reads")
+                .path_count,
+            1,
+            "the bytes the path left behind must stop counting it"
         );
     }
 

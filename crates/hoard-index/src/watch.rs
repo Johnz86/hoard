@@ -9,10 +9,10 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::task::JoinHandle;
 
 use crate::config::IndexConfig;
@@ -23,13 +23,27 @@ use crate::store::Store;
 /// How long a burst of events is collected before the sources it touched are rescanned.
 pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(750);
 
+/// How many debounce windows a burst may extend across before the rescan runs anyway.
+///
+/// Copying a large model in produces events continuously for as long as the copy takes, so
+/// a window that only ever restarts would never close and nothing would be indexed until
+/// the copy finished.
+const MAX_DEBOUNCE_WINDOWS: u32 = 20;
+
+/// How many unhandled paths the watcher buffers.
+///
+/// An unbounded queue lets a runaway writer grow the process without limit. Overflow costs
+/// nothing in practice: a burst large enough to fill this has already named every source it
+/// touches many times over, and each source is rescanned once per burst regardless.
+const EVENT_CAPACITY: usize = 4096;
+
 /// Watches every configured source root and rescans what changes.
 ///
 /// The watcher must be created inside a tokio runtime; it holds a background task that
 /// lives until [`Watcher::stop`] is called or the watcher is dropped.
 #[derive(Debug)]
 pub struct Watcher {
-    watcher: RecommendedWatcher,
+    watcher: Option<RecommendedWatcher>,
     roots: Vec<PathBuf>,
     task: JoinHandle<()>,
 }
@@ -37,7 +51,7 @@ pub struct Watcher {
 impl Watcher {
     /// Starts watching every source of `config` that exists on disk.
     pub fn start(store: &Store, config: &IndexConfig, debounce: Duration) -> Result<Self> {
-        let (sender, receiver) = unbounded_channel();
+        let (sender, receiver) = channel(EVENT_CAPACITY);
         let mut watcher = notify::recommended_watcher(move |event| forward(&sender, event))
             .map_err(watch_error)?;
 
@@ -55,26 +69,31 @@ impl Watcher {
 
         let task = tokio::spawn(pump(store.clone(), config.clone(), debounce, receiver));
         Ok(Self {
-            watcher,
+            watcher: Some(watcher),
             roots,
             task,
         })
     }
 
-    /// Stops watching and cancels the pending rescan. Dropping the watcher does the same.
+    /// Stops watching. Dropping the watcher does the same.
+    ///
+    /// A rescan already under way is left to finish rather than cancelled: it owns a
+    /// `job` row, and a cancelled task never marks that row finished or failed, so the
+    /// JOBS tab would show it running for ever.
     pub fn stop(&mut self) {
+        let Some(mut watcher) = self.watcher.take() else {
+            return;
+        };
         for root in self.roots.drain(..) {
-            if let Err(error) = self.watcher.unwatch(&root) {
+            if let Err(error) = watcher.unwatch(&root) {
                 tracing::debug!(path = %root.display(), %error, "root was already unwatched");
             }
         }
-        self.task.abort();
     }
-}
 
-impl Drop for Watcher {
-    fn drop(&mut self) {
-        self.task.abort();
+    /// True once the pump has drained the rescans it was asked for and exited.
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
     }
 }
 
@@ -83,7 +102,7 @@ fn watch_error(error: notify::Error) -> IndexError {
 }
 
 /// Passes on the paths of events that can change what the index holds.
-fn forward(sender: &UnboundedSender<PathBuf>, event: notify::Result<notify::Event>) {
+fn forward(sender: &Sender<PathBuf>, event: notify::Result<notify::Event>) {
     let event = match event {
         Ok(event) => event,
         Err(error) => {
@@ -95,7 +114,10 @@ fn forward(sender: &UnboundedSender<PathBuf>, event: notify::Result<notify::Even
         return;
     }
     for path in event.paths {
-        let _ = sender.send(path);
+        if sender.try_send(path).is_err() {
+            tracing::debug!("the watch queue is full or closed; a path was dropped");
+            return;
+        }
     }
 }
 
@@ -110,15 +132,12 @@ async fn pump(
     store: Store,
     config: IndexConfig,
     debounce: Duration,
-    mut events: UnboundedReceiver<PathBuf>,
+    mut events: Receiver<PathBuf>,
 ) {
     let quiet: &(dyn Fn(ScanProgress) + Send + Sync) = &|_| {};
+    let window = debounce.saturating_mul(MAX_DEBOUNCE_WINDOWS);
     while let Some(first) = events.recv().await {
-        let mut pending = BTreeSet::new();
-        note(&config, &first, &mut pending);
-        while let Ok(Some(path)) = tokio::time::timeout(debounce, events.recv()).await {
-            note(&config, &path, &mut pending);
-        }
+        let pending = collect_burst(&config, &mut events, first, debounce, window).await;
         for name in pending {
             let options = ScanOptions::from_config(&config).for_source(name.clone());
             match scan(&store, &config, options, quiet).await {
@@ -132,6 +151,30 @@ async fn pump(
                 Err(error) => tracing::warn!(source = name, %error, "watched rescan failed"),
             }
         }
+    }
+}
+
+/// The sources one burst of events names.
+///
+/// The window closes when the events stop for `debounce`, or when `window` has passed since
+/// the first of them, whichever comes first. Without that ceiling a long copy would keep
+/// restarting the debounce and no rescan would ever run while it was in progress.
+async fn collect_burst(
+    config: &IndexConfig,
+    events: &mut Receiver<PathBuf>,
+    first: PathBuf,
+    debounce: Duration,
+    window: Duration,
+) -> BTreeSet<String> {
+    let mut pending = BTreeSet::new();
+    note(config, &first, &mut pending);
+    let deadline = Instant::now() + window;
+    loop {
+        let remaining = debounce.min(deadline.saturating_duration_since(Instant::now()));
+        let Ok(Some(path)) = tokio::time::timeout(remaining, events.recv()).await else {
+            return pending;
+        };
+        note(config, &path, &mut pending);
     }
 }
 
@@ -204,6 +247,78 @@ mod tests {
         assert_eq!(
             pending.into_iter().collect::<Vec<_>>(),
             ["comfy".to_owned(), "vault".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unending_burst_still_closes_its_window() {
+        let dir = TempDir::new().expect("temp dir");
+        let comfy = dir.path().join("comfy");
+        let config = IndexConfig {
+            sources: vec![source("comfy", &comfy)],
+            ..IndexConfig::default()
+        };
+
+        let debounce = Duration::from_millis(5);
+        let window = debounce * MAX_DEBOUNCE_WINDOWS;
+        let (sender, mut events) = channel(EVENT_CAPACITY);
+        let path = comfy.join("loras/copying.safetensors");
+        let writer = tokio::spawn({
+            let path = path.clone();
+            async move {
+                while sender.send(path.clone()).await.is_ok() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let pending = tokio::time::timeout(
+            Duration::from_secs(10),
+            collect_burst(&config, &mut events, path, debounce, window),
+        )
+        .await
+        .expect("a burst that never pauses must still be acted on");
+        let elapsed = started.elapsed();
+        writer.abort();
+
+        assert_eq!(
+            pending.into_iter().collect::<Vec<_>>(),
+            ["comfy".to_owned()]
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the window closed after {elapsed:?}, so a long copy would never be indexed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quiet_gap_closes_the_window_before_the_ceiling() {
+        let dir = TempDir::new().expect("temp dir");
+        let comfy = dir.path().join("comfy");
+        let config = IndexConfig {
+            sources: vec![source("comfy", &comfy)],
+            ..IndexConfig::default()
+        };
+
+        let (sender, mut events) = channel(EVENT_CAPACITY);
+        sender
+            .send(comfy.join("loras/b.safetensors"))
+            .await
+            .expect("the queue accepts a path");
+        drop(sender);
+
+        let pending = collect_burst(
+            &config,
+            &mut events,
+            comfy.join("loras/a.safetensors"),
+            Duration::from_secs(30),
+            Duration::from_secs(600),
+        )
+        .await;
+        assert_eq!(
+            pending.into_iter().collect::<Vec<_>>(),
+            ["comfy".to_owned()]
         );
     }
 

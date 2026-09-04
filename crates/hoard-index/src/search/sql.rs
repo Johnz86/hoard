@@ -34,6 +34,10 @@ const BASE_FILTER_SQL: &str =
 
 /// `compat:` resolves against the same families, and here `any` does belong: an upscaler
 /// that declares it really does plug into a host of any architecture.
+///
+/// Compatibility is symmetric, so the target being `any` is as decisive as the candidate
+/// being `any`; that half is not written here because a target of `any` leaves the role
+/// predicate alone rather than emitting a base clause at all.
 const BASE_COMPAT_SQL: &str = "(base <> '' AND (base = ? OR base LIKE ? || '%' \
      OR ? LIKE base || '%' OR base = 'any'))";
 const BASE_PARAMS: usize = 3;
@@ -213,6 +217,11 @@ pub fn compile(
 
 /// Compiles a query with one dimension dropped, which is how a facet counts its own buckets
 /// without the click that produced them narrowing the count to zero.
+///
+/// Only tokens the user typed are dropped. A shelf keeps every token of its stored query,
+/// including one naming the excluded dimension: a shelf is a scope chosen by name, not a
+/// facet click, so `shelf:sdxl-loras` counts BASE buckets within that shelf rather than
+/// across the whole index.
 pub fn compile_excluding(
     query: &ParsedQuery,
     exclude_key: &str,
@@ -380,14 +389,17 @@ impl Compiler<'_> {
         })
     }
 
+    /// `size:` compares an integer byte count. A value that is not one binds nothing: in
+    /// SQLite every integer sorts before every string, so `size < 'huge'` would otherwise
+    /// be true of every row and hand back the whole index.
     fn size_clause(&mut self, token: &Token) -> String {
         let op = token.op.unwrap_or(CompareOp::Eq);
-        self.each_value(token, |compiler, value| {
-            compiler.params.push(match value.parse::<i64>() {
-                Ok(bytes) => SqlValue::Int(bytes),
-                Err(_) => SqlValue::text(value),
-            });
-            format!("size {} ?", op.as_str())
+        self.each_value(token, |compiler, value| match value.parse::<i64>() {
+            Ok(bytes) => {
+                compiler.params.push(SqlValue::Int(bytes));
+                format!("size {} ?", op.as_str())
+            }
+            Err(_) => MATCH_NOTHING.to_owned(),
         })
     }
 
@@ -431,11 +443,14 @@ impl Compiler<'_> {
         if roles.is_empty() {
             return Ok(MATCH_NOTHING.to_owned());
         }
-        let base = target.base.to_string();
         let placeholders = vec!["?"; roles.len()].join(", ");
         for role in roles {
             self.params.push(SqlValue::text(role.as_str()));
         }
+        if target.base.is_any() {
+            return Ok(format!("role IN ({placeholders})"));
+        }
+        let base = target.base.to_string();
         self.bind_repeated(&base, BASE_PARAMS);
         Ok(format!("(role IN ({placeholders}) AND {BASE_COMPAT_SQL})"))
     }
@@ -649,6 +664,18 @@ mod tests {
     }
 
     #[test]
+    fn a_size_that_is_not_a_byte_count_matches_nothing_rather_than_everything() {
+        for query in ["size:<huge", "size:>tiny", "size:big"] {
+            let compiled = compiled(query);
+            assert_eq!(compiled.where_sql, MATCH_NOTHING, "{query} must not run");
+            assert!(compiled.params.is_empty(), "{query} must bind nothing");
+        }
+        let mixed = compiled("size:<400mb,huge");
+        assert_eq!(mixed.params, vec![SqlValue::Int(400_000_000)]);
+        assert_eq!(mixed.where_sql, format!("(size < ? OR {MATCH_NOTHING})"));
+    }
+
+    #[test]
     fn used_compares_against_a_cutoff_from_the_context_clock() {
         let query = compiled("used:>30d");
         assert_eq!(query.where_sql, "(last_used IS NOT NULL AND last_used < ?)");
@@ -726,6 +753,24 @@ mod tests {
         let query = compile(&parse("compat:some/dataset"), SortSpec::default(), &context)
             .expect("compiles");
         assert_eq!(query.where_sql, "1 = 0");
+    }
+
+    #[test]
+    fn a_target_that_plugs_into_anything_is_left_to_its_role_predicate() {
+        let target = CompatTarget::new(Role::Upsc, Base::any());
+        let context = context().with_compat(target);
+        let query = compile(
+            &parse("compat:some/upscaler"),
+            SortSpec::default(),
+            &context,
+        )
+        .expect("compiles");
+        assert_eq!(query.where_sql, "role IN (?, ?)");
+        assert_eq!(texts(&query.params), vec!["ckpt", "llm"]);
+        assert!(
+            !query.where_sql.contains("base"),
+            "matching is symmetric: an `any` target selects every family, not none of them"
+        );
     }
 
     #[test]

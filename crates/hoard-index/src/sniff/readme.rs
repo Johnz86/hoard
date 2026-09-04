@@ -3,6 +3,13 @@
 use pulldown_cmark::{Event, Options, Parser, html};
 use serde_yaml_ng::Value;
 
+/// How much frontmatter is parsed as YAML.
+///
+/// The parse is superlinear in nesting depth, and a downloaded card is untrusted input, so
+/// a document whose frontmatter runs past this keeps its body and reports no keys. Real
+/// model cards declare a few hundred bytes.
+const MAX_FRONTMATTER_BYTES: usize = 64 * 1024;
+
 /// A README as the CARD tab shows it. `bytes` and `lines` cover the whole document so the
 /// server can render the meta line without reading the file again.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -53,6 +60,13 @@ fn split_frontmatter(text: &str) -> (Option<&str>, &str) {
 }
 
 fn parse_frontmatter(yaml: &str) -> Vec<(String, String)> {
+    if yaml.len() > MAX_FRONTMATTER_BYTES {
+        tracing::debug!(
+            bytes = yaml.len(),
+            "frontmatter is too large to parse; the card keeps its body only"
+        );
+        return Vec::new();
+    }
     let Ok(Value::Mapping(mapping)) = serde_yaml_ng::from_str::<Value>(yaml) else {
         return Vec::new();
     };
@@ -163,6 +177,24 @@ mod tests {
     fn an_empty_document_is_harmless() {
         let readme = parse_readme("");
         assert_eq!(readme, ReadmeDoc::default());
+    }
+
+    #[test]
+    fn oversized_frontmatter_is_skipped_rather_than_parsed() {
+        let padding = "x".repeat(MAX_FRONTMATTER_BYTES);
+        let card = format!("---\nlicense: mit\nnote: {padding}\n---\n\nbody\n");
+        let readme = parse_readme(&card);
+        assert!(readme.frontmatter.is_empty());
+        assert_eq!(readme.body, "body\n");
+    }
+
+    #[test]
+    fn deeply_nested_frontmatter_cannot_occupy_a_worker() {
+        let nesting = "[".repeat(200_000);
+        let card = format!("---\nkey: {nesting}\n---\n\nbody\n");
+        let readme = parse_readme(&card);
+        assert!(readme.frontmatter.is_empty());
+        assert_eq!(readme.body, "body\n");
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 use hoard_core::{Base, Evidence, EvidenceSource, Role, SubRole, TensorSummary};
 
+use crate::error::{IndexError, Result};
 use crate::infer::Inference;
 
 const MAX_TRIAGE_PREFIXES: usize = 8;
@@ -29,11 +30,16 @@ pub struct TriageEntry {
 impl TriageEntry {
     /// Keeps the guess that inference recorded as evidence even when the verdict itself
     /// stayed unclassified, which is what the queue offers the user to confirm.
+    ///
+    /// `confidence` belongs to the guess it is shown beside: when the guess comes from a
+    /// single piece of evidence rather than the verdict, so does the number. The two are
+    /// never taken from different answers.
     pub fn from_inference(inference: &Inference, header: TriageHeader) -> Self {
-        let guess_role = inference
+        let guessed = inference
             .strongest("role")
-            .and_then(|evidence| Role::from_alias(&evidence.value))
-            .unwrap_or(inference.role);
+            .and_then(|evidence| Some((Role::from_alias(&evidence.value)?, evidence.confidence)));
+        let (guess_role, confidence) =
+            guessed.unwrap_or((inference.role, inference.role_confidence));
         let guess_base = inference
             .strongest("base")
             .map(|evidence| Base::new(&evidence.value))
@@ -41,7 +47,7 @@ impl TriageEntry {
         Self {
             guess_role,
             guess_base,
-            confidence: inference.role_confidence,
+            confidence,
             header,
         }
     }
@@ -89,14 +95,32 @@ fn hidden_dim(tensors: &TensorSummary) -> Option<u64> {
         .map(|(width, _)| width)
 }
 
+/// Rejects a verdict that names a role and a sub-role belonging to a different one.
+///
+/// Every sub-role belongs to exactly one role, so `role: ctrl` with `sub_role: ipa` is not
+/// a decision the index can record either way; whichever field were applied last would
+/// silently become the answer.
+pub fn check_verdict(role: Option<Role>, sub_role: Option<SubRole>) -> Result<()> {
+    match (role, sub_role) {
+        (Some(role), Some(sub)) if sub.role() != role => Err(IndexError::Query(format!(
+            "sub-role {sub} belongs to {}, not to {role}",
+            sub.role()
+        ))),
+        (Some(_) | None, Some(_) | None) => Ok(()),
+    }
+}
+
 /// Applies a user's verdict. Overrides beat inference: every field set here reaches
 /// confidence 1.0 and records a `user` source for the DERIVED FACTS panel.
+///
+/// A verdict whose role and sub-role disagree is rejected; see [`check_verdict`].
 pub fn apply_override(
     inference: &mut Inference,
     role: Option<Role>,
     sub_role: Option<SubRole>,
     base: Option<Base>,
-) {
+) -> Result<()> {
+    check_verdict(role, sub_role)?;
     if let Some(role) = role {
         inference.role = role;
         inference.role_confidence = 1.0;
@@ -128,6 +152,7 @@ pub fn apply_override(
         inference.base = base;
         inference.base_confidence = 1.0;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -227,7 +252,8 @@ mod tests {
             Some(Role::Ctrl),
             Some(SubRole::Mot),
             Some(Base::new("sd15")),
-        );
+        )
+        .expect("a sub-role of the role named is consistent");
         assert_eq!(inference.role, Role::Ctrl);
         assert_eq!(inference.sub_role, Some(SubRole::Mot));
         assert_eq!(inference.role_confidence, 1.0);
@@ -245,8 +271,40 @@ mod tests {
     #[test]
     fn a_sub_role_override_carries_its_role() {
         let mut inference = unclassified();
-        apply_override(&mut inference, None, Some(SubRole::Ipa), None);
+        apply_override(&mut inference, None, Some(SubRole::Ipa), None)
+            .expect("a sub-role alone names its own role");
         assert_eq!(inference.role, Role::Lora);
         assert_eq!(inference.role_confidence, 1.0);
+    }
+
+    #[test]
+    fn a_role_that_contradicts_its_sub_role_is_refused() {
+        let mut inference = unclassified();
+        let before = inference.clone();
+        let error = apply_override(&mut inference, Some(Role::Ctrl), Some(SubRole::Ipa), None);
+        assert!(matches!(error, Err(IndexError::Query(_))));
+        assert_eq!(inference.role, before.role);
+        assert_eq!(inference.sub_role, before.sub_role);
+        assert_eq!(inference.evidence.len(), before.evidence.len());
+    }
+
+    #[test]
+    fn the_queued_guess_and_its_confidence_come_from_one_answer() {
+        let mut inference = unclassified();
+        inference.evidence.push(Evidence::new(
+            "role",
+            Role::Ctrl.as_str(),
+            EvidenceSource::Filename,
+            0.7,
+        ));
+        inference.role_confidence = 0.2;
+
+        let entry = TriageEntry::from_inference(&inference, header_facts(&summary()));
+        assert_eq!(entry.guess_role, Role::Ctrl);
+        assert_eq!(
+            entry.confidence, 0.7,
+            "the number shown must be the one that produced the guess beside it, not the \
+             score of the combined verdict that stayed unclassified"
+        );
     }
 }
