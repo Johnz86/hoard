@@ -13,7 +13,7 @@ pub use client::{
     Authorization, JSON_CONTENT_TYPE, MAX_PASS_THROUGH_BYTES, ProxyResponse, RequestBody,
     RetryPolicy, Retryability, UpstreamClient, UpstreamRequest, classify, read_capped,
 };
-pub use hub::{BlockFetch, Hub, RemoteFile, UpstreamKind, UpstreamRevision};
+pub use hub::{BlockFetch, HEADER_CONTENT_SHA256, Hub, RemoteFile, UpstreamKind, UpstreamRevision};
 pub use meta::{DEFAULT_REVISION, MetaKind, MetaRequest};
 pub use peer::{DEFAULT_PEER_PORT, peer_base_url, peer_upstream};
 pub use range::{ByteRange, RangeOutcome, parse_ranges};

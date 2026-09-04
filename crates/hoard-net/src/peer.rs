@@ -796,13 +796,20 @@ fn write_artifact(
 ///
 /// A disagreement here is caught before a byte moves; a peer whose headers and bytes
 /// disagree is caught by the hash taken over the stream itself.
+/// The content hash the answer states, if it states one.
+///
+/// A peer names it outright for a file of any size; the LFS etag carries it only for large
+/// ones, and a plain etag is a git blob name below the LFS threshold. Without one there is
+/// nothing to verify the bytes against, so the pull is refused rather than trusted.
 fn advertised_sha256(answer: &hoard_mirror::resolve::FileAnswer) -> Option<Sha256> {
-    answer
-        .linked_etag
-        .as_deref()
-        .or(Some(answer.etag.as_str()))
-        .map(|etag| etag.trim_matches('"'))
-        .and_then(|etag| etag.parse::<Sha256>().ok())
+    answer.content_sha256.or_else(|| {
+        answer
+            .linked_etag
+            .as_deref()
+            .or(Some(answer.etag.as_str()))
+            .map(|etag| etag.trim_matches('"'))
+            .and_then(|etag| etag.parse::<Sha256>().ok())
+    })
 }
 
 /// Whether a path segment names a file rather than a step out of the directory above it.

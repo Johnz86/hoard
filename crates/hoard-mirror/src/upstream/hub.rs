@@ -9,7 +9,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use hoard_core::{CommitSha, RepoId, RepoType};
+use hoard_core::{CommitSha, RepoId, RepoType, Sha256};
 use reqwest::StatusCode;
 use reqwest::header::{
     CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue,
@@ -61,6 +61,9 @@ struct RevisionDocument {
     last_modified: Option<HubTimestamp>,
 }
 
+/// The header a hoard node uses to state a file's content hash whatever its size.
+pub const HEADER_CONTENT_SHA256: &str = "x-hoard-sha256";
+
 /// What a resolve HEAD says about a file, read in one upstream request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteFile {
@@ -70,6 +73,12 @@ pub struct RemoteFile {
     pub linked_size: Option<u64>,
     pub commit: Option<CommitSha>,
     pub content_type: Option<String>,
+    /// The content hash a hoard peer states for a file of any size.
+    ///
+    /// `x-linked-etag` only ever names a hash for LFS-sized files, so a peer serving a
+    /// small artifact from its own index has no standard header to put one in, and a
+    /// puller that must verify against a promised hash would have to refuse it.
+    pub content_sha256: Option<Sha256>,
 }
 
 impl RemoteFile {
@@ -262,6 +271,8 @@ impl Hub {
             size,
             etag: header_text(headers, ETAG.as_str()).map(quoted),
             linked_etag: header_text(headers, HEADER_LINKED_ETAG).map(quoted),
+            content_sha256: header_text(headers, HEADER_CONTENT_SHA256)
+                .and_then(|value| value.trim_matches('"').parse::<Sha256>().ok()),
             linked_size,
             commit: header_text(headers, HEADER_REPO_COMMIT)
                 .and_then(|value| value.parse::<CommitSha>().ok()),

@@ -219,6 +219,12 @@ pub struct FileAnswer {
     pub etag: String,
     pub linked_etag: Option<String>,
     pub linked_size: Option<u64>,
+    /// The content hash of the whole file, whatever its size.
+    ///
+    /// `linked_etag` names a hash only for LFS-sized files, so it cannot carry one for a
+    /// small artifact a peer serves from its own index. A puller that verifies against a
+    /// promised hash needs one for every file, not only the large ones.
+    pub content_sha256: Option<Sha256>,
     pub content_type: String,
     pub source: ByteSource,
 }
@@ -266,6 +272,12 @@ pub fn served_response(answer: &FileAnswer, range: Option<&str>) -> ServedRespon
         ("x-repo-commit".to_owned(), answer.commit.to_hex()),
         ("etag".to_owned(), answer.etag.clone()),
     ];
+    if let Some(hash) = &answer.content_sha256 {
+        headers.push((
+            crate::upstream::hub::HEADER_CONTENT_SHA256.to_owned(),
+            hash.to_hex(),
+        ));
+    }
     if let Some(linked) = &answer.linked_etag {
         headers.push(("x-linked-etag".to_owned(), linked.clone()));
     }
@@ -818,6 +830,7 @@ impl Mirror {
         Ok(Some(FileAnswer {
             commit: *sha,
             size,
+            content_sha256: linked_etag.as_deref().and_then(parse_sha256),
             etag,
             linked_etag,
             linked_size,
@@ -902,6 +915,9 @@ impl Mirror {
             etag,
             linked_etag: remote.linked_etag.clone(),
             linked_size: remote.linked_size,
+            content_sha256: remote
+                .content_sha256
+                .or_else(|| remote.linked_etag.as_deref().and_then(parse_sha256)),
             content_type: remote
                 .content_type
                 .clone()
@@ -939,6 +955,7 @@ fn local_answer(location: FileLocation, sha: &CommitSha, path: &str) -> FileAnsw
         etag,
         linked_size: linked.as_ref().map(|_| location.size),
         linked_etag: linked,
+        content_sha256: location.sha256,
         content_type: guess_content_type(path),
         source: ByteSource::Local(location.abs_path),
     }
@@ -1206,6 +1223,45 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[test]
+    fn a_small_file_still_states_its_content_hash() {
+        let sha256: Sha256 = "9f2c000000000000000000000000000000000000000000000000000000ee41ab"
+            .parse()
+            .expect("hash parses");
+        let commit: CommitSha = "462c3cb0f1a2b3c4d5e6f708192a3b4c5d6e7f80"
+            .parse()
+            .expect("commit parses");
+        let location = FileLocation {
+            abs_path: std::path::PathBuf::from("/srv/config.json"),
+            size: 807,
+            sha256: Some(sha256),
+            git_sha1: Some(commit),
+            is_lfs: false,
+            lfs_pointer_only: false,
+            artifact_id: None,
+            repo_id: hoard_core::RepoRowId::new(1),
+            commit,
+        };
+
+        let answer = local_answer(location, &commit, "config.json");
+        assert_eq!(
+            answer.linked_etag, None,
+            "a file below the LFS threshold has no linked etag, which is the whole problem"
+        );
+        assert_eq!(
+            answer.content_sha256,
+            Some(sha256),
+            "a peer must be able to promise a hash for a small file, or it cannot be pulled"
+        );
+
+        let served = served_response(&answer, None);
+        assert_eq!(
+            served.header(crate::upstream::hub::HEADER_CONTENT_SHA256),
+            Some(sha256.to_hex().as_str()),
+            "and the promise has to reach the wire"
+        );
+    }
     use crate::access::AccessRule;
     use crate::config::{Geometry, MirrorConfig};
     use crate::upstream::client::{RetryPolicy, UpstreamClient};
