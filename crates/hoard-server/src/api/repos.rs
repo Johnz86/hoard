@@ -205,6 +205,7 @@ pub async fn list(
                 text,
                 repo_type,
                 node_row: None,
+                present_only: true,
             };
             let all = repo::list_repos(conn, &filter, None, u32::MAX)?;
             let total = all.len() as u64;

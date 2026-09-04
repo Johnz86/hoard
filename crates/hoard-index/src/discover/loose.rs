@@ -6,7 +6,7 @@
 //! itself is handed to inference unchanged, which already reads known layout names as low
 //! confidence evidence.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use hoard_core::{CommitSha, RepoId, RepoType};
@@ -118,22 +118,23 @@ pub fn discover(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(org);
+    let organizations = organizations(&files);
 
-    let mut grouped: BTreeMap<String, Vec<DiscoveredEntry>> = BTreeMap::new();
+    let mut grouped: BTreeMap<(String, String), Vec<DiscoveredEntry>> = BTreeMap::new();
     for file in files {
-        let (folder, rel_path) = match per_folder {
-            true => split_folder(&file.rel_path, root_name),
-            false => (root_name.to_owned(), file.rel_path.clone()),
+        let (repo_org, folder, rel_path) = match per_folder {
+            true => locate(&file.rel_path, root_name, org, &organizations),
+            false => (org.to_owned(), root_name.to_owned(), file.rel_path.clone()),
         };
         let mut entry = DiscoveredEntry::from_file(file);
         entry.rel_path = rel_path;
-        grouped.entry(folder).or_default().push(entry);
+        grouped.entry((repo_org, folder)).or_default().push(entry);
     }
 
     Ok(grouped
         .into_iter()
-        .map(|(folder, entries)| {
-            let repo = RepoId::new(RepoType::Models, Some(org.to_owned()), folder);
+        .map(|((repo_org, folder), entries)| {
+            let repo = RepoId::new(RepoType::Models, Some(repo_org), folder);
             let mut discovered = DiscoveredRepo::new(repo, root.to_path_buf());
             discovered
                 .revisions
@@ -155,6 +156,50 @@ fn split_folder(rel_path: &str, root_name: &str) -> (String, String) {
         Some((folder, rest)) => (folder.to_owned(), rest.to_owned()),
         None => (root_name.to_owned(), rel_path.to_owned()),
     }
+}
+
+/// The top level folders that name an organization rather than a repository.
+///
+/// A folder holding no files of its own, only directories that do, is the HuggingFace
+/// convention of publisher then repository, which LM Studio and any on-disk mirror of the
+/// Hub follow. Reading such a folder as one repository would gather every model a
+/// publisher ships into a single entry, and offer all of them as one pull.
+///
+/// A tool layout like ComfyUI keeps its weights directly in `loras` or `checkpoints`, so
+/// those folders hold files and stay repositories of their own.
+fn organizations(files: &[walker::DiscoveredFile]) -> BTreeSet<String> {
+    let mut holds_files = BTreeSet::new();
+    let mut holds_directories = BTreeSet::new();
+    for file in files {
+        let Some((first, rest)) = file.rel_path.split_once('/') else {
+            continue;
+        };
+        match rest.contains('/') {
+            false => holds_files.insert(first.to_owned()),
+            true => holds_directories.insert(first.to_owned()),
+        };
+    }
+    holds_directories
+        .difference(&holds_files)
+        .cloned()
+        .collect()
+}
+
+/// The organization, repository and path within it that one discovered file belongs to.
+fn locate(
+    rel_path: &str,
+    root_name: &str,
+    source_org: &str,
+    organizations: &BTreeSet<String>,
+) -> (String, String, String) {
+    let mut parts = rel_path.splitn(3, '/');
+    if let (Some(org), Some(name), Some(rest)) = (parts.next(), parts.next(), parts.next())
+        && organizations.contains(org)
+    {
+        return (org.to_owned(), name.to_owned(), rest.to_owned());
+    }
+    let (folder, rest) = split_folder(rel_path, root_name);
+    (source_org.to_owned(), folder, rest)
 }
 
 /// One file's contribution to a folder's synthetic revision.
@@ -240,6 +285,49 @@ mod tests {
         let plain = dir.path().join("plain");
         fs::create_dir_all(plain.join("stuff")).expect("dir is creatable");
         assert_eq!(layout(&plain), None);
+    }
+
+    #[test]
+    fn a_publisher_folder_yields_one_repository_per_model() {
+        let dir = TempDir::new().expect("temp dir");
+        let publisher = dir.path().join("lmstudio-community");
+        for model in ["Qwen3.5-35B-A3B-GGUF", "Qwen3.6-35B-A3B-GGUF"] {
+            let repo = publisher.join(model);
+            fs::create_dir_all(&repo).expect("dir is creatable");
+            write(&repo, &format!("{model}.gguf"), b"GGUF");
+            write(&repo, &format!("mmproj-{model}.gguf"), b"GGUF");
+        }
+
+        let repos = discover(
+            dir.path(),
+            "lmstudio",
+            true,
+            &WalkOptions::default(),
+            &NoiseFilter::default(),
+        )
+        .expect("loose root is readable");
+
+        let qualified: Vec<String> = repos.iter().map(|found| found.repo.qualified()).collect();
+        assert_eq!(
+            qualified,
+            vec![
+                "models/lmstudio-community/Qwen3.5-35B-A3B-GGUF".to_owned(),
+                "models/lmstudio-community/Qwen3.6-35B-A3B-GGUF".to_owned(),
+            ],
+            "a publisher is an organization, not a repository holding every model it ships"
+        );
+        for found in &repos {
+            let entries = &found.revisions[0].entries;
+            assert_eq!(
+                entries.len(),
+                2,
+                "the model and its projector travel together"
+            );
+            assert!(
+                entries.iter().all(|entry| !entry.rel_path.contains('/')),
+                "paths are relative to the model, not to the publisher"
+            );
+        }
     }
 
     #[test]

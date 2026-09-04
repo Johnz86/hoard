@@ -373,6 +373,7 @@ pub async fn list_repos(store: &Store, query: &RepoListQuery) -> Result<Vec<Repo
             text: query.search.clone(),
             repo_type: Some(query.repo_type),
             node_row: Some(node.id),
+            present_only: true,
         };
         let page = query.limit.max(1).saturating_mul(2).min(512);
         let mut cursor = None;

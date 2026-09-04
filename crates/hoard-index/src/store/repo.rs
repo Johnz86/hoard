@@ -118,6 +118,14 @@ pub struct RepoFilter {
     pub text: Option<String>,
     pub repo_type: Option<RepoType>,
     pub node_row: Option<i64>,
+    /// Keep only repositories that still hold at least one file.
+    ///
+    /// A vanished file is marked absent rather than deleted, so its repository survives a
+    /// rescan and its history with it. That is right for the record and wrong for a list
+    /// someone picks from: a repository with nothing left in it would still be offered,
+    /// and pulling it would fetch nothing. The scan leaves this off, because it needs
+    /// every repository to rebuild its stamp cache.
+    pub present_only: bool,
 }
 
 /// Inserts a repository or refreshes it, keeping metadata a metadata-less rescan omits.
@@ -229,6 +237,13 @@ pub fn list_repos(
     if let Some(node_row) = filter.node_row {
         values.push(SqlValue::Int(node_row));
         clauses.push(format!("node_id = ?{}", values.len()));
+    }
+    if filter.present_only {
+        clauses.push(
+            "EXISTS (SELECT 1 FROM revision v JOIN entry e ON e.revision_id = v.id \
+             WHERE v.repo_id = repo.id AND e.present = 1)"
+                .to_owned(),
+        );
     }
     values.push(SqlValue::Int(i64::from(limit)));
     let sql = format!(

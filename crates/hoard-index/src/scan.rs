@@ -1242,15 +1242,11 @@ impl RevisionFacts<'_> {
     /// shards share when they sit in one, and the name they have in common otherwise. No
     /// single shard's file name describes the model.
     fn label(&self, set: &ShardSet) -> String {
-        let repo_named = matches!(self.naming.kind, SourceKind::HfCache | SourceKind::Git);
-        if self.naming.single && repo_named {
+        if self.naming.single {
             return self.naming.repo.name().to_owned();
         }
         match file_name(&set.directory) {
-            "" => match repo_named {
-                true => self.naming.repo.name().to_owned(),
-                false => set.stem.clone(),
-            },
+            "" => set.stem.clone(),
             directory => directory.to_owned(),
         }
     }
