@@ -12,7 +12,7 @@ let searchTimer = null;
 
 function splitToken(token) {
     const raw = String(token.raw ?? "");
-    if (!token.key) return { key: "~", value: raw };
+    if (!token.key) return { key: token.fuzzy ? "~" : "", value: raw.replace(/^~/, "") };
     const colon = raw.indexOf(":");
     if (colon < 0) return { key: `${token.key}:`, value: String(token.value ?? "") };
     return { key: raw.slice(0, colon + 1), value: raw.slice(colon + 1) };
@@ -89,7 +89,12 @@ export function renderTokenStrip(app) {
             return el(
                 "span",
                 { class: "chip" },
-                el("span", { class: token.key ? "chip-key" : "chip-key chip-key-text", text: parts.key }),
+                parts.key
+                    ? el("span", {
+                          class: token.key ? "chip-key" : "chip-key chip-key-text",
+                          text: parts.key
+                      })
+                    : null,
                 el("span", { class: "chip-val", text: parts.value }),
                 el("span", {
                     class: "chip-x",
