@@ -261,7 +261,9 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .expect("temp dir is named");
-        assert_eq!(names, ["checkpoints", "loras", root_name, "vae"]);
+        let mut expected = vec!["checkpoints", "loras", root_name, "vae"];
+        expected.sort_unstable();
+        assert_eq!(names, expected);
 
         let loras = repos
             .iter()

@@ -72,7 +72,7 @@ pub fn discover(
             }
         })
         .collect();
-    repos.sort_by(|left, right| left.repo.qualified().cmp(&right.repo.qualified()));
+    repos.sort_by_key(|found| found.repo.qualified());
     Ok(repos)
 }
 

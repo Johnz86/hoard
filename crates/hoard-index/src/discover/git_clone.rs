@@ -39,7 +39,7 @@ pub fn is_git_repo(path: &Path) -> bool {
 /// Reads every clone at or below `root`.
 pub fn discover(root: &Path, noise: &NoiseFilter) -> Result<Vec<DiscoveredRepo>> {
     let mut clones = Vec::new();
-    collect_clones(root, root, CLONE_DEPTH, noise, &mut clones)?;
+    collect_clones(root, CLONE_DEPTH, noise, &mut clones)?;
     clones.sort();
 
     let mut repos: Vec<DiscoveredRepo> = clones
@@ -52,12 +52,11 @@ pub fn discover(root: &Path, noise: &NoiseFilter) -> Result<Vec<DiscoveredRepo>>
             }
         })
         .collect();
-    repos.sort_by(|left, right| left.repo.qualified().cmp(&right.repo.qualified()));
+    repos.sort_by_key(|found| found.repo.qualified());
     Ok(repos)
 }
 
 fn collect_clones(
-    root: &Path,
     dir: &Path,
     depth: usize,
     noise: &NoiseFilter,
@@ -77,7 +76,7 @@ fn collect_clones(
     for child in children.flatten() {
         let path = child.path();
         if path.is_dir() {
-            collect_clones(root, &path, depth - 1, noise, found)?;
+            collect_clones(&path, depth - 1, noise, found)?;
         }
     }
     Ok(())
@@ -128,11 +127,14 @@ fn repo_id(repository: &gix::Repository, root: &Path, path: &Path) -> RepoId {
 
 /// Recovers `type/org/name` from a clone URL, http or scp shaped.
 pub fn repo_from_url(url: &str) -> Option<RepoId> {
-    let trimmed = url.trim().trim_end_matches('/').trim_end_matches(".git");
-    let after_scheme = trimmed.split_once("://").map_or(trimmed, |(_, rest)| rest);
-    let path = match after_scheme.split_once('/') {
-        Some((_, rest)) => rest,
-        None => after_scheme.split_once(':').map(|(_, rest)| rest)?,
+    let trimmed = url.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let path = match trimmed.split_once("://") {
+        Some((_, rest)) => rest.split_once('/').map(|(_, path)| path)?,
+        None => match trimmed.split_once(':') {
+            Some((host, rest)) if !host.contains('/') => rest,
+            _ => trimmed.split_once('/').map(|(_, path)| path)?,
+        },
     };
     let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
     let (repo_type, segments) = match segments.split_first() {

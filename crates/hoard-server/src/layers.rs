@@ -38,7 +38,7 @@ pub const REQUEST_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Compression for text responses only. Weights are already incompressible and running
 /// them through gzip would burn CPU on every LAN pull for nothing.
-pub fn compression() -> CompressionLayer<impl Predicate + Clone + Send + Sync + 'static> {
+pub fn compression() -> CompressionLayer<impl Predicate + Send + Sync + 'static> {
     let predicate = DefaultPredicate::new()
         .and(NotForContentType::new("application/octet-stream"))
         .and(NotForContentType::new("binary/octet-stream"))

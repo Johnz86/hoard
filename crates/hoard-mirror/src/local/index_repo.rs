@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use hoard_core::{ArtifactId, CommitSha, RepoId, RepoRowId, RepoType, Sha256, clean_repo_path};
+use hoard_index::IndexError;
 use hoard_index::hash::git_blob_sha1_bytes;
 use hoard_index::sniff::parse_readme;
 use hoard_index::store::blob::blob;
@@ -18,7 +19,6 @@ use hoard_index::store::repo::{
 };
 use hoard_index::store::revision::{RevisionRow, resolve_revision, revision_by_sha};
 use hoard_index::store::{Reader, Store, Writer};
-use hoard_index::IndexError;
 use jiff::Timestamp;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256 as Sha256Hasher};
@@ -640,7 +640,7 @@ fn build_paths_info(files: &[RevisionFile], paths: &[String]) -> Vec<PathsInfoEn
         let Some(path) = clean_repo_path(raw) else {
             continue;
         };
-        if path.is_empty() || seen.iter().any(|other| *other == path) {
+        if path.is_empty() || seen.contains(&path) {
             continue;
         }
         if let Some(file) = files.iter().find(|file| file.path == path) {
@@ -649,7 +649,10 @@ fn build_paths_info(files: &[RevisionFile], paths: &[String]) -> Vec<PathsInfoEn
             .iter()
             .any(|file| under(&file.path, &path).is_some_and(|rest| !rest.is_empty()))
         {
-            out.push(PathsInfoEntry::new(TreeEntry::directory(UNKNOWN_OID, path.clone())));
+            out.push(PathsInfoEntry::new(TreeEntry::directory(
+                UNKNOWN_OID,
+                path.clone(),
+            )));
         } else {
             continue;
         }
@@ -661,6 +664,8 @@ fn build_paths_info(files: &[RevisionFile], paths: &[String]) -> Vec<PathsInfoEn
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
 
     use hoard_core::NodeId;
     use hoard_core::{RepoType, State};
@@ -844,7 +849,8 @@ mod tests {
         let lfs = deep[0].lfs.as_ref().expect("the weight file is lfs");
         assert_eq!(lfs.oid, WEIGHTS_SHA256);
         assert_eq!(lfs.size, 4_265_146_304);
-        assert_eq!(lfs.pointer_size, 128);
+        assert_eq!(lfs.pointer_size, LFS_POINTER_SIZE);
+        assert_eq!(deep[0].oid, WEIGHTS_POINTER_OID);
         assert_ne!(deep[0].oid, UNKNOWN_OID);
     }
 
@@ -881,13 +887,13 @@ mod tests {
             serde_json::json!([
                 {
                     "type": "file",
-                    "oid": "e0b8bb1cd53f6b8b78c6ffbd7f1c1b1b1b0f5b0f",
+                    "oid": WEIGHTS_POINTER_OID,
                     "size": 4265146304u64,
                     "path": WEIGHTS,
                     "lfs": {
                         "oid": WEIGHTS_SHA256,
                         "size": 4265146304u64,
-                        "pointerSize": 128,
+                        "pointerSize": LFS_POINTER_SIZE,
                     },
                 },
                 {"type": "file", "oid": CONFIG_SHA1, "size": 12, "path": "config.json"},
@@ -896,13 +902,22 @@ mod tests {
         );
     }
 
+    /// The git blob name of the canonical LFS pointer for [`WEIGHTS_SHA256`], confirmed
+    /// against `git hash-object`. The Hub reports this as a tree entry's `oid`, because the
+    /// blob git tracks for an LFS file is the pointer, never the media.
+    const WEIGHTS_POINTER_OID: &str = "e5ac5c26df05b49b81220fd5128d05097e959822";
+    /// The byte length of that pointer file.
+    const LFS_POINTER_SIZE: u64 = 135;
+
     static STATEMENTS: AtomicUsize = AtomicUsize::new(0);
     static ENTRY_STATEMENTS: AtomicUsize = AtomicUsize::new(0);
 
-    fn count(sql: &str) {
-        STATEMENTS.fetch_add(1, Ordering::Relaxed);
-        if sql.contains("FROM entry") {
-            ENTRY_STATEMENTS.fetch_add(1, Ordering::Relaxed);
+    fn count(event: TraceEvent<'_>) {
+        if let TraceEvent::Stmt(_, sql) = event {
+            STATEMENTS.fetch_add(1, Ordering::Relaxed);
+            if sql.contains("FROM entry") {
+                ENTRY_STATEMENTS.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -910,8 +925,8 @@ mod tests {
     fn paths_info_reads_the_entry_table_once_however_many_paths_are_asked_about() {
         let store = store();
         let repo = seed(&store);
-        let mut conn = store.read().expect("reader");
-        conn.trace(Some(count));
+        let conn = store.read().expect("reader");
+        conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(count));
 
         let one = vec![WEIGHTS.to_owned()];
         let five: Vec<String> = ["a", "b", "c", "d", "e"]
@@ -935,7 +950,7 @@ mod tests {
         build_paths_info(&files, &five);
         assert_eq!(STATEMENTS.load(Ordering::Relaxed), single);
         assert_eq!(ENTRY_STATEMENTS.load(Ordering::Relaxed), 1);
-        conn.trace(None);
+        conn.trace_v2(TraceEventCodes::empty(), None);
     }
 
     #[tokio::test]

@@ -36,6 +36,7 @@ humansize.workspace = true
 crc32fast.workspace = true
 
 [dev-dependencies]
+rusqlite.workspace = true
 tempfile.workspace = true
 wiremock.workspace = true
 
