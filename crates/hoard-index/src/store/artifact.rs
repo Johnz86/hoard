@@ -200,6 +200,18 @@ pub fn artifact_by_blob(
 }
 
 /// The artifacts waiting in the triage queue, oldest first.
+/// How many artifacts are waiting in the triage queue.
+///
+/// Counted in SQL: the queue is unbounded in principle, and the badge only needs a number.
+pub fn triage_count(conn: &Connection) -> Result<u64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM artifact WHERE triage = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(to_u64(count))
+}
+
 pub fn triage_queue(conn: &Connection, limit: u32) -> Result<Vec<ArtifactRow>> {
     let mut statement = conn.prepare(&format!(
         "SELECT {ARTIFACT_COLUMNS} {ARTIFACT_FROM} WHERE a.triage = 1 ORDER BY a.id LIMIT ?1"

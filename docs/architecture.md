@@ -96,7 +96,7 @@ hoard/
     design/handoff/          Claude Design export, verbatim
   src/
     main.rs                  clap entry
-    cli/                     serve, scan, ls, path, loadout, apply, link, nodes, doctor
+    cli/                     serve, scan, ls, path, loadout, apply, link, node, doctor
   crates/
     hoard-core/              domain types, no IO
       src/
@@ -131,6 +131,7 @@ hoard/
           schema.sql  migrations.rs  pool.rs
           node.rs  source.rs  blob.rs  artifact.rs  repo.rs  revision.rs  entry.rs
           shelf.rs  loadout.rs  job.rs  usage.rs  overrides.rs  setting.rs
+          projection.rs  search_exec.rs  row.rs
         search/
           grammar.rs         winnow parser
           token.rs           token kinds and the parsed strip

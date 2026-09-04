@@ -12,6 +12,7 @@ pub mod migrations;
 pub mod node;
 pub mod overrides;
 pub mod pool;
+pub mod projection;
 pub mod repo;
 pub mod revision;
 pub mod row;
