@@ -3,6 +3,7 @@
 pub mod artifact;
 pub mod blob;
 mod convert;
+pub mod digest;
 pub mod entry;
 #[cfg(test)]
 pub(crate) mod fixture;

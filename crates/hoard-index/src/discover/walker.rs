@@ -54,6 +54,7 @@ pub struct WalkOptions {
     exclude: Option<GlobSet>,
     follow_symlinks: bool,
     threads: usize,
+    boundary: Option<PathBuf>,
 }
 
 impl WalkOptions {
@@ -65,11 +66,34 @@ impl WalkOptions {
             exclude: compile(exclude)?,
             follow_symlinks,
             threads: default_threads(),
+            boundary: None,
         })
     }
 
+    /// Sets the boundary only when the caller has not, so a discovery that walks
+    /// subdirectories cannot accidentally narrow it to the directory in hand.
+    pub fn with_default_boundary(&self, root: impl Into<PathBuf>) -> Self {
+        match self.boundary {
+            Some(_) => self.clone(),
+            None => self.clone().with_boundary(root),
+        }
+    }
+
+    /// Pins the directory a symlink may not leave.
+    ///
+    /// The walk root is not the boundary: a HuggingFace cache snapshot is walked one
+    /// directory at a time while its blobs sit two levels above, so the source root is what
+    /// decides whether a link stays inside what the operator nominated.
+    pub fn with_boundary(mut self, boundary: impl Into<PathBuf>) -> Self {
+        self.boundary = Some(boundary.into());
+        self
+    }
+
     pub fn from_source(source: &SourceConfig) -> Result<Self> {
-        Self::new(&source.include, &source.exclude, source.follow_symlinks)
+        Ok(
+            Self::new(&source.include, &source.exclude, source.follow_symlinks)?
+                .with_boundary(source.path.clone()),
+        )
     }
 
     /// Pins the walk to a thread count, so a caller already spread over rayon does not
@@ -80,6 +104,7 @@ impl WalkOptions {
             exclude: self.exclude.clone(),
             follow_symlinks: self.follow_symlinks,
             threads: threads.max(1),
+            boundary: self.boundary.clone(),
         }
     }
 
@@ -103,6 +128,7 @@ impl Default for WalkOptions {
             exclude: None,
             follow_symlinks: false,
             threads: default_threads(),
+            boundary: None,
         }
     }
 }
@@ -231,6 +257,14 @@ fn visit(
         return WalkState::Continue;
     }
     let is_symlink = file_type.is_symlink();
+    let boundary = options.boundary.as_deref().unwrap_or(root);
+    if is_symlink && !options.follow_symlinks && !resolves_inside(boundary, path) {
+        tracing::debug!(
+            path = %path.display(),
+            "symlink leaves the source root; set follow_symlinks to index it"
+        );
+        return WalkState::Continue;
+    }
     found.lock().push(DiscoveredFile {
         abs_path: path.to_path_buf(),
         rel_path,
@@ -240,6 +274,20 @@ fn visit(
         symlink_target: is_symlink.then(|| std::fs::read_link(path).ok()).flatten(),
     });
     WalkState::Continue
+}
+
+/// Whether a symlink's target is inside the root that was nominated.
+///
+/// A source names the directories hoard may index, and every indexed file is servable to
+/// the whole LAN. A symlink pointing outside its root would therefore hand out files the
+/// operator never nominated, so by default one is skipped; `follow_symlinks` opts in.
+/// Targets inside the root are unaffected, which is what the HuggingFace cache relies on
+/// when a snapshot links to a blob beside it.
+fn resolves_inside(boundary: &Path, path: &Path) -> bool {
+    let (Ok(target), Ok(root)) = (path.canonicalize(), boundary.canonicalize()) else {
+        return false;
+    };
+    target.starts_with(root)
 }
 
 /// The stamp of an already read `stat`, so the walk never stats a candidate twice.
@@ -281,6 +329,57 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn a_symlink_out_of_the_root_is_not_indexed_unless_it_is_opted_into() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("models");
+        std::fs::create_dir_all(&root).expect("root is creatable");
+        std::fs::write(root.join("real.safetensors"), b"inside").expect("file writes");
+
+        let outside = dir.path().join("outside.safetensors");
+        std::fs::write(&outside, b"outside").expect("file writes");
+        std::os::unix::fs::symlink(&outside, root.join("escaped.safetensors"))
+            .expect("symlink is creatable");
+        std::os::unix::fs::symlink(
+            root.join("real.safetensors"),
+            root.join("beside.safetensors"),
+        )
+        .expect("symlink is creatable");
+
+        let guarded = WalkOptions::new(&[], &[], false).expect("options compile");
+        let names = walked_names(&root, &guarded);
+        assert!(names.contains(&"real.safetensors".to_owned()));
+        assert!(
+            names.contains(&"beside.safetensors".to_owned()),
+            "a link inside the root is what the HuggingFace cache is made of"
+        );
+        assert!(
+            !names.contains(&"escaped.safetensors".to_owned()),
+            "a link out of the root would serve a file the operator never nominated"
+        );
+
+        let permissive = WalkOptions::new(&[], &[], true).expect("options compile");
+        assert!(
+            walked_names(&root, &permissive).contains(&"escaped.safetensors".to_owned()),
+            "follow_symlinks is the explicit opt in"
+        );
+
+        let wider = guarded.with_boundary(dir.path());
+        assert!(
+            walked_names(&root, &wider).contains(&"escaped.safetensors".to_owned()),
+            "the boundary is the source root, not the directory being walked, which is what \
+             lets a cache snapshot link down to the blobs beside it"
+        );
+    }
+
+    fn walked_names(root: &Path, options: &WalkOptions) -> Vec<String> {
+        walk(root, options, &NoiseFilter::default())
+            .expect("the walk succeeds")
+            .into_iter()
+            .map(|found| found.rel_path)
+            .collect()
+    }
     use crate::store::Store;
     use crate::store::overrides::add_noise;
 

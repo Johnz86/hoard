@@ -48,6 +48,7 @@ pub fn discover(
     options: &WalkOptions,
     noise: &NoiseFilter,
 ) -> Result<Vec<DiscoveredRepo>> {
+    let options = &options.with_default_boundary(root);
     let mut dirs: Vec<(PathBuf, RepoId)> = std::fs::read_dir(root)
         .map_err(|error| IndexError::io(root, error))?
         .flatten()
