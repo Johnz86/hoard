@@ -9,3 +9,49 @@ pub mod hub;
 pub mod layers;
 pub mod state;
 pub mod ui;
+
+use std::future::Future;
+
+use axum::Router;
+use tokio::net::TcpListener;
+
+pub use config::HoardConfig;
+pub use error::{ApiError, ApiResult, HubError, HubResult};
+pub use state::AppState;
+
+/// Builds the whole application.
+///
+/// Route order is load bearing. The hoard API and the Hub API both live under `/api`, and
+/// the Hub face ends in a catch-all that matches a bare hash, so the specific routers are
+/// merged before the UI, whose fallback serves the shell for every deep link.
+///
+/// The metadata timeout wraps only the JSON APIs. File routes stream weights that are
+/// legitimately measured in tens of gigabytes, and a slow LAN pull is not a hung request.
+pub fn app(state: AppState) -> Router {
+    let timeout = layers::metadata_timeout(state.config().server.metadata_timeout_secs);
+
+    Router::new()
+        .merge(api::routes().layer(timeout))
+        .merge(ui::routes())
+        .layer(layers::compression())
+        .layer(layers::cors())
+        .layer(layers::body_limit())
+        .layer(layers::propagate_request_id())
+        .layer(layers::tracing_layer())
+        .layer(layers::request_id())
+        .layer(layers::catch_panic())
+        .with_state(state)
+}
+
+/// Serves the application until `shutdown` resolves.
+///
+/// Graceful shutdown is not a nicety here: a block download interrupted mid-write would
+/// leave a partial block in the cache, so in-flight writes are allowed to finish.
+pub async fn serve<F>(listener: TcpListener, state: AppState, shutdown: F) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    axum::serve(listener, app(state))
+        .with_graceful_shutdown(shutdown)
+        .await
+}

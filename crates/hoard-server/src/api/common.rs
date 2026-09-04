@@ -3,31 +3,36 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use jiff::Timestamp;
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use hoard_core::{
-    ArtifactFormat, ArtifactId, Base, CommitSha, Precision, RepoId, RepoType, Role, Sha256, State,
-    SubRole, format_size,
+    ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, Precision, RepoId, RepoRowId, RepoType,
+    Role, Sha256, State, SubRole, format_size,
 };
 use hoard_index::IndexError;
 use hoard_index::search::{
     CompatTarget, CompileContext, ParsedQuery, SortKey, SortSpec, TokenKind, compile,
 };
 use hoard_index::store::entry::EntryRow;
-use hoard_index::store::row::SearchRow;
+use hoard_index::store::row::{SearchRow, SqlValue};
 use hoard_index::store::{revision, search_exec, shelf};
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+
+/// The SQLite connection the store hands to a blocking closure, named through the store
+/// rather than by depending on rusqlite from the HTTP layer.
+pub type Conn = <hoard_index::store::Reader as std::ops::Deref>::Target;
 
 /// Rows returned when a request names no limit.
 pub const DEFAULT_LIMIT: u32 = 100;
 const MAX_LIMIT: u32 = 500;
 /// How many compatible artifacts the inspector's PLUGS INTO list shows.
 pub const PLUGS_INTO_LIMIT: u32 = 4;
+/// How far a bounded probe of an unbounded table reads before it reports a saturated count.
+pub const PROBE_LIMIT: u32 = 10_000;
 
-const MIDDOT: &str = "\u{b7}";
+pub const MIDDOT: &str = "\u{b7}";
 const TIMES: &str = "\u{d7}";
 
 const SECONDS_PER_MINUTE: i64 = 60;
@@ -53,8 +58,12 @@ pub struct PageParams {
 
 impl PageParams {
     pub fn limit(&self) -> u32 {
-        self.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
+        clamp_limit(self.limit)
     }
+}
+
+pub fn clamp_limit(limit: Option<u32>) -> u32 {
+    limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)
 }
 
 /// An opaque position in one ordered result set, bound to the query that produced it so a
@@ -84,7 +93,13 @@ fn fingerprint(key: &str) -> u64 {
 }
 
 /// The cursor for the next page, or `None` when this page is the last one.
-pub fn next_cursor(offset: u32, limit: u32, returned: usize, total: u64, key: &str) -> Option<String> {
+pub fn next_cursor(
+    offset: u32,
+    limit: u32,
+    returned: usize,
+    total: u64,
+    key: &str,
+) -> Option<String> {
     let seen = u64::from(offset) + returned as u64;
     (returned as u32 == limit && seen < total).then(|| encode_cursor(offset + limit, key))
 }
@@ -98,35 +113,39 @@ pub struct SortParams {
 
 impl SortParams {
     pub fn spec(&self) -> ApiResult<SortSpec> {
-        let key = match self.sort.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(raw) => raw.parse::<SortKey>().map_err(ApiError::from)?,
-            None => SortKey::default(),
-        };
-        let descending = match self.dir.as_deref().map(str::trim) {
-            Some("desc") | Some("DESC") => true,
-            None | Some("") | Some("asc") | Some("ASC") => false,
-            Some(other) => {
-                return Err(ApiError::bad_request(format!(
-                    "{other:?} is not a sort direction"
-                )));
-            }
-        };
-        Ok(SortSpec::new(key, descending))
+        sort_spec(self.sort.as_deref(), self.dir.as_deref())
     }
 
     pub fn key(&self) -> String {
-        format!(
-            "{}:{}",
-            self.sort.as_deref().unwrap_or_default(),
-            self.dir.as_deref().unwrap_or_default()
-        )
+        sort_key(self.sort.as_deref(), self.dir.as_deref())
     }
+}
+
+pub fn sort_spec(sort: Option<&str>, dir: Option<&str>) -> ApiResult<SortSpec> {
+    let key = match sort.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(raw) => raw.parse::<SortKey>().map_err(ApiError::from)?,
+        None => SortKey::default(),
+    };
+    let descending = match dir.map(str::trim) {
+        Some("desc") | Some("DESC") => true,
+        None | Some("") | Some("asc") | Some("ASC") => false,
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "{other:?} is not a sort direction"
+            )));
+        }
+    };
+    Ok(SortSpec::new(key, descending))
+}
+
+pub fn sort_key(sort: Option<&str>, dir: Option<&str>) -> String {
+    format!("{}:{}", sort.unwrap_or_default(), dir.unwrap_or_default())
 }
 
 /// Everything compilation needs that the query text does not carry: the shelves a
 /// `shelf:` token expands to, this node's name and the resolved `compat:` target.
 pub fn compile_context(
-    conn: &Connection,
+    conn: &Conn,
     node: &str,
     query: &ParsedQuery,
     now: Timestamp,
@@ -152,7 +171,7 @@ pub fn compile_context(
 /// Resolves what a `compat:` value names, because the rule reads a role and a base rather
 /// than a string. A repository reference wins over free text.
 pub fn resolve_compat_target(
-    conn: &Connection,
+    conn: &Conn,
     value: &str,
     now: Timestamp,
 ) -> Result<Option<CompatTarget>, IndexError> {
@@ -177,6 +196,51 @@ pub fn resolve_compat_target(
         }
     }
     Ok(None)
+}
+
+/// One artifact of the `search_row` view, read by its identity rather than by a query.
+pub fn row_by_artifact(conn: &Conn, id: ArtifactId) -> Result<Option<SearchRow>, IndexError> {
+    let rows = search_exec::query_rows(
+        conn,
+        "artifact_id = ?",
+        &[SqlValue::Int(id.get())],
+        "",
+        1,
+        0,
+    )?;
+    Ok(rows.into_iter().next())
+}
+
+pub fn require_row(conn: &Conn, id: ArtifactId) -> Result<SearchRow, IndexError> {
+    row_by_artifact(conn, id)?.ok_or_else(|| IndexError::not_found("artifact", id.to_string()))
+}
+
+/// Every artifact reachable through one repository, most bytes first.
+pub fn rows_for_repo(
+    conn: &Conn,
+    repo: RepoRowId,
+    limit: u32,
+) -> Result<Vec<SearchRow>, IndexError> {
+    search_exec::query_rows(
+        conn,
+        "repo_id = ?",
+        &[SqlValue::Int(repo.get())],
+        "size DESC, artifact_id ASC",
+        limit,
+        0,
+    )
+}
+
+/// Every artifact sharing one blob, which is what a duplicate is.
+pub fn rows_for_blob(conn: &Conn, blob: BlobId) -> Result<Vec<SearchRow>, IndexError> {
+    search_exec::query_rows(
+        conn,
+        "blob_id = ?",
+        &[SqlValue::Int(blob.get())],
+        "",
+        MAX_LIMIT,
+        0,
+    )
 }
 
 /// One row of the results table, the cards view and `hoard ls --json`.
@@ -208,9 +272,12 @@ pub struct RowView {
     pub path_count: u32,
     pub last_used: Option<Timestamp>,
     pub repo: String,
-    pub size_label: String,
+    pub repo_type: RepoType,
+    pub size_human: String,
     pub state_label: String,
     pub role_code: String,
+    pub dupe: bool,
+    pub triage: bool,
 }
 
 impl From<&SearchRow> for RowView {
@@ -242,11 +309,22 @@ impl From<&SearchRow> for RowView {
             path_count: row.path_count,
             last_used: row.last_used,
             repo: row.repo.clone(),
-            size_label: format_size(row.size),
-            state_label: state_label(row.state, row.pull_progress, ""),
+            repo_type: repo_type_of(&row.repo),
+            size_human: format_size(row.size),
+            state_label: state_label(row.state, row.pull_progress, None),
             role_code: row.role.code().to_owned(),
+            dupe: row.dupe,
+            triage: row.triage,
         }
     }
+}
+
+/// The namespace of a qualified `type/org/name`, falling back to models.
+pub fn repo_type_of(qualified: &str) -> RepoType {
+    qualified
+        .split_once('/')
+        .and_then(|(head, _)| head.parse().ok())
+        .unwrap_or(RepoType::Models)
 }
 
 /// One path of an artifact as the ENTRIES and PATHS ON DISK lists show it.
@@ -265,12 +343,11 @@ pub struct EntryView {
 /// Renders entries with the ref name each revision answers to, falling back to the short
 /// sha exactly as the `search_row` view does.
 pub fn entry_views(
-    conn: &Connection,
+    conn: &Conn,
     entries: &[EntryRow],
     host: &str,
 ) -> Result<Vec<EntryView>, IndexError> {
-    let mut labels: Vec<(hoard_core::RepoRowId, Vec<(hoard_core::RevisionId, String)>)> =
-        Vec::new();
+    let mut labels: Vec<(RepoRowId, Vec<(hoard_core::RevisionId, String)>)> = Vec::new();
     let mut views = Vec::with_capacity(entries.len());
     for entry in entries {
         if !labels.iter().any(|(repo, _)| *repo == entry.repo) {
@@ -299,7 +376,7 @@ pub fn entry_views(
                 false => entry.node.clone(),
             },
             state: entry.state,
-            state_label: state_label(entry.state, entry.pull_progress, host),
+            state_label: state_label(entry.state, entry.pull_progress, Some(host)),
             symlink: entry.is_symlink,
         });
     }
@@ -344,10 +421,7 @@ pub fn facts(row: &SearchRow) -> Vec<Fact> {
         Fact::new("blob", blob_value(row.blob_sha256.as_ref())),
     ];
     match row.role {
-        Role::Lora => facts.push(Fact::new(
-            "rank / alpha",
-            rank_alpha(row.rank, row.alpha),
-        )),
+        Role::Lora => facts.push(Fact::new("rank / alpha", rank_alpha(row.rank, row.alpha))),
         Role::Llm => {
             if let Some(context) = row.context {
                 facts.push(Fact::new("context", context.to_string()));
@@ -421,15 +495,19 @@ fn resolution(base: &Base) -> Option<String> {
     Some(format!("{side} {TIMES} {side}"))
 }
 
-/// The detail header's state badge: `SERVED · hoard.lan`, `PULLING 64%`.
-pub fn state_label(state: State, progress: Option<f32>, host: &str) -> String {
-    match state {
-        State::Served => format!("{} {MIDDOT} {host}", state.label()),
-        State::Pulling => match progress {
+/// The state badge: `SERVED` in a table cell, `SERVED · hoard.lan` in a detail header.
+pub fn state_label(state: State, progress: Option<f32>, host: Option<&str>) -> String {
+    match (state, host) {
+        (State::Served, Some(host)) => format!("{} {MIDDOT} {host}", state.label()),
+        (State::Pulling, _) => match progress {
             Some(progress) => format!("{} {}%", state.label(), (progress * 100.0).round() as i64),
             None => state.label().to_owned(),
         },
-        State::Local | State::Stale | State::Remote | State::Triage => state.label().to_owned(),
+        (State::Served, None)
+        | (State::Local, _)
+        | (State::Stale, _)
+        | (State::Remote, _)
+        | (State::Triage, _) => state.label().to_owned(),
     }
 }
 
@@ -495,6 +573,14 @@ pub fn repo_id(repo_type: &str, org: &str, name: &str) -> ApiResult<RepoId> {
     RepoId::parse_ref(repo_type, &reference).map_err(ApiError::from)
 }
 
+/// Quotes a grammar value that would otherwise tokenize as more than one word.
+pub fn quoted(value: &str) -> String {
+    match value.contains(char::is_whitespace) || value.contains('"') {
+        true => format!("\"{}\"", value.replace('"', "")),
+        false => value.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,7 +597,10 @@ mod tests {
             100
         );
         assert!(decode_cursor(Some(&cursor), "role:ckpt|size:desc").is_err());
-        assert_eq!(decode_cursor(None, "any").expect("no cursor is page one"), 0);
+        assert_eq!(
+            decode_cursor(None, "any").expect("no cursor is page one"),
+            0
+        );
         assert!(decode_cursor(Some("nonsense"), "any").is_err());
     }
 
@@ -524,40 +613,22 @@ mod tests {
 
     #[test]
     fn sort_parameters_reject_an_unknown_column_or_direction() {
-        let sort = SortParams {
-            sort: Some("size".to_owned()),
-            dir: Some("desc".to_owned()),
-        };
         assert_eq!(
-            sort.spec().expect("spec"),
+            sort_spec(Some("size"), Some("desc")).expect("spec"),
             SortSpec::new(SortKey::Size, true)
         );
-        assert_eq!(
-            SortParams::default().spec().expect("spec"),
-            SortSpec::default()
-        );
-        assert!(
-            SortParams {
-                sort: Some("colour".to_owned()),
-                dir: None
-            }
-            .spec()
-            .is_err()
-        );
-        assert!(
-            SortParams {
-                sort: None,
-                dir: Some("sideways".to_owned())
-            }
-            .spec()
-            .is_err()
-        );
+        assert_eq!(sort_spec(None, None).expect("spec"), SortSpec::default());
+        assert!(sort_spec(Some("colour"), None).is_err());
+        assert!(sort_spec(None, Some("sideways")).is_err());
     }
 
     #[test]
     fn relative_times_read_the_way_the_design_writes_them() {
         let ago = |seconds: i64| {
-            relative_time(now(), Timestamp::from_second(now().as_second() - seconds).expect("time"))
+            relative_time(
+                now(),
+                Timestamp::from_second(now().as_second() - seconds).expect("time"),
+            )
         };
         assert_eq!(ago(10), "just now");
         assert_eq!(ago(300), "5m ago");
@@ -582,13 +653,14 @@ mod tests {
     }
 
     #[test]
-    fn the_state_badge_names_the_host_it_is_served_from() {
+    fn the_state_badge_names_the_host_only_where_the_design_shows_it() {
         assert_eq!(
-            state_label(State::Served, None, "hoard.lan"),
+            state_label(State::Served, None, Some("hoard.lan")),
             "SERVED \u{b7} hoard.lan"
         );
-        assert_eq!(state_label(State::Pulling, Some(0.64), "x"), "PULLING 64%");
-        assert_eq!(state_label(State::Remote, None, "x"), "REMOTE");
+        assert_eq!(state_label(State::Served, None, None), "SERVED");
+        assert_eq!(state_label(State::Pulling, Some(0.64), None), "PULLING 64%");
+        assert_eq!(state_label(State::Remote, None, Some("x")), "REMOTE");
     }
 
     #[test]
@@ -602,5 +674,12 @@ mod tests {
             "datasets/squad"
         );
         assert!(repo_id("nonsense", "org", "name").is_err());
+    }
+
+    #[test]
+    fn a_qualified_repo_names_its_namespace() {
+        assert_eq!(repo_type_of("datasets/org/name"), RepoType::Datasets);
+        assert_eq!(repo_type_of("models/name"), RepoType::Models);
+        assert_eq!(repo_type_of("loose-folder"), RepoType::Models);
     }
 }

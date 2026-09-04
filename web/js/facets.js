@@ -16,13 +16,21 @@ export function facetToken(item, key) {
     return /\s/.test(value) ? `${key}:"${value}"` : `${key}:${value}`;
 }
 
+function selectFacet(app, item, key) {
+    if (!item.active && typeof item.query === "string") {
+        app.commitQuery(item.query, { echo: true });
+        return;
+    }
+    app.toggleToken(facetToken(item, key));
+}
+
 function facetRow(app, item, key) {
     const count = Number(item.count) || 0;
     return el(
         "div",
         {
             class: `facet-row${item.active ? " is-active" : ""}`,
-            onClick: () => app.toggleToken(facetToken(item, key))
+            onClick: () => selectFacet(app, item, key)
         },
         el("span", { class: "facet-mark" }),
         el("span", { class: `facet-label${count ? "" : " is-empty"}`, text: item.label || item.value }),

@@ -1,0 +1,677 @@
+use std::path::PathBuf;
+
+use axum::Json;
+use axum::extract::{Path as RoutePath, Query, State};
+use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
+
+use hoard_core::{
+    ArtifactFormat, ArtifactId, CommitSha, FileState, RepoId, RepoRowId, RepoType, Role,
+    State as ArtifactState, format_size,
+};
+use hoard_index::IndexError;
+use hoard_index::sniff::parse_readme;
+use hoard_index::store::entry::entries_for_revision;
+use hoard_index::store::revision::{RefKind, RevisionRow};
+use hoard_index::store::row::SearchRow;
+use hoard_index::store::usage::{PullRow, UsageDay};
+use hoard_index::store::{artifact, blob, entry, node, repo, revision, usage};
+
+use crate::api::common::{
+    Conn, DEFAULT_LIMIT, EntryView, Fact, MIDDOT, PullCommands, RowView, clamp_limit,
+    decode_cursor, entry_views, facts, next_cursor, pull_commands, relative_time, repo_id,
+    state_label,
+};
+use crate::api::compat::{CompatView, compat_for};
+use crate::error::{ApiError, ApiResult};
+use crate::state::AppState;
+
+/// How many days the USAGE chart covers.
+const USAGE_DAYS: u32 = 7;
+/// How many lines RECENT PULLS shows.
+const RECENT_PULLS: u32 = 20;
+/// How many artifacts of a repository are read to pick the one the header describes.
+const REPO_ARTIFACTS: u32 = 64;
+const README_PATH: &str = "README.md";
+const README_LIMIT: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ListParams {
+    pub q: Option<String>,
+    #[serde(rename = "type")]
+    pub repo_type: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RevisionParams {
+    pub revision: Option<String>,
+}
+
+impl RevisionParams {
+    fn wanted(&self) -> String {
+        self.revision
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("main")
+            .to_owned()
+    }
+}
+
+/// One line of the repositories listing.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RepoListRow {
+    pub id: RepoRowId,
+    pub repo: String,
+    #[serde(rename = "type")]
+    pub repo_type: RepoType,
+    pub org: Option<String>,
+    pub name: String,
+    pub node: String,
+    pub kind: String,
+    pub default_ref: String,
+    pub files: u64,
+    pub size: u64,
+    pub size_human: String,
+    pub last_modified: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RepoListView {
+    pub rows: Vec<RepoListRow>,
+    pub next_cursor: Option<String>,
+    pub total: u64,
+}
+
+/// A named pointer into the repository's history, as the REFS tab lists it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RefView {
+    pub name: String,
+    pub sha: CommitSha,
+    pub short: String,
+    pub when: String,
+    pub kind: RefKind,
+    pub current: bool,
+}
+
+/// The repository detail header, its refs and everything the right rail prints.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RepoView {
+    pub repo: String,
+    #[serde(rename = "type")]
+    pub repo_type: RepoType,
+    pub org: Option<String>,
+    pub name: String,
+    pub node: String,
+    pub artifact_id: Option<ArtifactId>,
+    pub role: Role,
+    pub role_code: String,
+    pub role_full: &'static str,
+    pub state: ArtifactState,
+    pub state_full: String,
+    pub pull_progress: Option<f32>,
+    pub meta: String,
+    pub revision: String,
+    pub revision_sha: CommitSha,
+    pub revision_summary: String,
+    pub refs: Vec<RefView>,
+    pub facts: Vec<Fact>,
+    pub paths: Vec<EntryView>,
+    pub pull: PullCommands,
+    pub rows: Vec<RowView>,
+}
+
+/// One file of a revision as the FILES tab lists it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FileRow {
+    pub path: String,
+    pub kind: &'static str,
+    pub size: u64,
+    pub size_human: String,
+    pub state: FileState,
+    pub state_label: &'static str,
+    pub artifact_id: Option<ArtifactId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FilesView {
+    pub revision: String,
+    pub rows: Vec<FileRow>,
+}
+
+/// The CARD tab: frontmatter split from the rendered body.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReadmeView {
+    pub frontmatter: Vec<FrontmatterEntry>,
+    pub html: String,
+    pub generated: bool,
+    pub meta: String,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FrontmatterEntry {
+    pub key: String,
+    pub value: String,
+}
+
+/// The USAGE tab: seven days of bars, the recent pulls and how many clients pulled.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsageView {
+    pub days: Vec<UsageDay>,
+    pub pulls: Vec<PullView>,
+    pub clients: u64,
+    pub total: u64,
+}
+
+/// One line of RECENT PULLS. `when` is the relative spelling the design prints; `at` is the
+/// instant behind it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PullView {
+    pub when: String,
+    pub at: Timestamp,
+    pub who: Option<String>,
+    pub what: String,
+    pub bytes: u64,
+    pub rate_bps: Option<u64>,
+}
+
+pub async fn list(
+    State(state): State<AppState>,
+    Query(params): Query<ListParams>,
+) -> ApiResult<Json<RepoListView>> {
+    let limit = clamp_limit(params.limit);
+    let repo_type = params
+        .repo_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::parse::<RepoType>)
+        .transpose()
+        .map_err(ApiError::from)?;
+    let key = format!(
+        "{}|{}",
+        params.q.clone().unwrap_or_default(),
+        params.repo_type.clone().unwrap_or_default()
+    );
+    let offset = decode_cursor(params.cursor.as_deref(), &key)?;
+    let text = params.q.clone();
+    let view = state
+        .store()
+        .call(move |conn| {
+            let filter = repo::RepoFilter {
+                text,
+                repo_type,
+                node_row: None,
+            };
+            let all = repo::list_repos(conn, &filter, None, u32::MAX)?;
+            let total = all.len() as u64;
+            let mut rows = Vec::new();
+            for record in all.into_iter().skip(offset as usize).take(limit as usize) {
+                rows.push(list_row(conn, &record)?);
+            }
+            Ok(RepoListView {
+                next_cursor: next_cursor(offset, limit, rows.len(), total, &key),
+                rows,
+                total,
+            })
+        })
+        .await?;
+    Ok(Json(view))
+}
+
+fn list_row(conn: &Conn, record: &repo::RepoRow) -> Result<RepoListRow, IndexError> {
+    let node = node::node(conn, record.node_row)?;
+    let revision = revision::resolve_revision(conn, record.id, &record.default_ref).ok();
+    let entries = match &revision {
+        Some(revision) => entries_for_revision(conn, revision.id)?,
+        None => Vec::new(),
+    };
+    let size = entries.iter().map(|entry| entry.size).sum();
+    Ok(RepoListRow {
+        id: record.id,
+        repo: record.repo.qualified(),
+        repo_type: record.repo.repo_type(),
+        org: record.repo.org().map(str::to_owned),
+        name: record.repo.name().to_owned(),
+        node: node.name,
+        kind: record.kind.as_str().to_owned(),
+        default_ref: record.default_ref.clone(),
+        files: entries.len() as u64,
+        size,
+        size_human: format_size(size),
+        last_modified: record.last_modified,
+    })
+}
+
+pub async fn detail(
+    State(state): State<AppState>,
+    RoutePath((repo_type, org, name)): RoutePath<(String, String, String)>,
+    Query(params): Query<RevisionParams>,
+) -> ApiResult<Json<RepoView>> {
+    let repo = repo_id(&repo_type, &org, &name)?;
+    let wanted = params.wanted();
+    let host = state.node_name().to_owned();
+    let public = public_host(state.public_url());
+    let now = Timestamp::now();
+    let commands = pull_commands(&state, &repo, None);
+    let view = state
+        .store()
+        .call(move |conn| {
+            let record = repo_row(conn, &repo)?;
+            let revision = revision::resolve_revision(conn, record.id, &wanted)?;
+            let rows = crate::api::common::rows_for_repo(conn, record.id, REPO_ARTIFACTS)?;
+            let primary = pick_primary(&rows);
+            let entries = entries_for_revision(conn, revision.id)?;
+            let refs = ref_views(conn, record.id, &revision, now)?;
+            let paths = match primary {
+                Some(row) => entry_views(
+                    conn,
+                    &entry::entries_for_artifact(conn, row.artifact_id)?,
+                    &host,
+                )?,
+                None => entry_views(conn, &entries, &host)?,
+            };
+            let node_name = node::node(conn, record.node_row)?.name;
+            let path = primary.and_then(|row| row.abs_path.clone());
+            let view = RepoView {
+                repo: record.repo.qualified(),
+                repo_type: record.repo.repo_type(),
+                org: record.repo.org().map(str::to_owned),
+                name: record.repo.name().to_owned(),
+                node: node_name,
+                artifact_id: primary.map(|row| row.artifact_id),
+                role: primary.map_or(Role::Unk, |row| row.role),
+                role_code: primary.map_or(Role::Unk, |row| row.role).code().to_owned(),
+                role_full: primary.map_or(Role::Unk, |row| row.role).label(),
+                state: primary.map_or(ArtifactState::Remote, |row| row.state),
+                state_full: state_label(
+                    primary.map_or(ArtifactState::Remote, |row| row.state),
+                    primary.and_then(|row| row.pull_progress),
+                    Some(&public),
+                ),
+                pull_progress: primary.and_then(|row| row.pull_progress),
+                meta: meta_line(primary, &entries, now),
+                revision: revision_name(&refs, &revision),
+                revision_sha: revision.sha,
+                revision_summary: revision_summary(&revision, entries.len(), &refs),
+                facts: repo_facts(conn, primary, now)?,
+                refs,
+                paths,
+                pull: PullCommands { path, ..commands },
+                rows: rows.iter().map(RowView::from).collect(),
+            };
+            Ok(view)
+        })
+        .await?;
+    Ok(Json(view))
+}
+
+pub async fn files(
+    State(state): State<AppState>,
+    RoutePath((repo_type, org, name)): RoutePath<(String, String, String)>,
+    Query(params): Query<RevisionParams>,
+) -> ApiResult<Json<FilesView>> {
+    let repo = repo_id(&repo_type, &org, &name)?;
+    let wanted = params.wanted();
+    let view = state
+        .store()
+        .call(move |conn| {
+            let record = repo_row(conn, &repo)?;
+            let revision = revision::resolve_revision(conn, record.id, &wanted)?;
+            let entries = entries_for_revision(conn, revision.id)?;
+            let single = entries
+                .iter()
+                .filter(|entry| entry.artifact.is_some())
+                .count()
+                == 1;
+            let mut rows = Vec::with_capacity(entries.len());
+            for item in &entries {
+                let deduped = match item.blob {
+                    Some(id) => blob::blob(conn, id)?.path_count > 1,
+                    None => false,
+                };
+                rows.push(FileRow {
+                    kind: file_kind(&item.path, item.artifact.is_some(), single),
+                    size: item.size,
+                    size_human: format_size(item.size),
+                    state: file_state(item.present, item.lfs_pointer, deduped),
+                    state_label: file_state(item.present, item.lfs_pointer, deduped).label(),
+                    artifact_id: item.artifact,
+                    path: item.path.clone(),
+                });
+            }
+            rows.sort_by(|left, right| left.path.cmp(&right.path));
+            Ok(FilesView {
+                revision: wanted,
+                rows,
+            })
+        })
+        .await?;
+    Ok(Json(view))
+}
+
+pub async fn readme(
+    State(state): State<AppState>,
+    RoutePath((repo_type, org, name)): RoutePath<(String, String, String)>,
+    Query(params): Query<RevisionParams>,
+) -> ApiResult<Json<ReadmeView>> {
+    let repo = repo_id(&repo_type, &org, &name)?;
+    let wanted = params.wanted();
+    let probe = repo.clone();
+    let revision = wanted.clone();
+    let (path, fallback) = state
+        .store()
+        .call(move |conn| {
+            let record = repo_row(conn, &probe)?;
+            let resolved = revision::resolve_revision(conn, record.id, &revision)?;
+            let entries = entries_for_revision(conn, resolved.id)?;
+            let path = entries
+                .iter()
+                .find(|entry| entry.path.eq_ignore_ascii_case(README_PATH))
+                .and_then(|entry| entry.abs_path.clone())
+                .map(PathBuf::from);
+            let rows = crate::api::common::rows_for_repo(conn, record.id, REPO_ARTIFACTS)?;
+            let primary = pick_primary(&rows).cloned();
+            Ok((path, primary))
+        })
+        .await?;
+
+    let source = match path {
+        Some(path) => read_card(&path).await,
+        None => None,
+    };
+    let (text, generated) = match source {
+        Some(text) => (text, false),
+        None => (generated_card(&state, &repo, fallback.as_ref()), true),
+    };
+    let document = parse_readme(&text);
+    Ok(Json(ReadmeView {
+        frontmatter: document
+            .frontmatter
+            .into_iter()
+            .map(|(key, value)| FrontmatterEntry { key, value })
+            .collect(),
+        html: document.html,
+        generated,
+        meta: format!(
+            "{} {MIDDOT} {} lines",
+            format_size(document.bytes),
+            document.lines
+        ),
+        revision: wanted,
+    }))
+}
+
+pub async fn compat(
+    State(state): State<AppState>,
+    RoutePath((repo_type, org, name)): RoutePath<(String, String, String)>,
+    Query(params): Query<RevisionParams>,
+) -> ApiResult<Json<CompatView>> {
+    let repo = repo_id(&repo_type, &org, &name)?;
+    let _ = params.wanted();
+    let now = Timestamp::now();
+    let view = state
+        .store()
+        .call(move |conn| {
+            let record = repo_row(conn, &repo)?;
+            let rows = crate::api::common::rows_for_repo(conn, record.id, REPO_ARTIFACTS)?;
+            match pick_primary(&rows) {
+                Some(row) => compat_for(conn, row, DEFAULT_LIMIT, now),
+                None => Err(IndexError::not_found("artifact", record.repo.qualified())),
+            }
+        })
+        .await?;
+    Ok(Json(view))
+}
+
+pub async fn repo_usage(
+    State(state): State<AppState>,
+    RoutePath((repo_type, org, name)): RoutePath<(String, String, String)>,
+) -> ApiResult<Json<UsageView>> {
+    let repo = repo_id(&repo_type, &org, &name)?;
+    let now = Timestamp::now();
+    let view = state
+        .store()
+        .call(move |conn| {
+            let record = repo_row(conn, &repo)?;
+            let days = usage::usage_days(conn, record.id, USAGE_DAYS)?;
+            let pulls: Vec<PullView> = usage::recent_pulls(conn, record.id, RECENT_PULLS)?
+                .into_iter()
+                .map(|pull| pull_view(pull, now))
+                .collect();
+            Ok(UsageView {
+                total: days.iter().map(|day| day.pulls).sum(),
+                days,
+                pulls,
+                clients: usage::distinct_clients(conn, record.id)?,
+            })
+        })
+        .await?;
+    Ok(Json(view))
+}
+
+fn pull_view(pull: PullRow, now: Timestamp) -> PullView {
+    PullView {
+        when: relative_time(now, pull.when),
+        at: pull.when,
+        who: pull.who,
+        what: pull.what,
+        bytes: pull.bytes,
+        rate_bps: pull.rate_bps,
+    }
+}
+
+/// The repository as this node holds it, falling back to a peer's copy so a REMOTE repo
+/// still opens.
+fn repo_row(conn: &Conn, wanted: &RepoId) -> Result<repo::RepoRow, IndexError> {
+    let qualified = wanted.qualified();
+    let rows = repo::repos_by_qualified(conn, &qualified)?;
+    let local = node::local_node(conn).ok().map(|node| node.id);
+    rows.iter()
+        .find(|row| Some(row.node_row) == local)
+        .or_else(|| rows.first())
+        .cloned()
+        .ok_or_else(|| IndexError::not_found("repo", qualified))
+}
+
+/// The artifact the header describes: the largest weights file, else the largest artifact.
+fn pick_primary(rows: &[SearchRow]) -> Option<&SearchRow> {
+    rows.iter()
+        .filter(|row| row.format.holds_tensors())
+        .max_by_key(|row| row.size)
+        .or_else(|| rows.iter().max_by_key(|row| row.size))
+}
+
+fn ref_views(
+    conn: &Conn,
+    repo: RepoRowId,
+    current: &RevisionRow,
+    now: Timestamp,
+) -> Result<Vec<RefView>, IndexError> {
+    let mut views = Vec::new();
+    for reference in revision::refs_for_repo(conn, repo)? {
+        let record = revision::revision(conn, reference.revision)?;
+        views.push(RefView {
+            when: record
+                .committed
+                .map(|at| relative_time(now, at))
+                .unwrap_or_else(|| "-".to_owned()),
+            short: reference.sha.short(),
+            current: reference.revision == current.id,
+            name: reference.name,
+            sha: reference.sha,
+            kind: reference.kind,
+        });
+    }
+    Ok(views)
+}
+
+fn revision_name(refs: &[RefView], revision: &RevisionRow) -> String {
+    refs.iter()
+        .find(|reference| reference.current)
+        .map(|reference| reference.name.clone())
+        .unwrap_or_else(|| revision.sha.short())
+}
+
+/// `462c3cb · 14 files · 3 branches · 2 tags`, the line under the revision chip.
+fn revision_summary(revision: &RevisionRow, files: usize, refs: &[RefView]) -> String {
+    let branches = refs
+        .iter()
+        .filter(|reference| reference.kind == RefKind::Branch)
+        .count();
+    let tags = refs.len() - branches;
+    format!(
+        "{} {MIDDOT} {files} files {MIDDOT} {branches} branches {MIDDOT} {tags} tags",
+        revision.sha.short()
+    )
+}
+
+/// `path · size · last used 2h ago`, the header's third line.
+fn meta_line(primary: Option<&SearchRow>, entries: &[entry::EntryRow], now: Timestamp) -> String {
+    let size: u64 = entries.iter().map(|entry| entry.size).sum();
+    let mut parts = Vec::with_capacity(3);
+    if let Some(path) = primary.and_then(|row| row.abs_path.clone()) {
+        parts.push(path);
+    }
+    parts.push(format_size(size));
+    if let Some(used) = primary.and_then(|row| row.last_used) {
+        parts.push(format!("last used {}", relative_time(now, used)));
+    }
+    parts.join(&format!(" {MIDDOT} "))
+}
+
+/// DERIVED FACTS: the inspector's facts plus what only a repository knows.
+fn repo_facts(
+    conn: &Conn,
+    primary: Option<&SearchRow>,
+    now: Timestamp,
+) -> Result<Vec<Fact>, IndexError> {
+    let Some(row) = primary else {
+        return Ok(Vec::new());
+    };
+    let mut list = facts(row);
+    let record = blob::blob(conn, row.blob_id)?;
+    list.push(Fact::new(
+        "first seen",
+        relative_time(now, record.first_seen),
+    ));
+    let uses = artifact::artifact(conn, row.artifact_id)?.use_count;
+    list.push(Fact::new("pulls on lan", uses.to_string()));
+    Ok(list)
+}
+
+/// The FILES tab's KIND column.
+fn file_kind(path: &str, is_artifact: bool, single: bool) -> &'static str {
+    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    if name.starts_with(".git") {
+        return "git";
+    }
+    if name.ends_with(".md") || name.ends_with(".markdown") {
+        return "card";
+    }
+    let format = name
+        .rsplit_once('.')
+        .and_then(|(_, extension)| extension.parse::<ArtifactFormat>().ok());
+    match format {
+        Some(format) if format.holds_tensors() => match single && is_artifact {
+            true => "single-file",
+            false => "weights",
+        },
+        Some(ArtifactFormat::Parquet)
+        | Some(ArtifactFormat::Arrow)
+        | Some(ArtifactFormat::Jsonl)
+        | Some(ArtifactFormat::Csv) => "weights",
+        _ => "config",
+    }
+}
+
+fn file_state(present: bool, lfs_pointer: bool, deduped: bool) -> FileState {
+    if !present {
+        return FileState::Absent;
+    }
+    if lfs_pointer {
+        return FileState::LfsPtr;
+    }
+    match deduped {
+        true => FileState::Deduped,
+        false => FileState::Present,
+    }
+}
+
+async fn read_card(path: &std::path::Path) -> Option<String> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    if !metadata.is_file() || metadata.len() > README_LIMIT {
+        return None;
+    }
+    tokio::fs::read_to_string(path).await.ok()
+}
+
+/// The card hoard writes when upstream never shipped one: what the index knows, and how to
+/// pull the repository it describes.
+fn generated_card(state: &AppState, repo: &RepoId, primary: Option<&SearchRow>) -> String {
+    let commands = pull_commands(state, repo, None);
+    let mut text = format!(
+        "# {}\n\nNo upstream card was recovered for this repository. This page is generated \
+         from hoard's index record.\n\n## What we know\n\n",
+        repo.reference()
+    );
+    match primary {
+        Some(row) => {
+            text.push_str(&format!("- role: {}\n", row.role.as_str()));
+            text.push_str(&format!(
+                "- base: {}\n",
+                crate::api::common::base_label(&row.base, row.base_label.as_deref())
+                    .unwrap_or_else(|| "unknown".to_owned())
+            ));
+            text.push_str(&format!("- format: {}\n", row.format.as_str()));
+            text.push_str(&format!("- size: {}\n", format_size(row.size)));
+            if let Some(trigger) = row.trigger.as_deref() {
+                text.push_str(&format!("- trigger words: {trigger}\n"));
+            }
+        }
+        None => text.push_str("- nothing has been classified in this repository yet\n"),
+    }
+    text.push_str(&format!(
+        "\n## Pull it\n\n```\n{}\n{}\n```\n",
+        commands.git, commands.hf
+    ));
+    text
+}
+
+fn public_host(url: &str) -> String {
+    url.trim_end_matches('/')
+        .rsplit_once("//")
+        .map(|(_, host)| host.to_owned())
+        .unwrap_or_else(|| url.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_files_row_is_named_by_what_it_holds() {
+        assert_eq!(file_kind("README.md", false, false), "card");
+        assert_eq!(file_kind(".gitattributes", false, false), "git");
+        assert_eq!(file_kind("config.json", false, false), "config");
+        assert_eq!(file_kind("unet/model.safetensors", true, false), "weights");
+        assert_eq!(file_kind("model.safetensors", true, true), "single-file");
+    }
+
+    #[test]
+    fn a_file_state_reads_the_way_the_design_colours_it() {
+        assert_eq!(file_state(true, false, false), FileState::Present);
+        assert_eq!(file_state(true, false, true), FileState::Deduped);
+        assert_eq!(file_state(true, true, false), FileState::LfsPtr);
+        assert_eq!(file_state(false, false, false), FileState::Absent);
+    }
+
+    #[test]
+    fn the_public_host_is_what_a_served_badge_names() {
+        assert_eq!(public_host("http://hoard.lan:7099"), "hoard.lan:7099");
+        assert_eq!(public_host("hoard.lan"), "hoard.lan");
+    }
+}

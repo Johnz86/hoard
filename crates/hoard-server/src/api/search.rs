@@ -1,19 +1,20 @@
 use axum::Json;
 use axum::extract::{Query, State};
 use jiff::Timestamp;
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use hoard_core::format_size;
 use hoard_index::IndexError;
 use hoard_index::search::{
-    FACET_DIMENSIONS, ParsedQuery, SortSpec, compile, compile_excluding, mark_active, parse,
+    CompileContext, FACET_DIMENSIONS, ParsedQuery, SortSpec, compile, compile_excluding,
+    mark_active, parse,
 };
-use hoard_index::store::row::DiskPressure;
+use hoard_index::store::row::{DiskPressure, SqlValue};
 use hoard_index::store::{blob, search_exec};
 
 use crate::api::common::{
-    PageParams, RowView, SortParams, compile_context, decode_cursor, next_cursor,
+    Conn, MIDDOT, RowView, clamp_limit, compile_context, decode_cursor, next_cursor, quoted,
+    sort_key, sort_spec,
 };
 use crate::error::ApiResult;
 use crate::state::AppState;
@@ -21,20 +22,21 @@ use crate::state::AppState;
 /// Everything `GET /api/v1/search` accepts.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SearchParams {
-    #[serde(default)]
     pub q: Option<String>,
-    #[serde(flatten)]
-    pub sort: SortParams,
-    #[serde(flatten)]
-    pub page: PageParams,
+    pub sort: Option<String>,
+    pub dir: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
 }
 
-/// One facet bucket, with the query its click produces so the UI never edits a query itself.
+/// One facet bucket. `token` is what a click toggles in the query; `query` is the whole
+/// query that selects exactly this bucket, and the query whose row count is `count`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FacetBucketView {
     pub value: String,
     pub count: u64,
     pub active: bool,
+    pub token: String,
     pub query: String,
 }
 
@@ -64,7 +66,7 @@ impl From<DiskPressure> for DiskPressureView {
             reclaimable_bytes: pressure.reclaimable_bytes,
             duplicate_blobs: pressure.duplicate_blobs,
             label: format!(
-                "{} reclaimable - {} duplicate blobs",
+                "{} reclaimable \u{2014} {} duplicate blobs",
                 format_size(pressure.reclaimable_bytes),
                 pressure.duplicate_blobs
             ),
@@ -83,6 +85,12 @@ pub struct SearchResponse {
     pub summary: String,
 }
 
+/// Only the parse, for the token strip while typing.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ParseResponse {
+    pub query: ParsedQuery,
+}
+
 /// The index screen: rows, facets and the counts the results header prints.
 pub async fn search(
     State(state): State<AppState>,
@@ -90,10 +98,10 @@ pub async fn search(
 ) -> ApiResult<Json<SearchResponse>> {
     let raw = params.q.clone().unwrap_or_default();
     let query = parse(&raw);
-    let sort = params.sort.spec()?;
-    let limit = params.page.limit();
-    let key = cursor_key(&raw, &params.sort);
-    let offset = decode_cursor(params.page.cursor.as_deref(), &key)?;
+    let sort = sort_spec(params.sort.as_deref(), params.dir.as_deref())?;
+    let limit = clamp_limit(params.limit);
+    let key = cursor_key(&raw, params.sort.as_deref(), params.dir.as_deref());
+    let offset = decode_cursor(params.cursor.as_deref(), &key)?;
     let node = state.node_name().to_owned();
     let now = Timestamp::now();
 
@@ -129,15 +137,17 @@ pub async fn search(
 }
 
 /// The token strip while typing: the parse with no database work behind it.
-pub async fn parse_query(Query(params): Query<SearchParams>) -> Json<ParsedQuery> {
-    Json(parse(params.q.as_deref().unwrap_or_default()))
+pub async fn parse_query(Query(params): Query<SearchParams>) -> Json<ParseResponse> {
+    Json(ParseResponse {
+        query: parse(params.q.as_deref().unwrap_or_default()),
+    })
 }
 
 fn facets(
-    conn: &Connection,
+    conn: &Conn,
     query: &ParsedQuery,
     sort: SortSpec,
-    context: &hoard_index::search::CompileContext,
+    context: &CompileContext,
 ) -> Result<FacetsView, IndexError> {
     let mut view = FacetsView {
         disk_pressure: blob::disk_pressure(conn)?.into(),
@@ -148,15 +158,27 @@ fn facets(
         let mut counted =
             search_exec::facet_counts(conn, key, &compiled.where_sql, &compiled.params)?;
         mark_active(&mut counted, query, key);
-        *buckets = counted
-            .into_iter()
-            .map(|bucket| FacetBucketView {
-                query: click(query, key, &bucket.value, bucket.active),
-                value: bucket.value,
-                count: bucket.count,
+        let mut rendered = Vec::with_capacity(counted.len());
+        for bucket in counted {
+            let count = exact_count(
+                conn,
+                key,
+                &bucket.value,
+                &compiled.where_sql,
+                &compiled.params,
+                sort,
+                context,
+                bucket.count,
+            )?;
+            rendered.push(FacetBucketView {
+                token: format!("{key}:{}", quoted(&bucket.value)),
+                query: select_query(query, key, &bucket.value),
+                count,
                 active: bucket.active,
-            })
-            .collect();
+                value: bucket.value,
+            });
+        }
+        *buckets = rendered;
     }
     Ok(view)
 }
@@ -173,9 +195,10 @@ impl FacetsView {
     }
 }
 
-/// The query a facet click produces. The dimension's own tokens go first, which is what
-/// makes the count on the bucket the count the click lands on.
-pub fn click(query: &ParsedQuery, key: &str, value: &str, active: bool) -> String {
+/// The query that selects exactly one bucket of one dimension: the query with that
+/// dimension's own tokens dropped, plus this value. Clicking it can never land on zero rows
+/// because the count beside it was measured against this very query.
+pub fn select_query(query: &ParsedQuery, key: &str, value: &str) -> String {
     let mut parts: Vec<&str> = query
         .tokens
         .iter()
@@ -183,24 +206,42 @@ pub fn click(query: &ParsedQuery, key: &str, value: &str, active: bool) -> Strin
         .map(|token| token.raw.as_str())
         .collect();
     let addition = format!("{key}:{}", quoted(value));
-    if !active {
-        parts.push(&addition);
-    }
+    parts.push(&addition);
     parts.join(" ")
 }
 
-fn quoted(value: &str) -> String {
-    match value.contains(char::is_whitespace) || value.contains('"') {
-        true => format!("\"{}\"", value.replace('"', "")),
-        false => value.to_owned(),
+/// The number of artifacts [`select_query`] returns.
+///
+/// The grouped count is right whenever the grammar compiles `key:value` to plain equality
+/// on the facet's own column. `base:` does not: it matches a family by prefix and lets
+/// `any` match everything, so that dimension is counted by running the query the bucket
+/// stands for rather than by grouping.
+#[allow(clippy::too_many_arguments)]
+fn exact_count(
+    conn: &Conn,
+    key: &str,
+    value: &str,
+    excluded_sql: &str,
+    excluded_params: &[SqlValue],
+    sort: SortSpec,
+    context: &CompileContext,
+    grouped: u64,
+) -> Result<u64, IndexError> {
+    let token = compile(&parse(&format!("{key}:{}", quoted(value))), sort, context)?;
+    if token.where_sql == format!("{key} = ?") && token.params == [SqlValue::text(value)] {
+        return Ok(grouped);
     }
+    let where_sql = format!("({excluded_sql}) AND ({})", token.where_sql);
+    let mut params = excluded_params.to_vec();
+    params.extend(token.params);
+    search_exec::count_rows(conn, &where_sql, &params)
 }
 
 /// `212 ARTIFACTS · 3 NODES`, the line the results header and the token strip both print.
 fn summary(total: u64, nodes: u64) -> String {
-    format!("{total} ARTIFACTS \u{b7} {nodes} NODES")
+    format!("{total} ARTIFACTS {MIDDOT} {nodes} NODES")
 }
 
-fn cursor_key(raw: &str, sort: &SortParams) -> String {
-    format!("{raw}|{}", sort.key())
+fn cursor_key(raw: &str, sort: Option<&str>, dir: Option<&str>) -> String {
+    format!("{raw}|{}", sort_key(sort, dir))
 }

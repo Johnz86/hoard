@@ -6,6 +6,8 @@ use hoard_index::store::Store;
 use hoard_mirror::access::AccessPolicy;
 use hoard_mirror::cache::BlockCache;
 use hoard_mirror::config::MirrorConfig;
+use hoard_mirror::resolve::Mirror;
+use hoard_mirror::upstream::{Hub, UpstreamClient};
 
 use crate::config::HoardConfig;
 use crate::error::ApiError;
@@ -19,10 +21,11 @@ pub struct AppState {
 
 struct Inner {
     config: HoardConfig,
-    mirror: Arc<MirrorConfig>,
+    mirror_config: Arc<MirrorConfig>,
     store: Store,
     cache: Arc<BlockCache>,
-    access: AccessPolicy,
+    access: Arc<AccessPolicy>,
+    mirror: Arc<Mirror>,
     node_token: Option<SecretString>,
     local_node_name: String,
     public_url: String,
@@ -33,7 +36,7 @@ impl std::fmt::Debug for AppState {
         f.debug_struct("AppState")
             .field("node", &self.inner.local_node_name)
             .field("public_url", &self.inner.public_url)
-            .field("offline", &self.inner.mirror.offline)
+            .field("offline", &self.inner.mirror_config.offline)
             .finish_non_exhaustive()
     }
 }
@@ -42,12 +45,24 @@ impl AppState {
     /// Builds the shared state. The node write token is read from the environment only,
     /// never from `hoard.toml`, so a config file can be committed without leaking it.
     pub fn new(config: HoardConfig, store: Store) -> Result<Self, ApiError> {
-        let mirror = Arc::new(config.mirror.clone());
-        let access = AccessPolicy::compile(&mirror)
-            .map_err(|error| ApiError::bad_request(format!("mirror access rules: {error}")))?;
+        let mirror_config = Arc::new(config.mirror.clone());
+        let access = Arc::new(
+            AccessPolicy::compile(&mirror_config)
+                .map_err(|error| ApiError::bad_request(format!("mirror access rules: {error}")))?,
+        );
         let cache = Arc::new(BlockCache::new(
-            Arc::clone(&mirror),
+            Arc::clone(&mirror_config),
             &config.server.data_dir,
+        ));
+        let upstream_client = UpstreamClient::from_config(&mirror_config)
+            .map_err(|error| ApiError::bad_request(format!("upstream client: {error}")))?;
+        let upstream = Hub::new(upstream_client, &mirror_config.upstream)
+            .map_err(|error| ApiError::bad_request(format!("upstream url: {error}")))?;
+        let mirror = Arc::new(Mirror::new(
+            store.clone(),
+            Arc::clone(&cache),
+            Arc::clone(&access),
+            upstream,
         ));
         let node_token = std::env::var("HOARD_NODE_TOKEN")
             .ok()
@@ -58,10 +73,11 @@ impl AppState {
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
-                mirror,
+                mirror_config,
                 store,
                 cache,
                 access,
+                mirror,
                 node_token,
                 local_node_name,
                 public_url,
@@ -78,7 +94,7 @@ impl AppState {
     }
 
     pub fn mirror_config(&self) -> &Arc<MirrorConfig> {
-        &self.inner.mirror
+        &self.inner.mirror_config
     }
 
     pub fn cache(&self) -> &Arc<BlockCache> {
@@ -87,6 +103,12 @@ impl AppState {
 
     pub fn access(&self) -> &AccessPolicy {
         &self.inner.access
+    }
+
+    /// The Hub face: revision resolution, file opening, the block cache and the upstream
+    /// proxy behind one handle.
+    pub fn mirror(&self) -> &Arc<Mirror> {
+        &self.inner.mirror
     }
 
     pub fn node_name(&self) -> &str {
@@ -99,7 +121,7 @@ impl AppState {
     }
 
     pub fn offline(&self) -> bool {
-        self.inner.mirror.offline
+        self.inner.mirror_config.offline
     }
 
     /// Mutating routes require the node token when one is configured. Read routes are open
