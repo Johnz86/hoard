@@ -1,8 +1,11 @@
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use secrecy::{ExposeSecret, SecretString};
 
 use hoard_index::store::Store;
+use hoard_mirror::MirrorError;
 use hoard_mirror::access::AccessPolicy;
 use hoard_mirror::cache::BlockCache;
 use hoard_mirror::config::MirrorConfig;
@@ -12,11 +15,55 @@ use hoard_mirror::upstream::{Hub, UpstreamClient};
 use crate::config::HoardConfig;
 use crate::error::ApiError;
 
+/// Where a profile's links land under the data directory. Every projection is confined to
+/// this root, so a caller cannot name a directory the server would write symlinks into.
+pub const PROFILE_DIR: &str = "profiles";
+
+/// What the last upstream call showed, which is what `/healthz` reports as `upstream`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamHealth {
+    /// This node is configured never to leave the LAN.
+    Offline,
+    /// The last upstream call was answered.
+    Reachable,
+    /// The last upstream call timed out or failed to connect.
+    Unreachable,
+}
+
+impl UpstreamHealth {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            UpstreamHealth::Offline => "offline",
+            UpstreamHealth::Reachable => "ok",
+            UpstreamHealth::Unreachable => "unreachable",
+        }
+    }
+
+    const fn code(self) -> u8 {
+        match self {
+            UpstreamHealth::Offline => 0,
+            UpstreamHealth::Reachable => 1,
+            UpstreamHealth::Unreachable => 2,
+        }
+    }
+
+    const fn from_code(code: u8) -> Self {
+        match code {
+            0 => UpstreamHealth::Offline,
+            2 => UpstreamHealth::Unreachable,
+            1_u8..=u8::MAX => UpstreamHealth::Reachable,
+        }
+    }
+}
+
 /// Everything a handler needs, cloned per request. Cheap to clone: the store is a pooled
 /// handle and the rest is behind `Arc`.
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Inner>,
+    /// Held beside the shared state rather than inside it so a builder can replace it on a
+    /// state that has already been cloned.
+    node_token: Option<Arc<SecretString>>,
 }
 
 struct Inner {
@@ -26,7 +73,8 @@ struct Inner {
     cache: Arc<BlockCache>,
     access: Arc<AccessPolicy>,
     mirror: Arc<Mirror>,
-    node_token: Option<SecretString>,
+    upstream_health: AtomicU8,
+    scan_handoff: tokio::sync::Mutex<()>,
     local_node_name: String,
     public_url: String,
 }
@@ -70,6 +118,10 @@ impl AppState {
             .map(SecretString::from);
         let local_node_name = config.node.name.clone();
         let public_url = config.server.resolved_public_url();
+        let health = match mirror_config.offline {
+            true => UpstreamHealth::Offline,
+            false => UpstreamHealth::Reachable,
+        };
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
@@ -78,11 +130,20 @@ impl AppState {
                 cache,
                 access,
                 mirror,
-                node_token,
+                upstream_health: AtomicU8::new(health.code()),
+                scan_handoff: tokio::sync::Mutex::new(()),
                 local_node_name,
                 public_url,
             }),
+            node_token: node_token.map(Arc::new),
         })
+    }
+
+    /// Replaces the node write token the environment supplied.
+    #[must_use]
+    pub fn with_node_token(mut self, token: &str) -> Self {
+        self.node_token = Some(Arc::new(SecretString::from(token.to_owned())));
+        self
     }
 
     pub fn store(&self) -> &Store {
@@ -124,10 +185,50 @@ impl AppState {
         self.inner.mirror_config.offline
     }
 
+    /// Held across the window in which a scan request watches for the job row the scanner
+    /// opens, so two requests cannot each be handed the other's job.
+    pub fn scan_handoff(&self) -> &tokio::sync::Mutex<()> {
+        &self.inner.scan_handoff
+    }
+
+    /// The root every projection is written under: `data_dir/profiles`.
+    pub fn projection_root(&self) -> PathBuf {
+        self.inner.config.server.data_dir.join(PROFILE_DIR)
+    }
+
+    /// Records what one upstream call showed and hands the outcome back unchanged.
+    ///
+    /// An offline node never leaves the LAN, so its reported health is not moved by a call
+    /// the mirror refused on its behalf.
+    pub fn note_upstream<T>(&self, outcome: Result<T, MirrorError>) -> Result<T, MirrorError> {
+        if self.offline() {
+            return outcome;
+        }
+        let health = match &outcome {
+            Ok(_) => UpstreamHealth::Reachable,
+            Err(MirrorError::ProxyTimeout | MirrorError::Upstream(_)) => {
+                UpstreamHealth::Unreachable
+            }
+            Err(_) => return outcome,
+        };
+        self.inner
+            .upstream_health
+            .store(health.code(), Ordering::Relaxed);
+        outcome
+    }
+
+    /// What the last upstream call showed.
+    pub fn upstream_health(&self) -> UpstreamHealth {
+        match self.offline() {
+            true => UpstreamHealth::Offline,
+            false => UpstreamHealth::from_code(self.inner.upstream_health.load(Ordering::Relaxed)),
+        }
+    }
+
     /// Mutating routes require the node token when one is configured. Read routes are open
     /// on the LAN, which is the whole point of a mirror.
     pub fn authorize_write(&self, header: Option<&str>) -> Result<(), ApiError> {
-        let Some(expected) = self.inner.node_token.as_ref() else {
+        let Some(expected) = self.node_token.as_ref() else {
             return Ok(());
         };
         let presented = header
@@ -165,16 +266,56 @@ mod tests {
 
     #[test]
     fn a_configured_token_is_required_and_compared_in_full() {
-        let store = Store::open_in_memory().expect("in-memory store opens");
-        let mut state = AppState::new(HoardConfig::default(), store).expect("state builds");
-        let inner = Arc::get_mut(&mut state.inner).expect("state is not shared yet");
-        inner.node_token = Some(SecretString::from("swordfish"));
+        let state = state().with_node_token("swordfish");
 
         assert!(state.authorize_write(None).is_err());
         assert!(state.authorize_write(Some("swordfish")).is_err());
         assert!(state.authorize_write(Some("Bearer wrong")).is_err());
         assert!(state.authorize_write(Some("Bearer swordfis")).is_err());
         assert!(state.authorize_write(Some("Bearer swordfish")).is_ok());
+    }
+
+    #[test]
+    fn an_offline_node_never_reports_an_unreachable_upstream() {
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let mut config = HoardConfig::default();
+        config.mirror.offline = true;
+        let state = AppState::new(config, store).expect("state builds");
+        let refused: Result<(), MirrorError> = Err(MirrorError::ProxyTimeout);
+        assert!(state.note_upstream(refused).is_err());
+        assert_eq!(state.upstream_health(), UpstreamHealth::Offline);
+    }
+
+    #[test]
+    fn a_timed_out_upstream_call_is_remembered_until_the_next_answer() {
+        let state = state();
+        assert_eq!(state.upstream_health(), UpstreamHealth::Reachable);
+        let refused: Result<(), MirrorError> = Err(MirrorError::ProxyTimeout);
+        assert!(state.note_upstream(refused).is_err());
+        assert_eq!(state.upstream_health(), UpstreamHealth::Unreachable);
+
+        let missing: Result<(), MirrorError> = Err(MirrorError::EntryNotFound("a.bin".to_owned()));
+        assert!(state.note_upstream(missing).is_err());
+        assert_eq!(
+            state.upstream_health(),
+            UpstreamHealth::Unreachable,
+            "only an upstream failure moves upstream health"
+        );
+
+        assert!(state.note_upstream(Ok(())).is_ok());
+        assert_eq!(state.upstream_health(), UpstreamHealth::Reachable);
+    }
+
+    #[test]
+    fn every_projection_lands_under_the_data_directory() {
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let mut config = HoardConfig::default();
+        config.server.data_dir = std::path::PathBuf::from("/srv/hoard");
+        let state = AppState::new(config, store).expect("state builds");
+        assert_eq!(
+            state.projection_root(),
+            std::path::PathBuf::from("/srv/hoard/profiles")
+        );
     }
 
     #[test]

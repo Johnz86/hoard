@@ -29,7 +29,7 @@ pub(crate) async fn whoami(
     headers: HeaderMap,
 ) -> HubResult<Response> {
     let auth = authorization(&headers);
-    let answer = state.mirror().whoami(auth.as_ref()).await?;
+    let answer = state.note_upstream(state.mirror().whoami(auth.as_ref()).await)?;
     forward(answer)
 }
 
@@ -41,10 +41,12 @@ pub(crate) async fn xet_read_token(
 ) -> HubResult<Response> {
     let repo = repo_of(&params)?;
     let auth = authorization(&headers);
-    let answer = state
-        .mirror()
-        .xet_read_token(&repo, revision_of(&params), auth.as_ref())
-        .await?;
+    let answer = state.note_upstream(
+        state
+            .mirror()
+            .xet_read_token(&repo, revision_of(&params), auth.as_ref())
+            .await,
+    )?;
     forward(answer)
 }
 
@@ -57,10 +59,12 @@ pub(crate) async fn xet_bridge(
     let repo_hash = param(&params, "repo_hash")?;
     let hash = param(&params, "hash")?;
     let auth = authorization(&headers);
-    let answer = state
-        .mirror()
-        .xet_bridge(repo_hash, hash, auth.as_ref())
-        .await?;
+    let answer = state.note_upstream(
+        state
+            .mirror()
+            .xet_bridge(repo_hash, hash, auth.as_ref())
+            .await,
+    )?;
     forward(answer)
 }
 

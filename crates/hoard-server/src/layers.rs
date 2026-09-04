@@ -2,13 +2,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::http::{
-    Extensions, HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Version, header,
+    Extensions, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Version, header,
 };
 use tower_http::LatencyUnit;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::compression::predicate::{Predicate, SizeAbove};
 use tower_http::cors::{Any, CorsLayer};
+
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{
     MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
@@ -111,11 +112,18 @@ pub fn propagate_request_id() -> PropagateRequestIdLayer {
     PropagateRequestIdLayer::new(REQUEST_ID_HEADER)
 }
 
-/// Read routes are open on the LAN, so the browser UI of one node may talk to another.
+/// The methods a cross-origin caller is approved for.
+///
+/// Reads are open on the LAN, so the browser UI of one node may talk to another. Writes are
+/// not: a node with no token configured would otherwise let any page the user happens to
+/// visit scan, apply a loadout, project symlinks or delete a shelf against this host. The
+/// UI is served from this same origin and so is never subject to this list.
+const CROSS_ORIGIN_METHODS: [Method; 3] = [Method::GET, Method::HEAD, Method::OPTIONS];
+
 pub fn cors() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods(Any)
+        .allow_methods(CROSS_ORIGIN_METHODS)
         .allow_headers(Any)
 }
 
@@ -169,6 +177,20 @@ mod tests {
             &HeaderMap::new(),
             &Extensions::new()
         ));
+    }
+
+    #[test]
+    fn a_cross_origin_write_is_never_approved() {
+        assert!(
+            !CROSS_ORIGIN_METHODS.contains(&Method::POST),
+            "a page on another origin must not be able to write to this node"
+        );
+        for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+            assert!(
+                !CROSS_ORIGIN_METHODS.contains(&method),
+                "{method} is a write"
+            );
+        }
     }
 
     #[test]

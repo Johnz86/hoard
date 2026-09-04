@@ -1,4 +1,4 @@
-use std::path::{Path as StdPath, PathBuf};
+use std::path::Path as StdPath;
 use std::sync::Arc;
 
 use axum::Json;
@@ -20,7 +20,7 @@ use hoard_net::{PullRequest, Puller};
 
 use crate::api::artifacts::artifact_id;
 use crate::api::common::{Conn, authorize, require_row};
-use crate::api::link;
+use crate::api::link::{self, Profile};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -29,9 +29,7 @@ const APPLY_KIND: &str = "apply";
 /// The slot an upscaler occupies, which is the one that reads a factor rather than a weight.
 const FACTOR_SLOT: LoadoutSlot = LoadoutSlot::Upscaler;
 /// The tool layout an apply writes when none is named.
-const DEFAULT_PROFILE: &str = "comfyui";
-/// Where a profile's links land under the data directory when the caller names no place.
-const PROFILE_DIR: &str = "profiles";
+const DEFAULT_PROFILE: Profile = Profile::ComfyUi;
 
 /// One line of the loadout drawer, with whether the target node can satisfy it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -120,15 +118,16 @@ pub struct ItemBody {
     pub weight: Option<f32>,
 }
 
+/// What an apply names: the node whose disk is written and the tool layout to write.
+///
+/// Where the links land is not part of the request. An apply writes this node's own
+/// `profiles/<profile>` directory, which is what the contract documents.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ApplyBody {
     #[serde(default)]
     pub node: Option<String>,
     #[serde(default)]
     pub profile: Option<String>,
-    /// Where the layout is written; the node's own `profiles/<profile>` by default.
-    #[serde(default)]
-    pub dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -283,13 +282,15 @@ pub async fn apply(
         .filter(|value| !value.is_empty())
         .unwrap_or(state.node_name())
         .to_owned();
-    let profile = body
+    let profile = match body
         .profile
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_PROFILE)
-        .to_ascii_lowercase();
+    {
+        Some(named) => Profile::parse(named)?,
+        None => DEFAULT_PROFILE,
+    };
     let node_name = target.clone();
     let (view, job_id) = state
         .store()
@@ -305,19 +306,13 @@ pub async fn apply(
         .await?;
 
     let preview = view.apply_preview.clone();
-    let dir = body
-        .dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| profile_dir(&state, &profile));
+    let dir = link::projection_dir(&state, profile, None)?;
     let local = target == state.node_name();
     let background = state.clone();
     tokio::spawn(async move {
         let settled = match local {
-            true => run_apply(&background, id, job_id, &profile, &dir).await,
-            false => report_only(&background, job_id, &preview, &profile).await,
+            true => run_apply(&background, id, job_id, profile, &dir).await,
+            false => report_only(&background, job_id, &preview, profile).await,
         };
         if let Err(error) = settled {
             tracing::error!(code = error.code(), "the apply job could not be settled");
@@ -336,11 +331,14 @@ async fn report_only(
     state: &AppState,
     job: JobId,
     preview: &ApplyPreview,
-    profile: &str,
+    profile: Profile,
 ) -> ApiResult<()> {
     let phase = format!(
-        "{} present, {} elsewhere, {} missing for {profile}",
-        preview.present, preview.pulling, preview.missing
+        "{} present, {} elsewhere, {} missing for {}",
+        preview.present,
+        preview.pulling,
+        preview.missing,
+        profile.as_str()
     );
     let bytes = preview.bytes;
     let missing = preview.missing;
@@ -376,7 +374,7 @@ async fn run_apply(
     state: &AppState,
     id: LoadoutId,
     job: JobId,
-    profile: &str,
+    profile: Profile,
     dir: &StdPath,
 ) -> ApiResult<()> {
     let plan = plan_of(state, id).await?;
@@ -387,7 +385,7 @@ async fn run_apply(
     let mut bytes = 0u64;
 
     for (index, line) in plan.iter().enumerate() {
-        let phase = format!("{} ({profile})", line.name);
+        let phase = format!("{} ({})", line.name, profile.as_str());
         let progress = index as f32 / total;
         let pulled = bytes;
         state
@@ -417,7 +415,7 @@ async fn run_apply(
                 Ok(outcome) => {
                     bytes += outcome.size;
                     ready.push(ReadyLine {
-                        artifact: outcome.artifact,
+                        artifact: Some(outcome.artifact),
                         role: line.role,
                         name: line.name.clone(),
                         target: outcome.abs_path.to_string_lossy().into_owned(),
@@ -477,15 +475,6 @@ fn puller(state: &AppState) -> ApiResult<Puller> {
     .map_err(|error| ApiError::internal(error.to_string()))
 }
 
-fn profile_dir(state: &AppState, profile: &str) -> PathBuf {
-    state
-        .config()
-        .server
-        .data_dir
-        .join(PROFILE_DIR)
-        .join(profile)
-}
-
 /// Where one line's bytes are coming from.
 #[derive(Debug, Clone)]
 enum LineSource {
@@ -498,7 +487,9 @@ enum LineSource {
 
 #[derive(Debug, Clone)]
 struct PlannedLine {
-    artifact: ArtifactId,
+    /// `None` when nothing on this LAN answers the pin, which is a line with no artifact
+    /// rather than a line pinned to artifact zero.
+    artifact: Option<ArtifactId>,
     role: Role,
     name: String,
     source: LineSource,
@@ -506,7 +497,7 @@ struct PlannedLine {
 
 #[derive(Debug, Clone)]
 struct ReadyLine {
-    artifact: ArtifactId,
+    artifact: Option<ArtifactId>,
     role: Role,
     name: String,
     target: String,
@@ -518,9 +509,10 @@ async fn plan_of(state: &AppState, id: LoadoutId) -> ApiResult<Vec<PlannedLine>>
         .store()
         .call(move |conn| {
             let document = loadout::loadout(conn, id)?.parse()?;
+            let local = node::local_node(conn)?.name;
             let mut lines = Vec::with_capacity(document.len());
             for (_, pin) in document.pins() {
-                lines.push(plan_line(conn, pin)?);
+                lines.push(plan_line(conn, pin, &local)?);
             }
             Ok(lines)
         })
@@ -528,15 +520,14 @@ async fn plan_of(state: &AppState, id: LoadoutId) -> ApiResult<Vec<PlannedLine>>
     Ok(plan)
 }
 
-fn plan_line(conn: &Conn, pin: &LoadoutPin) -> Result<PlannedLine, IndexError> {
-    let local = node::local_node(conn)?;
+fn plan_line(conn: &Conn, pin: &LoadoutPin, local: &str) -> Result<PlannedLine, IndexError> {
     let candidates = resolve_pin(conn, pin)?;
     let held = candidates
         .iter()
-        .find(|row| row.node == local.name && row.state.has_bytes() && row.abs_path.is_some());
+        .find(|row| row.node == local && row.state.has_bytes() && row.abs_path.is_some());
     let elsewhere = candidates
         .iter()
-        .find(|row| row.node != local.name && row.blob_sha256.is_some());
+        .find(|row| row.node != local && row.blob_sha256.is_some());
     let row = held.or(elsewhere).or_else(|| candidates.first());
     let name = row.map_or_else(
         || pin.display_name().to_owned(),
@@ -551,7 +542,7 @@ fn plan_line(conn: &Conn, pin: &LoadoutPin) -> Result<PlannedLine, IndexError> {
         (None, None) => LineSource::Nowhere,
     };
     Ok(PlannedLine {
-        artifact: row.map_or(ArtifactId::new(0), |row| row.artifact_id),
+        artifact: row.map(|row| row.artifact_id),
         role: row.map_or(Role::Unk, |row| row.role),
         name,
         source,
@@ -589,7 +580,7 @@ fn pull_request(conn: &Conn, row: &SearchRow) -> Result<Option<PullRequest>, Ind
 /// hoard made from a file that was always there.
 async fn write_links(
     state: &AppState,
-    profile: &str,
+    profile: Profile,
     dir: &StdPath,
     lines: &[ReadyLine],
 ) -> ApiResult<usize> {
@@ -598,15 +589,13 @@ async fn write_links(
         if line.target.is_empty() {
             continue;
         }
-        let link = dir
-            .join(link::directory(profile, line.role))
-            .join(&line.name);
-        match link_file(StdPath::new(&line.target), &link).await {
-            Ok(()) => written.push(NewProjection {
+        let link = dir.join(profile.directory(line.role)).join(&line.name);
+        match link::write_link(StdPath::new(&line.target), &link).await {
+            Ok(_) => written.push(NewProjection {
                 link_path: link.to_string_lossy().into_owned(),
                 target_path: line.target.clone(),
-                profile: profile.to_owned(),
-                artifact_id: Some(line.artifact),
+                profile: profile.as_str().to_owned(),
+                artifact_id: line.artifact,
             }),
             Err(error) => {
                 tracing::warn!(link = %link.display(), %error, "an apply link was not written");
@@ -628,30 +617,6 @@ async fn write_links(
             .await?;
     }
     Ok(count)
-}
-
-/// Replaces an existing link rather than failing, so an apply can be re-run.
-#[cfg(unix)]
-async fn link_file(target: &StdPath, link: &StdPath) -> std::io::Result<()> {
-    if let Some(parent) = link.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    if tokio::fs::read_link(link)
-        .await
-        .is_ok_and(|current| current == target)
-    {
-        return Ok(());
-    }
-    let _ = tokio::fs::remove_file(link).await;
-    tokio::fs::symlink(target, link).await
-}
-
-#[cfg(not(unix))]
-async fn link_file(_target: &StdPath, _link: &StdPath) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "hoard writes projections as symlinks, which this platform does not offer",
-    ))
 }
 
 fn file_name(path: &str) -> &str {
@@ -839,8 +804,9 @@ fn unpinnable(error: IndexError) -> ApiError {
 
 fn hf_script(view: &LoadoutView, public: &str) -> String {
     let mut text = format!(
-        "#!/bin/sh\n# {} \u{2014} generated by hoard\nexport HF_ENDPOINT={public}\n\n",
-        view.name
+        "#!/bin/sh\n# {} \u{2014} generated by hoard\nexport HF_ENDPOINT={}\n\n",
+        view.name,
+        shell_quoted(public)
     );
     for item in &view.items {
         let reference = item
@@ -848,7 +814,11 @@ fn hf_script(view: &LoadoutView, public: &str) -> String {
             .split_once('/')
             .map(|(_, rest)| rest.to_owned())
             .unwrap_or_else(|| item.repo.clone());
-        text.push_str(&format!("hf download {reference} {}\n", item.path));
+        text.push_str(&format!(
+            "hf download {} {}\n",
+            shell_quoted(&reference),
+            shell_quoted(&item.path)
+        ));
     }
     text
 }
@@ -859,14 +829,33 @@ fn comfy_script(view: &LoadoutView) -> String {
         view.name
     );
     for item in &view.items {
-        let directory = crate::api::link::comfy_directory(item.role);
+        let directory = link::comfy_directory(item.role);
         text.push_str(&format!(
-            "mkdir -p \"$COMFYUI/models/{directory}\" && ln -sf \"{}\" \"$COMFYUI/models/{directory}/{}\"\n",
-            item.path,
-            item.name
+            "mkdir -p \"$COMFYUI/models/{directory}\" && ln -sf {} \"$COMFYUI/models/{directory}\"/{}\n",
+            shell_quoted(&item.path),
+            shell_quoted(&item.name)
         ));
     }
     text
+}
+
+/// One argument of a generated script, quoted so a name carrying a space, a quote or a
+/// shell metacharacter is one word rather than several.
+///
+/// Single quotes, because nothing inside them is expanded. `$COMFYUI` is the one thing the
+/// script does expand, so it is written outside these quotes and the untrusted half of the
+/// path is concatenated to it.
+fn shell_quoted(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for character in value.chars() {
+        match character {
+            '\'' => quoted.push_str("'\\''"),
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 fn loadout_id(raw: &str) -> ApiResult<LoadoutId> {
@@ -923,6 +912,18 @@ mod tests {
         .expect("peer node");
         drop(conn);
         store
+    }
+
+    #[test]
+    fn a_generated_script_quotes_every_name_it_interpolates() {
+        assert_eq!(shell_quoted("plain.safetensors"), "'plain.safetensors'");
+        assert_eq!(shell_quoted("a b.safetensors"), "'a b.safetensors'");
+        assert_eq!(
+            shell_quoted("$(rm -rf ~)"),
+            "'$(rm -rf ~)'",
+            "a command substitution must survive as text"
+        );
+        assert_eq!(shell_quoted("it's"), "'it'\\''s'");
     }
 
     #[test]

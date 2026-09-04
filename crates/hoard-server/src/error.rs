@@ -17,6 +17,8 @@ pub struct HubError {
     status: StatusCode,
     code: &'static str,
     body: Option<serde_json::Value>,
+    /// The size a 416 reports as `content-range: bytes */<size>`.
+    range_size: Option<u64>,
 }
 
 impl HubError {
@@ -27,6 +29,7 @@ impl HubError {
             status: StatusCode::UNAUTHORIZED,
             code: "RepoNotFound",
             body: Some(json!({ "error": "Repository not found" })),
+            range_size: None,
         }
     }
 
@@ -36,6 +39,7 @@ impl HubError {
             status: StatusCode::NOT_FOUND,
             code: "RepoNotFound",
             body: Some(json!({ "error": "Sorry, we can't find the page you are looking for." })),
+            range_size: None,
         }
     }
 
@@ -45,6 +49,7 @@ impl HubError {
             status: StatusCode::NOT_FOUND,
             code: "EntryNotFound",
             body: None,
+            range_size: None,
         }
     }
 
@@ -53,6 +58,7 @@ impl HubError {
             status: StatusCode::NOT_FOUND,
             code: "RevisionNotFound",
             body: Some(json!({ "error": format!("Invalid rev id: {revision}") })),
+            range_size: None,
         }
     }
 
@@ -61,6 +67,7 @@ impl HubError {
             status: StatusCode::GATEWAY_TIMEOUT,
             code: "ProxyTimeout",
             body: None,
+            range_size: None,
         }
     }
 
@@ -69,15 +76,18 @@ impl HubError {
             status: StatusCode::GATEWAY_TIMEOUT,
             code: "ProxyInvalidData",
             body: None,
+            range_size: None,
         }
     }
 
-    /// 416 carrying `content-range: bytes */<size>` when no requested range is satisfiable.
+    /// 416 with an empty body carrying `content-range: bytes */<size>`, which is what the
+    /// contract requires when no requested range is satisfiable.
     pub fn range_not_satisfiable(size: u64) -> Self {
         Self {
             status: StatusCode::RANGE_NOT_SATISFIABLE,
             code: "RangeNotSatisfiable",
-            body: Some(json!({ "size": size })),
+            body: None,
+            range_size: Some(size),
         }
     }
 
@@ -86,6 +96,7 @@ impl HubError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             code: "BadRequest",
             body: Some(json!({ "error": message })),
+            range_size: None,
         }
     }
 
@@ -104,7 +115,6 @@ impl From<MirrorError> for HubError {
             MirrorError::RepoNotFound(_) => HubError::repo_not_found(),
             MirrorError::RevisionNotFound(revision) => HubError::revision_not_found(&revision),
             MirrorError::EntryNotFound(_) => HubError::entry_not_found(),
-            MirrorError::RangeNotSatisfiable { size } => HubError::range_not_satisfiable(size),
             MirrorError::Offline(_) => HubError::entry_not_found(),
             MirrorError::ProxyTimeout | MirrorError::Upstream(_) => HubError::proxy_timeout(),
             MirrorError::ProxyInvalidData(_) | MirrorError::CacheCorrupt(_) => {
@@ -136,11 +146,13 @@ impl IntoResponse for HubError {
             Some(body) => (self.status, Json(body)).into_response(),
             None => self.status.into_response(),
         };
-        response
-            .headers_mut()
-            .insert("x-error-code", HeaderValue::from_static(self.code));
-        if self.status == StatusCode::RANGE_NOT_SATISFIABLE {
-            response.headers_mut().remove(header::CONTENT_TYPE);
+        let headers = response.headers_mut();
+        headers.insert("x-error-code", HeaderValue::from_static(self.code));
+        if let Some(size) = self.range_size {
+            headers.remove(header::CONTENT_TYPE);
+            if let Ok(value) = HeaderValue::from_str(&format!("bytes */{size}")) {
+                headers.insert(header::CONTENT_RANGE, value);
+            }
         }
         response
     }

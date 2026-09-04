@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use axum::Json;
 use axum::extract::State;
@@ -17,7 +17,48 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 /// The tool layouts `hoard link --profile` knows.
-const PROFILES: [&str; 3] = ["comfyui", "a1111", "llama"];
+///
+/// An enum rather than a string, so a role's directory is chosen by an exhaustive match
+/// and an unknown profile is refused where it is read rather than silently becoming
+/// ComfyUI's layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Profile {
+    ComfyUi,
+    A1111,
+    Llama,
+}
+
+impl Profile {
+    /// Every layout, in the order the CLI documents them.
+    pub const ALL: [Profile; 3] = [Profile::ComfyUi, Profile::A1111, Profile::Llama];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Profile::ComfyUi => "comfyui",
+            Profile::A1111 => "a1111",
+            Profile::Llama => "llama",
+        }
+    }
+
+    /// Reads what a request named, ignoring case and surrounding space.
+    pub fn parse(raw: &str) -> ApiResult<Self> {
+        let wanted = raw.trim().to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|profile| profile.as_str() == wanted)
+            .ok_or_else(|| ApiError::bad_request(format!("{wanted:?} is not a projection profile")))
+    }
+
+    /// The directory a role lands in, in this tool's layout.
+    pub const fn directory(self, role: Role) -> &'static str {
+        match self {
+            Profile::ComfyUi => comfy_directory(role),
+            Profile::A1111 => a1111_directory(role),
+            Profile::Llama => "models",
+        }
+    }
+}
 
 /// One symlink the projection wrote.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -32,7 +73,7 @@ pub struct LinkRow {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LinkView {
-    pub profile: String,
+    pub profile: Profile,
     pub dir: String,
     pub written: Vec<LinkRow>,
     pub skipped: Vec<String>,
@@ -47,7 +88,10 @@ pub struct LinkBody {
     #[serde(default)]
     pub shelf_id: Option<String>,
     pub profile: String,
-    pub dir: String,
+    /// Where the links land. Empty names the profile's own directory under the node's
+    /// projection root.
+    #[serde(default)]
+    pub dir: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
 }
@@ -58,16 +102,8 @@ pub async fn link(
     Json(body): Json<LinkBody>,
 ) -> ApiResult<Json<LinkView>> {
     authorize(&state, &headers)?;
-    let profile = body.profile.trim().to_ascii_lowercase();
-    if !PROFILES.contains(&profile.as_str()) {
-        return Err(ApiError::bad_request(format!(
-            "{profile:?} is not a projection profile"
-        )));
-    }
-    let dir = PathBuf::from(body.dir.trim());
-    if dir.as_os_str().is_empty() {
-        return Err(ApiError::bad_request("a projection needs a directory"));
-    }
+    let profile = Profile::parse(&body.profile)?;
+    let dir = projection_dir(&state, profile, body.dir.as_deref())?;
     let limit = clamp_limit(body.limit);
     let shelf_id = body
         .shelf_id
@@ -114,7 +150,7 @@ pub async fn link(
             continue;
         }
         let file = target.rsplit('/').next().unwrap_or(&row.name).to_owned();
-        let link = dir.join(directory(&profile, row.role)).join(&file);
+        let link = dir.join(profile.directory(row.role)).join(&file);
         match write_link(Path::new(&target), &link).await {
             Ok(created) => written.push(LinkRow {
                 artifact_id: row.artifact_id,
@@ -130,7 +166,7 @@ pub async fn link(
             }
         }
     }
-    record(&state, &profile, &written).await?;
+    record(&state, profile, &written).await?;
 
     Ok(Json(LinkView {
         profile,
@@ -141,9 +177,63 @@ pub async fn link(
     }))
 }
 
+/// Confines a projection to the directories this node is configured to write into.
+///
+/// A projection creates directories and replaces symlinks, so where it may do that is a
+/// property of the node rather than of the request: `data_dir/profiles` always, plus
+/// whatever `server.projection_roots` names. A relative directory resolves under the
+/// profile's own directory in the projection root.
+pub fn projection_dir(state: &AppState, profile: Profile, dir: Option<&str>) -> ApiResult<PathBuf> {
+    let root = state.projection_root();
+    let Some(wanted) = dir.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(root.join(profile.as_str()));
+    };
+    let candidate = Path::new(wanted);
+    if candidate.is_absolute() {
+        let roots = std::iter::once(root.as_path()).chain(
+            state
+                .config()
+                .server
+                .projection_roots
+                .iter()
+                .map(PathBuf::as_path),
+        );
+        let allowed = roots
+            .filter(|allowed| candidate.starts_with(allowed))
+            .count()
+            > 0;
+        return match allowed && !candidate.components().any(is_upward) {
+            true => Ok(candidate.to_path_buf()),
+            false => Err(outside(wanted, &root)),
+        };
+    }
+    let mut resolved = root.join(profile.as_str());
+    for component in candidate.components() {
+        match component {
+            Component::Normal(segment) => resolved.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(outside(wanted, &root));
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn is_upward(component: Component<'_>) -> bool {
+    matches!(component, Component::ParentDir)
+}
+
+fn outside(wanted: &str, root: &Path) -> ApiError {
+    ApiError::bad_request(format!(
+        "{wanted:?} is outside {} and is not a configured projection root",
+        root.display()
+    ))
+}
+
 /// Records the links this projection wrote, so PATHS ON DISK can tell a file hoard linked
 /// from a file that was always there, and a later projection can replace its own links.
-async fn record(state: &AppState, profile: &str, written: &[LinkRow]) -> ApiResult<()> {
+async fn record(state: &AppState, profile: Profile, written: &[LinkRow]) -> ApiResult<()> {
     if written.is_empty() {
         return Ok(());
     }
@@ -152,7 +242,7 @@ async fn record(state: &AppState, profile: &str, written: &[LinkRow]) -> ApiResu
         .map(|row| NewProjection {
             link_path: row.link.clone(),
             target_path: row.target.clone(),
-            profile: profile.to_owned(),
+            profile: profile.as_str().to_owned(),
             artifact_id: Some(row.artifact_id),
         })
         .collect();
@@ -171,8 +261,11 @@ async fn record(state: &AppState, profile: &str, written: &[LinkRow]) -> ApiResu
 }
 
 /// Replaces an existing link rather than failing, so a projection can be re-run.
+///
+/// Only a symlink is replaced. A regular file already at the link path is left alone and
+/// the symlink call fails, because a projection writes links and never deletes content.
 #[cfg(unix)]
-async fn write_link(target: &Path, link: &Path) -> Result<bool, IndexError> {
+pub(crate) async fn write_link(target: &Path, link: &Path) -> Result<bool, IndexError> {
     if let Some(parent) = link.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -194,7 +287,7 @@ async fn write_link(target: &Path, link: &Path) -> Result<bool, IndexError> {
 }
 
 #[cfg(not(unix))]
-async fn write_link(_target: &Path, link: &Path) -> Result<bool, IndexError> {
+pub(crate) async fn write_link(_target: &Path, link: &Path) -> Result<bool, IndexError> {
     Err(IndexError::io(
         link,
         std::io::Error::new(
@@ -204,16 +297,7 @@ async fn write_link(_target: &Path, link: &Path) -> Result<bool, IndexError> {
     ))
 }
 
-/// The directory a role lands in, per tool layout.
-pub fn directory(profile: &str, role: Role) -> &'static str {
-    match profile {
-        "a1111" => a1111_directory(role),
-        "llama" => "models",
-        _ => comfy_directory(role),
-    }
-}
-
-pub fn comfy_directory(role: Role) -> &'static str {
+pub const fn comfy_directory(role: Role) -> &'static str {
     match role {
         Role::Ckpt => "checkpoints",
         Role::Lora => "loras",
@@ -227,7 +311,7 @@ pub fn comfy_directory(role: Role) -> &'static str {
     }
 }
 
-fn a1111_directory(role: Role) -> &'static str {
+const fn a1111_directory(role: Role) -> &'static str {
     match role {
         Role::Ckpt => "Stable-diffusion",
         Role::Lora => "Lora",
@@ -243,11 +327,22 @@ fn a1111_directory(role: Role) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use hoard_index::store::Store;
+
     use super::*;
+    use crate::config::HoardConfig;
+
+    fn state_at(data_dir: &Path, roots: Vec<PathBuf>) -> AppState {
+        let store = Store::open_in_memory().expect("store opens");
+        let mut config = HoardConfig::default();
+        config.server.data_dir = data_dir.to_path_buf();
+        config.server.projection_roots = roots;
+        AppState::new(config, store).expect("state builds")
+    }
 
     #[test]
     fn every_role_lands_somewhere_in_every_profile() {
-        for profile in PROFILES {
+        for profile in Profile::ALL {
             for role in [
                 Role::Ckpt,
                 Role::Lora,
@@ -259,11 +354,69 @@ mod tests {
                 Role::Ds,
                 Role::Unk,
             ] {
-                assert!(!directory(profile, role).is_empty());
+                assert!(!profile.directory(role).is_empty());
             }
         }
-        assert_eq!(directory("comfyui", Role::Lora), "loras");
-        assert_eq!(directory("a1111", Role::Ckpt), "Stable-diffusion");
-        assert_eq!(directory("llama", Role::Llm), "models");
+        assert_eq!(Profile::ComfyUi.directory(Role::Lora), "loras");
+        assert_eq!(Profile::A1111.directory(Role::Ckpt), "Stable-diffusion");
+        assert_eq!(Profile::Llama.directory(Role::Llm), "models");
+    }
+
+    #[test]
+    fn an_unknown_profile_is_refused_rather_than_treated_as_comfyui() {
+        assert_eq!(
+            Profile::parse(" ComfyUI ").expect("known"),
+            Profile::ComfyUi
+        );
+        assert_eq!(Profile::parse("A1111").expect("known"), Profile::A1111);
+        let error = Profile::parse("webui").expect_err("webui is not a layout");
+        assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn a_projection_never_escapes_the_directories_this_node_offers() {
+        let state = state_at(Path::new("/srv/hoard"), Vec::new());
+        assert_eq!(
+            projection_dir(&state, Profile::ComfyUi, None).expect("the default is the root"),
+            PathBuf::from("/srv/hoard/profiles/comfyui")
+        );
+        assert_eq!(
+            projection_dir(&state, Profile::A1111, Some("bench")).expect("a relative dir"),
+            PathBuf::from("/srv/hoard/profiles/a1111/bench")
+        );
+        assert_eq!(
+            projection_dir(&state, Profile::ComfyUi, Some("/srv/hoard/profiles/here"))
+                .expect("an absolute dir inside the root"),
+            PathBuf::from("/srv/hoard/profiles/here")
+        );
+        for escape in ["/etc", "../../etc", "/srv/hoard/profiles/../../etc"] {
+            let refused = projection_dir(&state, Profile::ComfyUi, Some(escape));
+            assert!(refused.is_err(), "{escape} must be refused");
+            assert_eq!(
+                refused.err().map(|error| error.status()),
+                Some(axum::http::StatusCode::BAD_REQUEST)
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_root_is_the_only_way_out_of_the_data_directory() {
+        let state = state_at(
+            Path::new("/srv/hoard"),
+            vec![PathBuf::from("/home/hoarder/ComfyUI/models")],
+        );
+        assert_eq!(
+            projection_dir(
+                &state,
+                Profile::ComfyUi,
+                Some("/home/hoarder/ComfyUI/models")
+            )
+            .expect("a configured root"),
+            PathBuf::from("/home/hoarder/ComfyUI/models")
+        );
+        assert!(
+            projection_dir(&state, Profile::ComfyUi, Some("/home/hoarder/.ssh")).is_err(),
+            "a sibling of a configured root is not itself a root"
+        );
     }
 }

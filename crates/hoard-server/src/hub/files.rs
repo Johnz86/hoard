@@ -5,6 +5,7 @@
 //! the framing come back from `served_response` and the body from `read_range`, so this
 //! module frames them as HTTP and measures what actually left the node.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::extract::{Path as RoutePath, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use futures::TryStreamExt;
 
 use hoard_core::{ArtifactId, CommitSha, RepoId, RepoRowId, Sha256};
@@ -34,8 +35,6 @@ use crate::hub::{
 };
 use crate::state::AppState;
 
-const ERROR_CODE: &str = "x-error-code";
-
 /// `HEAD`, `GET /{ref}/resolve/{revision}/{path}` in all three reference forms.
 pub(crate) async fn resolve(
     State(state): State<AppState>,
@@ -49,14 +48,16 @@ pub(crate) async fn resolve(
     let auth = authorization(&headers);
     let head = method == Method::HEAD;
     let revision = revision_of(&params);
-    let opened = state
-        .mirror()
-        .open_file(
-            FileRequest::new(&repo, revision, path)
-                .with_auth(auth.as_ref())
-                .head(head),
-        )
-        .await;
+    let opened = state.note_upstream(
+        state
+            .mirror()
+            .open_file(
+                FileRequest::new(&repo, revision, path)
+                    .with_auth(auth.as_ref())
+                    .head(head),
+            )
+            .await,
+    );
     let answer = match opened {
         Ok(answer) => answer,
         Err(error) => return Err(refine(&state, &repo, revision, error).await),
@@ -152,14 +153,16 @@ async fn by_content_hash(
     let auth = authorization(headers);
     let head = method == Method::HEAD;
     let revision = location.revision.to_hex();
-    let answer = state
-        .mirror()
-        .open_file(
-            FileRequest::new(&location.repo, &revision, &location.path)
-                .with_auth(auth.as_ref())
-                .head(head),
-        )
-        .await?;
+    let answer = state.note_upstream(
+        state
+            .mirror()
+            .open_file(
+                FileRequest::new(&location.repo, &revision, &location.path)
+                    .with_auth(auth.as_ref())
+                    .head(head),
+            )
+            .await,
+    )?;
     let served = Served::new(&location.repo, &location.path, head, client).without_commit();
     serve(state, &answer, served, headers).await
 }
@@ -167,24 +170,42 @@ async fn by_content_hash(
 /// Where in Hub terms the bytes of one content hash live, which is what both the CDN
 /// routes and the git LFS batch answer with.
 pub(crate) async fn locate_content(store: &Store, hash: &Sha256) -> HubResult<Option<LfsLocation>> {
-    let wanted = *hash;
+    Ok(locate_contents(store, vec![*hash]).await?.remove(hash))
+}
+
+/// Where the bytes of every named content hash live, resolved in one pass over the index.
+///
+/// An LFS batch names many objects at once, and one round trip to the store per object is
+/// one blocking task per object for a request that reads a single connection anyway.
+pub(crate) async fn locate_contents(
+    store: &Store,
+    hashes: Vec<Sha256>,
+) -> HubResult<HashMap<Sha256, LfsLocation>> {
     let located = store
         .call(move |conn| {
-            let Some(blob) = blob_by_sha256(conn, &wanted)? else {
-                return Ok(None);
-            };
             let node = local_node(conn)?;
-            Ok(entries_for_blob(conn, blob.id)?
-                .into_iter()
-                .find(|entry| entry.present && entry.node_row == node.id)
-                .map(|entry| (entry.repo_qualified, entry.revision_sha, entry.path)))
+            let mut found = Vec::with_capacity(hashes.len());
+            for hash in hashes {
+                let Some(blob) = blob_by_sha256(conn, &hash)? else {
+                    continue;
+                };
+                let held = entries_for_blob(conn, blob.id)?
+                    .into_iter()
+                    .find(|entry| entry.present && entry.node_row == node.id);
+                if let Some(entry) = held {
+                    found.push((hash, entry.repo_qualified, entry.revision_sha, entry.path));
+                }
+            }
+            Ok(found)
         })
         .await?;
-    let Some((qualified, revision, path)) = located else {
-        return Ok(None);
-    };
-    let repo = RepoId::parse_qualified(&qualified).map_err(|_| HubError::proxy_invalid_data())?;
-    Ok(Some(LfsLocation::new(repo, revision, path)))
+    let mut out = HashMap::with_capacity(located.len());
+    for (hash, qualified, revision, path) in located {
+        let repo =
+            RepoId::parse_qualified(&qualified).map_err(|_| HubError::proxy_invalid_data())?;
+        out.insert(hash, LfsLocation::new(repo, revision, path));
+    }
+    Ok(out)
 }
 
 /// What one served response has to record once its body has left the node.
@@ -232,8 +253,10 @@ async fn serve(
     let rendered = served_response(answer, range);
     let status =
         StatusCode::from_u16(rendered.status).map_err(|_| HubError::proxy_invalid_data())?;
-    let empty = served.head || status == StatusCode::RANGE_NOT_SATISFIABLE;
-    let body = match empty {
+    if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        return Ok(HubError::range_not_satisfiable(answer.size).into_response());
+    }
+    let body = match served.head {
         true => Body::empty(),
         false => {
             let meter = Meter::new(state, &served, answer, rendered.status);
@@ -251,12 +274,6 @@ async fn serve(
             HeaderName::from_bytes(name.as_bytes()).map_err(|_| HubError::proxy_invalid_data())?;
         let value = HeaderValue::from_str(value).map_err(|_| HubError::proxy_invalid_data())?;
         response.headers_mut().insert(name, value);
-    }
-    if status == StatusCode::RANGE_NOT_SATISFIABLE {
-        let code = HubError::range_not_satisfiable(answer.size).code();
-        response
-            .headers_mut()
-            .insert(ERROR_CODE, HeaderValue::from_static(code));
     }
     Ok(response)
 }

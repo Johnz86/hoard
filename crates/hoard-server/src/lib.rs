@@ -86,6 +86,41 @@ pub fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// The reason a job row left running by a previous process is failed with.
+const KILLED: &str = "the process running this job was stopped";
+
+/// Settles what a stopped process left behind.
+///
+/// Only the process that started a run knows it is still going, so a job still marked
+/// running when this one starts is a run that was killed: the JOBS tab would otherwise show
+/// it at whatever percentage it died at, forever.
+pub async fn sweep_stale_runs(state: &AppState) -> usize {
+    let swept = state
+        .store()
+        .call_mut(|conn| {
+            let running = hoard_index::store::job::list_jobs(
+                conn,
+                Some(hoard_index::store::job::JobState::Running),
+            )?;
+            for row in &running {
+                hoard_index::store::job::fail_job(conn, row.id, KILLED)?;
+            }
+            Ok(running.len())
+        })
+        .await;
+    match swept {
+        Ok(0) => 0,
+        Ok(count) => {
+            tracing::warn!(count, "jobs left running by a stopped process were failed");
+            count
+        }
+        Err(error) => {
+            tracing::error!(%error, "the jobs a stopped process left could not be settled");
+            0
+        }
+    }
+}
+
 /// Serves the application until `shutdown` resolves.
 ///
 /// The peer address is carried into the request so the usage log can name which machine
@@ -97,10 +132,147 @@ pub async fn serve<F>(listener: TcpListener, state: AppState, shutdown: F) -> st
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    sweep_stale_runs(&state).await;
     axum::serve(
         listener,
         app(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Method, Request, StatusCode, header};
+    use hoard_index::store::Store;
+    use hoard_index::store::job::{JobState, create_job, job, list_jobs};
+    use tower::ServiceExt;
+
+    use super::*;
+
+    fn state() -> AppState {
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        AppState::new(HoardConfig::default(), store).expect("state builds")
+    }
+
+    async fn through_the_stack(request: Request<Body>) -> axum::response::Response {
+        app(state())
+            .oneshot(request)
+            .await
+            .expect("the assembled application answers")
+    }
+
+    #[tokio::test]
+    async fn a_cross_origin_write_is_not_approved_by_the_preflight() {
+        let preflight = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/api/v1/scan")
+            .header(header::ORIGIN, "https://a-page-the-user-visited.example")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+            .body(Body::empty())
+            .expect("request");
+        let response = through_the_stack(preflight).await;
+        let approved = response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        assert!(
+            !approved.contains("POST"),
+            "a page on another origin was approved for POST: {approved:?}"
+        );
+        assert!(approved.contains("GET"), "reads stay open on the LAN");
+    }
+
+    #[tokio::test]
+    async fn the_assembled_stack_answers_the_api_and_stamps_a_request_id() {
+        let request = Request::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .expect("request");
+        let response = through_the_stack(request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("application/json"))
+        );
+        assert!(
+            response.headers().contains_key("x-request-id"),
+            "the request id layer is wired into the stack"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_route_answers_json_and_the_root_answers_the_shell() {
+        let unknown = Request::builder()
+            .uri("/api/v1/nothing-here")
+            .body(Body::empty())
+            .expect("request");
+        let response = through_the_stack(unknown).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-error-code")
+                .and_then(|value| value.to_str().ok()),
+            Some("RepoNotFound")
+        );
+
+        let root = Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .expect("request");
+        let shell = through_the_stack(root).await;
+        assert_eq!(shell.status(), StatusCode::OK);
+        let media = shell
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(media.starts_with("text/html"), "{media}");
+    }
+
+    #[tokio::test]
+    async fn a_body_larger_than_the_limit_never_reaches_a_handler() {
+        let oversized = vec![b'x'; layers::REQUEST_BODY_LIMIT + 1];
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/shelves")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(oversized))
+            .expect("request");
+        let response = through_the_stack(request).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn a_job_left_running_by_a_stopped_process_is_failed_at_startup() {
+        let state = state();
+        let id = state
+            .store()
+            .call_mut(|conn| create_job(conn, "scan", Some("cache")))
+            .await
+            .expect("a job starts");
+
+        assert_eq!(sweep_stale_runs(&state).await, 1);
+        let settled = state
+            .store()
+            .call(move |conn| job(conn, id))
+            .await
+            .expect("the job reads back");
+        assert_eq!(settled.state, JobState::Failed);
+        assert_eq!(settled.error.as_deref(), Some(KILLED));
+
+        assert_eq!(sweep_stale_runs(&state).await, 0, "the sweep is idempotent");
+        let running = state
+            .store()
+            .call(|conn| list_jobs(conn, Some(JobState::Running)))
+            .await
+            .expect("jobs read back");
+        assert!(running.is_empty());
+    }
 }

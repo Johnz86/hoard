@@ -10,6 +10,7 @@ use hoard_core::{
     State as ArtifactState, format_size,
 };
 use hoard_index::IndexError;
+use hoard_index::shard::parse_shard_name;
 use hoard_index::sniff::parse_readme;
 use hoard_index::store::entry::entries_for_revision;
 use hoard_index::store::revision::{RefKind, RevisionRow};
@@ -19,8 +20,8 @@ use hoard_index::store::{artifact, blob, entry, node, repo, revision, usage};
 
 use crate::api::common::{
     Conn, DEFAULT_LIMIT, EntryView, Fact, MIDDOT, PullCommands, RowView, clamp_limit,
-    decode_cursor, entry_views, facts, next_cursor, pull_commands, relative_time, repo_id,
-    state_label,
+    decode_row_cursor, encode_row_cursor, entry_views, facts, pull_commands, relative_time,
+    repo_id, state_label,
 };
 use crate::api::compat::{CompatView, compat_for};
 use crate::error::{ApiError, ApiResult};
@@ -196,7 +197,7 @@ pub async fn list(
         params.q.clone().unwrap_or_default(),
         params.repo_type.clone().unwrap_or_default()
     );
-    let offset = decode_cursor(params.cursor.as_deref(), &key)?;
+    let after = decode_row_cursor(params.cursor.as_deref(), &key)?.map(RepoRowId::new);
     let text = params.q.clone();
     let view = state
         .store()
@@ -207,16 +208,23 @@ pub async fn list(
                 node_row: None,
                 present_only: true,
             };
-            let all = repo::list_repos(conn, &filter, None, u32::MAX)?;
-            let total = all.len() as u64;
-            let mut rows = Vec::new();
-            for record in all.into_iter().skip(offset as usize).take(limit as usize) {
-                rows.push(list_row(conn, &record)?);
+            let mut page = repo::list_repos(conn, &filter, after, limit.saturating_add(1))?;
+            let more = page.len() > limit as usize;
+            page.truncate(limit as usize);
+            let next_cursor = match more {
+                true => page
+                    .last()
+                    .map(|record| encode_row_cursor(record.id.get(), &key)),
+                false => None,
+            };
+            let mut rows = Vec::with_capacity(page.len());
+            for record in &page {
+                rows.push(list_row(conn, record)?);
             }
             Ok(RepoListView {
-                next_cursor: next_cursor(offset, limit, rows.len(), total, &key),
+                next_cursor,
                 rows,
-                total,
+                total: repo::list_repos(conn, &filter, None, u32::MAX)?.len() as u64,
             })
         })
         .await?;
@@ -388,7 +396,9 @@ pub async fn readme(
         Some(text) => (text, false),
         None => (generated_card(&state, &repo, fallback.as_ref()), true),
     };
-    let document = parse_readme(&text);
+    let document = tokio::task::spawn_blocking(move || parse_readme(&text))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     Ok(Json(ReadmeView {
         frontmatter: document
             .frontmatter
@@ -412,13 +422,14 @@ pub async fn compat(
     Query(params): Query<RevisionParams>,
 ) -> ApiResult<Json<CompatView>> {
     let repo = repo_id(&repo_type, &org, &name)?;
-    let _ = params.wanted();
+    let wanted = params.wanted();
     let now = Timestamp::now();
     let view = state
         .store()
         .call(move |conn| {
             let record = repo_row(conn, &repo)?;
-            let rows = crate::api::common::rows_for_repo(conn, record.id, REPO_ARTIFACTS)?;
+            let resolved = revision::resolve_revision(conn, record.id, &wanted)?;
+            let rows = rows_in_revision(conn, record.id, resolved.id)?;
             match pick_primary(&rows) {
                 Some(row) => compat_for(conn, row, DEFAULT_LIMIT, now),
                 None => Err(IndexError::not_found("artifact", record.repo.qualified())),
@@ -564,6 +575,25 @@ fn repo_facts(
     Ok(list)
 }
 
+/// The artifacts one revision of a repository names, most bytes first.
+///
+/// A repository's artifacts are shared across its revisions, so the revision a request
+/// names is what decides which of them answer for it.
+fn rows_in_revision(
+    conn: &Conn,
+    repo: RepoRowId,
+    revision: hoard_core::RevisionId,
+) -> Result<Vec<SearchRow>, IndexError> {
+    let entries = entries_for_revision(conn, revision)?;
+    let mut rows = crate::api::common::rows_for_repo(conn, repo, REPO_ARTIFACTS)?;
+    rows.retain(|row| {
+        entries
+            .iter()
+            .any(|entry| entry.artifact == Some(row.artifact_id))
+    });
+    Ok(rows)
+}
+
 /// The FILES tab's KIND column.
 fn file_kind(path: &str, is_artifact: bool, single: bool) -> &'static str {
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
@@ -572,6 +602,9 @@ fn file_kind(path: &str, is_artifact: bool, single: bool) -> &'static str {
     }
     if name.ends_with(".md") || name.ends_with(".markdown") {
         return "card";
+    }
+    if parse_shard_name(&name).is_some() {
+        return "group";
     }
     let format = name
         .rsplit_once('.')
@@ -660,6 +693,15 @@ mod tests {
         assert_eq!(file_kind("config.json", false, false), "config");
         assert_eq!(file_kind("unet/model.safetensors", true, false), "weights");
         assert_eq!(file_kind("model.safetensors", true, true), "single-file");
+        assert_eq!(
+            file_kind("model-00001-of-00003.safetensors", true, false),
+            "group"
+        );
+        assert_eq!(
+            file_kind("something-of-note.safetensors", true, false),
+            "weights",
+            "a file with an unlucky name is not a shard"
+        );
     }
 
     #[test]

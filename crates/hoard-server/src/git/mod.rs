@@ -23,18 +23,25 @@ use hoard_core::{RepoId, RepoType, Sha256, clean_repo_path};
 use hoard_index::store::node::local_node;
 use hoard_index::store::repo::repo_by_qualified;
 use hoard_mirror::git::{
-    ADVERTISEMENT_CONTENT_TYPE, BatchRequest, CACHE_CONTROL, GitService, LfsLocation, PUSH_REFUSED,
+    ADVERTISEMENT_CONTENT_TYPE, BatchRequest, CACHE_CONTROL, GitService, PUSH_REFUSED,
     RESULT_CONTENT_TYPE, advertise_refs, build_batch_response, is_clonable, lfs_batch,
     strip_git_suffix, upload_pack,
 };
 
 use crate::error::{HubError, HubResult};
-use crate::hub::files::locate_content;
+use crate::hub::files::locate_contents;
 use crate::state::AppState;
 
 /// The leading path segments of a repo reference, named as the Hub face names them so both
 /// routers merge into one application.
 const REFERENCE_PARAMS: [&str; 2] = ["p1", "p2"];
+
+/// How many objects one LFS batch may name.
+///
+/// A client asks for the objects of one checkout, and git-lfs itself batches in hundreds.
+/// A larger request is a way to make this node read the index thousands of times for one
+/// call, so it is refused rather than answered slowly.
+const MAX_BATCH_OBJECTS: usize = 1_000;
 
 /// Every git face route, for both the `org/repo` and the orgless spelling of a clone URL.
 pub fn routes() -> Router<AppState> {
@@ -111,12 +118,13 @@ pub(crate) async fn batch(
     require_repo(&state, &repo).await?;
     let request: BatchRequest =
         serde_json::from_slice(&body).map_err(|_| HubError::unprocessable("invalid batch body"))?;
-    let mut located: HashMap<Sha256, LfsLocation> = HashMap::new();
-    for object in &request.objects {
-        if let Some(location) = locate_content(state.store(), &object.oid).await? {
-            located.insert(object.oid, location);
-        }
+    if request.objects.len() > MAX_BATCH_OBJECTS {
+        return Err(HubError::unprocessable("too many objects in one batch"));
     }
+    let mut wanted: Vec<Sha256> = request.objects.iter().map(|object| object.oid).collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let located = locate_contents(state.store(), wanted).await?;
     let answer = build_batch_response(&request, state.public_url(), &|oid| {
         located.get(oid).cloned()
     });

@@ -10,7 +10,7 @@ use hoard_index::store::row::FacetBucket;
 use hoard_index::store::{artifact, blob, node, repo, search_exec, setting};
 
 use crate::api::common::authorize;
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 const DENSITY_KEY: &str = "density";
@@ -18,9 +18,16 @@ const ROLE_COLOR_KEY: &str = "role_color_mode";
 const INSPECTOR_KEY: &str = "show_inspector";
 const THEME_KEY: &str = "theme";
 
-const DEFAULT_DENSITY: &str = "Condensed";
-const DEFAULT_ROLE_COLOR: &str = "Color-coded";
-const DEFAULT_THEME: &str = "system";
+/// The row heights the design names, in the order the settings sheet offers them.
+const DENSITIES: [&str; 2] = ["Condensed", "Roomy"];
+/// Whether the role column is coloured, as the design names it.
+const ROLE_COLORS: [&str; 2] = ["Color-coded", "Monochrome"];
+/// The themes the shell can be in; `system` follows the operating system.
+const THEMES: [&str; 3] = ["system", "dark", "light"];
+
+const DEFAULT_DENSITY: &str = DENSITIES[0];
+const DEFAULT_ROLE_COLOR: &str = ROLE_COLORS[0];
+const DEFAULT_THEME: &str = THEMES[0];
 
 /// What `GET /healthz` answers. `upstream` is `offline` when this node is configured never
 /// to leave the LAN.
@@ -92,6 +99,28 @@ impl SettingsView {
         }
     }
 
+    /// Rejects a value the shell has no spelling for, so a setting round trips as one of
+    /// the choices the design names rather than as whatever text was posted.
+    fn validated(self) -> ApiResult<Self> {
+        for (key, value, allowed) in [
+            (DENSITY_KEY, self.density.as_str(), DENSITIES.as_slice()),
+            (
+                ROLE_COLOR_KEY,
+                self.role_color_mode.as_str(),
+                ROLE_COLORS.as_slice(),
+            ),
+            (THEME_KEY, self.theme.as_str(), THEMES.as_slice()),
+        ] {
+            if !allowed.contains(&value) {
+                return Err(ApiError::bad_request(format!(
+                    "{value:?} is not a {key}; it is one of {}",
+                    allowed.join(", ")
+                )));
+            }
+        }
+        Ok(self)
+    }
+
     fn pairs(&self) -> [(&'static str, String); 4] {
         [
             (DENSITY_KEY, self.density.clone()),
@@ -102,8 +131,13 @@ impl SettingsView {
     }
 }
 
+/// Answers what this node can do rather than failing.
+///
+/// The peer count is the index probe: an index that cannot answer it is reported as
+/// degraded, because a health route that returns an error tells a watchdog nothing about
+/// which half of the node is down.
 pub async fn healthz(State(state): State<AppState>) -> ApiResult<Json<HealthView>> {
-    let peers = state
+    let probe = state
         .store()
         .call(|conn| {
             Ok(node::list_nodes(conn)?
@@ -111,14 +145,18 @@ pub async fn healthz(State(state): State<AppState>) -> ApiResult<Json<HealthView
                 .filter(|row| !row.is_self)
                 .count() as u64)
         })
-        .await?;
+        .await;
+    let (status, index, peers) = match probe {
+        Ok(peers) => ("ok", "ok", peers),
+        Err(error) => {
+            tracing::error!(%error, "the index did not answer the health probe");
+            ("degraded", "error", 0)
+        }
+    };
     Ok(Json(HealthView {
-        status: "ok",
-        index: "ok",
-        upstream: match state.offline() {
-            true => "offline",
-            false => "ok",
-        },
+        status,
+        index,
+        upstream: state.upstream_health().as_str(),
         peers,
     }))
 }
@@ -174,6 +212,7 @@ pub async fn put_settings(
     Json(body): Json<SettingsView>,
 ) -> ApiResult<Json<SettingsView>> {
     authorize(&state, &headers)?;
+    let body = body.validated()?;
     let view = state
         .store()
         .call_mut(move |conn| {
@@ -184,4 +223,35 @@ pub async fn put_settings(
         })
         .await?;
     Ok(Json(view))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_setting_the_shell_cannot_spell_is_refused() {
+        let stored = SettingsView::default();
+        assert_eq!(
+            stored.clone().validated().expect("defaults are valid"),
+            stored
+        );
+        for broken in [
+            SettingsView {
+                density: "Tiny".to_owned(),
+                ..SettingsView::default()
+            },
+            SettingsView {
+                role_color_mode: "Rainbow".to_owned(),
+                ..SettingsView::default()
+            },
+            SettingsView {
+                theme: "<script>".to_owned(),
+                ..SettingsView::default()
+            },
+        ] {
+            let error = broken.validated().expect_err("the value is not a choice");
+            assert_eq!(error.status(), axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
 }

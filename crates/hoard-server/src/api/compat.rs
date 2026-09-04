@@ -13,6 +13,13 @@ use crate::api::common::{Conn, MIDDOT, state_label};
 /// same way.
 const COMPAT_QUERY: &str = "compat:subject";
 
+/// How many candidates the domain rule is asked about.
+///
+/// The SQL narrows to one role and one base family, so this bounds a set that is already
+/// small; `total` is the number of those candidates the rule accepted, never the number the
+/// SQL admitted, because the rows beside it are that same accepted set.
+const CANDIDATE_LIMIT: u32 = 4_096;
+
 /// One line of the COMPAT tab and of the inspector's PLUGS INTO list.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CompatRowView {
@@ -91,7 +98,7 @@ pub fn compat_for(
         &compiled.where_sql,
         &compiled.params,
         &compiled.order_sql,
-        limit.saturating_add(1),
+        CANDIDATE_LIMIT,
         0,
     )?;
     let held = CompatSubject::new(
@@ -110,8 +117,8 @@ pub fn compat_for(
         })
         .map(CompatRowView::from)
         .collect();
+    let total = rows.len() as u64;
     rows.truncate(limit as usize);
-    let total = search_exec::count_rows(conn, &compiled.where_sql, &compiled.params)?;
     Ok(CompatView {
         banner: format!("{total} {} {}", rule.direction(), subject.name),
         rows,

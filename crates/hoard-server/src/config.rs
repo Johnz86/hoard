@@ -37,6 +37,13 @@ pub struct ServerConfig {
     /// Timeout for metadata routes. File streaming is deliberately never timed out here.
     #[serde(default = "default_metadata_timeout")]
     pub metadata_timeout_secs: u64,
+    /// Directories outside `data_dir/profiles` that a projection may write symlinks into.
+    ///
+    /// A projection is a write to this machine's filesystem asked for over HTTP, so the
+    /// places it may touch are named here rather than in the request. A tool's own model
+    /// directory belongs in this list; nothing is outside `data_dir/profiles` without it.
+    #[serde(default)]
+    pub projection_roots: Vec<PathBuf>,
 }
 
 const fn default_metadata_timeout() -> u64 {
@@ -50,6 +57,7 @@ impl Default for ServerConfig {
             public_url: None,
             data_dir: default_data_dir(),
             metadata_timeout_secs: default_metadata_timeout(),
+            projection_roots: Vec::new(),
         }
     }
 }
@@ -136,6 +144,9 @@ impl HoardConfig {
     /// off, so one `data_dir` setting moves the index and the mirror cache together.
     pub fn normalize(&mut self, home: Option<&Path>) {
         self.server.data_dir = hoard_index::config::expand_tilde(&self.server.data_dir, home);
+        for root in &mut self.server.projection_roots {
+            *root = hoard_index::config::expand_tilde(root, home);
+        }
         if self.index.data_dir == default_data_dir() {
             self.index.data_dir = self.server.data_dir.clone();
         }
@@ -202,6 +213,27 @@ mod tests {
             PathBuf::from("/srv/hoard/hoard.db")
         );
         assert_eq!(config.cache_root(), PathBuf::from("/srv/hoard/repos"));
+    }
+
+    #[test]
+    fn a_projection_root_is_expanded_like_every_other_path() {
+        let mut config = HoardConfig {
+            server: ServerConfig {
+                projection_roots: vec![PathBuf::from("~/ComfyUI/models")],
+                ..ServerConfig::default()
+            },
+            ..HoardConfig::default()
+        };
+        config.normalize(Some(Path::new("/home/hoarder")));
+        assert_eq!(
+            config.server.projection_roots,
+            vec![PathBuf::from("/home/hoarder/ComfyUI/models")]
+        );
+    }
+
+    #[test]
+    fn nothing_outside_the_data_directory_is_writable_by_default() {
+        assert!(HoardConfig::default().server.projection_roots.is_empty());
     }
 
     #[test]

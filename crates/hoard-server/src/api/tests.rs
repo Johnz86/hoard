@@ -491,18 +491,28 @@ async fn call(
     uri: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
+    call_as(state, method, uri, body, None).await
+}
+
+/// One request, optionally presenting an `authorization` header verbatim.
+async fn call_as(
+    state: &AppState,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+    presented: Option<&str>,
+) -> (StatusCode, Value) {
+    let builder = Request::builder().method(method).uri(uri);
+    let builder = match presented {
+        Some(value) => builder.header("authorization", value),
+        None => builder,
+    };
     let request = match body {
-        Some(value) => Request::builder()
-            .method(method)
-            .uri(uri)
+        Some(value) => builder
             .header("content-type", "application/json")
             .body(Body::from(value.to_string()))
             .expect("request"),
-        None => Request::builder()
-            .method(method)
-            .uri(uri)
-            .body(Body::empty())
-            .expect("request"),
+        None => builder.body(Body::empty()).expect("request"),
     };
     let response = router(state).oneshot(request).await.expect("response");
     let status = response.status();
@@ -1079,6 +1089,42 @@ async fn a_repository_detail_carries_the_header_refs_and_pull_box() {
         .collect();
     assert!(names.contains(&"sdxl-base-1.0"), "{names:?}");
     assert!(!names.contains(&"squad"));
+
+    let mut walked: Vec<String> = Vec::new();
+    let mut uri = "/api/v1/repos?type=models&limit=1".to_owned();
+    loop {
+        let page = get(&world.state, &uri).await;
+        let rows = page["rows"].as_array().expect("rows");
+        assert!(rows.len() <= 1, "a page never exceeds the limit: {page}");
+        walked.extend(
+            rows.iter()
+                .map(|row| row["id"].as_str().expect("id").to_owned()),
+        );
+        match page["next_cursor"].as_str() {
+            Some(cursor) => {
+                uri = format!(
+                    "/api/v1/repos?type=models&limit=1&cursor={}",
+                    encoded(cursor)
+                );
+            }
+            None => break,
+        }
+    }
+    let mut once = walked.clone();
+    once.sort();
+    once.dedup();
+    assert_eq!(walked.len(), once.len(), "paging never repeats a row");
+    assert_eq!(walked.len() as u64, listing["total"], "{walked:?}");
+
+    let (status, refused) = call(
+        &world.state,
+        Method::GET,
+        "/api/v1/repos?type=datasets&cursor=1-0000000000000000",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused["error"]["code"], "BadRequest");
 }
 
 #[tokio::test]
@@ -1181,6 +1227,31 @@ async fn a_repository_reports_its_usage_and_compatibility() {
     assert_eq!(compat["rule"], "adapter_resolves_against_host");
     assert_eq!(compat["rows"][0]["name"], "sdxl-base-1.0");
     assert_eq!(compat["rows"][0]["detail"], "fp16");
+    assert_eq!(
+        compat["total"],
+        compat["rows"].as_array().expect("rows").len(),
+        "the banner counts the rows beside it: {compat}"
+    );
+    assert!(
+        compat["banner"]
+            .as_str()
+            .expect("banner")
+            .starts_with(&format!("{} ", compat["total"])),
+        "{compat}"
+    );
+
+    let (status, unknown_revision) = call(
+        &world.state,
+        Method::GET,
+        "/api/v1/repos/models/kohya/film-grain-35mm/compat?revision=nope",
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a revision the repository does not have is not silently ignored: {unknown_revision}"
+    );
 
     let (status, missing) = call(
         &world.state,
@@ -1339,11 +1410,14 @@ async fn loadout_items_are_pinned_removed_and_exported() {
         &format!("/api/v1/loadouts/{id}/export?format=hf-script"),
     )
     .await;
+    let script_text = script["text"].as_str().expect("text");
     assert!(
-        script["text"]
-            .as_str()
-            .expect("text")
-            .contains("HF_ENDPOINT=http://hoard.lan:7099")
+        script_text.contains("HF_ENDPOINT='http://hoard.lan:7099'"),
+        "every interpolated value is quoted for the shell: {script_text}"
+    );
+    assert!(
+        script_text.contains("hf download 'kohya/film-grain-35mm' 'film-grain-35mm.safetensors'"),
+        "{script_text}"
     );
 
     let comfy = get(
@@ -1432,20 +1506,21 @@ async fn applying_a_loadout_starts_a_job() {
 #[tokio::test]
 async fn a_projection_writes_one_symlink_per_row() {
     let world = seeded();
-    let dir = tempfile::tempdir().expect("temp dir");
     let body = post(
         &world.state,
         "/api/v1/link",
-        json!({
-            "query": "role:lora",
-            "profile": "comfyui",
-            "dir": dir.path().to_string_lossy()
-        }),
+        json!({ "query": "role:lora", "profile": "comfyui", "dir": "bench" }),
     )
     .await;
     assert_eq!(body["profile"], "comfyui");
     assert_eq!(body["total"], 1);
     let link = body["written"][0]["link"].as_str().expect("link");
+    let root = world.state.projection_root().join("comfyui").join("bench");
+    assert!(
+        Path::new(link).starts_with(&root),
+        "{link} is not under {}",
+        root.display()
+    );
     assert!(
         link.ends_with("loras/film-grain-35mm.safetensors"),
         "{link}"
@@ -1456,11 +1531,64 @@ async fn a_projection_writes_one_symlink_per_row() {
         &world.state,
         Method::POST,
         "/api/v1/link",
-        Some(json!({ "query": "role:lora", "profile": "webui", "dir": "/tmp" })),
+        Some(json!({ "query": "role:lora", "profile": "webui", "dir": "bench" })),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(bad["error"]["code"], "BadRequest");
+
+    let (status, outside) = call(
+        &world.state,
+        Method::POST,
+        "/api/v1/link",
+        Some(json!({ "query": "role:lora", "profile": "comfyui", "dir": "/tmp/hoard-escape" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a projection outside the node's roots is refused: {outside}"
+    );
+    assert!(!Path::new("/tmp/hoard-escape").exists());
+}
+
+/// A projection replaces a link it made before, and never removes a file it did not make.
+#[tokio::test]
+async fn a_projection_replaces_its_own_link_and_leaves_a_file_alone() {
+    let world = seeded();
+    let first = post(
+        &world.state,
+        "/api/v1/link",
+        json!({ "query": "role:lora", "profile": "comfyui" }),
+    )
+    .await;
+    let link = first["written"][0]["link"]
+        .as_str()
+        .expect("link")
+        .to_owned();
+    let again = post(
+        &world.state,
+        "/api/v1/link",
+        json!({ "query": "role:lora", "profile": "comfyui" }),
+    )
+    .await;
+    assert_eq!(again["total"], 1);
+    assert_eq!(again["written"][0]["created"], false);
+
+    std::fs::remove_file(&link).expect("the link is removed");
+    std::fs::write(&link, b"a file that was always there").expect("a real file lands there");
+    let third = post(
+        &world.state,
+        "/api/v1/link",
+        json!({ "query": "role:lora", "profile": "comfyui" }),
+    )
+    .await;
+    assert_eq!(third["total"], 0, "a regular file is never unlinked");
+    assert_eq!(third["skipped"].as_array().expect("skipped").len(), 1);
+    assert_eq!(
+        std::fs::read(&link).expect("the file is still there"),
+        b"a file that was always there"
+    );
 }
 
 /// Waits for a job to leave the running state, which is how a scan reports its outcome.
@@ -1476,7 +1604,7 @@ async fn settle(state: &AppState, job: &str) -> Value {
 }
 
 #[tokio::test]
-async fn sources_scans_and_jobs_are_listed_and_cancelled() {
+async fn sources_scans_and_jobs_are_listed() {
     let world = seeded();
     let sources = get(&world.state, "/api/v1/sources").await;
     assert_eq!(sources.as_array().expect("sources").len(), 1);
@@ -1524,6 +1652,49 @@ async fn sources_scans_and_jobs_are_listed_and_cancelled() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(bad["error"]["code"], "BadRequest");
+}
+
+#[tokio::test]
+async fn a_running_job_is_cancelled_once_and_then_conflicts() {
+    let world = seeded();
+    let running = world
+        .state
+        .store()
+        .call_mut(|conn| hoard_index::store::job::create_job(conn, "pull", Some("film-grain")))
+        .await
+        .expect("a job starts");
+
+    let listed = get(&world.state, "/api/v1/jobs?state=running").await;
+    assert_eq!(listed.as_array().expect("jobs").len(), 1);
+
+    let cancelled = post(
+        &world.state,
+        &format!("/api/v1/jobs/{running}/cancel"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(cancelled["state"], "cancelled");
+    assert!(cancelled["finished"].is_string());
+
+    let (status, again) = call(
+        &world.state,
+        Method::POST,
+        &format!("/api/v1/jobs/{running}/cancel"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(again["error"]["code"], "Conflict");
+
+    let (status, unknown) = call(
+        &world.state,
+        Method::POST,
+        "/api/v1/jobs/job_9999/cancel",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(unknown["error"]["code"], "NotFound");
 }
 
 #[tokio::test]
@@ -1605,6 +1776,21 @@ async fn health_stats_and_settings_answer_the_shell() {
     assert_eq!(stats["triage"], 1);
     assert_eq!(stats["roles"].as_array().expect("roles").len(), 6);
     assert_eq!(stats["cache"]["bytes"], 0);
+
+    let (status, refused) = call(
+        &world.state,
+        Method::PUT,
+        "/api/v1/settings",
+        Some(json!({
+            "density": "Tiny",
+            "role_color_mode": "Color-coded",
+            "show_inspector": true,
+            "theme": "system"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused["error"]["code"], "BadRequest");
 
     let settings = get(&world.state, "/api/v1/settings").await;
     assert_eq!(
@@ -1697,6 +1883,162 @@ async fn a_write_is_open_when_this_node_has_no_token() {
     let world = seeded();
     let headers = axum::http::HeaderMap::new();
     crate::api::common::authorize(&world.state, &headers).expect("writes are open");
+
+    let (status, _) = call(
+        &world.state,
+        Method::PUT,
+        "/api/v1/settings",
+        Some(json!({
+            "density": "Roomy",
+            "role_color_mode": "Monochrome",
+            "show_inspector": false,
+            "theme": "dark"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+const NODE_TOKEN: &str = "swordfish";
+
+/// Every route that changes something, with a body it would accept.
+///
+/// The bodies are well formed on purpose: a malformed one is refused by the extractor
+/// before the handler runs, and the test would then pass whether or not the route is gated.
+fn mutating_routes(world: &World) -> Vec<(Method, String, Option<Value>)> {
+    let lora = world.lora.to_string();
+    let unknown = world.unknown.to_string();
+    vec![
+        (
+            Method::PUT,
+            format!("/api/v1/artifacts/{lora}/override"),
+            Some(json!({ "role": "ckpt" })),
+        ),
+        (
+            Method::DELETE,
+            format!("/api/v1/artifacts/{lora}/override"),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/triage/{unknown}/confirm"),
+            Some(json!({ "role": "lora", "base": "sdxl" })),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/triage/{unknown}/reject"),
+            None,
+        ),
+        (Method::DELETE, "/api/v1/triage/noise/1".to_owned(), None),
+        (
+            Method::POST,
+            "/api/v1/shelves".to_owned(),
+            Some(json!({ "name": "gated", "query": "role:lora" })),
+        ),
+        (
+            Method::PUT,
+            "/api/v1/shelves/1".to_owned(),
+            Some(json!({ "name": "gated", "query": "role:lora" })),
+        ),
+        (Method::DELETE, "/api/v1/shelves/1".to_owned(), None),
+        (
+            Method::POST,
+            "/api/v1/loadouts".to_owned(),
+            Some(json!({ "name": "gated" })),
+        ),
+        (
+            Method::POST,
+            "/api/v1/loadouts/1/items".to_owned(),
+            Some(json!({ "artifact_id": lora })),
+        ),
+        (
+            Method::DELETE,
+            format!("/api/v1/loadouts/1/items/{lora}"),
+            None,
+        ),
+        (Method::POST, "/api/v1/loadouts/1/validate".to_owned(), None),
+        (
+            Method::POST,
+            "/api/v1/loadouts/1/apply".to_owned(),
+            Some(json!({ "node": "workstation", "profile": "comfyui" })),
+        ),
+        (
+            Method::POST,
+            "/api/v1/link".to_owned(),
+            Some(json!({ "query": "role:lora", "profile": "comfyui", "dir": "gated" })),
+        ),
+        (
+            Method::POST,
+            "/api/v1/scan".to_owned(),
+            Some(json!({ "source": "cache", "hash": "never" })),
+        ),
+        (Method::POST, "/api/v1/jobs/1/cancel".to_owned(), None),
+        (
+            Method::POST,
+            "/api/v1/peers".to_owned(),
+            Some(json!({ "url": "http://127.0.0.1:1" })),
+        ),
+        (
+            Method::PUT,
+            "/api/v1/settings".to_owned(),
+            Some(json!({
+                "density": "Condensed",
+                "role_color_mode": "Color-coded",
+                "show_inspector": true,
+                "theme": "system"
+            })),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn every_mutating_route_refuses_a_request_without_the_node_token() {
+    let world = seeded();
+    let guarded = world.state.clone().with_node_token(NODE_TOKEN);
+    let routes = mutating_routes(&world);
+    assert_eq!(
+        routes.len(),
+        18,
+        "every route that writes belongs in this table"
+    );
+
+    for (method, uri, body) in routes {
+        let (missing, payload) = call(&guarded, method.clone(), &uri, body.clone()).await;
+        assert_eq!(
+            missing,
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} answered {payload} with no token"
+        );
+        assert_eq!(payload["error"]["code"], "Unauthorized", "{method} {uri}");
+
+        let (wrong, payload) = call_as(
+            &guarded,
+            method.clone(),
+            &uri,
+            body.clone(),
+            Some("Bearer not-the-token"),
+        )
+        .await;
+        assert_eq!(
+            wrong,
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} answered {payload} with the wrong token"
+        );
+
+        let (presented, payload) = call_as(
+            &guarded,
+            method.clone(),
+            &uri,
+            body,
+            Some(&format!("Bearer {NODE_TOKEN}")),
+        )
+        .await;
+        assert_ne!(
+            presented,
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} refused the configured token: {payload}"
+        );
+    }
 }
 
 #[tokio::test]

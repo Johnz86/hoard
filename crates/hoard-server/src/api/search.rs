@@ -159,18 +159,16 @@ fn facets(
         let mut counted =
             search_exec::facet_counts(conn, key, &compiled.where_sql, &compiled.params)?;
         mark_active(&mut counted, query, key);
+        let dimension = Dimension {
+            key,
+            excluded_sql: &compiled.where_sql,
+            excluded_params: &compiled.params,
+            sort,
+            context,
+        };
         let mut rendered = Vec::with_capacity(counted.len());
         for bucket in counted {
-            let count = exact_count(
-                conn,
-                key,
-                &bucket.value,
-                &compiled.where_sql,
-                &compiled.params,
-                sort,
-                context,
-                bucket.count,
-            )?;
+            let count = exact_count(conn, &dimension, &bucket.value, bucket.count)?;
             rendered.push(FacetBucketView {
                 token: format!("{key}:{}", quoted(&bucket.value)),
                 query: select_query(query, key, &bucket.value),
@@ -212,29 +210,39 @@ pub fn select_query(query: &ParsedQuery, key: &str, value: &str) -> String {
     parts.join(" ")
 }
 
+/// One facet dimension being counted: its key and the query with that dimension's own
+/// tokens removed, which is the query every bucket of it is measured against.
+struct Dimension<'a> {
+    key: &'a str,
+    excluded_sql: &'a str,
+    excluded_params: &'a [SqlValue],
+    sort: SortSpec,
+    context: &'a CompileContext,
+}
+
 /// The number of artifacts [`select_query`] returns.
 ///
 /// The grouped count is right whenever the grammar compiles `key:value` to plain equality
 /// on the facet's own column. `base:` does not: it matches a family by prefix and lets
 /// `any` match everything, so that dimension is counted by running the query the bucket
 /// stands for rather than by grouping.
-#[allow(clippy::too_many_arguments)]
 fn exact_count(
     conn: &Conn,
-    key: &str,
+    dimension: &Dimension<'_>,
     value: &str,
-    excluded_sql: &str,
-    excluded_params: &[SqlValue],
-    sort: SortSpec,
-    context: &CompileContext,
     grouped: u64,
 ) -> Result<u64, IndexError> {
-    let token = compile(&parse(&format!("{key}:{}", quoted(value))), sort, context)?;
+    let key = dimension.key;
+    let token = compile(
+        &parse(&format!("{key}:{}", quoted(value))),
+        dimension.sort,
+        dimension.context,
+    )?;
     if token.where_sql == format!("{key} = ?") && token.params == [SqlValue::text(value)] {
         return Ok(grouped);
     }
-    let where_sql = format!("({excluded_sql}) AND ({})", token.where_sql);
-    let mut params = excluded_params.to_vec();
+    let where_sql = format!("({}) AND ({})", dimension.excluded_sql, token.where_sql);
+    let mut params = dimension.excluded_params.to_vec();
     params.extend(token.params);
     search_exec::count_rows(conn, &where_sql, &params)
 }

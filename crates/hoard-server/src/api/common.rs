@@ -83,6 +83,28 @@ pub fn decode_cursor(cursor: Option<&str>, key: &str) -> ApiResult<u32> {
     Ok(offset)
 }
 
+/// A cursor for a listing the store resumes by row id rather than by offset.
+///
+/// It names the last row of the page just returned, so the next page is the rows after it
+/// however many rows were inserted or deleted in between.
+pub fn encode_row_cursor(after: i64, key: &str) -> String {
+    format!("{after:x}-{:016x}", fingerprint(key))
+}
+
+pub fn decode_row_cursor(cursor: Option<&str>, key: &str) -> ApiResult<Option<i64>> {
+    let Some(cursor) = cursor.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let invalid = || ApiError::bad_request(format!("cursor {cursor:?} is not from this query"));
+    let (after, digest) = cursor.split_once('-').ok_or_else(invalid)?;
+    let after = i64::from_str_radix(after, 16).map_err(|_| invalid())?;
+    let digest = u64::from_str_radix(digest, 16).map_err(|_| invalid())?;
+    if digest != fingerprint(key) || after < 0 {
+        return Err(invalid());
+    }
+    Ok(Some(after))
+}
+
 fn fingerprint(key: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
@@ -172,7 +194,7 @@ pub fn resolve_compat_target(
     value: &str,
     now: Timestamp,
 ) -> Result<Option<CompatTarget>, IndexError> {
-    for probe in [format!("repo:\"{value}\""), format!("\"{value}\"")] {
+    for probe in [format!("repo:{}", quoted(value)), quoted(value)] {
         let query = hoard_index::search::parse(&probe);
         let context = CompileContext::new(now);
         let compiled = compile(&query, SortSpec::new(SortKey::Size, true), &context)?;
@@ -605,6 +627,22 @@ mod tests {
             0
         );
         assert!(decode_cursor(Some("nonsense"), "any").is_err());
+    }
+
+    #[test]
+    fn a_row_cursor_names_the_last_row_and_refuses_another_query() {
+        let cursor = encode_row_cursor(41, "models|");
+        assert_eq!(
+            decode_row_cursor(Some(&cursor), "models|").expect("the cursor is ours"),
+            Some(41)
+        );
+        assert!(
+            decode_row_cursor(None, "models|")
+                .expect("no cursor is page one")
+                .is_none()
+        );
+        assert!(decode_row_cursor(Some(&cursor), "datasets|").is_err());
+        assert!(decode_row_cursor(Some("nonsense"), "models|").is_err());
     }
 
     #[test]

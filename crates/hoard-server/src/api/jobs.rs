@@ -95,6 +95,12 @@ pub async fn sources(State(state): State<AppState>) -> ApiResult<Json<Vec<Source
     Ok(Json(rows))
 }
 
+/// Starts a scan and answers with the job the scanner opened for it.
+///
+/// The scanner owns its job row, so this watches for the row that appears rather than
+/// opening a second one beside it. The window between reading what was there and seeing
+/// the new row is held one request at a time, so two scans started at once are never handed
+/// each other's job.
 pub async fn scan(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -112,8 +118,9 @@ pub async fn scan(
         Some(wanted) => Some(resolve_source(&state, &wanted).await?),
         None => None,
     };
-    let previous = newest_scan_job(&state).await?;
 
+    let handoff = state.scan_handoff().lock().await;
+    let previous = newest_scan_job(&state).await?;
     let background = state.clone();
     let options = ScanOptions { source, hash };
     tokio::spawn(async move {
@@ -122,6 +129,7 @@ pub async fn scan(
         }
     });
     let job_id = await_scan_job(&state, previous).await?;
+    drop(handoff);
     Ok(Json(ScanStarted { job_id }))
 }
 
@@ -134,6 +142,9 @@ async fn hand_off_to_scanner(state: &AppState, options: ScanOptions) -> Result<(
 
 /// The scanner records its own job as its first act, so the handler answers with that row
 /// rather than opening a second one beside it.
+///
+/// Whatever state it reached: a scan of one small source settles before this handler next
+/// looks, and the row it settled as is still the row the request started.
 async fn newest_scan_job(state: &AppState) -> Result<Option<JobId>, IndexError> {
     state
         .store()
@@ -147,10 +158,11 @@ async fn newest_scan_job(state: &AppState) -> Result<Option<JobId>, IndexError> 
 }
 
 async fn await_scan_job(state: &AppState, previous: Option<JobId>) -> ApiResult<JobId> {
+    let after = previous.map_or(0, JobId::get);
     for _ in 0..JOB_ATTEMPTS {
         match newest_scan_job(state).await? {
-            Some(job) if Some(job) != previous => return Ok(job),
-            _ => tokio::time::sleep(JOB_POLL).await,
+            Some(job) if job.get() > after => return Ok(job),
+            Some(_) | None => tokio::time::sleep(JOB_POLL).await,
         }
     }
     Err(ApiError::internal("the scan did not start"))
