@@ -19,11 +19,22 @@ const FREE_TEXT_SQL: &str = "(COALESCE(org, '') || ' ' || name || ' ' || base ||
      COALESCE(trigger_words, '') || ' ' || role || ' ' || node) LIKE '%' || ? || '%'";
 const FTS_SQL: &str =
     "artifact_id IN (SELECT artifact_id FROM artifact_fts WHERE artifact_fts MATCH ?)";
-/// Mirrors `Base::matches`, including its guard that an unknown base matches nothing. The
-/// guard is not cosmetic: without it `? LIKE base || '%'` reduces to `? LIKE '%'` for an
-/// empty base, so every artifact whose base could not be inferred answers every `base:`
-/// query.
-const BASE_SQL: &str = "(base <> '' AND (base = ? OR base LIKE ? || '%' \
+/// `base:` as a filter: the family asked for, or a family it prefixes either way.
+///
+/// The `base <> ''` guard is not cosmetic. Without it `? LIKE base || '%'` reduces to
+/// `? LIKE '%'` for an empty base, so every artifact whose base could not be inferred
+/// answers every `base:` query.
+///
+/// A filter deliberately does not honour `any`. `any` means "works with every architecture",
+/// which is a statement about compatibility, not about being an SDXL model: an upscaler
+/// must not appear under `base:lfm2`, and counting it under every family at once is what
+/// made each bucket in the facet rail read far larger than the shelf it opens.
+const BASE_FILTER_SQL: &str =
+    "(base <> '' AND (base = ? OR base LIKE ? || '%' OR ? LIKE base || '%'))";
+
+/// `compat:` resolves against the same families, and here `any` does belong: an upscaler
+/// that declares it really does plug into a host of any architecture.
+const BASE_COMPAT_SQL: &str = "(base <> '' AND (base = ? OR base LIKE ? || '%' \
      OR ? LIKE base || '%' OR base = 'any'))";
 const BASE_PARAMS: usize = 3;
 
@@ -267,7 +278,7 @@ impl Compiler<'_> {
             TokenKind::Role => Ok(self.role_clause(token)),
             TokenKind::Base => Ok(self.each_value(token, |compiler, value| {
                 compiler.bind_repeated(value, BASE_PARAMS);
-                BASE_SQL.to_owned()
+                BASE_FILTER_SQL.to_owned()
             })),
             TokenKind::Format => Ok(self.column_clause(token, "format")),
             TokenKind::Precision => Ok(self.column_clause(token, "precision")),
@@ -426,7 +437,7 @@ impl Compiler<'_> {
             self.params.push(SqlValue::text(role.as_str()));
         }
         self.bind_repeated(&base, BASE_PARAMS);
-        Ok(format!("(role IN ({placeholders}) AND {BASE_SQL})"))
+        Ok(format!("(role IN ({placeholders}) AND {BASE_COMPAT_SQL})"))
     }
 
     fn shelf_clause(&mut self, token: &Token) -> Result<String> {
@@ -554,7 +565,7 @@ mod tests {
         assert_eq!(
             query.where_sql,
             "role = ? AND (base <> '' AND (base = ? OR base LIKE ? || '%' OR ? LIKE base || \
-             '%' OR base = 'any')) AND size < ? AND ((COALESCE(org, '') || ' ' || name || ' ' || base || ' ' || \
+             '%')) AND size < ? AND ((COALESCE(org, '') || ' ' || name || ' ' || base || ' ' || \
              COALESCE(trigger_words, '') || ' ' || role || ' ' || node) LIKE '%' || ? || '%' AND \
              (COALESCE(org, '') || ' ' || name || ' ' || base || ' ' || COALESCE(trigger_words, \
              '') || ' ' || role || ' ' || node) LIKE '%' || ? || '%')"
@@ -677,7 +688,7 @@ mod tests {
         .expect("compiles");
         assert_eq!(
             query.where_sql,
-            format!("(role IN (?, ?, ?, ?, ?) AND {BASE_SQL})")
+            format!("(role IN (?, ?, ?, ?, ?) AND {BASE_COMPAT_SQL})")
         );
         assert_eq!(
             texts(&query.params),
@@ -732,11 +743,11 @@ mod tests {
         let query = parse("role:lora base:sdxl");
         let compiled =
             compile_excluding(&query, "role", SortSpec::default(), &context()).expect("compiles");
-        assert_eq!(compiled.where_sql, BASE_SQL);
+        assert_eq!(compiled.where_sql, BASE_FILTER_SQL);
         assert_eq!(texts(&compiled.params), vec!["sdxl", "sdxl", "sdxl"]);
         let kept =
             compile_excluding(&query, "node", SortSpec::default(), &context()).expect("compiles");
-        assert_eq!(kept.where_sql, format!("role = ? AND {BASE_SQL}"));
+        assert_eq!(kept.where_sql, format!("role = ? AND {BASE_FILTER_SQL}"));
     }
 
     #[test]
@@ -766,6 +777,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_base_filter_does_not_collect_architecture_agnostic_artifacts() {
+        let filter = compiled("base:lfm2");
+        assert!(
+            !filter.where_sql.contains("'any'"),
+            "an upscaler that plugs into anything is not an lfm2 model, and counting it \
+             under every family inflates every bucket in the facet rail"
+        );
+        let compat = compile(
+            &parse("compat:host"),
+            SortSpec::default(),
+            &context().with_compat(CompatTarget::new(Role::Ckpt, Base::new("sdxl"))),
+        )
+        .expect("compat compiles");
+        assert!(
+            compat.where_sql.contains("'any'"),
+            "compatibility is where `any` belongs"
+        );
     }
 
     #[test]
@@ -824,7 +855,7 @@ mod tests {
             &context,
         )
         .expect("compiles");
-        assert_eq!(query.where_sql, format!("({BASE_SQL})"));
+        assert_eq!(query.where_sql, format!("({BASE_FILTER_SQL})"));
         assert_eq!(texts(&query.params), vec!["flux", "flux", "flux"]);
         let slugged = compile(
             &parse("shelf:flux-workhorse"),

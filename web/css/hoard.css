@@ -1373,8 +1373,9 @@ input.field:focus {
 }
 
 .prose li {
-    display: grid;
-    grid-template-columns: 18px minmax(0, 1fr);
+    position: relative;
+    list-style: none;
+    padding-left: 18px;
     font-family: var(--sans);
     font-size: 14.5px;
     line-height: 1.6;
@@ -1384,6 +1385,9 @@ input.field:focus {
 
 .prose li::before {
     content: "·";
+    position: absolute;
+    left: 0;
+    top: 0;
     color: var(--amb);
     font-family: var(--mono);
 }
