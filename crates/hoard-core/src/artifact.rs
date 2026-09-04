@@ -67,6 +67,15 @@ impl ArtifactFormat {
         )
     }
 
+    /// True when a file of this format is a thing in its own right rather than something
+    /// that describes its neighbours.
+    ///
+    /// A `config.json` or a README explains the weights beside it; making each one its own
+    /// unclassified row would bury the models the index exists to show.
+    pub const fn is_artifact(self) -> bool {
+        self.holds_tensors() || self.is_dataset()
+    }
+
     /// True when the format is tabular data rather than weights.
     pub const fn is_dataset(self) -> bool {
         matches!(

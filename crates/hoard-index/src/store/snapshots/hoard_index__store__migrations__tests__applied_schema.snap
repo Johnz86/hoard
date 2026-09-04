@@ -26,7 +26,7 @@ CREATE TABLE artifact (
     triage          INTEGER NOT NULL DEFAULT 0,
     last_used       TEXT,
     use_count       INTEGER NOT NULL DEFAULT 0,
-    created_at      TEXT    NOT NULL,
+    created_at      TEXT    NOT NULL, group_bytes INTEGER, shard_count INTEGER,
     UNIQUE(blob_id, sniff_version)
 )
 
@@ -283,7 +283,8 @@ SELECT
     a.trigger_words                               AS trigger_words,
     a.triage                                      AS triage,
     a.last_used                                   AS last_used,
-    b.size                                        AS size,
+    COALESCE(a.group_bytes, b.size)               AS size,
+    COALESCE(a.shard_count, 1)                    AS shard_count,
     b.path_count                                  AS path_count,
     CASE WHEN b.path_count > 1 THEN 1 ELSE 0 END  AS dupe,
     e.id                                          AS entry_id,
@@ -310,10 +311,12 @@ SELECT
     n.name                                        AS node,
     n.is_self                                     AS node_is_self,
     s.name                                        AS source,
-    (n.is_self * 4)
+    ((n.is_self * 4)
       + CASE e.state WHEN 'served' THEN 3 WHEN 'local' THEN 2 WHEN 'triage' THEN 2
                      WHEN 'stale' THEN 1 ELSE 0 END
-      + e.present                                 AS preference
+      + e.present) * 2
+      + CASE WHEN e.blob_id = a.blob_id THEN 1 ELSE 0 END
+                                                  AS preference
 FROM artifact a
 JOIN blob b     ON b.id = a.blob_id
 JOIN entry e    ON e.artifact_id = a.id

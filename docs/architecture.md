@@ -137,6 +137,7 @@ hoard/
           token.rs           token kinds and the parsed strip
           sql.rs             Query -> WHERE and ORDER
           facets.rs          per-dimension counts excluding own key, disk pressure
+        shard.rs             groups a model split across files into one artifact
         scan.rs              discover -> sniff -> hash -> infer -> store
         watch.rs             notify-driven incremental rescans
     hoard-mirror/            serving faces and upstreams, transport-agnostic

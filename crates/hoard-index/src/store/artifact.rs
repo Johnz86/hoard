@@ -1,6 +1,7 @@
 use jiff::Timestamp;
 use rusqlite::{Connection, Row, params};
 use serde::Serialize;
+use strum::IntoEnumIterator;
 
 use hoard_core::{
     Artifact, ArtifactFormat, ArtifactId, Base, BlobId, Evidence, EvidenceSource, Precision, Role,
@@ -14,7 +15,8 @@ use crate::store::convert::{
 };
 
 const ARTIFACT_COLUMNS: &str = "a.id AS id, a.blob_id AS blob_id, b.sha256 AS sha256, \
-     b.size AS size, a.sniff_version AS sniff_version, a.format AS format, a.role AS role, \
+     COALESCE(a.group_bytes, b.size) AS size, a.shard_count AS shard_count, \
+     a.sniff_version AS sniff_version, a.format AS format, a.role AS role, \
      a.sub_role AS sub_role, a.role_confidence AS role_confidence, a.base AS base, \
      a.base_label AS base_label, a.base_confidence AS base_confidence, \
      a.precision AS precision, a.quant AS quant, a.rank AS rank, a.alpha AS alpha, \
@@ -45,6 +47,10 @@ pub struct NewArtifact {
     pub trigger: Option<String>,
     pub org: Option<String>,
     pub name: String,
+    /// What the whole model weighs when it is split across files, and how many files that
+    /// is. Both are `None` for a model held in one file, which reads its size from its blob.
+    pub group_bytes: Option<u64>,
+    pub shard_count: Option<u32>,
 }
 
 impl NewArtifact {
@@ -69,6 +75,8 @@ impl NewArtifact {
             trigger: None,
             org: None,
             name: name.into(),
+            group_bytes: None,
+            shard_count: None,
         }
     }
 }
@@ -77,6 +85,8 @@ impl NewArtifact {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ArtifactRow {
     pub artifact: Artifact,
+    /// How many files hold the artifact, one unless a shard set was grouped into it.
+    pub shard_count: u32,
     pub org: Option<String>,
     pub name: String,
     pub triage: bool,
@@ -114,6 +124,10 @@ impl ArtifactRow {
         };
         Ok(Self {
             artifact,
+            shard_count: row
+                .get::<_, Option<i64>>("shard_count")?
+                .map_or(1, to_u32)
+                .max(1),
             org: row.get("org")?,
             name: row.get("name")?,
             triage: row.get::<_, i64>("triage")? != 0,
@@ -133,16 +147,17 @@ pub fn upsert_artifact(
     let id: i64 = conn.query_row(
         "INSERT INTO artifact(blob_id, sniff_version, format, role, sub_role, role_confidence, \
              base, base_label, base_confidence, precision, quant, rank, alpha, params, context, \
-             trigger_words, org, name, created_at) \
+             trigger_words, org, name, group_bytes, shard_count, created_at) \
          VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19) \
+             ?18, ?19, ?20, ?21) \
          ON CONFLICT(blob_id, sniff_version) DO UPDATE SET \
              format = excluded.format, role = excluded.role, sub_role = excluded.sub_role, \
              role_confidence = excluded.role_confidence, base = excluded.base, \
              base_label = excluded.base_label, base_confidence = excluded.base_confidence, \
              precision = excluded.precision, quant = excluded.quant, rank = excluded.rank, \
              alpha = excluded.alpha, params = excluded.params, context = excluded.context, \
-             trigger_words = excluded.trigger_words, org = excluded.org, name = excluded.name \
+             trigger_words = excluded.trigger_words, org = excluded.org, name = excluded.name, \
+             group_bytes = excluded.group_bytes, shard_count = excluded.shard_count \
          RETURNING id",
         params![
             input.blob.get(),
@@ -163,6 +178,8 @@ pub fn upsert_artifact(
             input.trigger,
             input.org,
             input.name,
+            input.group_bytes.map(|bytes| bytes as i64),
+            input.shard_count.map(i64::from),
             timestamp_text(at),
         ],
         |row| row.get(0),
@@ -214,6 +231,33 @@ pub fn delete_superseded(conn: &Connection, current: u32) -> Result<u64> {
         "DELETE FROM artifact WHERE sniff_version <> ?1 \
          AND NOT EXISTS (SELECT 1 FROM entry e WHERE e.artifact_id = artifact.id)",
         [i64::from(current)],
+    )?;
+    Ok(to_u64(removed as i64))
+}
+
+/// Removes artifacts for formats that describe their neighbours rather than standing alone.
+///
+/// A `config.json` or a README is context for the weights beside it, never a row of its own.
+/// The scan has always applied that rule, but the upstream ingest once did not, so an index
+/// can hold such rows from before; the entries stay, because the files are still servable.
+pub fn delete_describing(conn: &Connection) -> Result<u64> {
+    let standalone: Vec<&'static str> = ArtifactFormat::iter()
+        .filter(|format| format.is_artifact())
+        .map(ArtifactFormat::as_str)
+        .collect();
+    let placeholders = vec!["?"; standalone.len()].join(", ");
+    let params = rusqlite::params_from_iter(standalone.iter());
+    conn.execute(
+        &format!(
+            "UPDATE entry SET artifact_id = NULL WHERE artifact_id IN \
+             (SELECT id FROM artifact WHERE format NOT IN ({placeholders}))"
+        ),
+        params,
+    )?;
+    let params = rusqlite::params_from_iter(standalone.iter());
+    let removed = conn.execute(
+        &format!("DELETE FROM artifact WHERE format NOT IN ({placeholders})"),
+        params,
     )?;
     Ok(to_u64(removed as i64))
 }
@@ -478,6 +522,27 @@ mod tests {
         assert!(!row.triage);
         assert_eq!(row.use_count, 0);
         assert_eq!(artifact_by_blob(&conn, blob, 1).expect("lookup"), Some(row));
+    }
+
+    #[test]
+    fn artifacts_for_describing_formats_are_swept_but_their_files_stay() {
+        let store = Store::open_in_memory().expect("store opens");
+        let conn = store.write().expect("writer");
+        let weights = upsert_blob(&conn, "xxh3:weights", 64, at()).expect("blob inserts");
+        let config = upsert_blob(&conn, "xxh3:config", 12, at()).expect("blob inserts");
+
+        let kept = upsert_artifact(&conn, &lora(weights), at()).expect("weights write");
+        let mut describing = lora(config);
+        describing.format = ArtifactFormat::Config;
+        let swept = upsert_artifact(&conn, &describing, at()).expect("config writes");
+
+        assert_eq!(delete_describing(&conn).expect("swept"), 1);
+        assert!(artifact(&conn, kept).is_ok(), "weights are untouched");
+        assert!(
+            artifact(&conn, swept).is_err(),
+            "a config is not a row of its own"
+        );
+        assert_eq!(delete_describing(&conn).expect("idempotent"), 0);
     }
 
     #[test]

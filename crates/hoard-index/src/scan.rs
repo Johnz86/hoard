@@ -33,13 +33,16 @@ use crate::discover::{
 use crate::error::{IndexError, Result};
 use crate::hash::{self, FileStamp};
 use crate::infer::{InferInput, Inference, infer};
+use crate::shard::{self, ShardCandidate, ShardSet, directory_of, file_name};
 use crate::sniff::{self, SniffResult};
 use crate::store::Store;
 use crate::store::artifact::{
-    NewArtifact, delete_superseded, replace_evidence, set_card, set_tensor_summary, set_triage,
-    upsert_artifact,
+    NewArtifact, artifact_by_blob, delete_describing, delete_superseded, replace_evidence,
+    set_card, set_tensor_summary, set_triage, upsert_artifact,
 };
-use crate::store::blob::{blob, blob_by_sha256, set_sha256, unhashed_blobs, upsert_blob};
+use crate::store::blob::{
+    blob, blob_by_fingerprint, blob_by_sha256, set_sha256, unhashed_blobs, upsert_blob,
+};
 use crate::store::entry::{
     NewEntry, entries_for_blob, entries_for_revision, mark_absent, upsert_entry,
 };
@@ -72,7 +75,7 @@ pub const PHASE_STORE: &str = "store";
 /// Bump this whenever those rules change. A scan whose recorded version differs ignores the
 /// stamp cache and reads every header again, because the incremental short-circuit is what
 /// otherwise keeps an improved rule from ever reaching an index that already exists.
-pub const SNIFF_VERSION: u32 = 2;
+pub const SNIFF_VERSION: u32 = 3;
 
 /// Where the last scan's [`SNIFF_VERSION`] is recorded.
 const SNIFF_VERSION_KEY: &str = "sniff_version";
@@ -87,6 +90,10 @@ const ENTRY_BATCH: usize = 512;
 
 /// How many blobs one hashing round reads before it writes their hashes back.
 const HASH_BATCH: usize = 64;
+
+/// The ceiling on a `*.index.json` read for its `weight_map`. A forty shard model names a
+/// few hundred kilobytes of tensors; anything larger is not one of these documents.
+const INDEX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 
 /// How many repositories one page of the stamp cache query reads.
 const REPO_PAGE: u32 = 500;
@@ -206,6 +213,13 @@ pub async fn scan(
     store
         .call_mut(move |conn| {
             apply_overrides(conn)?;
+            let described = delete_describing(conn)?;
+            if described > 0 {
+                tracing::info!(
+                    described,
+                    "artifacts for files that describe others removed"
+                );
+            }
             let dropped = delete_superseded(conn, SNIFF_VERSION)?;
             if dropped > 0 {
                 tracing::info!(dropped, "artifacts from a superseded sniff version removed");
@@ -620,6 +634,15 @@ enum Facts {
         state: State,
     },
     Fresh(Box<FreshFacts>),
+    /// One shard of a set the artifact of which rides on another file's blob.
+    Shard(Box<ShardFacts>),
+}
+
+/// The content hashes of one file, empty until the bytes behind it are read.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ContentDigest {
+    sha256: Option<Sha256>,
+    git_sha1: Option<GitSha1>,
 }
 
 #[derive(Debug)]
@@ -628,12 +651,32 @@ struct FreshFacts {
     format: ArtifactFormat,
     tensors: Option<TensorSummary>,
     card: Option<String>,
-    sha256: Option<Sha256>,
-    git_sha1: Option<GitSha1>,
+    digest: ContentDigest,
     org: Option<String>,
     name: String,
     inference: Option<Inference>,
     triage: bool,
+    /// What the whole model weighs and how many files carry it, for a shard set only.
+    group_bytes: Option<u64>,
+    shard_count: Option<u32>,
+}
+
+/// A file that holds part of a model: its own bytes, and the anchor whose artifact speaks
+/// for the set it belongs to.
+#[derive(Debug)]
+struct ShardFacts {
+    fingerprint: String,
+    digest: ContentDigest,
+    anchor: AnchorKey,
+    triage: bool,
+}
+
+/// The bytes a shard set's artifact is identified by, which is what a member entry has to
+/// find at write time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnchorKey {
+    fingerprint: String,
+    size: u64,
 }
 
 struct Preparation {
@@ -721,26 +764,32 @@ fn prepare_revision(
         entries,
     } = revision;
 
-    let sniffed: Vec<Sniffed> = entries
+    let mut sniffed: Vec<Sniffed> = entries
         .par_iter()
         .map(|entry| sniff_entry(entry, setup, counters))
         .collect();
-    let context = InferenceContext::collect(&entries, &sniffed);
-    let artifacts = sniffed.iter().filter(|found| found.is_artifact()).count();
-    let naming = Naming {
-        repo,
-        root_path,
-        kind: setup.kind,
-        single: artifacts <= 1,
+    let sets = regroup(&entries, &mut sniffed, counters);
+    let mut facts = RevisionFacts {
+        naming: Naming {
+            repo,
+            root_path,
+            kind: setup.kind,
+            single: artifact_units(&sniffed, &sets) <= 1,
+        },
+        context: InferenceContext::collect(&entries, &sniffed),
+        triage_confidence: setup.triage_confidence,
+        groups: Vec::new(),
+        roles: vec![None; entries.len()],
     };
+    facts.adopt(&entries, &sniffed, &sets);
 
-    let plans: Vec<EntryPlan> = entries
+    let mut plans: Vec<EntryPlan> = entries
         .into_par_iter()
         .zip(sniffed)
-        .map(|(entry, sniffed)| {
-            finish_entry(entry, sniffed, &naming, &context, setup.triage_confidence)
-        })
+        .enumerate()
+        .map(|(position, (entry, sniffed))| finish_entry(entry, sniffed, position, &facts))
         .collect();
+    plans.sort_by_key(|plan| matches!(plan.facts, Facts::Shard(_)));
 
     let shell = RevisionShell {
         sha: match name {
@@ -861,6 +910,144 @@ fn read_header(path: &Path, size: u64) -> Result<(String, SniffResult)> {
     Ok((fingerprint, result))
 }
 
+/// The size an entry will be stored with: what its stamp proves, or what discovery said.
+fn plan_size(entry: &DiscoveredEntry, sniffed: &Sniffed) -> u64 {
+    sniffed.stamp.map_or(entry.size, |stamp| stamp.size)
+}
+
+/// The shard sets of one revision, addressed by entry position.
+///
+/// A set describes itself from the union of its shard headers, so a member the stamp cache
+/// answered for is read again as soon as any other member changed. A set nothing touched is
+/// left out entirely: its entries still point at the artifact the last scan gave them.
+fn regroup(
+    entries: &[DiscoveredEntry],
+    sniffed: &mut [Sniffed],
+    counters: &Counters<'_>,
+) -> Vec<ShardSet> {
+    let documents = index_documents(entries, sniffed);
+    let mut positions: Vec<usize> = Vec::new();
+    let mut candidates: Vec<ShardCandidate<'_>> = Vec::new();
+    for (position, entry) in entries.iter().enumerate() {
+        if !is_shard_candidate(entry, &sniffed[position]) {
+            continue;
+        }
+        let mut candidate = ShardCandidate::new(entry.rel_path.as_str());
+        if let Some(document) = documents.get(&position) {
+            candidate = candidate.with_index_document(document);
+        }
+        positions.push(position);
+        candidates.push(candidate);
+    }
+
+    let found = shard::group_shards(&candidates);
+    let mut sets = Vec::with_capacity(found.len());
+    for set in found {
+        let members: Vec<usize> = set
+            .members
+            .iter()
+            .map(|candidate| positions[*candidate])
+            .collect();
+        if members
+            .iter()
+            .all(|member| matches!(sniffed[*member].outcome, Outcome::Known { .. }))
+        {
+            continue;
+        }
+        for member in &members {
+            reread(&entries[*member], &mut sniffed[*member], counters);
+        }
+        sets.push(ShardSet { members, ..set });
+    }
+    sets
+}
+
+/// Only a container a model splits across, whose bytes are on this node, can be a shard.
+fn is_shard_candidate(entry: &DiscoveredEntry, sniffed: &Sniffed) -> bool {
+    if entry.abs_path.is_none() {
+        return false;
+    }
+    let file = file_name(&entry.rel_path);
+    if !shard::is_shardable(file) && !shard::is_index_document(file) {
+        return false;
+    }
+    match &sniffed.outcome {
+        Outcome::Absent => false,
+        Outcome::Known { .. } => true,
+        Outcome::Fresh { result, .. } => result.lfs_pointer.is_none(),
+    }
+}
+
+/// Reads the header of a file the stamp cache had already answered for, which is what a
+/// shard set needs of every member once one of them changed.
+fn reread(entry: &DiscoveredEntry, sniffed: &mut Sniffed, counters: &Counters<'_>) {
+    if !matches!(sniffed.outcome, Outcome::Known { .. }) {
+        return;
+    }
+    let Some(abs_path) = entry.abs_path.as_deref() else {
+        return;
+    };
+    let size = plan_size(entry, sniffed);
+    match read_header(abs_path, size) {
+        Ok((fingerprint, result)) => {
+            counters.sniffed.fetch_add(1, Ordering::Relaxed);
+            sniffed.outcome = Outcome::Fresh {
+                fingerprint,
+                result: Box::new(result),
+            };
+        }
+        Err(error) => {
+            tracing::debug!(path = %abs_path.display(), %error, "shard is unreadable");
+        }
+    }
+}
+
+/// The `weight_map` documents of a revision, read from the file itself when the stamp cache
+/// answered for it. They are a few hundred kilobytes at most and there are never many.
+fn index_documents(
+    entries: &[DiscoveredEntry],
+    sniffed: &[Sniffed],
+) -> HashMap<usize, serde_json::Value> {
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| shard::is_index_document(file_name(&entry.rel_path)))
+        .filter_map(|(position, entry)| {
+            index_document(entry, &sniffed[position]).map(|document| (position, document))
+        })
+        .collect()
+}
+
+/// A cache blob is content addressed, so the file the entry points at carries no name and
+/// no format was ever decided for it. The document is read as the JSON it is.
+fn index_document(entry: &DiscoveredEntry, sniffed: &Sniffed) -> Option<serde_json::Value> {
+    if let Some(config) = sniffed
+        .result()
+        .and_then(|result| result.config.as_ref())
+        .cloned()
+    {
+        return Some(config);
+    }
+    let abs_path = entry.abs_path.as_deref()?;
+    let text = sniff::read_text(abs_path, INDEX_DOCUMENT_BYTES).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// How many artifacts a revision will hold: one per shard set, plus every file that stands
+/// on its own. This is what decides whether the repository names its single artifact.
+fn artifact_units(sniffed: &[Sniffed], sets: &[ShardSet]) -> usize {
+    let grouped: HashSet<usize> = sets
+        .iter()
+        .flat_map(|set| set.members.iter().copied())
+        .collect();
+    let alone = sniffed
+        .iter()
+        .enumerate()
+        .filter(|(position, found)| !grouped.contains(position) && found.is_artifact())
+        .count();
+    alone + sets.len()
+}
+
 /// The documents of a revision that describe the weights beside them.
 #[derive(Debug, Default)]
 struct InferenceContext {
@@ -923,12 +1110,6 @@ fn covers(prefix: &str, directory: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-fn directory_of(rel_path: &str) -> &str {
-    rel_path
-        .rsplit_once('/')
-        .map_or("", |(directory, _)| directory)
-}
-
 fn is_model_config(name: &str) -> bool {
     matches!(name, "config.json" | "model_index.json")
 }
@@ -940,12 +1121,186 @@ struct Naming<'a> {
     single: bool,
 }
 
+/// Which part one entry plays in a shard set, by the position of the set it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupRole {
+    Anchor(usize),
+    Member(usize),
+}
+
+/// One model split across files, as the scan will write it: the artifact rides on the
+/// anchor shard's blob, and it describes the union of every member's header.
+#[derive(Debug)]
+struct ShardGroup {
+    anchor: usize,
+    members: Vec<usize>,
+    label: String,
+    stem: String,
+    bytes: u64,
+    tensors: Option<TensorSummary>,
+    inference: Inference,
+    triage: bool,
+    anchor_key: AnchorKey,
+}
+
+/// The one file an inference is about, whatever number of files it was read from.
+struct InferSubject<'a> {
+    rel_path: &'a str,
+    abs_path: Option<&'a Path>,
+    format: ArtifactFormat,
+    tensors: Option<&'a TensorSummary>,
+    config: Option<&'a serde_json::Value>,
+    size: u64,
+}
+
+/// Everything the per entry pass reads besides the entry itself.
+struct RevisionFacts<'a> {
+    naming: Naming<'a>,
+    context: InferenceContext,
+    triage_confidence: f32,
+    groups: Vec<ShardGroup>,
+    roles: Vec<Option<GroupRole>>,
+}
+
+impl RevisionFacts<'_> {
+    /// Turns each shard set into the one artifact it stands for and records which entry
+    /// plays which part in it.
+    fn adopt(&mut self, entries: &[DiscoveredEntry], sniffed: &[Sniffed], sets: &[ShardSet]) {
+        for set in sets {
+            let Some(group) = self.group(entries, sniffed, set) else {
+                continue;
+            };
+            let position = self.groups.len();
+            for member in &group.members {
+                self.roles[*member] = Some(match *member == group.anchor {
+                    true => GroupRole::Anchor(position),
+                    false => GroupRole::Member(position),
+                });
+            }
+            self.groups.push(group);
+        }
+        self.disambiguate();
+    }
+
+    /// A set becomes a group only when its anchor was read and holds something an artifact
+    /// is made of; otherwise every member stays the file it was.
+    fn group(
+        &self,
+        entries: &[DiscoveredEntry],
+        sniffed: &[Sniffed],
+        set: &ShardSet,
+    ) -> Option<ShardGroup> {
+        let anchor = set.anchor();
+        let Outcome::Fresh {
+            fingerprint,
+            result,
+        } = &sniffed[anchor].outcome
+        else {
+            return None;
+        };
+        if !creates_artifact(result.format) {
+            return None;
+        }
+        let bytes: u64 = set
+            .members
+            .iter()
+            .map(|member| plan_size(&entries[*member], &sniffed[*member]))
+            .sum();
+        let parts: Vec<&TensorSummary> = set
+            .members
+            .iter()
+            .filter_map(|member| sniffed[*member].result())
+            .filter_map(|found| found.tensors.as_ref())
+            .collect();
+        let tensors = (!parts.is_empty()).then(|| shard::merge_tensor_summaries(&parts));
+        let entry = &entries[anchor];
+        let inference = self.infer_one(&InferSubject {
+            rel_path: &entry.rel_path,
+            abs_path: entry.abs_path.as_deref(),
+            format: result.format,
+            tensors: tensors.as_ref(),
+            config: result.config.as_ref(),
+            size: bytes,
+        });
+        Some(ShardGroup {
+            anchor,
+            members: set.members.clone(),
+            label: self.label(set),
+            stem: set.stem.clone(),
+            bytes,
+            tensors,
+            triage: needs_triage(&inference, self.triage_confidence),
+            inference,
+            anchor_key: AnchorKey {
+                fingerprint: fingerprint.clone(),
+                size: plan_size(entry, &sniffed[anchor]),
+            },
+        })
+    }
+
+    /// What the row reads: the repository when it holds this model alone, the directory the
+    /// shards share when they sit in one, and the name they have in common otherwise. No
+    /// single shard's file name describes the model.
+    fn label(&self, set: &ShardSet) -> String {
+        let repo_named = matches!(self.naming.kind, SourceKind::HfCache | SourceKind::Git);
+        if self.naming.single && repo_named {
+            return self.naming.repo.name().to_owned();
+        }
+        match file_name(&set.directory) {
+            "" => match repo_named {
+                true => self.naming.repo.name().to_owned(),
+                false => set.stem.clone(),
+            },
+            directory => directory.to_owned(),
+        }
+    }
+
+    /// Two sets of one revision that would read the same are told apart by their stems.
+    fn disambiguate(&mut self) {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for group in &self.groups {
+            *counts.entry(group.label.clone()).or_default() += 1;
+        }
+        for group in &mut self.groups {
+            if counts.get(&group.label).copied().unwrap_or_default() > 1 {
+                group.label = format!("{}/{}", group.label, group.stem);
+            }
+        }
+    }
+
+    /// The rules applied to one artifact, whether its bytes came from one file or forty.
+    fn infer_one(&self, subject: &InferSubject<'_>) -> Inference {
+        let path = inference_path(self.naming.root_path, subject.rel_path, subject.abs_path);
+        let file = file_name(subject.rel_path).to_owned();
+        let mut input = InferInput::new(subject.format, &path, &file, subject.size);
+        if let Some(tensors) = subject.tensors {
+            input = input.with_tensors(tensors);
+        }
+        if let Some(config) = subject
+            .config
+            .or_else(|| self.context.config_for(subject.rel_path))
+        {
+            input = input.with_config(config);
+        }
+        if let Some(frontmatter) = &self.context.frontmatter {
+            input = input.with_frontmatter(frontmatter);
+        }
+        infer(&input)
+    }
+}
+
+/// One file as header sniffing left it, ready to become an artifact or part of one.
+struct FreshInput {
+    result: SniffResult,
+    fingerprint: String,
+    digest: ContentDigest,
+}
+
 fn finish_entry(
     entry: DiscoveredEntry,
     sniffed: Sniffed,
-    naming: &Naming<'_>,
-    context: &InferenceContext,
-    triage_confidence: f32,
+    position: usize,
+    facts: &RevisionFacts<'_>,
 ) -> EntryPlan {
     let DiscoveredEntry {
         rel_path,
@@ -995,15 +1350,29 @@ fn finish_entry(
                 plan.abs_path = None;
                 return plan;
             }
-            plan.facts = Facts::Fresh(Box::new(fresh_facts(
-                &plan,
-                *result,
+            let input = FreshInput {
+                result: *result,
                 fingerprint,
-                (sha256, git_sha1),
-                naming,
-                context,
-                triage_confidence,
-            )));
+                digest: ContentDigest { sha256, git_sha1 },
+            };
+            plan.facts = match facts.roles.get(position).copied().flatten() {
+                Some(GroupRole::Member(group)) => {
+                    let group = &facts.groups[group];
+                    Facts::Shard(Box::new(ShardFacts {
+                        fingerprint: input.fingerprint,
+                        digest: input.digest,
+                        anchor: group.anchor_key.clone(),
+                        triage: group.triage,
+                    }))
+                }
+                Some(GroupRole::Anchor(group)) => Facts::Fresh(Box::new(fresh_facts(
+                    &plan,
+                    input,
+                    facts,
+                    Some(&facts.groups[group]),
+                ))),
+                None => Facts::Fresh(Box::new(fresh_facts(&plan, input, facts, None))),
+            };
         }
     }
     plan
@@ -1011,90 +1380,91 @@ fn finish_entry(
 
 fn fresh_facts(
     plan: &EntryPlan,
-    result: SniffResult,
-    fingerprint: String,
-    known: (Option<Sha256>, Option<GitSha1>),
-    naming: &Naming<'_>,
-    context: &InferenceContext,
-    triage_confidence: f32,
+    input: FreshInput,
+    facts: &RevisionFacts<'_>,
+    group: Option<&ShardGroup>,
 ) -> FreshFacts {
+    let FreshInput {
+        result,
+        fingerprint,
+        digest,
+    } = input;
     let SniffResult {
         format,
         tensors,
         config,
         ..
     } = result;
-    let (org, name) = artifact_name(naming, &plan.rel_path);
-    let inference = creates_artifact(format).then(|| {
-        let path = inference_path(naming.root_path, &plan.rel_path, plan.abs_path.as_deref());
-        let file = file_name(&plan.rel_path).to_owned();
-        let mut input = InferInput::new(format, &path, &file, plan.size);
-        if let Some(tensors) = &tensors {
-            input = input.with_tensors(tensors);
-        }
-        if let Some(config) = config
+    let (org, name) = artifact_name(&facts.naming, &plan.rel_path, group);
+    let inference = match group {
+        Some(group) => Some(group.inference.clone()),
+        None => creates_artifact(format).then(|| {
+            facts.infer_one(&InferSubject {
+                rel_path: &plan.rel_path,
+                abs_path: plan.abs_path.as_deref(),
+                format,
+                tensors: tensors.as_ref(),
+                config: config.as_ref(),
+                size: plan.size,
+            })
+        }),
+    };
+    let triage = match group {
+        Some(group) => group.triage,
+        None => inference
             .as_ref()
-            .or_else(|| context.config_for(&plan.rel_path))
-        {
-            input = input.with_config(config);
-        }
-        if let Some(frontmatter) = &context.frontmatter {
-            input = input.with_frontmatter(frontmatter);
-        }
-        infer(&input)
-    });
-    let triage = inference
-        .as_ref()
-        .is_some_and(|inference| needs_triage(inference, triage_confidence));
+            .is_some_and(|inference| needs_triage(inference, facts.triage_confidence)),
+    };
 
     FreshFacts {
         fingerprint,
         format,
-        card: inference.is_some().then(|| context.card.clone()).flatten(),
-        tensors,
-        sha256: known.0,
-        git_sha1: known.1,
+        card: inference
+            .is_some()
+            .then(|| facts.context.card.clone())
+            .flatten(),
+        tensors: match group {
+            Some(group) => group.tensors.clone(),
+            None => tensors,
+        },
+        digest,
         org,
         name,
         inference,
         triage,
+        group_bytes: group.map(|group| group.bytes),
+        shard_count: group.map(|group| group.members.len() as u32),
     }
 }
 
 /// Only weight and dataset containers become artifacts; cards and configs describe the
 /// files beside them rather than standing on their own.
 const fn creates_artifact(format: ArtifactFormat) -> bool {
-    match format {
-        ArtifactFormat::Safetensors
-        | ArtifactFormat::Gguf
-        | ArtifactFormat::Pth
-        | ArtifactFormat::Pt
-        | ArtifactFormat::Bin
-        | ArtifactFormat::Onnx
-        | ArtifactFormat::Parquet
-        | ArtifactFormat::Arrow
-        | ArtifactFormat::Jsonl
-        | ArtifactFormat::Csv => true,
-        ArtifactFormat::Diffusers
-        | ArtifactFormat::Transformers
-        | ArtifactFormat::Readme
-        | ArtifactFormat::Config
-        | ArtifactFormat::Unknown => false,
-    }
+    format.is_artifact()
 }
 
-/// A repository names its artifact; a loose file is named by its own file name.
-fn artifact_name(naming: &Naming<'_>, rel_path: &str) -> (Option<String>, String) {
-    match naming.kind {
-        SourceKind::Loose | SourceKind::Auto => (None, file_name(rel_path).to_owned()),
-        SourceKind::HfCache | SourceKind::Git => {
-            let name = match naming.single {
-                true => naming.repo.name().to_owned(),
-                false => rel_path.to_owned(),
-            };
-            (naming.repo.org().map(str::to_owned), name)
-        }
+/// A repository names its artifact; a loose file is named by its own file name; a shard set
+/// carries the label the set was given, because no one shard's name describes the model.
+fn artifact_name(
+    naming: &Naming<'_>,
+    rel_path: &str,
+    group: Option<&ShardGroup>,
+) -> (Option<String>, String) {
+    let org = match naming.kind {
+        SourceKind::Loose | SourceKind::Auto => None,
+        SourceKind::HfCache | SourceKind::Git => naming.repo.org().map(str::to_owned),
+    };
+    if let Some(group) = group {
+        return (org, group.label.clone());
     }
+    let name = match naming.kind {
+        SourceKind::Loose | SourceKind::Auto => file_name(rel_path).to_owned(),
+        SourceKind::HfCache | SourceKind::Git => match naming.single {
+            true => naming.repo.name().to_owned(),
+            false => rel_path.to_owned(),
+        },
+    };
+    (org, name)
 }
 
 /// The path inference reads folder hints from. A cache blob is content addressed, so its
@@ -1111,50 +1481,93 @@ fn inference_path(root_path: &Path, rel_path: &str, abs_path: Option<&Path>) -> 
     }
 }
 
-fn file_name(rel_path: &str) -> &str {
-    rel_path.rsplit('/').next().unwrap_or(rel_path)
-}
-
 impl EntryPlan {
     fn fingerprint(&self) -> Option<&str> {
         match &self.facts {
             Facts::Absent => None,
             Facts::Known { fingerprint, .. } => Some(fingerprint),
             Facts::Fresh(fresh) => Some(&fresh.fingerprint),
+            Facts::Shard(shard) => Some(&shard.fingerprint),
+        }
+    }
+
+    /// The artifact this entry contributes to, and whether it belongs in the triage queue.
+    /// A shard contributes nothing of its own: its anchor already stands for the whole set.
+    fn artifact_mark(&self) -> Option<(ArtifactMark<'_>, bool)> {
+        match &self.facts {
+            Facts::Absent | Facts::Shard(_) => None,
+            Facts::Known {
+                artifact, state, ..
+            } => artifact.map(|id| (ArtifactMark::Stored(id.get()), *state == State::Triage)),
+            Facts::Fresh(fresh) => fresh.inference.as_ref().map(|_| {
+                (
+                    ArtifactMark::Fresh(&fresh.fingerprint, self.size),
+                    fresh.triage,
+                )
+            }),
+        }
+    }
+
+    /// Where the bytes still waiting for a content hash are, if this entry brought any.
+    fn unhashed(&self) -> Option<(&str, &Path)> {
+        let abs_path = self.abs_path.as_deref()?;
+        match &self.facts {
+            Facts::Absent | Facts::Known { .. } => None,
+            Facts::Fresh(fresh) => fresh
+                .digest
+                .sha256
+                .is_none()
+                .then_some((fresh.fingerprint.as_str(), abs_path)),
+            Facts::Shard(shard) => shard
+                .digest
+                .sha256
+                .is_none()
+                .then_some((shard.fingerprint.as_str(), abs_path)),
+        }
+    }
+
+    fn digest_mut(&mut self) -> Option<&mut ContentDigest> {
+        match &mut self.facts {
+            Facts::Absent | Facts::Known { .. } => None,
+            Facts::Fresh(fresh) => Some(&mut fresh.digest),
+            Facts::Shard(shard) => Some(&mut shard.digest),
         }
     }
 }
 
-/// Counts unique bytes across the whole plan, which is what a source row records.
+/// What identifies the artifact an entry contributes to while the plan is still in memory:
+/// the row a cached entry points at, or the bytes a fresh one will create it from.
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum ArtifactMark<'a> {
+    Stored(i64),
+    Fresh(&'a str, u64),
+}
+
+/// Counts unique bytes across the whole plan, which is what a source row records. Bytes are
+/// counted per file and artifacts per model, so a set of forty shards is forty blobs, forty
+/// files and one artifact.
 fn summarize(plan: &[RepoPlan]) -> ScanReport {
     let mut report = ScanReport::default();
-    let mut blobs: HashMap<(&str, u64), (bool, bool)> = HashMap::new();
+    let mut blobs: HashSet<(&str, u64)> = HashSet::new();
+    let mut artifacts: HashMap<ArtifactMark<'_>, bool> = HashMap::new();
     for repo in plan {
         for revision in &repo.entries {
             report.files += revision.len() as u64;
             for entry in revision {
-                let Some(fingerprint) = entry.fingerprint() else {
-                    continue;
-                };
-                let facts = match &entry.facts {
-                    Facts::Absent => continue,
-                    Facts::Known {
-                        artifact, state, ..
-                    } => (artifact.is_some(), *state == State::Triage),
-                    Facts::Fresh(fresh) => (fresh.inference.is_some(), fresh.triage),
-                };
-                let slot = blobs.entry((fingerprint, entry.size)).or_insert(facts);
-                slot.0 = slot.0 || facts.0;
-                slot.1 = slot.1 || facts.1;
+                if let Some(fingerprint) = entry.fingerprint() {
+                    blobs.insert((fingerprint, entry.size));
+                }
+                if let Some((mark, triage)) = entry.artifact_mark() {
+                    let slot = artifacts.entry(mark).or_insert(triage);
+                    *slot = *slot || triage;
+                }
             }
         }
     }
     report.blobs = blobs.len() as u64;
-    for ((_, size), (artifact, triage)) in &blobs {
-        report.bytes += size;
-        report.artifacts += u64::from(*artifact);
-        report.triage += u64::from(*triage);
-    }
+    report.bytes = blobs.iter().map(|(_, size)| *size).sum();
+    report.artifacts = artifacts.len() as u64;
+    report.triage = artifacts.values().filter(|triage| **triage).count() as u64;
     report
 }
 
@@ -1166,14 +1579,11 @@ async fn hash_inline(plan: &mut [RepoPlan], threshold: u64, reporter: &Reporter<
     for repo in plan.iter() {
         for revision in &repo.entries {
             for entry in revision {
-                let (Facts::Fresh(fresh), Some(abs_path)) = (&entry.facts, &entry.abs_path) else {
+                let Some((fingerprint, abs_path)) = entry.unhashed() else {
                     continue;
                 };
-                if fresh.sha256.is_some() {
-                    continue;
-                }
-                jobs.entry(fresh.fingerprint.clone())
-                    .or_insert_with(|| (abs_path.clone(), entry.size));
+                jobs.entry(fingerprint.to_owned())
+                    .or_insert_with(|| (abs_path.to_path_buf(), entry.size));
             }
         }
     }
@@ -1193,12 +1603,13 @@ async fn hash_inline(plan: &mut [RepoPlan], threshold: u64, reporter: &Reporter<
     for repo in plan.iter_mut() {
         for revision in repo.entries.iter_mut() {
             for entry in revision.iter_mut() {
-                let Facts::Fresh(fresh) = &mut entry.facts else {
-                    continue;
-                };
-                if let Some((sha256, git_sha1)) = digests.get(fresh.fingerprint.as_str()) {
-                    fresh.sha256 = Some(*sha256);
-                    fresh.git_sha1 = fresh.git_sha1.or(*git_sha1);
+                let found = entry
+                    .fingerprint()
+                    .and_then(|fingerprint| digests.get(fingerprint))
+                    .copied();
+                if let (Some((sha256, git_sha1)), Some(digest)) = (found, entry.digest_mut()) {
+                    digest.sha256 = Some(sha256);
+                    digest.git_sha1 = digest.git_sha1.or(git_sha1);
                 }
             }
         }
@@ -1343,8 +1754,8 @@ fn write_entry(
         } => (Some(*blob), *artifact, *state),
         Facts::Fresh(fresh) => {
             let id = upsert_blob(conn, &fresh.fingerprint, plan.size, context.at)?;
-            if let Some(sha256) = fresh.sha256 {
-                record_hashes(conn, id, sha256, fresh.git_sha1, context.at)?;
+            if let Some(sha256) = fresh.digest.sha256 {
+                record_hashes(conn, id, sha256, fresh.digest.git_sha1, context.at)?;
             }
             let artifact = match &fresh.inference {
                 Some(inference) => Some(write_artifact(conn, id, fresh, inference, context)?),
@@ -1355,6 +1766,17 @@ fn write_entry(
                 false => State::Local,
             };
             (Some(id), artifact, state)
+        }
+        Facts::Shard(shard) => {
+            let id = upsert_blob(conn, &shard.fingerprint, plan.size, context.at)?;
+            if let Some(sha256) = shard.digest.sha256 {
+                record_hashes(conn, id, sha256, shard.digest.git_sha1, context.at)?;
+            }
+            let state = match shard.triage {
+                true => State::Triage,
+                false => State::Local,
+            };
+            (Some(id), anchor_artifact(conn, &shard.anchor)?, state)
         }
     };
 
@@ -1400,6 +1822,8 @@ fn write_artifact(
     input.params = inference.params;
     input.context = inference.context;
     input.trigger = inference.trigger.clone();
+    input.group_bytes = fresh.group_bytes;
+    input.shard_count = fresh.shard_count;
 
     let id = upsert_artifact(conn, &input, context.at)?;
     if let Some(tensors) = &fresh.tensors {
@@ -1411,6 +1835,15 @@ fn write_artifact(
     }
     set_triage(conn, id, fresh.triage)?;
     Ok(id)
+}
+
+/// The artifact of a shard set, reached through the blob of its anchor shard. Members are
+/// written after their anchor, so the row they point at already exists.
+fn anchor_artifact(conn: &Connection, anchor: &AnchorKey) -> Result<Option<ArtifactId>> {
+    let Some(blob) = blob_by_fingerprint(conn, &anchor.fingerprint, anchor.size)? else {
+        return Ok(None);
+    };
+    Ok(artifact_by_blob(conn, blob.id, SNIFF_VERSION)?.map(|row| row.artifact.id))
 }
 
 /// Records content hashes, keeping the sha256 of a blob that already claims them.
@@ -1563,6 +1996,7 @@ mod tests {
     use crate::store::overrides::put_override;
     use crate::store::repo::repo_by_qualified;
     use crate::store::revision::refs_for_repo;
+    use crate::store::search_exec::query_rows;
 
     #[derive(Default)]
     struct Recorder {
@@ -1970,6 +2404,294 @@ mod tests {
             .expect("summary reads")
             .expect("an unclassified artifact still shows its header");
         assert_eq!(summary.tensor_count, 2);
+    }
+
+    /// One piece of a language model: blocks alone, or the embedding alone, so that only
+    /// the union of the pieces is recognizable.
+    fn shard_bytes(keys: &[&str], width: u64) -> Vec<u8> {
+        let shape = [width, width];
+        let shapes: Vec<(&str, &[u64], &str)> = keys
+            .iter()
+            .map(|key| (*key, shape.as_slice(), "F16"))
+            .collect();
+        safetensors(&shapes, &[])
+    }
+
+    fn parquet_bytes(payload: usize) -> Vec<u8> {
+        let mut file = b"PAR1".to_vec();
+        file.resize(4 + payload, 7);
+        file.extend_from_slice(&(payload as u32).to_le_bytes());
+        file.extend_from_slice(b"PAR1");
+        file
+    }
+
+    /// The three pieces of one model: blocks, more blocks, and the embedding that makes the
+    /// set a causal language model. No piece classifies alone.
+    fn llm_shards() -> Vec<Vec<u8>> {
+        vec![
+            shard_bytes(&["model.layers.0.self_attn.q_proj.weight"], 64),
+            shard_bytes(&["model.layers.1.self_attn.q_proj.weight"], 48),
+            shard_bytes(&["lm_head.weight"], 32),
+        ]
+    }
+
+    fn rows(store: &Store) -> Vec<crate::store::SearchRow> {
+        let conn = store.read().expect("reader");
+        query_rows(&conn, "", &[], "", 50, 0).expect("rows read")
+    }
+
+    #[tokio::test]
+    async fn a_sharded_model_is_one_artifact_over_every_file_it_was_split_across() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("hub");
+        fs::create_dir_all(&root).expect("cache root is creatable");
+        let shards = llm_shards();
+        let total: u64 = shards.iter().map(|bytes| bytes.len() as u64).sum();
+        hf_cache(
+            &root,
+            "Qwen/Qwen3-Sharded",
+            &[
+                ("model-00001-of-00003.safetensors", shards[0].clone()),
+                ("model-00002-of-00003.safetensors", shards[1].clone()),
+                ("model-00003-of-00003.safetensors", shards[2].clone()),
+            ],
+        );
+
+        let store = Store::open_in_memory().expect("store opens");
+        let config = config(
+            dir.path(),
+            vec![source("cache", &root, SourceKind::HfCache)],
+        );
+        let recorder = Recorder::default();
+        let report = run(&store, &config, &recorder).await;
+        assert_eq!(report.files, 3);
+        assert_eq!(report.blobs, 3, "a blob stays per file");
+        assert_eq!(report.artifacts, 1, "the shards are one model");
+        assert_eq!(report.triage, 0);
+
+        let listed = rows(&store);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].role, Role::Llm);
+        assert_eq!(listed[0].name, "Qwen3-Sharded");
+        assert_eq!(listed[0].org.as_deref(), Some("Qwen"));
+        assert_eq!(listed[0].size, total, "the row weighs the whole model");
+        assert_eq!(listed[0].shard_count, 3);
+        assert!(!listed[0].triage);
+
+        let conn = store.read().expect("reader");
+        assert!(
+            triage_queue(&conn, 10)
+                .expect("triage queue reads")
+                .is_empty(),
+            "no shard is left over as a question mark"
+        );
+        let repo = repo_by_qualified(&conn, "models/Qwen/Qwen3-Sharded", 1)
+            .expect("repo lookup succeeds")
+            .expect("the repository is indexed");
+        let revision = revisions_for_repo(&conn, repo.id).expect("revisions load");
+        let entries = entries_for_revision(&conn, revision[0].id).expect("entries load");
+        assert_eq!(entries.len(), 3);
+        let artifacts: HashSet<Option<i64>> = entries
+            .iter()
+            .map(|entry| entry.artifact.map(ArtifactId::get))
+            .collect();
+        assert_eq!(artifacts.len(), 1, "every shard points at the one artifact");
+        assert_eq!(
+            artifacts,
+            HashSet::from([Some(listed[0].artifact_id.get())])
+        );
+        let blobs: HashSet<Option<i64>> = entries
+            .iter()
+            .map(|entry| entry.blob.map(BlobId::get))
+            .collect();
+        assert_eq!(blobs.len(), 3, "each shard is served from its own blob");
+
+        let summary = crate::store::artifact::tensor_summary(&conn, listed[0].artifact_id)
+            .expect("summary reads")
+            .expect("the model carries the union of its headers");
+        assert_eq!(summary.tensor_count, 3);
+        assert_eq!(summary.params, 64 * 64 + 48 * 48 + 32 * 32);
+    }
+
+    #[tokio::test]
+    async fn a_weight_map_groups_the_files_it_names_whatever_they_are_called() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("hub");
+        fs::create_dir_all(&root).expect("cache root is creatable");
+        let shards = llm_shards();
+        let total: u64 = shards.iter().map(|bytes| bytes.len() as u64).sum();
+        let document = serde_json::json!({
+            "metadata": { "total_size": total },
+            "weight_map": {
+                "model.layers.0.self_attn.q_proj.weight": "piece-a.safetensors",
+                "model.layers.1.self_attn.q_proj.weight": "piece-b.safetensors",
+                "lm_head.weight": "piece-c.safetensors",
+            }
+        });
+        hf_cache(
+            &root,
+            "org/mapped",
+            &[
+                ("piece-a.safetensors", shards[0].clone()),
+                ("piece-b.safetensors", shards[1].clone()),
+                ("piece-c.safetensors", shards[2].clone()),
+                (
+                    "model.safetensors.index.json",
+                    serde_json::to_vec(&document).expect("the index document encodes"),
+                ),
+            ],
+        );
+
+        let store = Store::open_in_memory().expect("store opens");
+        let config = config(
+            dir.path(),
+            vec![source("cache", &root, SourceKind::HfCache)],
+        );
+        let recorder = Recorder::default();
+        let report = run(&store, &config, &recorder).await;
+        assert_eq!(report.files, 4);
+        assert_eq!(report.artifacts, 1);
+
+        let listed = rows(&store);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].role, Role::Llm);
+        assert_eq!(listed[0].name, "mapped");
+        assert_eq!(listed[0].size, total);
+        assert_eq!(listed[0].shard_count, 3);
+    }
+
+    #[tokio::test]
+    async fn a_sharded_dataset_groups_the_way_a_sharded_model_does() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("data");
+        let sizes = [4096, 3072, 2048];
+        for (index, payload) in sizes.iter().enumerate() {
+            write(
+                &root,
+                &format!("rStar-Coder/seed_sft/data-{index:05}-of-00003.parquet"),
+                &parquet_bytes(*payload),
+            );
+        }
+
+        let store = Store::open_in_memory().expect("store opens");
+        let config = config(dir.path(), vec![source("sets", &root, SourceKind::Loose)]);
+        let recorder = Recorder::default();
+        let report = run(&store, &config, &recorder).await;
+        assert_eq!(report.files, 3);
+        assert_eq!(report.artifacts, 1);
+
+        let listed = rows(&store);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].role, Role::Ds);
+        assert_eq!(listed[0].name, "seed_sft", "the split names the set");
+        assert_eq!(listed[0].shard_count, 3);
+        assert_eq!(
+            listed[0].size,
+            sizes
+                .iter()
+                .map(|payload| *payload as u64 + 12)
+                .sum::<u64>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_file_model_and_an_unlucky_name_are_left_alone() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("scratch");
+        write(&root, "loras/style.safetensors", &lora_bytes(768));
+        write(
+            &root,
+            "loras/something-of-note.safetensors",
+            &lora_bytes(512),
+        );
+        write(
+            &root,
+            "loras/solo-00001-of-00001.safetensors",
+            &lora_bytes(256),
+        );
+
+        let store = Store::open_in_memory().expect("store opens");
+        let config = config(
+            dir.path(),
+            vec![source("scratch", &root, SourceKind::Loose)],
+        );
+        let recorder = Recorder::default();
+        let report = run(&store, &config, &recorder).await;
+        assert_eq!(report.artifacts, 3, "nothing here is a set");
+
+        let listed = rows(&store);
+        assert_eq!(listed.len(), 3);
+        for row in &listed {
+            assert_eq!(row.shard_count, 1);
+            assert!(row.name.ends_with(".safetensors"));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_set_groups_what_is_there_and_claims_no_more() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("hub");
+        fs::create_dir_all(&root).expect("cache root is creatable");
+        let shards = llm_shards();
+        let present: u64 = shards[0].len() as u64 + shards[2].len() as u64;
+        hf_cache(
+            &root,
+            "org/partial",
+            &[
+                ("model-00001-of-00005.safetensors", shards[0].clone()),
+                ("model-00003-of-00005.safetensors", shards[2].clone()),
+            ],
+        );
+
+        let store = Store::open_in_memory().expect("store opens");
+        let config = config(
+            dir.path(),
+            vec![source("cache", &root, SourceKind::HfCache)],
+        );
+        let recorder = Recorder::default();
+        let report = run(&store, &config, &recorder).await;
+        assert_eq!(report.artifacts, 1);
+
+        let listed = rows(&store);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].shard_count, 2, "only what is on disk counts");
+        assert_eq!(listed[0].size, present);
+        assert_eq!(listed[0].role, Role::Llm);
+    }
+
+    #[tokio::test]
+    async fn a_rescan_leaves_a_shard_set_as_the_one_artifact_it_already_was() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("hub");
+        fs::create_dir_all(&root).expect("cache root is creatable");
+        let shards = llm_shards();
+        hf_cache(
+            &root,
+            "org/stable",
+            &[
+                ("model-00001-of-00003.safetensors", shards[0].clone()),
+                ("model-00002-of-00003.safetensors", shards[1].clone()),
+                ("model-00003-of-00003.safetensors", shards[2].clone()),
+            ],
+        );
+
+        let store = Store::open_in_memory().expect("store opens");
+        let config = config(
+            dir.path(),
+            vec![source("cache", &root, SourceKind::HfCache)],
+        );
+        let recorder = Recorder::default();
+        let first = run(&store, &config, &recorder).await;
+        let before = rows(&store);
+        let second = run(&store, &config, &recorder).await;
+        let after = rows(&store);
+
+        assert_eq!(first.artifacts, second.artifacts);
+        assert_eq!(before.len(), 1);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].artifact_id, before[0].artifact_id);
+        assert_eq!(after[0].size, before[0].size);
+        assert_eq!(after[0].shard_count, 3);
     }
 
     #[tokio::test]

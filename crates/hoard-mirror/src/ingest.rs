@@ -43,7 +43,7 @@ pub struct IngestOutcome {
     pub sha256: Sha256,
     pub size: u64,
     pub blob: BlobId,
-    pub artifact: ArtifactId,
+    pub artifact: Option<ArtifactId>,
     pub entry: EntryId,
 }
 
@@ -106,7 +106,7 @@ pub async fn ingest_cached_file(
         let artifact = classify(conn, blob, &repo, &path, size)?;
         let mut new_entry = NewEntry::new(revision, path.clone(), node.id);
         new_entry.blob = Some(blob);
-        new_entry.artifact = Some(artifact);
+        new_entry.artifact = artifact;
         new_entry.size = size;
         new_entry.state = State::Served;
         let entry = upsert_entry(conn, &new_entry, now)?;
@@ -155,13 +155,17 @@ async fn hash_entry(entry: &mut CacheEntry, size: u64) -> Result<EntryHashes> {
 ///
 /// The bytes are blocks in the cache rather than a file on disk, so the container is read
 /// from the extension; a later scan of a projected copy refines it from the magic bytes.
+///
+/// Returns `None` for a file that describes its neighbours rather than standing alone, which
+/// is the same rule a scan applies: a proxied `config.json` should not become a row of its
+/// own any more than a scanned one does.
 fn classify(
     conn: &Writer<'_>,
     blob: BlobId,
     repo: &RepoId,
     path: &str,
     size: u64,
-) -> Result<ArtifactId> {
+) -> Result<Option<ArtifactId>> {
     let as_path = Path::new(path);
     let file_name = as_path
         .file_name()
@@ -172,6 +176,9 @@ fn classify(
         .and_then(|extension| extension.to_str())
         .and_then(|extension| extension.parse::<ArtifactFormat>().ok())
         .unwrap_or(ArtifactFormat::Unknown);
+    if !format.is_artifact() {
+        return Ok(None);
+    }
     let inference = infer(&InferInput::new(format, as_path, file_name, size));
     let mut artifact = NewArtifact::new(blob, file_name);
     artifact.format = format;
@@ -191,7 +198,7 @@ fn classify(
     artifact.org = repo.org().map(str::to_owned);
     let id = upsert_artifact(conn, &artifact, Timestamp::now())?;
     replace_evidence(conn, id, &inference.evidence)?;
-    Ok(id)
+    Ok(Some(id))
 }
 
 #[cfg(test)]
@@ -279,6 +286,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_proxied_config_is_indexed_without_becoming_a_row_of_its_own() {
+        let store = store();
+        let root = TempDir::new().expect("temp dir");
+        let cache = cache(&root);
+        let bytes: Vec<u8> = br#"{"model_type":"llama"}"#.to_vec();
+        let mut entry = entry_of(&cache, &bytes, 1).await;
+
+        let outcome = ingest_cached_file(
+            &store,
+            &cache,
+            &mut entry,
+            CachedFile {
+                repo: &repo(),
+                commit: commit(),
+                path: "config.json",
+                expected: None,
+            },
+        )
+        .await
+        .expect("ingest runs")
+        .expect("entry is complete");
+
+        assert!(
+            outcome.artifact.is_none(),
+            "a config describes its neighbours, exactly as it does when scanned"
+        );
+        let conn = store.read().expect("reader");
+        let node = local_node(&conn).expect("local node");
+        let repo_row = repo_by_qualified(&conn, &repo().qualified(), node.id)
+            .expect("repo reads")
+            .expect("repo exists");
+        let revisions = revisions_for_repo(&conn, repo_row.id).expect("revisions read");
+        let entries = entries_for_revision(&conn, revisions[0].id).expect("entries read");
+        assert_eq!(entries.len(), 1, "the file is still indexed and servable");
+        assert!(entries[0].artifact.is_none());
+        assert!(
+            entries[0].blob.is_some(),
+            "and still deduplicated by content"
+        );
+    }
+
+    #[tokio::test]
     async fn a_completed_entry_becomes_a_searchable_artifact() {
         let store = store();
         let root = TempDir::new().expect("temp dir");
@@ -294,7 +343,8 @@ mod tests {
         assert_eq!(outcome.size, 129);
 
         let conn = store.read().expect("reader");
-        let stored = artifact(&conn, outcome.artifact).expect("artifact reads");
+        let stored = artifact(&conn, outcome.artifact.expect("weights become an artifact"))
+            .expect("artifact reads");
         assert_eq!(stored.name, "model.safetensors");
         assert_eq!(stored.org.as_deref(), Some("openai"));
         assert_eq!(stored.artifact.format, ArtifactFormat::Safetensors);

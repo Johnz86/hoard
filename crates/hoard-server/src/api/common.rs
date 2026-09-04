@@ -267,6 +267,8 @@ pub struct RowView {
     pub trigger: Option<String>,
     pub path: String,
     pub path_count: u32,
+    /// How many files the model spans; 1 unless it is sharded.
+    pub shard_count: u32,
     pub last_used: Option<Timestamp>,
     pub repo: String,
     pub repo_type: RepoType,
@@ -304,6 +306,7 @@ impl From<&SearchRow> for RowView {
             trigger: row.trigger.clone(),
             path: row.abs_path.clone().unwrap_or_else(|| row.path.clone()),
             path_count: row.path_count,
+            shard_count: row.shard_count,
             last_used: row.last_used,
             repo: row.repo.clone(),
             repo_type: repo_type_of(&row.repo),
@@ -417,6 +420,9 @@ pub fn facts(row: &SearchRow) -> Vec<Fact> {
         Fact::new("node", row.node.clone()),
         Fact::new("blob", blob_value(row.blob_sha256.as_ref())),
     ];
+    if row.shard_count > 1 {
+        facts.push(Fact::new("files", format!("{} shards", row.shard_count)));
+    }
     match row.role {
         Role::Lora => facts.push(Fact::new("rank / alpha", rank_alpha(row.rank, row.alpha))),
         Role::Llm => {

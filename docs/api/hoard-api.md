@@ -32,10 +32,15 @@ remote triage`, `format` in `safetensors gguf diffusers pth pt onnx parquet json
     "params": null, "context": null, "quant": null, "revision": "main", "revision_sha": "462c3cb...",
     "node": "workstation", "state": "served", "pull_progress": null,
     "trigger": "film grain, 35mm, halation", "path": "/mnt/vault/loras/film-grain-35mm.safetensors",
-    "path_count": 2, "last_used": "2026-09-04T09:10:00Z" } ],
+    "path_count": 2, "shard_count": 1, "last_used": "2026-09-04T09:10:00Z" } ],
   "next_cursor": "...", "total": 212, "nodes": 3
 }
 ```
+
+`shard_count` is how many files the model spans: a checkpoint split into
+`model-00001-of-00040.safetensors` and its siblings is one row whose `size` is the whole
+model, not forty unclassifiable rows. `path_count` stays per file, because deduplication
+and serving are per file.
 
 `GET /api/v1/search/parse?q=` returns only `query`, for the token strip while typing.
 

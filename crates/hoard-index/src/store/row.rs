@@ -83,6 +83,9 @@ pub struct SearchRow {
     pub precision: Option<Precision>,
     pub quant: Option<String>,
     pub size: u64,
+    /// How many files the artifact is split across; one for a model that is a single file.
+    #[serde(default = "single_shard")]
+    pub shard_count: u32,
     pub rank: Option<u32>,
     pub alpha: Option<f32>,
     pub params: Option<u64>,
@@ -109,10 +112,15 @@ pub struct SearchRow {
 
 /// The column list every search query selects, in the order `SearchRow::from_row` reads.
 pub const SEARCH_COLUMNS: &str = "artifact_id, blob_id, blob_sha256, role, sub_role, \
-     role_confidence, org, name, base, base_label, format, precision, quant, size, rank, alpha, \
-     params, context, revision, revision_sha, node, state, pull_progress, trigger_words, path, \
-     abs_path, path_count, dupe, triage, last_used, repo, repo_id, entry_id, source, is_symlink, \
-     lfs_pointer";
+     role_confidence, org, name, base, base_label, format, precision, quant, size, shard_count, \
+     rank, alpha, params, context, revision, revision_sha, node, state, pull_progress, \
+     trigger_words, path, abs_path, path_count, dupe, triage, last_used, repo, repo_id, \
+     entry_id, source, is_symlink, lfs_pointer";
+
+/// What [`SearchRow::shard_count`] holds for a model nothing split.
+fn single_shard() -> u32 {
+    1
+}
 
 impl SearchRow {
     /// Reads a row selected with [`SEARCH_COLUMNS`], by name so column order cannot drift.
@@ -134,6 +142,7 @@ impl SearchRow {
                 .map(Precision::new),
             quant: row.get("quant")?,
             size: row.get::<_, i64>("size")?.max(0) as u64,
+            shard_count: row.get::<_, i64>("shard_count")?.max(1) as u32,
             rank: row
                 .get::<_, Option<i64>>("rank")?
                 .map(|value| value.max(0) as u32),

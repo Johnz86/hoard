@@ -28,3 +28,6 @@ pub use row::{DiskPressure, FacetBucket, SEARCH_COLUMNS, SearchRow, SqlValue};
 
 /// The schema as applied by migration 1. Kept as a file so it reads as SQL.
 pub const SCHEMA_SQL: &str = include_str!("schema.sql");
+
+/// Migration 2: the columns a sharded model needs, and the view that reads them.
+pub const SCHEMA_V2_SQL: &str = include_str!("schema_v2.sql");
