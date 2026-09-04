@@ -150,6 +150,7 @@ hoard/
           client.rs          reqwest client, header forwarding, redirects
           hub.rs             huggingface.co metadata and files
           peer.rs            another hoard node as an upstream
+          range.rs           Range header parsing and clamping, 416 decisions
         cache/
           layout.rs  entry.rs  block.rs  policy.rs
         git/
