@@ -115,6 +115,7 @@ mod tests {
     fn bucket(value: &str) -> FacetBucket {
         FacetBucket {
             value: value.to_owned(),
+            label: None,
             count: 1,
             active: false,
         }

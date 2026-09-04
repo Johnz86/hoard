@@ -34,6 +34,7 @@ pub struct SearchParams {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FacetBucketView {
     pub value: String,
+    pub label: String,
     pub count: u64,
     pub active: bool,
     pub token: String,
@@ -175,6 +176,7 @@ fn facets(
                 query: select_query(query, key, &bucket.value),
                 count,
                 active: bucket.active,
+                label: bucket.label.unwrap_or_else(|| bucket.value.clone()),
                 value: bucket.value,
             });
         }

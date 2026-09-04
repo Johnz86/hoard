@@ -208,6 +208,12 @@ fn parse_opt_timestamp(value: Option<String>) -> Result<Option<Timestamp>> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FacetBucket {
     pub value: String,
+    /// The spelling to show, when every artifact in the bucket agrees on one.
+    ///
+    /// `value` is the normalized matching key, so a base family reads `nemotronh` while the
+    /// architecture is written `nemotron_h`. Where a bucket holds one spelling it is shown;
+    /// where it holds several the key is the only honest label for the group.
+    pub label: Option<String>,
     pub count: u64,
     pub active: bool,
 }

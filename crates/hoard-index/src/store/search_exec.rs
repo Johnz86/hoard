@@ -72,8 +72,15 @@ pub fn facet_counts(
             "unknown facet dimension {column:?}"
         )));
     }
+    let label = match label_column(column) {
+        Some(label) => {
+            format!("CASE WHEN COUNT(DISTINCT {label}) = 1 THEN MIN({label}) ELSE NULL END")
+        }
+        None => "NULL".to_owned(),
+    };
     let sql = format!(
-        "SELECT {column} AS value, COUNT(DISTINCT artifact_id) AS hits FROM search_row \
+        "SELECT {column} AS value, COUNT(DISTINCT artifact_id) AS hits, {label} AS label \
+         FROM search_row \
          WHERE ({}) AND {column} IS NOT NULL AND {column} <> '' \
          GROUP BY {column} ORDER BY hits DESC, value",
         filter(where_sql)
@@ -83,10 +90,20 @@ pub fn facet_counts(
         Ok(FacetBucket {
             value: row.get(0)?,
             count: to_u64(row.get::<_, i64>(1)?),
+            label: row.get(2)?,
             active: false,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<FacetBucket>>>()?)
+}
+
+/// The column holding the readable spelling of a facet value, where the value is a
+/// normalized key rather than the thing itself.
+const fn label_column(column: &str) -> Option<&'static str> {
+    match column.as_bytes() {
+        b"base" => Some("base_label"),
+        _ => None,
+    }
 }
 
 /// How many nodes hold something the query matches, which is the `nodes` count.
