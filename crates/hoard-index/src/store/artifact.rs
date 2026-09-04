@@ -203,6 +203,21 @@ pub fn artifact_by_blob(
 /// How many artifacts are waiting in the triage queue.
 ///
 /// Counted in SQL: the queue is unbounded in principle, and the badge only needs a number.
+/// Removes artifacts produced by a superseded sniff version that nothing points at any more.
+///
+/// Bumping the sniff version writes a second artifact for the same blob rather than editing
+/// the first, because the pair `(blob, sniff version)` is the identity. Once the scan has
+/// re-pointed every entry at the new row, the old one is unreachable, and leaving it behind
+/// would double every count the UI shows.
+pub fn delete_superseded(conn: &Connection, current: u32) -> Result<u64> {
+    let removed = conn.execute(
+        "DELETE FROM artifact WHERE sniff_version <> ?1 \
+         AND NOT EXISTS (SELECT 1 FROM entry e WHERE e.artifact_id = artifact.id)",
+        [i64::from(current)],
+    )?;
+    Ok(to_u64(removed as i64))
+}
+
 pub fn triage_count(conn: &Connection) -> Result<u64> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM artifact WHERE triage = 1",
@@ -463,6 +478,28 @@ mod tests {
         assert!(!row.triage);
         assert_eq!(row.use_count, 0);
         assert_eq!(artifact_by_blob(&conn, blob, 1).expect("lookup"), Some(row));
+    }
+
+    #[test]
+    fn a_superseded_artifact_is_dropped_once_nothing_points_at_it() {
+        let store = Store::open_in_memory().expect("store opens");
+        let conn = store.write().expect("writer");
+        let blob = upsert_blob(&conn, "xxh3:superseded", 64, at()).expect("blob inserts");
+
+        let stale = upsert_artifact(&conn, &lora(blob), at()).expect("old artifact writes");
+        let next = NewArtifact {
+            sniff_version: 2,
+            ..lora(blob)
+        };
+        upsert_artifact(&conn, &next, at()).expect("new artifact writes");
+
+        assert!(artifact(&conn, stale).is_ok());
+        assert_eq!(delete_superseded(&conn, 2).expect("swept"), 1);
+        assert!(
+            artifact(&conn, stale).is_err(),
+            "the unreachable row is gone"
+        );
+        assert_eq!(delete_superseded(&conn, 2).expect("swept again"), 0);
     }
 
     #[test]

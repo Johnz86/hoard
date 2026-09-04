@@ -59,7 +59,10 @@ const post = (path, body) => request("POST", path, body ?? {});
 const put = (path, body) => request("PUT", path, body ?? {});
 const del = (path) => request("DELETE", path);
 
-const repoBase = (type, org, name) => `/repos/${segment(type)}/${segment(org)}/${segment(name)}`;
+const repoBase = (type, org, name) =>
+    org
+        ? `/repos/${segment(type)}/${segment(org)}/${segment(name)}`
+        : `/repos/${segment(type)}/${segment(name)}`;
 
 export const search = (params) => get("/search", params);
 export const parseQuery = (q) => get("/search/parse", { q });

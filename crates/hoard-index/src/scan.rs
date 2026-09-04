@@ -36,7 +36,8 @@ use crate::infer::{InferInput, Inference, infer};
 use crate::sniff::{self, SniffResult};
 use crate::store::Store;
 use crate::store::artifact::{
-    NewArtifact, replace_evidence, set_card, set_tensor_summary, set_triage, upsert_artifact,
+    NewArtifact, delete_superseded, replace_evidence, set_card, set_tensor_summary, set_triage,
+    upsert_artifact,
 };
 use crate::store::blob::{blob, blob_by_sha256, set_sha256, unhashed_blobs, upsert_blob};
 use crate::store::entry::{
@@ -49,6 +50,7 @@ use crate::store::repo::{NewRepo, RepoFilter, list_repos, upsert_repo};
 use crate::store::revision::{
     NewRevision, RefKind, revisions_for_repo, upsert_ref, upsert_revision,
 };
+use crate::store::setting::{get_setting, put_setting};
 use crate::store::source::{ScanStats, record_scan_stats, upsert_source};
 use crate::triage::needs_triage;
 
@@ -65,6 +67,16 @@ pub const PHASE_HASH: &str = "hash";
 pub const PHASE_STORE: &str = "store";
 
 /// The `job.kind` a scan records.
+/// The version of the sniffing and inference rules an artifact was produced by.
+///
+/// Bump this whenever those rules change. A scan whose recorded version differs ignores the
+/// stamp cache and reads every header again, because the incremental short-circuit is what
+/// otherwise keeps an improved rule from ever reaching an index that already exists.
+pub const SNIFF_VERSION: u32 = 2;
+
+/// Where the last scan's [`SNIFF_VERSION`] is recorded.
+const SNIFF_VERSION_KEY: &str = "sniff_version";
+
 pub const SCAN_JOB: &str = "scan";
 /// The `job.kind` a background hashing run records.
 pub const HASH_JOB: &str = "hash";
@@ -194,6 +206,11 @@ pub async fn scan(
     store
         .call_mut(move |conn| {
             apply_overrides(conn)?;
+            let dropped = delete_superseded(conn, SNIFF_VERSION)?;
+            if dropped > 0 {
+                tracing::info!(dropped, "artifacts from a superseded sniff version removed");
+            }
+            put_setting(conn, SNIFF_VERSION_KEY, &SNIFF_VERSION.to_string())?;
             finish_job(conn, job)
         })
         .await?;
@@ -427,7 +444,10 @@ async fn scan_source(
         .call_mut(move |conn| upsert_source(conn, &name, &path, kind, node_row))
         .await?;
 
-    let cache = load_stamp_cache(store, node_row, source_id).await?;
+    let cache = match rules_are_current(store).await? {
+        true => load_stamp_cache(store, node_row, source_id).await?,
+        false => StampCache::new(),
+    };
     let repos = discovered.into_repos();
     let triage_confidence = config.triage_confidence;
     let mut plan = reporter
@@ -485,6 +505,16 @@ struct Cached {
 }
 
 type StampCache = HashMap<PathBuf, Cached>;
+
+/// Whether the index was built by the rules this binary carries.
+///
+/// When it was not, every header is read again so the new rules actually decide the answer.
+async fn rules_are_current(store: &Store) -> Result<bool> {
+    let recorded = store
+        .call(|conn| get_setting(conn, SNIFF_VERSION_KEY))
+        .await?;
+    Ok(recorded.and_then(|value| value.parse::<u32>().ok()) == Some(SNIFF_VERSION))
+}
 
 /// Reads every entry this source recorded before, so an unchanged file is never opened.
 async fn load_stamp_cache(store: &Store, node_row: i64, source: SourceId) -> Result<StampCache> {
@@ -1354,6 +1384,7 @@ fn write_artifact(
     context: &WriteContext,
 ) -> Result<ArtifactId> {
     let mut input = NewArtifact::new(blob, fresh.name.clone());
+    input.sniff_version = SNIFF_VERSION;
     input.org = fresh.org.clone();
     input.format = fresh.format;
     input.role = inference.role;
@@ -1721,7 +1752,7 @@ mod tests {
         assert_eq!(refs[0].name, "main");
         assert_eq!(refs[0].sha.to_hex(), commit);
 
-        let artifact = artifact_by_blob(&conn, found.id, 1)
+        let artifact = artifact_by_blob(&conn, found.id, SNIFF_VERSION)
             .expect("artifact lookup succeeds")
             .expect("the weights are an artifact");
         assert_eq!(artifact.artifact.role, Role::Lora);

@@ -19,7 +19,12 @@ const FREE_TEXT_SQL: &str = "(COALESCE(org, '') || ' ' || name || ' ' || base ||
      COALESCE(trigger_words, '') || ' ' || role || ' ' || node) LIKE '%' || ? || '%'";
 const FTS_SQL: &str =
     "artifact_id IN (SELECT artifact_id FROM artifact_fts WHERE artifact_fts MATCH ?)";
-const BASE_SQL: &str = "(base = ? OR base LIKE ? || '%' OR ? LIKE base || '%' OR base = 'any')";
+/// Mirrors `Base::matches`, including its guard that an unknown base matches nothing. The
+/// guard is not cosmetic: without it `? LIKE base || '%'` reduces to `? LIKE '%'` for an
+/// empty base, so every artifact whose base could not be inferred answers every `base:`
+/// query.
+const BASE_SQL: &str = "(base <> '' AND (base = ? OR base LIKE ? || '%' \
+     OR ? LIKE base || '%' OR base = 'any'))";
 const BASE_PARAMS: usize = 3;
 
 /// A compiled query: a predicate over the `search_row` view, its positional parameters in
@@ -548,8 +553,8 @@ mod tests {
         let query = compiled("role:lora base:sdxl size:<400mb film grain");
         assert_eq!(
             query.where_sql,
-            "role = ? AND (base = ? OR base LIKE ? || '%' OR ? LIKE base || '%' OR base = 'any') \
-             AND size < ? AND ((COALESCE(org, '') || ' ' || name || ' ' || base || ' ' || \
+            "role = ? AND (base <> '' AND (base = ? OR base LIKE ? || '%' OR ? LIKE base || \
+             '%' OR base = 'any')) AND size < ? AND ((COALESCE(org, '') || ' ' || name || ' ' || base || ' ' || \
              COALESCE(trigger_words, '') || ' ' || role || ' ' || node) LIKE '%' || ? || '%' AND \
              (COALESCE(org, '') || ' ' || name || ' ' || base || ' ' || COALESCE(trigger_words, \
              '') || ' ' || role || ' ' || node) LIKE '%' || ? || '%')"
@@ -748,12 +753,28 @@ mod tests {
         for (key, _) in FACET_DIMENSIONS {
             let compiled =
                 compile_excluding(&query, key, SortSpec::default(), &context()).expect("compiles");
-            assert_eq!(
-                compiled.where_sql.matches(" AND ").count(),
-                3,
-                "dimension {key}"
+            assert!(
+                !compiled.where_sql.contains(key),
+                "excluding {key} must drop its own clause, got {}",
+                compiled.where_sql
             );
+            for (other, _) in FACET_DIMENSIONS.iter().filter(|(other, _)| *other != key) {
+                assert!(
+                    compiled.where_sql.contains(other),
+                    "excluding {key} must keep {other}, got {}",
+                    compiled.where_sql
+                );
+            }
         }
+    }
+
+    #[test]
+    fn an_unknown_base_answers_no_base_query() {
+        let compiled = compiled("base:sdxl");
+        assert!(
+            compiled.where_sql.contains("base <> ''"),
+            "an artifact whose base could not be inferred must not match every base query"
+        );
     }
 
     #[test]

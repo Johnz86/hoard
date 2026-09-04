@@ -372,12 +372,24 @@ function toggleSelection() {
     paintCursor();
 }
 
+function repoPathOf(row) {
+    const parts = String((row && row.repo) || "")
+        .split("/")
+        .filter(Boolean);
+    const [type, org, name] =
+        parts.length >= 3
+            ? [parts[0], parts[1], parts.slice(2).join("/")]
+            : parts.length === 2
+              ? [parts[0], "", parts[1]]
+              : [repoTypeOf(row), row.org || "", row.name || ""];
+    return [type, org, name].map(encodeURIComponent).join("/");
+}
+
 function openRow(row) {
     if (!row) return;
     const params = new URLSearchParams({ tab: "FILES" });
     if (row.artifact_id) params.set("aid", row.artifact_id);
-    const path = [repoTypeOf(row), row.org, row.name].map(encodeURIComponent).join("/");
-    navigate(`#/repo/${path}?${params.toString()}`);
+    navigate(`#/repo/${repoPathOf(row)}?${params.toString()}`);
 }
 
 async function openArtifact(item) {
