@@ -10,6 +10,11 @@ use http_range_header::{EndPosition, StartPosition, parse_range_header};
 /// The multipart part header, boundary aside, that separates two ranges of a 206.
 const PART_CONTENT_TYPE: &str = "application/octet-stream";
 
+/// The most ranges one `Range` header may name. Each range costs an upstream request on the
+/// uncached path, so a longer list is a request amplifier rather than a range request; nginx
+/// draws the same line in the same place.
+pub const MAX_RANGES: usize = 10;
+
 /// One satisfiable byte range, inclusive at both ends as HTTP spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteRange {
@@ -66,12 +71,16 @@ impl RangeOutcome {
 /// Measures a `Range` header against a file of `size` bytes.
 ///
 /// Unsatisfiable members of a comma list are dropped rather than failing the request; a
-/// header that is not valid range syntax is ignored entirely, which is what RFC 9110
-/// requires. Only when every member was unsatisfiable does the caller answer 416.
+/// header that is not valid range syntax, or one naming more than [`MAX_RANGES`] ranges, is
+/// ignored entirely, which is what RFC 9110 permits. Only when every member was
+/// unsatisfiable does the caller answer 416.
 pub fn parse_ranges(header: &str, size: u64) -> RangeOutcome {
     let Ok(parsed) = parse_range_header(header) else {
         return RangeOutcome::Whole;
     };
+    if parsed.ranges.len() > MAX_RANGES {
+        return RangeOutcome::Whole;
+    }
     let mut ranges = Vec::with_capacity(parsed.ranges.len());
     for range in &parsed.ranges {
         let start = match range.start {
@@ -286,6 +295,30 @@ mod tests {
             body.len() as u64
         );
         assert!(body.contains("content-range: bytes 500-599/1000"));
+    }
+
+    #[test]
+    fn a_comma_list_longer_than_the_cap_is_served_as_the_whole_file() {
+        let at_cap = (0..MAX_RANGES)
+            .map(|index| format!("{}-{}", index * 10, index * 10 + 9))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            parse_ranges(&format!("bytes={at_cap}"), SIZE)
+                .ranges()
+                .len(),
+            MAX_RANGES
+        );
+
+        let past_cap = (0..=MAX_RANGES)
+            .map(|index| format!("{}-{}", index * 10, index * 10 + 9))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            parse_ranges(&format!("bytes={past_cap}"), SIZE),
+            RangeOutcome::Whole,
+            "one header must not become one upstream request per member"
+        );
     }
 
     #[test]

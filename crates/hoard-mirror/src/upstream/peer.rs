@@ -35,9 +35,10 @@ pub fn peer_base_url(address: &str) -> Result<Url> {
     Ok(url)
 }
 
-/// The upstream that pulls from a peer, which is the same code path as `huggingface.co`.
+/// The upstream that pulls from a peer, which is the same code path as `huggingface.co`
+/// minus the caller's credentials: a peer is not the audience of an `hf_` token.
 pub fn peer_upstream(client: UpstreamClient, address: &str) -> Result<Hub> {
-    Hub::new(client, peer_base_url(address)?.as_str())
+    Hub::peer(client, peer_base_url(address)?.as_str())
 }
 
 #[cfg(test)]
@@ -76,6 +77,14 @@ mod tests {
     #[test]
     fn a_peer_pull_asks_for_exactly_the_hub_routes() {
         let hub = peer_upstream(client(), "hoard.lan").expect("peer upstream builds");
+        assert_eq!(hub.kind(), crate::upstream::hub::UpstreamKind::Peer);
+        assert!(
+            hub.forwarded_auth(Some(&crate::upstream::client::Authorization::new(
+                "Bearer hf_secret"
+            )))
+            .is_none(),
+            "a peer is not the audience of the caller's token"
+        );
         let repo = RepoId::new(RepoType::Models, Some("openai".to_owned()), "whisper");
         assert_eq!(
             hub.api_url(&repo, "/revision/main").expect("url").as_str(),

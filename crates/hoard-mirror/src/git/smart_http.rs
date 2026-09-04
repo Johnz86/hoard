@@ -1,16 +1,15 @@
 //! Read-only git smart HTTP. `gix` cannot serve `upload-pack`, so the protocol side is
 //! delegated to the `git` binary and this module only frames and streams its output.
 
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::process::Stdio;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::Stream;
 use hoard_index::config::SourceKind;
-use tokio::sync::mpsc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStdout, Command};
 
 use crate::error::{MirrorError, Result};
 
@@ -32,7 +31,7 @@ const FLUSH_PACKET: &[u8] = b"0000";
 const MAX_PACKET_PAYLOAD: usize = 65516;
 const CHUNK_BYTES: usize = 64 * 1024;
 const UPLOAD_PACK_TIMEOUT: Duration = Duration::from_secs(1800);
-const STREAM_QUEUE_DEPTH: usize = 4;
+const TIMED_OUT: &str = "upload-pack exceeded its time limit";
 
 /// The clone directory a git face request is served from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,18 +90,15 @@ pub fn service_header(service: &str) -> Result<Vec<u8>> {
 
 /// Runs `git upload-pack --advertise-refs` and prefixes the smart HTTP service header.
 pub async fn advertise_refs(git_dir: &Path) -> Result<Vec<u8>> {
-    let git_dir = git_dir.to_path_buf();
-    let output = tokio::task::spawn_blocking(move || {
-        Command::new(GIT_BINARY)
-            .arg("upload-pack")
-            .arg("--stateless-rpc")
-            .arg("--advertise-refs")
-            .arg(&git_dir)
-            .stdin(Stdio::null())
-            .output()
-    })
-    .await
-    .map_err(|error| MirrorError::Git(format!("upload-pack task failed: {error}")))??;
+    let output = Command::new(GIT_BINARY)
+        .arg("upload-pack")
+        .arg("--stateless-rpc")
+        .arg("--advertise-refs")
+        .arg(git_dir)
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await?;
     if !output.status.success() {
         return Err(MirrorError::Git(format!(
             "upload-pack --advertise-refs exited with {}: {}",
@@ -116,24 +112,23 @@ pub async fn advertise_refs(git_dir: &Path) -> Result<Vec<u8>> {
 }
 
 /// Runs `git upload-pack --stateless-rpc`, feeding it the request body and streaming its
-/// packfile back. The child is killed when the stream is dropped or the timeout expires.
+/// packfile back.
+///
+/// Everything runs on the async runtime: a client that opens a clone and never reads parks
+/// no thread, and dropping the stream kills the child.
 pub async fn upload_pack(
     git_dir: &Path,
     request_body: Bytes,
 ) -> Result<impl Stream<Item = Result<Bytes>> + Send + 'static> {
-    let git_dir = git_dir.to_path_buf();
-    let mut child = tokio::task::spawn_blocking(move || {
-        Command::new(GIT_BINARY)
-            .arg("upload-pack")
-            .arg("--stateless-rpc")
-            .arg(&git_dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-    })
-    .await
-    .map_err(|error| MirrorError::Git(format!("upload-pack task failed: {error}")))??;
+    let mut child = Command::new(GIT_BINARY)
+        .arg("upload-pack")
+        .arg("--stateless-rpc")
+        .arg(git_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
 
     let mut stdin = child
         .stdin
@@ -143,33 +138,46 @@ pub async fn upload_pack(
         .stdout
         .take()
         .ok_or_else(|| MirrorError::Git("upload-pack stdout unavailable".to_owned()))?;
-
-    tokio::task::spawn_blocking(move || {
-        let _ = stdin.write_all(&request_body).and_then(|()| stdin.flush());
-    });
-
-    let shared = Arc::new(Mutex::new(Some(child)));
-    let watchdog = Arc::clone(&shared);
-    let handle = ChildHandle(shared);
-    let (finished, deadline) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        if tokio::time::timeout(UPLOAD_PACK_TIMEOUT, deadline)
-            .await
-            .is_err()
-        {
-            kill_shared(&watchdog);
-        }
+        let _ = stdin.write_all(&request_body).await;
+        let _ = stdin.shutdown().await;
     });
+    Ok(pack_stream(Pack { child, stdout }))
+}
 
-    let (sender, receiver) = mpsc::channel(STREAM_QUEUE_DEPTH);
-    tokio::task::spawn_blocking(move || {
-        pump(handle, stdout, &sender);
-        drop(finished);
-    });
-    Ok(futures::stream::unfold(
-        receiver,
-        |mut receiver| async move { receiver.recv().await.map(|chunk| (chunk, receiver)) },
-    ))
+/// The running `upload-pack` and the pipe its packfile arrives on.
+#[derive(Debug)]
+struct Pack {
+    child: Child,
+    stdout: ChildStdout,
+}
+
+fn pack_stream(pack: Pack) -> impl Stream<Item = Result<Bytes>> + Send + 'static {
+    let deadline = tokio::time::Instant::now() + UPLOAD_PACK_TIMEOUT;
+    futures::stream::unfold(Some(pack), move |state| async move {
+        let mut pack = state?;
+        let mut buffer = vec![0u8; CHUNK_BYTES];
+        let read = match tokio::time::timeout_at(deadline, pack.stdout.read(&mut buffer)).await {
+            Err(_) => return Some((Err(MirrorError::Git(TIMED_OUT.to_owned())), None)),
+            Ok(Err(error)) => return Some((Err(MirrorError::Io(error)), None)),
+            Ok(Ok(read)) => read,
+        };
+        if read > 0 {
+            buffer.truncate(read);
+            return Some((Ok(Bytes::from(buffer)), Some(pack)));
+        }
+        match tokio::time::timeout_at(deadline, pack.child.wait()).await {
+            Ok(Ok(status)) if status.success() => None,
+            Ok(Ok(status)) => Some((
+                Err(MirrorError::Git(format!(
+                    "upload-pack exited with {status}"
+                ))),
+                None,
+            )),
+            Ok(Err(error)) => Some((Err(MirrorError::Io(error)), None)),
+            Err(_) => Some((Err(MirrorError::Git(TIMED_OUT.to_owned())), None)),
+        }
+    })
 }
 
 /// Only git sources can be cloned; cache-backed and loose repos stay on the Hub face and
@@ -181,74 +189,6 @@ pub const fn is_clonable(kind: SourceKind) -> bool {
 /// The single answer every push route gives.
 pub fn refuse_push() -> MirrorError {
     MirrorError::Git(PUSH_REFUSED.to_owned())
-}
-
-#[derive(Debug)]
-struct ChildHandle(Arc<Mutex<Option<Child>>>);
-
-impl Drop for ChildHandle {
-    fn drop(&mut self) {
-        kill_shared(&self.0);
-        if let Some(mut child) = self.take() {
-            let _ = child.wait();
-        }
-    }
-}
-
-impl ChildHandle {
-    fn take(&self) -> Option<Child> {
-        self.0.lock().ok().and_then(|mut slot| slot.take())
-    }
-}
-
-fn kill_shared(shared: &Mutex<Option<Child>>) {
-    if let Ok(mut slot) = shared.lock()
-        && let Some(child) = slot.as_mut()
-    {
-        let _ = child.kill();
-    }
-}
-
-fn pump(handle: ChildHandle, mut stdout: ChildStdout, sender: &mpsc::Sender<Result<Bytes>>) {
-    let deadline = Instant::now() + UPLOAD_PACK_TIMEOUT;
-    let mut buffer = vec![0u8; CHUNK_BYTES];
-    loop {
-        if Instant::now() > deadline {
-            let _ = sender.blocking_send(Err(MirrorError::Git(
-                "upload-pack exceeded its time limit".to_owned(),
-            )));
-            return;
-        }
-        match stdout.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                if sender
-                    .blocking_send(Ok(Bytes::copy_from_slice(&buffer[..read])))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            Err(error) => {
-                let _ = sender.blocking_send(Err(MirrorError::Io(error)));
-                return;
-            }
-        }
-    }
-    let Some(mut child) = handle.take() else {
-        return;
-    };
-    match child.wait() {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            let _ = sender.blocking_send(Err(MirrorError::Git(format!(
-                "upload-pack exited with {status}"
-            ))));
-        }
-        Err(error) => {
-            let _ = sender.blocking_send(Err(MirrorError::Io(error)));
-        }
-    }
 }
 
 #[cfg(test)]
@@ -380,6 +320,22 @@ mod tests {
         }
         assert!(!body.is_empty());
         assert!(body.windows(4).any(|window| window == b"PACK"));
+    }
+
+    #[tokio::test]
+    async fn upload_pack_reports_a_child_that_failed_rather_than_ending_the_body() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let stream = upload_pack(&dir.path().join("absent"), Bytes::from_static(FLUSH_PACKET))
+            .await
+            .expect("the child spawns");
+        futures::pin_mut!(stream);
+        let mut failure = None;
+        while let Some(chunk) = stream.next().await {
+            if let Err(error) = chunk {
+                failure = Some(error);
+            }
+        }
+        assert!(matches!(failure, Some(MirrorError::Git(_))), "{failure:?}");
     }
 
     #[tokio::test]

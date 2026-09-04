@@ -13,9 +13,16 @@ pub const CONTENT_TYPE: &str = "application/vnd.git-lfs+json";
 pub const OBJECT_MISSING: &str = "Object does not exist";
 /// Message for a write attempt against a read-only mirror.
 pub const UPLOAD_REFUSED: &str = "this mirror is read-only: upload is not supported";
+/// Message for an object past the end of what one batch is answered for.
+pub const BATCH_TOO_LARGE: &str = "too many objects in one batch";
+
+/// The most objects one batch request is resolved for. Every object costs a resolver call,
+/// so an unbounded list is a request amplifier; `git lfs` batches a hundred at a time.
+pub const MAX_BATCH_OBJECTS: usize = 256;
 
 const MISSING_CODE: u16 = 404;
 const REFUSED_CODE: u16 = 403;
+const TOO_LARGE_CODE: u16 = 413;
 const PATH_ESCAPES: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -155,6 +162,9 @@ impl LfsLocation {
 /// Answers a batch request: every held object gets a `download` action pointing at the Hub
 /// `resolve` route, every unheld object gets the 404 error form, and an `upload` batch is
 /// refused object by object.
+///
+/// Objects past [`MAX_BATCH_OBJECTS`] are refused without reaching the resolver, so the
+/// index work one request can ask for is bounded by the cap rather than by the body.
 pub fn build_batch_response(
     request: &BatchRequest,
     base_url: &str,
@@ -163,7 +173,9 @@ pub fn build_batch_response(
     let objects = request
         .objects
         .iter()
-        .map(|object| match request.operation {
+        .enumerate()
+        .map(|(position, object)| match request.operation {
+            _ if position >= MAX_BATCH_OBJECTS => failed(object, TOO_LARGE_CODE, BATCH_TOO_LARGE),
             BatchOperation::Upload => failed(object, REFUSED_CODE, UPLOAD_REFUSED),
             BatchOperation::Download => match resolver(&object.oid) {
                 Some(location) => downloadable(object, location.resolve_url(base_url)),
@@ -261,6 +273,37 @@ mod tests {
         });
         let parsed: BatchRequest = serde_json::from_value(body).expect("request parses");
         assert_eq!(parsed, request(BatchOperation::Download, &[HELD]));
+    }
+
+    #[test]
+    fn a_batch_past_the_cap_is_refused_without_reaching_the_resolver() {
+        let oids: Vec<String> = (0..=MAX_BATCH_OBJECTS)
+            .map(|index| format!("{index:064x}"))
+            .collect();
+        let mut request = request(BatchOperation::Download, &[HELD]);
+        request.objects = oids
+            .iter()
+            .map(|oid| BatchObject {
+                oid: sha256(oid),
+                size: 4096,
+            })
+            .collect();
+
+        let calls = std::cell::Cell::new(0usize);
+        let counting = |oid: &Sha256| {
+            calls.set(calls.get() + 1);
+            resolver(oid)
+        };
+        let response = build_batch_response(&request, "http://hoard.lan:7099/", &counting);
+
+        assert_eq!(response.objects.len(), MAX_BATCH_OBJECTS + 1);
+        assert_eq!(calls.get(), MAX_BATCH_OBJECTS);
+        let last = response.objects.last().expect("an answer per object");
+        assert_eq!(
+            last.error.as_ref().map(|error| error.code),
+            Some(TOO_LARGE_CODE)
+        );
+        assert!(last.actions.is_none());
     }
 
     #[test]

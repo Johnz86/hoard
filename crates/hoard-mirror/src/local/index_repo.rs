@@ -226,6 +226,39 @@ pub(crate) fn revision_files(conn: &Reader, revision: &RevisionRow) -> Result<Ve
     Ok(files)
 }
 
+/// One present file of a revision, named by path.
+///
+/// Only the matching row's blob is read, so resolving one path of a large revision does not
+/// pay for the content hashes of every other file in it.
+pub(crate) fn revision_file(
+    conn: &Reader,
+    revision: &RevisionRow,
+    path: &str,
+) -> Result<Option<RevisionFile>> {
+    let Some(row) = entries_for_revision(conn, revision.id)?
+        .into_iter()
+        .find(|row| row.present && row.path == path)
+    else {
+        return Ok(None);
+    };
+    let (sha256, git_sha1) = match row.blob {
+        Some(id) => {
+            let record = blob(conn, id)?;
+            (record.sha256, record.git_sha1)
+        }
+        None => (None, None),
+    };
+    Ok(Some(RevisionFile {
+        path: row.path,
+        size: row.size,
+        abs_path: row.abs_path.map(PathBuf::from),
+        sha256,
+        git_sha1,
+        artifact: row.artifact,
+        lfs_pointer: row.lfs_pointer,
+    }))
+}
+
 /// `/api/{repo_type}/{ref}` and `/api/{repo_type}/{ref}/revision/{revision}`.
 pub async fn repo_info(store: &Store, repo: &RepoId, revision: &str) -> Result<RepoInfo> {
     let wanted = repo.clone();
@@ -328,10 +361,7 @@ pub async fn locate(
     read_index(store, move |conn| {
         let row = repo_row(conn, &wanted)?;
         let revision = revision_row_by_sha(conn, &row, &sha)?;
-        let files = revision_files(conn, &revision)?;
-        let file = files
-            .into_iter()
-            .find(|file| file.path == cleaned)
+        let file = revision_file(conn, &revision, &cleaned)?
             .ok_or_else(|| MirrorError::EntryNotFound(cleaned.clone()))?;
         let abs_path = file
             .abs_path

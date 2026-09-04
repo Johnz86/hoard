@@ -69,6 +69,7 @@ pub async fn ingest_cached_file(
     if let Some(expected) = file.expected
         && expected != hashes.sha256
     {
+        discard(entry).await;
         return Err(MirrorError::ProxyInvalidData(format!(
             "{path} hashes to {} but upstream promised {}",
             hashes.sha256.to_hex(),
@@ -119,6 +120,21 @@ pub async fn ingest_cached_file(
         }))
     })
     .await
+}
+
+/// Drops every block of an entry whose bytes were not what was promised, so no later
+/// request is served them from the cache under the upstream's etag.
+async fn discard(entry: &mut CacheEntry) {
+    for index in 0..entry.meta().block_count() {
+        if let Err(error) = entry.invalidate_block(index).await {
+            tracing::warn!(
+                dir = %entry.dir().display(),
+                index,
+                %error,
+                "a block of a rejected cache entry was not dropped"
+            );
+        }
+    }
 }
 
 /// The content hashes of a cached file: the sha256 every node dedupes on, plus the git
@@ -434,11 +450,23 @@ mod tests {
         .await
         .expect_err("a wrong hash is refused");
         assert!(matches!(error, MirrorError::ProxyInvalidData(_)), "{error}");
+        assert!(
+            !entry.has_block(0).await,
+            "the bytes that failed the check are gone rather than left to be served"
+        );
+        assert_eq!(
+            ingest_cached_file(&store, &cache, &mut entry, file(&repo(), None))
+                .await
+                .expect("ingest runs"),
+            None,
+            "and the entry reports itself incomplete until it is fetched again"
+        );
 
+        let mut refetched = entry_of(&cache, &bytes, 1).await;
         ingest_cached_file(
             &store,
             &cache,
-            &mut entry,
+            &mut refetched,
             file(&repo(), Some(sha256_of(&bytes))),
         )
         .await

@@ -21,7 +21,8 @@ use crate::cache::{BlockLease, CacheEntry};
 use crate::error::{MirrorError, Result};
 use crate::model::HubTimestamp;
 use crate::upstream::client::{
-    Authorization, IDENTITY_ENCODING, ProxyResponse, UpstreamClient, UpstreamRequest,
+    Authorization, IDENTITY_ENCODING, MAX_PASS_THROUGH_BYTES, ProxyResponse, UpstreamClient,
+    UpstreamRequest, read_capped,
 };
 use crate::upstream::meta::MetaRequest;
 
@@ -87,24 +88,61 @@ pub struct BlockFetch<'a> {
     pub index: u64,
 }
 
+/// Whether an upstream is the origin Hub the caller's credentials belong to, or another
+/// hoard node that merely speaks the same API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamKind {
+    Origin,
+    Peer,
+}
+
 /// An upstream that speaks the Hub API.
 #[derive(Debug, Clone)]
 pub struct Hub {
     client: UpstreamClient,
     base: Url,
+    kind: UpstreamKind,
 }
 
 impl Hub {
+    /// The origin Hub, which is the audience of whatever credentials a caller presented.
     pub fn new(client: UpstreamClient, base: &str) -> Result<Self> {
+        Self::of_kind(client, base, UpstreamKind::Origin)
+    }
+
+    /// Another hoard node. A peer is not the audience of the caller's token, so nothing sent
+    /// to one ever carries it.
+    pub fn peer(client: UpstreamClient, base: &str) -> Result<Self> {
+        Self::of_kind(client, base, UpstreamKind::Peer)
+    }
+
+    fn of_kind(client: UpstreamClient, base: &str, kind: UpstreamKind) -> Result<Self> {
         let base = Url::parse(base).map_err(|error| MirrorError::Config(error.to_string()))?;
         if base.cannot_be_a_base() {
             return Err(MirrorError::Config(format!("upstream {base} has no path")));
         }
-        Ok(Self { client, base })
+        Ok(Self { client, base, kind })
     }
 
     pub fn base(&self) -> &Url {
         &self.base
+    }
+
+    pub const fn kind(&self) -> UpstreamKind {
+        self.kind
+    }
+
+    /// The credentials this upstream may be given. A caller's `Authorization` is addressed
+    /// to the origin Hub, so forwarding it to a peer would hand one machine on the LAN
+    /// another user's token.
+    pub const fn forwarded_auth<'a>(
+        &self,
+        auth: Option<&'a Authorization>,
+    ) -> Option<&'a Authorization> {
+        match self.kind {
+            UpstreamKind::Origin => auth,
+            UpstreamKind::Peer => None,
+        }
     }
 
     pub fn client(&self) -> &UpstreamClient {
@@ -157,7 +195,7 @@ impl Hub {
         let url = self.api_url(repo, "")?;
         let response = self
             .client
-            .send(UpstreamRequest::head(&url).with_auth(auth))
+            .send(UpstreamRequest::head(&url).with_auth(self.forwarded_auth(auth)))
             .await?;
         Ok(response.status().is_success())
     }
@@ -175,14 +213,14 @@ impl Hub {
             .client
             .send(
                 UpstreamRequest::get(&url)
-                    .with_auth(auth)
+                    .with_auth(self.forwarded_auth(auth))
                     .with_accept_encoding(IDENTITY_ENCODING),
             )
             .await?;
         if !response.status().is_success() {
             return Ok(None);
         }
-        let body = response.bytes().await?;
+        let body = read_capped(response, MAX_PASS_THROUGH_BYTES, &url).await?;
         let document: RevisionDocument = serde_json::from_slice(&body)
             .map_err(|error| MirrorError::ProxyInvalidData(error.to_string()))?;
         let sha = document
@@ -207,7 +245,7 @@ impl Hub {
         let url = self.resolve_url(repo, revision, path)?;
         let response = self
             .client
-            .send(UpstreamRequest::head(&url).with_auth(auth))
+            .send(UpstreamRequest::head(&url).with_auth(self.forwarded_auth(auth)))
             .await?;
         let status = response.status();
         if !status.is_success() {
@@ -244,19 +282,14 @@ impl Hub {
             .client
             .send(
                 UpstreamRequest::get(url)
-                    .with_auth(auth)
+                    .with_auth(self.forwarded_auth(auth))
                     .with_byte_range(range.start, range.end)
                     .with_accept_encoding(IDENTITY_ENCODING),
             )
             .await?;
-        if !response.status().is_success() {
-            return Err(MirrorError::ProxyInvalidData(format!(
-                "{url} answered {} for a range request",
-                response.status()
-            )));
-        }
+        require_partial_content(response.status(), url)?;
         reject_transfer_encoding(response.headers(), url)?;
-        let body = response.bytes().await?;
+        let body = read_capped(response, expected, url).await?;
         if body.len() as u64 != expected {
             return Err(MirrorError::ProxyInvalidData(format!(
                 "{url} returned {} bytes for a {expected} byte range",
@@ -285,28 +318,27 @@ impl Hub {
             .client
             .send(
                 UpstreamRequest::get(fetch.url)
-                    .with_auth(fetch.auth)
+                    .with_auth(self.forwarded_auth(fetch.auth))
                     .with_byte_range(range.start, range.end)
                     .with_accept_encoding(IDENTITY_ENCODING),
             )
             .await?;
-        if !response.status().is_success() {
-            return Err(MirrorError::ProxyInvalidData(format!(
-                "{} answered {} for block {}",
-                fetch.url,
-                response.status(),
-                fetch.index
-            )));
-        }
+        require_partial_content(response.status(), fetch.url)?;
         reject_transfer_encoding(response.headers(), fetch.url)?;
 
         let mut response = response;
         let mut block = BytesMut::with_capacity(usize::try_from(expected).unwrap_or_default());
         let mut beat = Instant::now();
         while let Some(chunk) = response.chunk().await? {
+            if block.len() as u64 + chunk.len() as u64 > expected {
+                return Err(MirrorError::ProxyInvalidData(format!(
+                    "block {} of {} runs past its {expected} bytes",
+                    fetch.index, fetch.url
+                )));
+            }
             block.extend_from_slice(&chunk);
             if beat.elapsed() >= HEARTBEAT_INTERVAL {
-                guard.heartbeat();
+                guard.heartbeat().await;
                 beat = Instant::now();
             }
         }
@@ -331,7 +363,7 @@ impl Hub {
     ) -> Result<ProxyResponse> {
         let url = self.url(suffix)?;
         self.client
-            .pass_through(UpstreamRequest::get(&url).with_auth(auth))
+            .pass_through(UpstreamRequest::get(&url).with_auth(self.forwarded_auth(auth)))
             .await
     }
 
@@ -341,8 +373,8 @@ impl Hub {
     /// its body, without the visibility probe olah sent first.
     pub async fn metadata(&self, request: &MetaRequest<'_>) -> Result<ProxyResponse> {
         let url = self.api_url(request.repo, &request.kind.suffix())?;
-        let mut upstream =
-            UpstreamRequest::new(request.kind.method(), &url).with_auth(request.auth);
+        let mut upstream = UpstreamRequest::new(request.kind.method(), &url)
+            .with_auth(self.forwarded_auth(request.auth));
         if let Some(query) = request.kind.query() {
             upstream = upstream.with_query(query);
         }
@@ -415,6 +447,18 @@ fn metadata_error(status: StatusCode, repo: &RepoId, path: &str) -> MirrorError 
         404 => MirrorError::EntryNotFound(path.to_owned()),
         code => MirrorError::ProxyInvalidData(format!("resolve answered {code}")),
     }
+}
+
+/// A range request is answered with 206. An upstream that answers 200 ignored the `Range`
+/// and is sending the whole file, which is neither the bytes that were asked for nor a body
+/// this node will hold.
+fn require_partial_content(status: StatusCode, url: &Url) -> Result<()> {
+    if status == StatusCode::PARTIAL_CONTENT {
+        return Ok(());
+    }
+    Err(MirrorError::ProxyInvalidData(format!(
+        "{url} answered {status} for a range request"
+    )))
 }
 
 fn reject_transfer_encoding(headers: &HeaderMap, url: &Url) -> Result<()> {
@@ -725,7 +769,7 @@ mod tests {
         hub.fill_block(&mut entry, fetch)
             .await
             .expect("block fetches");
-        assert!(entry.has_block(1));
+        assert!(entry.has_block(1).await);
         assert_eq!(entry.read_range(64..128).await.expect("reads"), body);
 
         hub.fill_block(&mut entry, fetch)
@@ -762,7 +806,7 @@ mod tests {
             .await
             .expect_err("a short block is not written");
         assert!(matches!(error, MirrorError::ProxyInvalidData(_)), "{error}");
-        assert!(!entry.has_block(0));
+        assert!(!entry.has_block(0).await);
 
         let compressed = MockServer::start().await;
         Mock::given(method("GET"))
@@ -789,6 +833,126 @@ mod tests {
                 .expect_err("a compressed block is not a block"),
             MirrorError::ProxyInvalidData(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_body_that_runs_past_the_range_is_refused_before_it_is_held() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(vec![1u8; 4096]))
+            .mount(&server)
+            .await;
+
+        let root = TempDir::new().expect("temp dir");
+        let cache = cache(&root);
+        let sha = SHA.parse::<CommitSha>().expect("sha parses");
+        let mut entry = cache
+            .file_entry(&repo(), &sha, "model.bin", 64, None)
+            .await
+            .expect("entry opens");
+        let hub = hub(&server.uri());
+        let url = hub.url("file").expect("url");
+        let error = hub
+            .fill_block(
+                &mut entry,
+                BlockFetch {
+                    url: &url,
+                    auth: None,
+                    index: 0,
+                },
+            )
+            .await
+            .expect_err("an over-long block is refused");
+        assert!(matches!(error, MirrorError::ProxyInvalidData(_)), "{error}");
+        assert!(!entry.has_block(0).await);
+
+        let error = hub
+            .download_range(&url, None, 0..64)
+            .await
+            .expect_err("and so is an over-long range");
+        assert!(matches!(error, MirrorError::ProxyInvalidData(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_upstream_that_ignores_the_range_and_answers_200_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![2u8; 64]))
+            .mount(&server)
+            .await;
+
+        let root = TempDir::new().expect("temp dir");
+        let cache = cache(&root);
+        let sha = SHA.parse::<CommitSha>().expect("sha parses");
+        let mut entry = cache
+            .file_entry(&repo(), &sha, "model.bin", 64, None)
+            .await
+            .expect("entry opens");
+        let hub = hub(&server.uri());
+        let url = hub.url("file").expect("url");
+        let error = hub
+            .fill_block(
+                &mut entry,
+                BlockFetch {
+                    url: &url,
+                    auth: None,
+                    index: 0,
+                },
+            )
+            .await
+            .expect_err("200 means the range was ignored");
+        assert!(matches!(error, MirrorError::ProxyInvalidData(_)), "{error}");
+        assert!(!entry.has_block(0).await);
+
+        let error = hub
+            .download_range(&url, None, 0..64)
+            .await
+            .expect_err("200 means the range was ignored");
+        assert!(matches!(error, MirrorError::ProxyInvalidData(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_peer_is_never_handed_the_callers_credentials() {
+        let server = MockServer::start().await;
+        Mock::given(header("authorization", "Bearer hf_secret"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sha": SHA,
+            })))
+            .mount(&server)
+            .await;
+
+        let auth = Authorization::new("Bearer hf_secret");
+        let client = UpstreamClient::new(false)
+            .expect("client builds")
+            .with_retry(RetryPolicy::immediate(2));
+        let peer = Hub::peer(client, &server.uri()).expect("peer hub builds");
+        assert_eq!(peer.kind(), UpstreamKind::Peer);
+        assert!(peer.forwarded_auth(Some(&auth)).is_none());
+
+        assert!(
+            peer.probe_repo(&repo(), Some(&auth))
+                .await
+                .expect("the probe answers")
+        );
+        assert!(
+            peer.revision(&repo(), "main", Some(&auth))
+                .await
+                .expect("the revision answers")
+                .is_some()
+        );
+
+        let origin = hub(&server.uri());
+        assert_eq!(origin.kind(), UpstreamKind::Origin);
+        assert_eq!(origin.forwarded_auth(Some(&auth)), Some(&auth));
     }
 
     #[tokio::test]

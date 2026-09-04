@@ -6,6 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::config::CleanStrategy;
 use crate::error::Result;
 
+/// The header of a block-cache entry. An entry that lost it to a crash mid-rewrite is still
+/// an entry, so eviction recognises the `blocks/` directory as well.
+const META_FILE: &str = "meta.bin";
+const BLOCKS_DIR: &str = "blocks";
+const META_LOCK_FILE: &str = "meta.lock";
+
 /// What eviction knows about one cache unit: a block-cache entry directory, or a cached API
 /// response and its `.body` sidecar.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,22 +120,21 @@ fn collect_into(dir: &Path, units: &mut Vec<EntryStat>) -> Result<()> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    let mut has_meta = false;
+    let mut is_entry = false;
     let mut files = Vec::new();
     for entry in read {
         let entry = entry?;
         let path = entry.path();
         if entry.file_type()?.is_dir() {
+            is_entry |= path.file_name().is_some_and(|name| name == BLOCKS_DIR);
             children.push(path);
             continue;
         }
-        if path.file_name().is_some_and(|name| name == "meta.bin") {
-            has_meta = true;
-        }
+        is_entry |= path.file_name().is_some_and(|name| name == META_FILE);
         files.push(path);
     }
 
-    if has_meta {
+    if is_entry {
         units.push(entry_stat(dir)?);
         return Ok(());
     }
@@ -149,9 +154,9 @@ fn collect_into(dir: &Path, units: &mut Vec<EntryStat>) -> Result<()> {
 
 fn entry_stat(dir: &Path) -> Result<EntryStat> {
     let size = directory_size(dir)?;
-    let marker = dir.join("meta.lock");
-    let accessed = seconds_modified(&marker).or_else(|| seconds_modified(&dir.join("meta.bin")));
-    let created = seconds_created(&dir.join("meta.bin"));
+    let marker = dir.join(META_LOCK_FILE);
+    let accessed = seconds_modified(&marker).or_else(|| seconds_modified(&dir.join(META_FILE)));
+    let created = seconds_created(&dir.join(META_FILE));
     Ok(EntryStat {
         path: dir.to_path_buf(),
         size,
@@ -324,6 +329,61 @@ mod tests {
         assert!(!entry.exists());
         assert!(!api.join("meta_get.json").exists());
         assert!(!api.join("meta_get.json.body").exists());
+    }
+
+    #[test]
+    fn an_entry_that_lost_its_header_to_a_crash_is_still_an_entry() {
+        let root = TempDir::new().expect("temp dir");
+        let orphan = root
+            .path()
+            .join("files/models/org/name/resolve/sha/model.bin");
+        std::fs::create_dir_all(orphan.join("blocks")).expect("entry dirs");
+        std::fs::write(orphan.join("blocks/block_00000000.bin"), vec![0u8; 4096]).expect("block");
+
+        let units = collect(root.path()).expect("scan");
+        assert_eq!(
+            units
+                .iter()
+                .map(|unit| unit.path.clone())
+                .collect::<Vec<_>>(),
+            vec![orphan.clone()],
+            "a header lost between wipe and rewrite must not hide the bytes from eviction"
+        );
+        assert_eq!(units[0].size, 4096);
+        assert_eq!(
+            select_evictions(&units, 0, CleanStrategy::Lru),
+            vec![orphan]
+        );
+    }
+
+    #[tokio::test]
+    async fn eviction_orders_real_entries_by_the_marker_a_cache_hit_refreshes() {
+        let root = TempDir::new().expect("temp dir");
+        let mut paths = Vec::new();
+        for (name, age) in [("cold", 7_200u64), ("warm", 60)] {
+            let entry = root.path().join(format!("files/models/org/{name}"));
+            std::fs::create_dir_all(entry.join("blocks")).expect("entry dirs");
+            std::fs::write(entry.join("meta.bin"), vec![0u8; 64]).expect("meta");
+            std::fs::write(entry.join("meta.lock"), b"").expect("marker");
+            std::fs::write(entry.join("blocks/block_00000000.bin"), vec![0u8; 512]).expect("block");
+            let when = SystemTime::now() - std::time::Duration::from_secs(age);
+            std::fs::File::options()
+                .write(true)
+                .open(entry.join("meta.lock"))
+                .expect("marker opens")
+                .set_times(std::fs::FileTimes::new().set_modified(when))
+                .expect("marker backdates");
+            paths.push(entry);
+        }
+
+        let units = collect(root.path()).expect("scan");
+        assert_eq!(units.len(), 2);
+        let total: u64 = units.iter().map(|unit| unit.size).sum();
+        assert_eq!(
+            select_evictions(&units, total - 1, CleanStrategy::Lru),
+            vec![paths[0].clone()],
+            "the entry nobody has touched goes first"
+        );
     }
 
     #[tokio::test]

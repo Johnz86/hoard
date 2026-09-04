@@ -45,8 +45,9 @@ pub const REVISION_TTL: Duration = Duration::from_secs(300);
 /// How many resolved revisions are remembered in memory.
 pub const REVISION_CACHE_CAPACITY: u64 = 4_096;
 
-/// How long a cached metadata document answers for while this node is online. Offline, or
-/// under a proxy rule that denies the repository, a document is served whatever its age.
+/// How long a cached metadata document answers for while this node is online. Offline, a
+/// document is served whatever its age; under a proxy rule that denies the repository,
+/// nothing cached is served at all.
 pub const METADATA_TTL: Duration = REVISION_TTL;
 
 /// The read size of a file served straight off the filesystem.
@@ -91,6 +92,10 @@ pub struct FileRequest<'a> {
     /// A HEAD answers with identical headers and status and an empty body, and never
     /// creates or extends a cache entry.
     pub head: bool,
+    /// The content hash the caller already knows these bytes must have, which ingest checks
+    /// instead of the hash the upstream's `x-linked-etag` claims. A peer pull sets it to the
+    /// digest the peer promised, so a peer cannot file bytes of its own choosing here.
+    pub expected: Option<Sha256>,
 }
 
 impl<'a> FileRequest<'a> {
@@ -101,6 +106,7 @@ impl<'a> FileRequest<'a> {
             path,
             auth: None,
             head: false,
+            expected: None,
         }
     }
 
@@ -111,6 +117,13 @@ impl<'a> FileRequest<'a> {
 
     pub fn head(mut self, head: bool) -> Self {
         self.head = head;
+        self
+    }
+
+    /// The content hash ingest must see, overriding the one derived from the upstream's
+    /// `x-linked-etag`.
+    pub fn with_expected(mut self, expected: Option<Sha256>) -> Self {
+        self.expected = expected;
         self
     }
 }
@@ -437,13 +450,18 @@ impl Mirror {
     /// The metadata routes hoard forwards rather than answers: repo info, tree, paths-info
     /// and commits.
     ///
-    /// The documented order in exactly one upstream call: the cached document while it is
-    /// fresh, then the upstream when the rules and the network allow it, then the cached
-    /// document at any age. The commit the answer is filed under is read out of the answer
-    /// itself, so proxying one never costs a second lookup.
+    /// A repository the `proxy` rules deny is 401 `RepoNotFound` before the cache is
+    /// consulted, so revoking access revokes it for documents already on disk. Otherwise the
+    /// documented order in exactly one upstream call: the cached document while it is fresh,
+    /// then the upstream while the network allows it, then the cached document at any age.
+    /// The commit the answer is filed under is read out of the answer itself, so proxying
+    /// one never costs a second lookup.
     pub async fn metadata(&self, request: MetaRequest<'_>) -> Result<ProxyResponse> {
         let subject = request.repo.reference();
-        let live = self.access.proxy_allowed(&subject) && !self.is_offline();
+        if !self.access.proxy_allowed(&subject) {
+            return Err(MirrorError::RepoNotFound(subject));
+        }
+        let live = !self.is_offline();
         if let Some(answer) = self
             .cached_metadata(&request, live.then_some(METADATA_TTL))
             .await?
@@ -595,15 +613,7 @@ impl Mirror {
             });
         }
         if !self.access.proxy_allowed(&repo.reference()) {
-            return self.cached_revision(repo, wanted).await.map_or_else(
-                || Err(MirrorError::RepoNotFound(repo.reference())),
-                |sha| {
-                    Ok(Resolution {
-                        sha,
-                        source: RevisionSource::Cache,
-                    })
-                },
-            );
+            return Err(MirrorError::RepoNotFound(repo.reference()));
         }
         if self.is_offline() {
             return self.cached_revision(repo, wanted).await.map_or_else(
@@ -635,6 +645,10 @@ impl Mirror {
     }
 
     /// Opens one path of one revision, choosing the cheapest source that can serve it.
+    ///
+    /// A repository the `proxy` rules deny is 401 `RepoNotFound` for everything the cache
+    /// holds as well as for everything upstream: only what this node's own index names is
+    /// still servable, because that is this node's content rather than a proxied copy.
     pub async fn open_file(&self, request: FileRequest<'_>) -> Result<FileAnswer> {
         let path = clean_repo_path(request.path)
             .filter(|path| !path.is_empty())
@@ -647,6 +661,10 @@ impl Mirror {
             .await
         {
             return Ok(answer);
+        }
+        let subject = request.repo.reference();
+        if !self.access.proxy_allowed(&subject) {
+            return Err(MirrorError::RepoNotFound(subject));
         }
         if let Some(answer) = self.cached_answer(&request, &resolution.sha, &path).await? {
             return Ok(answer);
@@ -827,7 +845,7 @@ impl Mirror {
             url: self
                 .upstream
                 .resolve_url(request.repo, &sha.to_hex(), path)?,
-            auth: request.auth.cloned(),
+            auth: self.upstream.forwarded_auth(request.auth).cloned(),
         }))
     }
 
@@ -839,9 +857,6 @@ impl Mirror {
     ) -> Result<FileAnswer> {
         let repo = request.repo;
         let subject = repo.reference();
-        if !self.access.proxy_allowed(&subject) {
-            return Err(MirrorError::RepoNotFound(subject));
-        }
         if self.is_offline() {
             return Err(MirrorError::Offline(format!(
                 "{}/{path}@{}",
@@ -877,7 +892,9 @@ impl Mirror {
             repo: repo.clone(),
             commit: *sha,
             path: path.clone(),
-            expected: remote.linked_etag.as_deref().and_then(parse_sha256),
+            expected: request
+                .expected
+                .or_else(|| remote.linked_etag.as_deref().and_then(parse_sha256)),
         });
         Ok(FileAnswer {
             commit: remote.commit.unwrap_or(*sha),
@@ -893,7 +910,7 @@ impl Mirror {
                 remote: RemoteBytes {
                     hub: self.upstream.clone(),
                     url: self.upstream.resolve_url(repo, &sha.to_hex(), &path)?,
-                    auth: request.auth.cloned(),
+                    auth: self.upstream.forwarded_auth(request.auth).cloned(),
                 },
                 entry,
                 ingest,
@@ -1127,7 +1144,7 @@ impl BlockReader {
         let mut entry = self.entry.lock().await;
         let index = entry.meta().geometry().block_of(position);
         let end = block_end(&entry, position, limit);
-        if !entry.has_block(index) {
+        if !entry.has_block(index).await {
             self.fill(&mut entry, index).await?;
         }
         match entry.read_range(position..end).await {
@@ -1161,12 +1178,15 @@ fn lost_block(error: &MirrorError) -> bool {
     }
 }
 
-/// The end of the read that keeps one read inside one block.
+/// The end of the read that keeps one read inside one chunk, so a stream of a large file
+/// hands the transport one chunk-sized buffer at a time rather than one block-sized one.
 fn block_end(entry: &CacheEntry, position: u64, limit: u64) -> u64 {
-    let block = entry
-        .meta()
-        .block_range(entry.meta().geometry().block_of(position));
-    (position + limit).min(block.end.max(position))
+    let geometry = entry.meta().geometry();
+    let block = entry.meta().block_range(geometry.block_of(position));
+    let chunk_end = (position / geometry.chunk_size() + 1) * geometry.chunk_size();
+    (position + limit)
+        .min(block.end.max(position))
+        .min(chunk_end)
 }
 
 #[cfg(test)]
@@ -1223,13 +1243,6 @@ mod tests {
 
     fn harness(upstream: &str, config: MirrorConfig) -> Harness {
         let root = TempDir::new().expect("temp dir");
-        let offline = config.offline;
-        let access = AccessPolicy::compile(&config).expect("rules compile");
-        let cache = BlockCache::at_root(Arc::new(config), root.path());
-        let client = UpstreamClient::new(offline)
-            .expect("client builds")
-            .with_retry(RetryPolicy::immediate(2));
-        let hub = Hub::new(client, upstream).expect("hub builds");
         let store = Store::open_in_memory().expect("store opens");
         let conn = store.write().expect("writer");
         upsert_node(
@@ -1244,9 +1257,22 @@ mod tests {
         .expect("node inserts");
         drop(conn);
         Harness {
-            mirror: Mirror::new(store, Arc::new(cache), Arc::new(access), hub),
+            mirror: mirror_at(root.path(), upstream, config, store),
             _root: root,
         }
+    }
+
+    /// A mirror over an existing cache tree and index, for the tests that change the rules
+    /// and ask the same node again.
+    fn mirror_at(root: &Path, upstream: &str, config: MirrorConfig, store: Store) -> Mirror {
+        let offline = config.offline;
+        let access = AccessPolicy::compile(&config).expect("rules compile");
+        let cache = BlockCache::at_root(Arc::new(config), root);
+        let client = UpstreamClient::new(offline)
+            .expect("client builds")
+            .with_retry(RetryPolicy::immediate(2));
+        let hub = Hub::new(client, upstream).expect("hub builds");
+        Mirror::new(store, Arc::new(cache), Arc::new(access), hub)
     }
 
     fn index_file(store: &Store, dir: &Path, bytes: &[u8]) -> PathBuf {
@@ -2223,6 +2249,286 @@ mod tests {
                 .expect("path builds")
                 .exists(),
             "nothing is written for a repo the cache rules deny"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proxy_denial_refuses_a_repository_whose_cache_is_already_populated() {
+        let server = MockServer::start().await;
+        mount_revision(&server, SHA).await;
+        let bytes: Vec<u8> = (0..192u8).collect();
+        upstream_file(&server, bytes.clone()).await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/api/models/openai/whisper"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(info_body(SHA)))
+            .mount(&server)
+            .await;
+
+        let open = harness(&server.uri(), config(false, true));
+        let answer = open
+            .mirror
+            .open_file(FileRequest::new(&repo(), "main", "model.safetensors"))
+            .await
+            .expect("opens");
+        assert_eq!(collect(&answer, None).await, bytes);
+        open.mirror
+            .metadata(meta_request(&repo(), MetaKind::RepoInfo { revision: None }))
+            .await
+            .expect("the repo info is proxied");
+        let entry = open
+            .mirror
+            .cache()
+            .layout()
+            .file_entry(&repo(), &commit(), "model.safetensors")
+            .expect("path builds");
+        assert!(
+            entry.exists(),
+            "the cache is populated before the rule lands"
+        );
+
+        let mut denied = config(false, true);
+        denied.proxy = vec![AccessRule::glob("other/*", true)];
+        let strict = mirror_at(
+            open._root.path(),
+            &server.uri(),
+            denied,
+            open.mirror.store().clone(),
+        );
+
+        let error = strict
+            .open_file(FileRequest::new(&repo(), "main", "model.safetensors"))
+            .await
+            .expect_err("a denied repository is not served from the cache");
+        assert!(matches!(error, MirrorError::RepoNotFound(_)), "{error}");
+
+        let error = strict
+            .open_file(FileRequest::new(&repo(), SHA, "model.safetensors"))
+            .await
+            .expect_err("naming the commit does not walk around the rule");
+        assert!(matches!(error, MirrorError::RepoNotFound(_)), "{error}");
+
+        let error = strict
+            .metadata(meta_request(&repo(), MetaKind::RepoInfo { revision: None }))
+            .await
+            .expect_err("nor is the cached metadata document");
+        assert!(matches!(error, MirrorError::RepoNotFound(_)), "{error}");
+
+        let error = strict
+            .resolve_revision(&repo(), "main", None)
+            .await
+            .expect_err("nor is the cached revision");
+        assert!(matches!(error, MirrorError::RepoNotFound(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_denied_repository_still_serves_what_this_node_holds_itself() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let mut denied = config(true, false);
+        denied.proxy = vec![AccessRule::glob("other/*", true)];
+        let harness = harness(&server.uri(), denied);
+        let bytes = vec![6u8; 64];
+        index_file(harness.mirror.store(), harness._root.path(), &bytes);
+
+        let answer = harness
+            .mirror
+            .open_file(FileRequest::new(&repo(), "main", "model.safetensors"))
+            .await
+            .expect("the index is this node's own content, not a proxied copy");
+        assert!(matches!(answer.source, ByteSource::Local(_)));
+        assert_eq!(collect(&answer, None).await, bytes);
+    }
+
+    #[tokio::test]
+    async fn an_upstream_that_dies_mid_body_fails_the_stream_rather_than_the_answer() {
+        let server = MockServer::start().await;
+        mount_revision(&server, SHA).await;
+        Mock::given(method("HEAD"))
+            .and(path_matcher(format!(
+                "/openai/whisper/resolve/{SHA}/model.safetensors"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", "192")
+                    .insert_header("etag", "\"upstream-etag\"")
+                    .insert_header("x-repo-commit", SHA),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_matcher(format!(
+                "/openai/whisper/resolve/{SHA}/model.safetensors"
+            )))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(vec![0u8; 8]))
+            .mount(&server)
+            .await;
+        let harness = harness(&server.uri(), config(false, true));
+
+        let answer = harness
+            .mirror
+            .open_file(FileRequest::new(&repo(), "main", "model.safetensors"))
+            .await
+            .expect("the head answers");
+        assert_eq!(answer.size, 192);
+
+        let mut stream = read_range(&answer, None).await.expect("body opens");
+        let error = stream
+            .next()
+            .await
+            .expect("the stream yields")
+            .expect_err("a short block is never published");
+        assert!(matches!(error, MirrorError::ProxyInvalidData(_)), "{error}");
+        assert!(
+            !harness
+                .mirror
+                .cache()
+                .layout()
+                .file_entry(&repo(), &commit(), "model.safetensors")
+                .expect("path builds")
+                .join("blocks/block_00000000.bin")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_chunk_is_one_chunk_rather_than_one_block() {
+        let server = MockServer::start().await;
+        mount_revision(&server, SHA).await;
+        let bytes: Vec<u8> = (0..192u8).collect();
+        upstream_file(&server, bytes.clone()).await;
+        let harness = harness(&server.uri(), config(false, true));
+
+        let answer = harness
+            .mirror
+            .open_file(FileRequest::new(&repo(), "main", "model.safetensors"))
+            .await
+            .expect("opens");
+        let mut stream = read_range(&answer, None).await.expect("body opens");
+        let mut sizes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            sizes.push(chunk.expect("chunk reads").len());
+        }
+        assert_eq!(sizes.iter().sum::<usize>(), bytes.len());
+        assert!(
+            sizes.iter().all(|size| *size <= 16),
+            "a chunk of the 16 byte geometry, not a 64 byte block: {sizes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_evicted_mid_read_is_fetched_again_rather_than_failing() {
+        let server = MockServer::start().await;
+        mount_revision(&server, SHA).await;
+        let bytes: Vec<u8> = (0..192u8).collect();
+        upstream_file(&server, bytes.clone()).await;
+        let harness = harness(&server.uri(), config(false, true));
+        let subject = repo();
+        let route = FileRequest::new(&subject, "main", "model.safetensors");
+
+        let warm = harness.mirror.open_file(route).await.expect("opens");
+        assert_eq!(collect(&warm, None).await, bytes);
+        let dir = harness
+            .mirror
+            .cache()
+            .layout()
+            .file_entry(&repo(), &commit(), "model.safetensors")
+            .expect("path builds");
+
+        let answer = harness.mirror.open_file(route).await.expect("opens cached");
+        assert!(matches!(answer.source, ByteSource::Cache(_)));
+        let mut stream = read_range(&answer, None).await.expect("body opens");
+        let mut served = stream
+            .next()
+            .await
+            .expect("a chunk")
+            .expect("chunk reads")
+            .to_vec();
+        std::fs::remove_dir_all(&dir).expect("eviction removes the entry mid-read");
+        while let Some(chunk) = stream.next().await {
+            served.extend_from_slice(&chunk.expect("an evicted block is fetched again"));
+        }
+        assert_eq!(served, bytes);
+    }
+
+    #[tokio::test]
+    async fn an_entry_evicted_mid_read_offline_fails_the_stream() {
+        let server = MockServer::start().await;
+        mount_revision(&server, SHA).await;
+        let bytes: Vec<u8> = (0..192u8).collect();
+        upstream_file(&server, bytes.clone()).await;
+        let harness = harness(&server.uri(), config(false, true));
+        let subject = repo();
+        let route = FileRequest::new(&subject, "main", "model.safetensors");
+        let warm = harness.mirror.open_file(route).await.expect("opens");
+        assert_eq!(collect(&warm, None).await, bytes);
+
+        let offline = mirror_at(
+            harness._root.path(),
+            &server.uri(),
+            config(true, true),
+            harness.mirror.store().clone(),
+        );
+        let answer = offline
+            .open_file(route)
+            .await
+            .expect("the entry is complete");
+        let mut stream = read_range(&answer, None).await.expect("body opens");
+        stream.next().await.expect("a chunk").expect("chunk reads");
+        let blocks = harness
+            .mirror
+            .cache()
+            .layout()
+            .file_entry(&repo(), &commit(), "model.safetensors")
+            .expect("path builds")
+            .join("blocks");
+        std::fs::remove_dir_all(&blocks).expect("eviction removes the blocks");
+
+        let error = stream
+            .next()
+            .await
+            .expect("the stream yields")
+            .expect_err("nothing offline can fetch the block again");
+        assert!(matches!(error, MirrorError::CacheCorrupt(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_caller_names_the_hash_ingest_must_see() {
+        let server = MockServer::start().await;
+        mount_revision(&server, SHA).await;
+        upstream_file(&server, vec![8u8; 64]).await;
+        let harness = harness(&server.uri(), config(false, true));
+
+        let promised = Sha256::from_bytes([3u8; 32]);
+        let named = harness
+            .mirror
+            .open_file(
+                FileRequest::new(&repo(), "main", "model.safetensors")
+                    .with_expected(Some(promised)),
+            )
+            .await
+            .expect("opens");
+        assert_eq!(
+            named.ingest().expect("a cached download ingests").expected,
+            Some(promised),
+            "the hash the caller promised is the one ingest checks"
+        );
+
+        let unnamed = harness
+            .mirror
+            .open_file(FileRequest::new(&repo(), "main", "model.safetensors"))
+            .await
+            .expect("opens");
+        assert_eq!(
+            unnamed
+                .ingest()
+                .expect("a cached download ingests")
+                .expected,
+            None,
+            "and an etag that is not a content hash still implies nothing"
         );
     }
 

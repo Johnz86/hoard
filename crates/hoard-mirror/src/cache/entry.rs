@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -26,6 +27,10 @@ const BLOCKS_DIR: &str = "blocks";
 pub const DEFAULT_LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
 
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Distinguishes the temporary block files of two writers that both believed a stale lock
+/// was theirs to take, so neither can see the other's half-written bytes.
+static WRITER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The in-process half of the per-block single flight.
 ///
@@ -78,8 +83,8 @@ impl BlockDownloadGuard {
 
     /// Refreshes the lock's modification time so a slow but healthy download is not mistaken
     /// for a dead one.
-    pub fn heartbeat(&self) {
-        touch(&self.lock_path);
+    pub async fn heartbeat(&self) {
+        touch(&self.lock_path).await;
     }
 }
 
@@ -143,7 +148,7 @@ impl CacheEntry {
             }
         };
 
-        touch(&dir.join(META_LOCK_FILE));
+        touch(&dir.join(META_LOCK_FILE)).await;
         let present = scan_present(&dir, meta.block_count()).await?;
         Ok(Self {
             dir,
@@ -154,13 +159,20 @@ impl CacheEntry {
         })
     }
 
-    /// Opens an entry that is already on disk without ever rewriting it, for offline reads
-    /// and for serving a cache directory another mirror wrote.
+    /// Opens an entry that is already on disk without rewriting its header, its CRCs or any
+    /// of its blocks, for offline reads and for serving a cache directory another mirror
+    /// wrote.
+    ///
+    /// The access marker is refreshed, because this is the path every cache hit takes and
+    /// `CleanStrategy::Lru` orders eviction by it.
     pub async fn open_existing(dir: impl Into<PathBuf>, locks: BlockLocks) -> Result<Self> {
         let dir = dir.into();
         let meta = read_meta(&dir)
             .await?
             .ok_or_else(|| MirrorError::EntryNotFound(dir.display().to_string()))?;
+        let marker = dir.join(META_LOCK_FILE);
+        ensure_file(&marker).await?;
+        touch(&marker).await;
         let present = scan_present(&dir, meta.block_count()).await?;
         Ok(Self {
             dir,
@@ -194,8 +206,10 @@ impl CacheEntry {
 
     /// Disk-authoritative presence: a block counts only when its file exists and is not
     /// empty.
-    pub fn has_block(&self, index: u64) -> bool {
-        std::fs::metadata(self.block_path(index)).is_ok_and(|meta| meta.len() > 0)
+    pub async fn has_block(&self, index: u64) -> bool {
+        fs::metadata(self.block_path(index))
+            .await
+            .is_ok_and(|meta| meta.len() > 0)
     }
 
     pub fn block_path(&self, index: u64) -> PathBuf {
@@ -239,7 +253,8 @@ impl CacheEntry {
             match self.read_block_range(index, start, end).await {
                 Ok(bytes) => out.extend_from_slice(&bytes),
                 Err(error) => {
-                    if matches!(error, MirrorError::CacheCorrupt(_)) && self.has_block(index) {
+                    if matches!(error, MirrorError::CacheCorrupt(_)) && self.has_block(index).await
+                    {
                         self.invalidate_block(index).await?;
                     }
                     return Err(error);
@@ -272,10 +287,12 @@ impl CacheEntry {
         let chunk_size = usize::try_from(self.meta.geometry().chunk_size()).unwrap_or(usize::MAX);
         let crcs: Vec<u32> = data.chunks(chunk_size).map(chunk_crc).collect();
 
-        let temp = self
-            .dir
-            .join(BLOCKS_DIR)
-            .join(format!(".{}.tmp", block_file_name(index)));
+        let writer = WRITER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp = self.dir.join(BLOCKS_DIR).join(format!(
+            ".{}.{}-{writer}.tmp",
+            block_file_name(index),
+            std::process::id()
+        ));
         let mut file = File::create(&temp).await?;
         file.write_all(data).await?;
         file.sync_all().await?;
@@ -304,41 +321,35 @@ impl CacheEntry {
     ///
     /// Returns `Present` once the block appears, so a caller that loses the race reads from
     /// the cache instead of fetching the same bytes twice.
+    ///
+    /// The entry directory is recreated first, so an eviction that lands between two blocks
+    /// of one download leaves the stream reading it able to finish.
     pub async fn acquire_block(&self, index: u64) -> Result<BlockLease> {
+        fs::create_dir_all(self.dir.join(BLOCKS_DIR)).await?;
         let lock_path = self.dir.join(BLOCKS_DIR).join(block_lock_name(index));
         let local = self.locks.acquire(&lock_path).await;
         loop {
-            if self.has_block(index) {
+            if self.has_block(index).await {
                 return Ok(BlockLease::Present);
             }
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-                .await
-            {
-                Ok(file) => {
-                    drop(file);
-                    return Ok(BlockLease::Download(BlockDownloadGuard {
-                        lock_path,
-                        index,
-                        locks: self.locks.clone(),
-                        local: Some(local),
-                    }));
+            let mut claim = claim_lock(&lock_path).await?;
+            if claim == LockClaim::Held && is_stale(&lock_path, self.stale_after).await {
+                match fs::remove_file(&lock_path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                    if is_stale(&lock_path, self.stale_after) {
-                        match fs::remove_file(&lock_path).await {
-                            Ok(()) => {}
-                            Err(error) if error.kind() == ErrorKind::NotFound => {}
-                            Err(error) => return Err(error.into()),
-                        }
-                        continue;
-                    }
-                    tokio::time::sleep(LOCK_POLL_INTERVAL).await;
-                }
-                Err(error) => return Err(error.into()),
+                claim = claim_lock(&lock_path).await?;
             }
+            if claim == LockClaim::Won {
+                return Ok(BlockLease::Download(BlockDownloadGuard {
+                    lock_path,
+                    index,
+                    locks: self.locks.clone(),
+                    local: Some(local),
+                }));
+            }
+            tokio::time::sleep(LOCK_POLL_INTERVAL).await;
         }
     }
 
@@ -349,7 +360,7 @@ impl CacheEntry {
     }
 
     async fn read_block_range(&self, index: u64, start: u64, end: u64) -> Result<Vec<u8>> {
-        if !self.has_block(index) {
+        if !self.has_block(index).await {
             return Err(MirrorError::CacheCorrupt(format!(
                 "block {index} is not cached"
             )));
@@ -551,17 +562,48 @@ async fn ensure_file(path: &Path) -> Result<()> {
     }
 }
 
-/// Bumps a file's modification time. Access time is unreliable under `relatime`, so the
-/// cache uses modification time as its access marker exactly as olah does.
-fn touch(path: &Path) {
-    if let Ok(file) = std::fs::File::options().write(true).open(path) {
-        let now = SystemTime::now();
-        let _ = file.set_times(std::fs::FileTimes::new().set_modified(now));
+/// Whether a `create_new` on the lock sidecar made this caller the one downloader.
+///
+/// A caller that removes a stale lock re-attempts the claim exactly once and waits if it
+/// lost, so two processes that both saw the same lock go stale still download the block
+/// once between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LockClaim {
+    Won,
+    Held,
+}
+
+async fn claim_lock(path: &Path) -> Result<LockClaim> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+    {
+        Ok(file) => {
+            drop(file);
+            Ok(LockClaim::Won)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(LockClaim::Held),
+        Err(error) => Err(error.into()),
     }
 }
 
-fn is_stale(path: &Path, stale_after: Duration) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
+/// Bumps a file's modification time. Access time is unreliable under `relatime`, so the
+/// cache uses modification time as its access marker exactly as olah does.
+async fn touch(path: &Path) {
+    let path = path.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(file) = std::fs::File::options().write(true).open(&path) {
+            let now = SystemTime::now();
+            let _ = file.set_times(std::fs::FileTimes::new().set_modified(now));
+        }
+    })
+    .await;
+}
+
+async fn is_stale(path: &Path, stale_after: Duration) -> bool {
+    let Ok(metadata) = fs::metadata(path).await else {
         return false;
     };
     metadata
@@ -636,7 +678,7 @@ mod tests {
         let data = payload(140);
         let mut cache = open_entry(&dir, 140).await;
         fill(&mut cache, &data, &[0]).await;
-        assert!(cache.has_block(0));
+        assert!(cache.has_block(0).await);
 
         let fresh = CacheEntry::open(
             dir.path().join("entry"),
@@ -647,7 +689,7 @@ mod tests {
         )
         .await
         .expect("entry reopens");
-        assert!(!fresh.has_block(0));
+        assert!(!fresh.has_block(0).await);
         assert_eq!(fresh.present().count(), 0);
     }
 
@@ -738,7 +780,7 @@ mod tests {
 
         let error = cache.read_range(64..128).await.expect_err("CRC mismatch");
         assert!(matches!(error, MirrorError::CacheCorrupt(_)), "{error}");
-        assert!(!cache.has_block(1));
+        assert!(!cache.has_block(1).await);
         assert!(!cache.present().test(1));
         assert_eq!(cache.missing_blocks(0..140), vec![1]);
 
@@ -767,7 +809,7 @@ mod tests {
             BlockLease::Download(guard) => guard,
             BlockLease::Present => panic!("the first caller must lead"),
         };
-        guard.heartbeat();
+        guard.heartbeat().await;
 
         let waiting = tokio::spawn(async move { follower.acquire_block(0).await });
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -813,6 +855,82 @@ mod tests {
 
         let lease = cache.acquire_block(0).await.expect("lease");
         assert!(matches!(lease, BlockLease::Download(_)));
+    }
+
+    #[tokio::test]
+    async fn reopening_an_entry_refreshes_the_access_marker_the_lru_orders_by() {
+        let dir = TempDir::new().expect("temp dir");
+        let data = payload(140);
+        {
+            let mut entry = open_entry(&dir, 140).await;
+            fill(&mut entry, &data, &[0, 1, 2]).await;
+        }
+        let marker = dir.path().join("entry").join(META_LOCK_FILE);
+        let stale = SystemTime::now() - Duration::from_secs(3_600);
+        std::fs::File::options()
+            .write(true)
+            .open(&marker)
+            .expect("marker opens")
+            .set_times(std::fs::FileTimes::new().set_modified(stale))
+            .expect("marker backdates");
+
+        let reopened = CacheEntry::open_existing(dir.path().join("entry"), BlockLocks::default())
+            .await
+            .expect("entry reopens");
+        assert!(reopened.is_complete());
+        let refreshed = std::fs::metadata(&marker)
+            .expect("marker reads")
+            .modified()
+            .expect("modified time");
+        assert!(
+            refreshed > stale + Duration::from_secs(60),
+            "a cache hit is a use, so eviction must see it as one"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_olah_written_entry_without_a_marker_gains_one_on_the_first_hit() {
+        let dir = TempDir::new().expect("temp dir");
+        let data = payload(140);
+        {
+            let mut entry = open_entry(&dir, 140).await;
+            fill(&mut entry, &data, &[0, 1, 2]).await;
+        }
+        let marker = dir.path().join("entry").join(META_LOCK_FILE);
+        std::fs::remove_file(&marker).expect("marker removes");
+
+        CacheEntry::open_existing(dir.path().join("entry"), BlockLocks::default())
+            .await
+            .expect("entry reopens");
+        assert!(marker.exists());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_block_write_publishes_nothing_and_collides_with_nobody() {
+        let dir = TempDir::new().expect("temp dir");
+        let data = payload(140);
+        let mut entry = open_entry(&dir, 140).await;
+        let abandoned = entry
+            .dir()
+            .join("blocks")
+            .join(".block_00000000.bin.99999-0.tmp");
+        std::fs::write(&abandoned, &data[..10]).expect("half written block");
+
+        entry.refresh_present().await.expect("presence rescans");
+        assert!(!entry.has_block(0).await, "a temp file is not a block");
+        assert_eq!(entry.missing_blocks(0..140), vec![0, 1, 2]);
+
+        fill(&mut entry, &data, &[0]).await;
+        assert!(entry.has_block(0).await);
+        assert_eq!(
+            entry.read_range(0..64).await.expect("reads"),
+            data[..64],
+            "the publish that finished is the one that is served"
+        );
+        assert!(
+            abandoned.exists(),
+            "and it named a file of its own rather than the other writer's"
+        );
     }
 
     #[tokio::test]

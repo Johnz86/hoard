@@ -2,12 +2,14 @@
 //! one place that forwards a caller's credentials without ever logging them.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use reqwest::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, HeaderMap, RANGE};
+use reqwest::redirect::{Attempt, Policy};
 use reqwest::{Client, Method, Response, StatusCode};
-use url::Url;
+use url::{Host, Url};
 
 use crate::config::MirrorConfig;
 use crate::error::{MirrorError, Result};
@@ -29,6 +31,11 @@ pub const XET_HEADER_PREFIX: &str = "x-xet-";
 
 /// The media type of every document the Hub API exchanges.
 pub const JSON_CONTENT_TYPE: &str = "application/json";
+
+/// The most a pass-through route may hold in memory. The routes that use it exchange tokens
+/// and reconstruction manifests, so an answer past this is an upstream that lost the plot
+/// rather than a body worth buffering.
+pub const MAX_PASS_THROUGH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A caller's `Authorization` header, forwarded upstream and never rendered.
 #[derive(Clone, PartialEq, Eq)]
@@ -244,7 +251,7 @@ impl UpstreamClient {
             .read_timeout(READ_TIMEOUT)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
-            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+            .redirect(redirect_policy())
             .no_gzip()
             .build()?;
         Ok(Self {
@@ -289,7 +296,9 @@ impl UpstreamClient {
                     return Ok(response);
                 }
                 Ok(response) => last = Some(response.status()),
-                Err(error) if error.is_builder() => return Err(error.into()),
+                Err(error) if error.is_builder() || error.is_redirect() => {
+                    return Err(error.into());
+                }
                 Err(_) => last = None,
             }
         }
@@ -323,17 +332,106 @@ impl UpstreamClient {
         builder.send().await
     }
 
-    /// Sends a request and holds the whole answer, for the pass-through routes.
+    /// Sends a request and holds the answer, for the pass-through routes.
+    ///
+    /// The body is capped at [`MAX_PASS_THROUGH_BYTES`]: these routes forward documents, so
+    /// an upstream that answers with a file instead is refused rather than buffered.
     pub async fn pass_through(&self, request: UpstreamRequest<'_>) -> Result<ProxyResponse> {
+        let url = request.target();
         let response = self.send(request).await?;
         let status = response.status().as_u16();
         let headers = header_pairs(response.headers());
-        let body = response.bytes().await?;
+        let body = read_capped(response, MAX_PASS_THROUGH_BYTES, &url).await?;
         Ok(ProxyResponse {
             status,
             headers,
             body,
         })
+    }
+}
+
+/// Reads a response body, failing as soon as more than `limit` bytes have arrived.
+///
+/// An upstream that ignores `Range` answers with the whole file, so a body is never held
+/// whole before its length is known to be the length that was asked for.
+pub async fn read_capped(response: Response, limit: u64, url: &Url) -> Result<Bytes> {
+    let mut response = response;
+    let hint = response.content_length().unwrap_or(0).min(limit);
+    let mut body = BytesMut::with_capacity(usize::try_from(hint).unwrap_or_default());
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() as u64 + chunk.len() as u64 > limit {
+            return Err(MirrorError::ProxyInvalidData(format!(
+                "{url} sent more than the {limit} bytes it was asked for"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
+/// Follows a redirect only back to the host the request started at or on to a public
+/// address, so an upstream on the LAN cannot point the mirror at loopback, a private range
+/// or a link-local metadata service and have the answer land in the block cache.
+fn redirect_policy() -> Policy {
+    Policy::custom(|attempt: Attempt<'_>| {
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error(format!("more than {MAX_REDIRECTS} redirects"));
+        }
+        if redirect_allowed(attempt.url(), attempt.previous()) {
+            return attempt.follow();
+        }
+        let refusal = format!(
+            "redirect to {} left the upstream for a non-public address",
+            attempt.url()
+        );
+        attempt.error(refusal)
+    })
+}
+
+fn redirect_allowed(next: &Url, previous: &[Url]) -> bool {
+    let Some(host) = next.host() else {
+        return false;
+    };
+    let started_here = previous
+        .first()
+        .and_then(Url::host_str)
+        .zip(next.host_str())
+        .is_some_and(|(origin, target)| origin == target);
+    if started_here {
+        return true;
+    }
+    match host {
+        Host::Domain(_) => true,
+        Host::Ipv4(address) => is_public_address(IpAddr::V4(address)),
+        Host::Ipv6(address) => is_public_address(IpAddr::V6(address)),
+    }
+}
+
+/// Whether an address is routable on the public internet, which is the only place a
+/// redirect may take an upstream that did not start on the LAN.
+fn is_public_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            !(address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_broadcast()
+                || address.is_documentation()
+                || octets[0] == 0
+                || (octets[0] == 100 && octets[1] & 0xc0 == 64))
+        }
+        IpAddr::V6(address) => match address.to_ipv4_mapped() {
+            Some(mapped) => is_public_address(IpAddr::V4(mapped)),
+            None => {
+                let segments = address.segments();
+                !(address.is_loopback()
+                    || address.is_unspecified()
+                    || segments[0] & 0xfe00 == 0xfc00
+                    || segments[0] & 0xffc0 == 0xfe80)
+            }
+        },
     }
 }
 
@@ -507,6 +605,71 @@ mod tests {
             .expect("request succeeds");
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.bytes().await.expect("body").len(), 64);
+    }
+
+    #[test]
+    fn a_redirect_may_come_home_or_go_public_and_nowhere_else() {
+        let origin = Url::parse("http://peer.lan:7099/file").expect("url parses");
+        let previous = [origin.clone()];
+        let allowed = [
+            "http://peer.lan:7099/elsewhere",
+            "https://cdn-lfs.huggingface.co/object",
+            "https://[2606:4700::1111]/object",
+            "https://93.184.216.34/object",
+        ];
+        for target in allowed {
+            let target = Url::parse(target).expect("url parses");
+            assert!(redirect_allowed(&target, &previous), "{target}");
+        }
+        let refused = [
+            "http://127.0.0.1:9000/object",
+            "http://169.254.169.254/latest/meta-data",
+            "http://192.168.1.4:7099/object",
+            "http://10.0.0.1/object",
+            "http://[::1]:9000/object",
+            "http://[fd00::1]/object",
+        ];
+        for target in refused {
+            let target = Url::parse(target).expect("url parses");
+            assert!(!redirect_allowed(&target, &previous), "{target}");
+        }
+        assert!(
+            !redirect_allowed(&Url::parse("http://127.0.0.1/x").expect("url"), &[]),
+            "a redirect with no origin to compare against is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_longer_than_its_cap_is_refused_rather_than_held() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/big"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 4096]))
+            .mount(&server)
+            .await;
+
+        let target = url(&server.uri(), "/big");
+        let client = client();
+        let response = client
+            .send(UpstreamRequest::get(&target))
+            .await
+            .expect("request succeeds");
+        let error = read_capped(response, 64, &target)
+            .await
+            .expect_err("a body past the cap is refused");
+        assert!(matches!(error, MirrorError::ProxyInvalidData(_)), "{error}");
+
+        let response = client
+            .send(UpstreamRequest::get(&target))
+            .await
+            .expect("request succeeds");
+        assert_eq!(
+            read_capped(response, 4096, &target)
+                .await
+                .expect("a body within the cap is kept")
+                .len(),
+            4096
+        );
     }
 
     #[tokio::test]
