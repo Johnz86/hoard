@@ -2,7 +2,7 @@
 //!
 //! Every verdict is drawn from a tensor summary, a parsed config, README frontmatter and
 //! path hints, so the rules stay testable against synthetic headers and never read weights.
-//! Sources combine through [`combine`]: the strongest source sets the floor and every
+//! Sources combine so that the strongest one sets the floor and every
 //! agreeing source closes part of the remaining gap, which keeps confidence monotone.
 
 mod base;
