@@ -1,0 +1,32 @@
+[package]
+name = "hoard-net"
+description = "Node identity, LAN discovery, index gossip and peer pulls between hoard nodes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hoard-core.workspace = true
+hoard-index.workspace = true
+hoard-mirror.workspace = true
+mdns-sd.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+jiff.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true
+
+[lints]
+workspace = true

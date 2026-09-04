@@ -1,0 +1,100 @@
+const BASE = "/api/v1";
+
+export class ApiError extends Error {
+    constructor(code, message, status) {
+        super(message);
+        this.name = "ApiError";
+        this.code = code;
+        this.status = status;
+    }
+}
+
+function query(params) {
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(params || {})) {
+        if (value === null || value === undefined || value === "") continue;
+        search.set(key, String(value));
+    }
+    const text = search.toString();
+    return text ? `?${text}` : "";
+}
+
+function segment(value) {
+    return encodeURIComponent(String(value));
+}
+
+async function request(method, path, body) {
+    let response;
+    try {
+        response = await fetch(BASE + path, {
+            method,
+            headers: body === undefined ? {} : { "content-type": "application/json" },
+            body: body === undefined ? undefined : JSON.stringify(body)
+        });
+    } catch {
+        throw new ApiError("NodeUnreachable", `cannot reach this hoard node at ${BASE}`, 0);
+    }
+    const text = await response.text();
+    let payload = null;
+    if (text) {
+        try {
+            payload = JSON.parse(text);
+        } catch {
+            payload = null;
+        }
+    }
+    if (!response.ok) {
+        const detail = payload && payload.error ? payload.error : null;
+        throw new ApiError(
+            (detail && detail.code) || `Http${response.status}`,
+            (detail && detail.message) || `${method} ${path} failed with ${response.status}`,
+            response.status
+        );
+    }
+    return payload;
+}
+
+const get = (path, params) => request("GET", path + query(params));
+const post = (path, body) => request("POST", path, body ?? {});
+const put = (path, body) => request("PUT", path, body ?? {});
+const del = (path) => request("DELETE", path);
+
+const repoBase = (type, org, name) => `/repos/${segment(type)}/${segment(org)}/${segment(name)}`;
+
+export const search = (params) => get("/search", params);
+export const parseQuery = (q) => get("/search/parse", { q });
+
+export const artifact = (id) => get(`/artifacts/${segment(id)}`);
+export const artifactCompat = (id, limit) => get(`/artifacts/${segment(id)}/compat`, { limit });
+export const pullCommand = (id) => get(`/artifacts/${segment(id)}/pull-command`);
+
+export const repo = (type, org, name) => get(repoBase(type, org, name));
+export const repoFiles = (type, org, name, revision) =>
+    get(`${repoBase(type, org, name)}/files`, { revision });
+export const repoReadme = (type, org, name, revision) =>
+    get(`${repoBase(type, org, name)}/readme`, { revision });
+export const repoCompat = (type, org, name, revision) =>
+    get(`${repoBase(type, org, name)}/compat`, { revision });
+export const repoUsage = (type, org, name) => get(`${repoBase(type, org, name)}/usage`);
+
+export const shelves = () => get("/shelves");
+export const createShelf = (name, q) => post("/shelves", { name, query: q });
+export const deleteShelf = (id) => del(`/shelves/${segment(id)}`);
+
+export const loadouts = () => get("/loadouts");
+export const loadout = (id) => get(`/loadouts/${segment(id)}`);
+export const addLoadoutItem = (id, artifactId, weight) =>
+    post(`/loadouts/${segment(id)}/items`, { artifact_id: artifactId, weight: weight ?? null });
+export const removeLoadoutItem = (id, artifactId) =>
+    del(`/loadouts/${segment(id)}/items/${segment(artifactId)}`);
+export const applyLoadout = (id, node, profile) =>
+    post(`/loadouts/${segment(id)}/apply`, { node, profile: profile ?? null });
+
+export const nodes = () => get("/nodes");
+export const sources = () => get("/sources");
+export const startScan = (source) => post("/scan", { source: source ?? null, hash: "later" });
+export const jobs = (state) => get("/jobs", { state });
+export const cancelJob = (id) => post(`/jobs/${segment(id)}/cancel`);
+
+export const settings = () => get("/settings");
+export const saveSettings = (body) => put("/settings", body);

@@ -1,0 +1,44 @@
+[package]
+name = "hoard-server"
+description = "axum application: HuggingFace-compatible API, hoard JSON API and the embedded web UI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hoard-core.workspace = true
+hoard-index.workspace = true
+hoard-mirror.workspace = true
+hoard-net.workspace = true
+axum.workspace = true
+axum-extra.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+http.workspace = true
+http-range-header.workspace = true
+headers.workspace = true
+mime_guess.workspace = true
+rust-embed.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+secrecy.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+humansize.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+jiff.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true
+
+[lints]
+workspace = true

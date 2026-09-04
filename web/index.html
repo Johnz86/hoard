@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hoard</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="vendor/pico.min.css">
+<link rel="stylesheet" href="css/tokens.css">
+<link rel="stylesheet" href="css/hoard.css">
+</head>
+<body>
+<div class="shell">
+    <header class="topbar">
+        <span class="wordmark" id="wordmark">HOARD</span>
+        <nav class="nav-tabs" id="nav-tabs"></nav>
+        <div class="search" id="search">
+            <span class="search-glyph">&#9906;</span>
+            <input id="search-input" type="text" spellcheck="false" autocomplete="off"
+                   placeholder="role:lora base:sdxl size:&lt;400mb film grain">
+            <span class="search-clear" id="search-clear" hidden>CLEAR</span>
+            <span class="search-hint" id="search-hint">/</span>
+        </div>
+        <span class="node-pulse" id="node-pulse" title="nodes"></span>
+        <button class="btn btn-amber" id="loadout-btn" type="button">LOADOUT 0</button>
+        <button class="btn btn-quiet" id="theme-btn" type="button" title="theme">SYSTEM</button>
+        <div class="prefs-wrap">
+            <button class="btn btn-quiet" id="prefs-btn" type="button">PREFS</button>
+            <div class="prefs-panel" id="prefs-panel" hidden></div>
+        </div>
+    </header>
+
+    <div class="token-strip" id="token-strip" hidden></div>
+
+    <main class="views">
+        <section class="view view-index" id="view-index">
+            <aside class="facet-rail" id="facet-rail"></aside>
+            <div class="results">
+                <div class="results-head" id="results-head"></div>
+                <div class="result-body" id="result-body"></div>
+                <div class="results-foot" id="results-foot"></div>
+            </div>
+            <div class="inspector-slot" id="inspector-slot"></div>
+        </section>
+        <section class="view" id="view-detail" hidden></section>
+        <section class="view view-panel-host" id="view-panel" hidden></section>
+    </main>
+</div>
+
+<div id="drawer-root"></div>
+<div id="keysheet-root"></div>
+<div id="toast-root"></div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

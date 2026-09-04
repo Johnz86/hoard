@@ -1,0 +1,344 @@
+use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
+use strum::EnumIter;
+
+use crate::error::HoardError;
+use crate::id::{ArtifactId, BlobId, Sha256};
+use crate::role::{Base, Role, SubRole};
+
+/// The container a blob is stored in, decided by magic bytes and never by extension alone.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, EnumIter,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtifactFormat {
+    Safetensors,
+    Gguf,
+    Diffusers,
+    Transformers,
+    Pth,
+    Pt,
+    Bin,
+    Onnx,
+    Parquet,
+    Arrow,
+    Jsonl,
+    Csv,
+    Readme,
+    Config,
+    Unknown,
+}
+
+impl ArtifactFormat {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ArtifactFormat::Safetensors => "safetensors",
+            ArtifactFormat::Gguf => "gguf",
+            ArtifactFormat::Diffusers => "diffusers",
+            ArtifactFormat::Transformers => "transformers",
+            ArtifactFormat::Pth => "pth",
+            ArtifactFormat::Pt => "pt",
+            ArtifactFormat::Bin => "bin",
+            ArtifactFormat::Onnx => "onnx",
+            ArtifactFormat::Parquet => "parquet",
+            ArtifactFormat::Arrow => "arrow",
+            ArtifactFormat::Jsonl => "jsonl",
+            ArtifactFormat::Csv => "csv",
+            ArtifactFormat::Readme => "readme",
+            ArtifactFormat::Config => "config",
+            ArtifactFormat::Unknown => "unknown",
+        }
+    }
+
+    /// True when the format carries tensors, so a tensor summary is expected.
+    pub const fn holds_tensors(self) -> bool {
+        matches!(
+            self,
+            ArtifactFormat::Safetensors
+                | ArtifactFormat::Gguf
+                | ArtifactFormat::Pth
+                | ArtifactFormat::Pt
+                | ArtifactFormat::Bin
+                | ArtifactFormat::Onnx
+        )
+    }
+
+    /// True when the format is tabular data rather than weights.
+    pub const fn is_dataset(self) -> bool {
+        matches!(
+            self,
+            ArtifactFormat::Parquet
+                | ArtifactFormat::Arrow
+                | ArtifactFormat::Jsonl
+                | ArtifactFormat::Csv
+        )
+    }
+}
+
+impl fmt::Display for ArtifactFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ArtifactFormat {
+    type Err = HoardError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value
+            .trim()
+            .trim_start_matches('.')
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "safetensors" | "sft" => Ok(ArtifactFormat::Safetensors),
+            "gguf" => Ok(ArtifactFormat::Gguf),
+            "diffusers" => Ok(ArtifactFormat::Diffusers),
+            "transformers" => Ok(ArtifactFormat::Transformers),
+            "pth" | "ckpt" => Ok(ArtifactFormat::Pth),
+            "pt" => Ok(ArtifactFormat::Pt),
+            "bin" => Ok(ArtifactFormat::Bin),
+            "onnx" => Ok(ArtifactFormat::Onnx),
+            "parquet" => Ok(ArtifactFormat::Parquet),
+            "arrow" => Ok(ArtifactFormat::Arrow),
+            "jsonl" | "jsonl.gz" | "ndjson" => Ok(ArtifactFormat::Jsonl),
+            "csv" | "tsv" => Ok(ArtifactFormat::Csv),
+            "readme" | "md" => Ok(ArtifactFormat::Readme),
+            "config" | "json" => Ok(ArtifactFormat::Config),
+            "unknown" => Ok(ArtifactFormat::Unknown),
+            other => Err(HoardError::UnknownFormat(other.to_owned())),
+        }
+    }
+}
+
+/// Numeric precision or quantization scheme. Open ended: GGUF adds file types faster than
+/// a closed enum can track them.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Precision(String);
+
+impl Precision {
+    pub fn new(value: impl AsRef<str>) -> Self {
+        Self(value.as_ref().trim().to_ascii_lowercase())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// True for the `q*` and `iq*` spellings GGUF uses, which the UI shows as QUANT.
+    pub fn is_quantized(&self) -> bool {
+        self.0.starts_with('q') || self.0.starts_with("iq") || self.0.starts_with("int")
+    }
+
+    /// Maps a tensor dtype spelling onto the precision the UI shows.
+    pub fn from_dtype(dtype: &str) -> Self {
+        let normalized = dtype.trim().to_ascii_uppercase();
+        let mapped = match normalized.as_str() {
+            "F16" | "FLOAT16" | "HALF" => "fp16",
+            "BF16" | "BFLOAT16" => "bf16",
+            "F32" | "FLOAT32" | "FLOAT" => "fp32",
+            "F64" | "FLOAT64" | "DOUBLE" => "fp64",
+            "F8_E4M3" | "F8_E5M2" | "FLOAT8_E4M3FN" | "FLOAT8_E5M2" => "fp8",
+            "I8" | "INT8" | "U8" | "UINT8" => "int8",
+            "I16" | "INT16" => "int16",
+            "I32" | "INT32" => "int32",
+            "I64" | "INT64" => "int64",
+            "BOOL" => "bool",
+            other => return Precision::new(other),
+        };
+        Precision::new(mapped)
+    }
+}
+
+impl fmt::Display for Precision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for Precision {
+    type Err = HoardError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Precision::new(value))
+    }
+}
+
+/// One tensor as read from a header: never its bytes, only its shape and dtype.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TensorSample {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<u64>,
+}
+
+impl TensorSample {
+    pub fn element_count(&self) -> u64 {
+        self.shape.iter().copied().product::<u64>()
+    }
+}
+
+/// What header sniffing learned about a tensor file. The inference rules read only this,
+/// which keeps them unit testable against synthetic fixtures.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TensorSummary {
+    pub tensor_count: u32,
+    pub params: u64,
+    /// dtype spelling to tensor count, ordered so the dominant dtype is stable.
+    pub dtypes: BTreeMap<String, u32>,
+    /// Leading key segments to how many tensors carry them, most frequent first.
+    pub key_prefixes: Vec<(String, u32)>,
+    pub samples: Vec<TensorSample>,
+    /// safetensors `__metadata__` or GGUF key/value metadata, verbatim.
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl TensorSummary {
+    /// The dtype carrying the most tensors, which decides the PREC column.
+    pub fn dominant_dtype(&self) -> Option<&str> {
+        self.dtypes
+            .iter()
+            .max_by_key(|(_, count)| **count)
+            .map(|(dtype, _)| dtype.as_str())
+    }
+
+    pub fn precision(&self) -> Option<Precision> {
+        self.dominant_dtype().map(Precision::from_dtype)
+    }
+
+    /// True when any tensor key starts with the given prefix.
+    pub fn has_prefix(&self, prefix: &str) -> bool {
+        self.key_prefixes
+            .iter()
+            .any(|(key, _)| key.starts_with(prefix))
+            || self
+                .samples
+                .iter()
+                .any(|sample| sample.name.starts_with(prefix))
+    }
+
+    /// True when any tensor key contains the given fragment.
+    pub fn has_fragment(&self, fragment: &str) -> bool {
+        self.key_prefixes
+            .iter()
+            .any(|(key, _)| key.contains(fragment))
+            || self
+                .samples
+                .iter()
+                .any(|sample| sample.name.contains(fragment))
+    }
+
+    pub fn sample(&self, name: &str) -> Option<&TensorSample> {
+        self.samples.iter().find(|sample| sample.name == name)
+    }
+
+    /// The first tensor whose key contains the fragment, for shape based base inference.
+    pub fn find_fragment(&self, fragment: &str) -> Option<&TensorSample> {
+        self.samples
+            .iter()
+            .find(|sample| sample.name.contains(fragment))
+    }
+}
+
+/// A blob interpreted. One blob yields one artifact per sniff version; the same bytes on
+/// twenty paths remain one artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Artifact {
+    pub id: ArtifactId,
+    pub blob: BlobId,
+    pub sha256: Option<Sha256>,
+    pub size: u64,
+    pub format: ArtifactFormat,
+    pub role: Role,
+    pub sub_role: Option<SubRole>,
+    pub role_confidence: f32,
+    pub base: Base,
+    /// The display spelling of the base, `sdxl 1.0`, when one was recovered.
+    pub base_label: Option<String>,
+    pub base_confidence: f32,
+    pub precision: Option<Precision>,
+    pub quant: Option<String>,
+    pub rank: Option<u32>,
+    pub alpha: Option<f32>,
+    pub params: Option<u64>,
+    pub context: Option<u32>,
+    pub trigger: Option<String>,
+    pub sniff_version: u32,
+}
+
+impl Artifact {
+    /// True when the artifact is unclassified or below the triage confidence threshold.
+    pub fn needs_triage(&self, threshold: f32) -> bool {
+        self.role == Role::Unk || self.role_confidence < threshold
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_parse_from_extensions_and_names() {
+        assert_eq!(
+            "safetensors".parse::<ArtifactFormat>().expect("known"),
+            ArtifactFormat::Safetensors
+        );
+        assert_eq!(
+            ".ckpt".parse::<ArtifactFormat>().expect("known"),
+            ArtifactFormat::Pth
+        );
+        assert_eq!(
+            "JSONL".parse::<ArtifactFormat>().expect("known"),
+            ArtifactFormat::Jsonl
+        );
+        assert!("weights".parse::<ArtifactFormat>().is_err());
+        assert!(ArtifactFormat::Gguf.holds_tensors());
+        assert!(ArtifactFormat::Parquet.is_dataset());
+    }
+
+    #[test]
+    fn precision_maps_dtypes_and_flags_quantization() {
+        assert_eq!(Precision::from_dtype("BF16").as_str(), "bf16");
+        assert_eq!(Precision::from_dtype("F32").as_str(), "fp32");
+        assert_eq!(Precision::from_dtype("F8_E4M3").as_str(), "fp8");
+        assert!(Precision::new("Q4_K_M").is_quantized());
+        assert!(!Precision::new("fp16").is_quantized());
+    }
+
+    #[test]
+    fn tensor_summary_answers_key_and_dtype_questions() {
+        let summary = TensorSummary {
+            tensor_count: 3,
+            params: 12,
+            dtypes: BTreeMap::from([("F16".to_owned(), 2), ("F32".to_owned(), 1)]),
+            key_prefixes: vec![("lora_unet".to_owned(), 2)],
+            samples: vec![TensorSample {
+                name: "lora_unet_down_blocks_0.lora_down.weight".to_owned(),
+                dtype: "F16".to_owned(),
+                shape: vec![32, 320],
+            }],
+            metadata: BTreeMap::new(),
+        };
+        assert_eq!(summary.dominant_dtype(), Some("F16"));
+        assert_eq!(
+            summary.precision().map(|p| p.as_str().to_owned()),
+            Some("fp16".to_owned())
+        );
+        assert!(summary.has_prefix("lora_unet"));
+        assert!(summary.has_fragment(".lora_down"));
+        assert_eq!(
+            summary
+                .find_fragment("lora_down")
+                .map(TensorSample::element_count),
+            Some(10240)
+        );
+    }
+}

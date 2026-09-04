@@ -1,0 +1,60 @@
+[server]
+bind = "0.0.0.0:7099"
+public_url = "http://hoard.lan:7099"
+data_dir = "./data"
+
+[node]
+name = "workstation"
+serve = true
+discovery = "mdns"
+
+[peers]
+static = []
+
+[index]
+hash_policy = "background"
+lfs_threshold = 10485760
+triage_confidence = 0.85
+
+[[index.sources]]
+name = "hf-cache"
+path = "~/.cache/huggingface/hub"
+kind = "hf-cache"
+
+[[index.sources]]
+name = "comfy"
+path = "~/comfy/models"
+kind = "loose"
+exclude = ["**/*.tmp", "**/.cache/**"]
+
+[[index.sources]]
+name = "vault"
+path = "/mnt/vault/hf"
+kind = "auto"
+
+[mirror]
+offline = false
+upstream = "https://huggingface.co"
+upstream_lfs = "https://cdn-lfs.huggingface.co"
+cache_size_limit = "500GB"
+cache_clean_strategy = "LRU"
+block_size = "64MiB"
+chunk_size = "1MiB"
+xet_passthrough = false
+xet_passthrough_min_size = "50GB"
+
+[[mirror.proxy]]
+repo = "*"
+allow = true
+
+[[mirror.proxy]]
+repo = "*/*"
+allow = true
+
+[[mirror.cache]]
+repo = "*"
+allow = true
+
+[[mirror.cache]]
+repo = "*/*"
+allow = true

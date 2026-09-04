@@ -1,0 +1,426 @@
+---
+source: crates/hoard-index/src/store/migrations.rs
+expression: "rows.join(\"\\n\\n\")"
+---
+table artifact
+CREATE TABLE artifact (
+    id              INTEGER PRIMARY KEY,
+    blob_id         INTEGER NOT NULL REFERENCES blob(id) ON DELETE CASCADE,
+    sniff_version   INTEGER NOT NULL DEFAULT 1,
+    format          TEXT    NOT NULL DEFAULT 'unknown',
+    role            TEXT    NOT NULL DEFAULT 'unk',
+    sub_role        TEXT,
+    role_confidence REAL    NOT NULL DEFAULT 0.0,
+    base            TEXT    NOT NULL DEFAULT '',
+    base_label      TEXT,
+    base_confidence REAL    NOT NULL DEFAULT 0.0,
+    precision       TEXT,
+    quant           TEXT,
+    rank            INTEGER,
+    alpha           REAL,
+    params          INTEGER,
+    context         INTEGER,
+    trigger_words   TEXT,
+    org             TEXT,
+    name            TEXT    NOT NULL DEFAULT '',
+    triage          INTEGER NOT NULL DEFAULT 0,
+    last_used       TEXT,
+    use_count       INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT    NOT NULL,
+    UNIQUE(blob_id, sniff_version)
+)
+
+index artifact_base
+CREATE INDEX artifact_base ON artifact(base)
+
+index artifact_format
+CREATE INDEX artifact_format ON artifact(format)
+
+table artifact_fts
+CREATE VIRTUAL TABLE artifact_fts USING fts5(
+    artifact_id UNINDEXED,
+    name,
+    org,
+    base,
+    trigger_words,
+    keys,
+    card,
+    tokenize = 'unicode61 remove_diacritics 2'
+)
+
+table artifact_fts_config
+CREATE TABLE 'artifact_fts_config'(k PRIMARY KEY, v) WITHOUT ROWID
+
+table artifact_fts_content
+CREATE TABLE 'artifact_fts_content'(id INTEGER PRIMARY KEY, c0, c1, c2, c3, c4, c5, c6)
+
+table artifact_fts_data
+CREATE TABLE 'artifact_fts_data'(id INTEGER PRIMARY KEY, block BLOB)
+
+table artifact_fts_docsize
+CREATE TABLE 'artifact_fts_docsize'(id INTEGER PRIMARY KEY, sz BLOB)
+
+table artifact_fts_idx
+CREATE TABLE 'artifact_fts_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID
+
+table artifact_override
+CREATE TABLE artifact_override (
+    artifact_id INTEGER PRIMARY KEY REFERENCES artifact(id) ON DELETE CASCADE,
+    role        TEXT,
+    sub_role    TEXT,
+    base        TEXT,
+    decided_at  TEXT NOT NULL
+)
+
+index artifact_role
+CREATE INDEX artifact_role ON artifact(role)
+
+index artifact_triage
+CREATE INDEX artifact_triage ON artifact(triage) WHERE triage = 1
+
+table blob
+CREATE TABLE blob (
+    id          INTEGER PRIMARY KEY,
+    sha256      TEXT    UNIQUE,
+    git_sha1    TEXT,
+    fingerprint TEXT    NOT NULL,
+    size        INTEGER NOT NULL,
+    path_count  INTEGER NOT NULL DEFAULT 0,
+    first_seen  TEXT    NOT NULL,
+    hashed_at   TEXT
+)
+
+index blob_fingerprint_size
+CREATE INDEX blob_fingerprint_size ON blob(fingerprint, size)
+
+index blob_unhashed
+CREATE INDEX blob_unhashed ON blob(sha256) WHERE sha256 IS NULL
+
+table entry
+CREATE TABLE entry (
+    id            INTEGER PRIMARY KEY,
+    revision_id   INTEGER NOT NULL REFERENCES revision(id) ON DELETE CASCADE,
+    path          TEXT    NOT NULL,
+    blob_id       INTEGER REFERENCES blob(id) ON DELETE SET NULL,
+    artifact_id   INTEGER REFERENCES artifact(id) ON DELETE SET NULL,
+    node_id       INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+    source_id     INTEGER REFERENCES source(id) ON DELETE SET NULL,
+    abs_path      TEXT,
+    size          INTEGER NOT NULL DEFAULT 0,
+    is_symlink    INTEGER NOT NULL DEFAULT 0,
+    lfs_pointer   INTEGER NOT NULL DEFAULT 0,
+    state         TEXT    NOT NULL DEFAULT 'local',
+    pull_progress REAL,
+    present       INTEGER NOT NULL DEFAULT 1,
+    mtime         INTEGER,
+    inode         INTEGER,
+    last_seen     TEXT    NOT NULL,
+    UNIQUE(revision_id, path, node_id)
+)
+
+index entry_abs_path
+CREATE INDEX entry_abs_path ON entry(abs_path)
+
+index entry_artifact
+CREATE INDEX entry_artifact ON entry(artifact_id)
+
+index entry_blob
+CREATE INDEX entry_blob ON entry(blob_id)
+
+index entry_revision
+CREATE INDEX entry_revision ON entry(revision_id)
+
+table evidence
+CREATE TABLE evidence (
+    id          INTEGER PRIMARY KEY,
+    artifact_id INTEGER NOT NULL REFERENCES artifact(id) ON DELETE CASCADE,
+    field       TEXT    NOT NULL,
+    value       TEXT    NOT NULL,
+    source      TEXT    NOT NULL,
+    detail      TEXT,
+    confidence  REAL    NOT NULL DEFAULT 0.0
+)
+
+index evidence_artifact
+CREATE INDEX evidence_artifact ON evidence(artifact_id)
+
+table git_ref
+CREATE TABLE git_ref (
+    id          INTEGER PRIMARY KEY,
+    repo_id     INTEGER NOT NULL REFERENCES repo(id) ON DELETE CASCADE,
+    name        TEXT    NOT NULL,
+    kind        TEXT    NOT NULL,
+    revision_id INTEGER NOT NULL REFERENCES revision(id) ON DELETE CASCADE,
+    UNIQUE(repo_id, name)
+)
+
+table job
+CREATE TABLE job (
+    id         INTEGER PRIMARY KEY,
+    kind       TEXT    NOT NULL,
+    state      TEXT    NOT NULL DEFAULT 'running',
+    phase      TEXT,
+    subject    TEXT,
+    progress   REAL    NOT NULL DEFAULT 0.0,
+    bytes      INTEGER NOT NULL DEFAULT 0,
+    total      INTEGER,
+    rate_bps   INTEGER,
+    error      TEXT,
+    started    TEXT    NOT NULL,
+    finished   TEXT
+)
+
+index job_state
+CREATE INDEX job_state ON job(state, id DESC)
+
+table loadout
+CREATE TABLE loadout (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    document   TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+
+table node
+CREATE TABLE node (
+    id            INTEGER PRIMARY KEY,
+    node_id       TEXT    NOT NULL UNIQUE,
+    name          TEXT    NOT NULL UNIQUE,
+    url           TEXT,
+    is_self       INTEGER NOT NULL DEFAULT 0,
+    online        INTEGER NOT NULL DEFAULT 1,
+    indexed_bytes INTEGER NOT NULL DEFAULT 0,
+    last_seen     TEXT
+)
+
+table noise
+CREATE TABLE noise (
+    id         INTEGER PRIMARY KEY,
+    path       TEXT NOT NULL UNIQUE,
+    reason     TEXT,
+    decided_at TEXT NOT NULL
+)
+
+table peer_cursor
+CREATE TABLE peer_cursor (
+    node_id  INTEGER PRIMARY KEY REFERENCES node(id) ON DELETE CASCADE,
+    cursor   TEXT,
+    synced   TEXT
+)
+
+table projection
+CREATE TABLE projection (
+    id          INTEGER PRIMARY KEY,
+    link_path   TEXT    NOT NULL UNIQUE,
+    target_path TEXT    NOT NULL,
+    profile     TEXT    NOT NULL,
+    artifact_id INTEGER REFERENCES artifact(id) ON DELETE CASCADE,
+    written_at  TEXT    NOT NULL
+)
+
+table repo
+CREATE TABLE repo (
+    id            INTEGER PRIMARY KEY,
+    qualified     TEXT    NOT NULL,
+    repo_type     TEXT    NOT NULL,
+    org           TEXT,
+    name          TEXT    NOT NULL,
+    node_id       INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+    source_id     INTEGER REFERENCES source(id) ON DELETE SET NULL,
+    kind          TEXT    NOT NULL,
+    root_path     TEXT,
+    git_dir       TEXT,
+    default_ref   TEXT    NOT NULL DEFAULT 'main',
+    description   TEXT,
+    card_data     TEXT,
+    license       TEXT,
+    downloads     INTEGER NOT NULL DEFAULT 0,
+    likes         INTEGER NOT NULL DEFAULT 0,
+    private       INTEGER NOT NULL DEFAULT 0,
+    gated         INTEGER NOT NULL DEFAULT 0,
+    last_modified TEXT,
+    created_at    TEXT,
+    UNIQUE(qualified, node_id)
+)
+
+index repo_lookup
+CREATE INDEX repo_lookup ON repo(qualified)
+
+table revision
+CREATE TABLE revision (
+    id        INTEGER PRIMARY KEY,
+    repo_id   INTEGER NOT NULL REFERENCES repo(id) ON DELETE CASCADE,
+    sha       TEXT    NOT NULL,
+    title     TEXT,
+    author    TEXT,
+    committed TEXT,
+    synthetic INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(repo_id, sha)
+)
+
+view search_row
+CREATE VIEW search_row AS
+SELECT
+    a.id                                          AS artifact_id,
+    a.blob_id                                     AS blob_id,
+    b.sha256                                      AS blob_sha256,
+    b.git_sha1                                    AS blob_git_sha1,
+    a.role                                        AS role,
+    a.sub_role                                    AS sub_role,
+    a.role_confidence                             AS role_confidence,
+    a.org                                         AS org,
+    a.name                                        AS name,
+    a.base                                        AS base,
+    a.base_label                                  AS base_label,
+    a.format                                      AS format,
+    a.precision                                   AS precision,
+    a.quant                                       AS quant,
+    a.rank                                        AS rank,
+    a.alpha                                       AS alpha,
+    a.params                                      AS params,
+    a.context                                     AS context,
+    a.trigger_words                               AS trigger_words,
+    a.triage                                      AS triage,
+    a.last_used                                   AS last_used,
+    b.size                                        AS size,
+    b.path_count                                  AS path_count,
+    CASE WHEN b.path_count > 1 THEN 1 ELSE 0 END  AS dupe,
+    e.id                                          AS entry_id,
+    e.path                                        AS path,
+    e.abs_path                                    AS abs_path,
+    e.state                                       AS state,
+    e.pull_progress                               AS pull_progress,
+    e.is_symlink                                  AS is_symlink,
+    e.lfs_pointer                                 AS lfs_pointer,
+    e.present                                     AS present,
+    e.mtime                                       AS mtime,
+    r.id                                          AS repo_id,
+    r.qualified                                   AS repo,
+    r.repo_type                                   AS repo_type,
+    r.name                                        AS repo_name,
+    r.org                                         AS repo_org,
+    v.sha                                         AS revision_sha,
+    COALESCE(
+        (SELECT g.name FROM git_ref g WHERE g.revision_id = v.id ORDER BY
+            CASE g.kind WHEN 'branch' THEN 0 ELSE 1 END, g.name LIMIT 1),
+        substr(v.sha, 1, 7)
+    )                                             AS revision,
+    n.id                                          AS node_row_id,
+    n.name                                        AS node,
+    n.is_self                                     AS node_is_self,
+    s.name                                        AS source,
+    (n.is_self * 4)
+      + CASE e.state WHEN 'served' THEN 3 WHEN 'local' THEN 2 WHEN 'triage' THEN 2
+                     WHEN 'stale' THEN 1 ELSE 0 END
+      + e.present                                 AS preference
+FROM artifact a
+JOIN blob b     ON b.id = a.blob_id
+JOIN entry e    ON e.artifact_id = a.id
+JOIN revision v ON v.id = e.revision_id
+JOIN repo r     ON r.id = v.repo_id
+JOIN node n     ON n.id = e.node_id
+LEFT JOIN source s ON s.id = e.source_id
+
+table setting
+CREATE TABLE setting (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)
+
+table shelf
+CREATE TABLE shelf (
+    id       INTEGER PRIMARY KEY,
+    name     TEXT    NOT NULL UNIQUE,
+    query    TEXT    NOT NULL,
+    builtin  INTEGER NOT NULL DEFAULT 0,
+    position INTEGER NOT NULL DEFAULT 0
+)
+
+table source
+CREATE TABLE source (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT    NOT NULL UNIQUE,
+    path       TEXT    NOT NULL,
+    kind       TEXT    NOT NULL,
+    node_id    INTEGER NOT NULL REFERENCES node(id) ON DELETE CASCADE,
+    file_count INTEGER NOT NULL DEFAULT 0,
+    blob_count INTEGER NOT NULL DEFAULT 0,
+    byte_count INTEGER NOT NULL DEFAULT 0,
+    last_scan  TEXT
+)
+
+index sqlite_autoindex_artifact_1
+
+
+index sqlite_autoindex_blob_1
+
+
+index sqlite_autoindex_entry_1
+
+
+index sqlite_autoindex_git_ref_1
+
+
+index sqlite_autoindex_loadout_1
+
+
+index sqlite_autoindex_node_1
+
+
+index sqlite_autoindex_node_2
+
+
+index sqlite_autoindex_noise_1
+
+
+index sqlite_autoindex_projection_1
+
+
+index sqlite_autoindex_repo_1
+
+
+index sqlite_autoindex_revision_1
+
+
+index sqlite_autoindex_setting_1
+
+
+index sqlite_autoindex_shelf_1
+
+
+index sqlite_autoindex_source_1
+
+
+table tensor_summary
+CREATE TABLE tensor_summary (
+    artifact_id  INTEGER PRIMARY KEY REFERENCES artifact(id) ON DELETE CASCADE,
+    tensor_count INTEGER NOT NULL DEFAULT 0,
+    params       INTEGER NOT NULL DEFAULT 0,
+    dtypes       TEXT    NOT NULL DEFAULT '{}',
+    key_prefixes TEXT    NOT NULL DEFAULT '[]',
+    samples      TEXT    NOT NULL DEFAULT '[]',
+    metadata     TEXT    NOT NULL DEFAULT '{}'
+)
+
+table usage
+CREATE TABLE usage (
+    id          INTEGER PRIMARY KEY,
+    at          TEXT    NOT NULL,
+    client      TEXT,
+    repo_id     INTEGER REFERENCES repo(id) ON DELETE SET NULL,
+    artifact_id INTEGER REFERENCES artifact(id) ON DELETE SET NULL,
+    path        TEXT    NOT NULL,
+    bytes       INTEGER NOT NULL DEFAULT 0,
+    rate_bps    INTEGER,
+    status      INTEGER NOT NULL DEFAULT 200
+)
+
+index usage_artifact
+CREATE INDEX usage_artifact ON usage(artifact_id, at DESC)
+
+index usage_at
+CREATE INDEX usage_at ON usage(at DESC)
+
+index usage_repo
+CREATE INDEX usage_repo ON usage(repo_id, at DESC)

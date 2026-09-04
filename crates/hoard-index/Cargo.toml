@@ -1,0 +1,45 @@
+[package]
+name = "hoard-index"
+description = "Filesystem discovery, artifact sniffing, role inference, search grammar and the SQLite index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hoard-core.workspace = true
+rusqlite.workspace = true
+r2d2.workspace = true
+r2d2_sqlite.workspace = true
+rusqlite_migration.workspace = true
+ignore.workspace = true
+notify.workspace = true
+globset.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+xxhash-rust.workspace = true
+hex.workspace = true
+winnow.workspace = true
+pulldown-cmark.workspace = true
+serde_yaml_ng.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+parking_lot.workspace = true
+jiff.workspace = true
+tracing.workspace = true
+gix.workspace = true
+humansize.workspace = true
+strum.workspace = true
+toml.workspace = true
+regex.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+insta.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,142 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+repository = "https://github.com/johnz86/hoard"
+
+[workspace.dependencies]
+hoard-core = { path = "crates/hoard-core" }
+hoard-index = { path = "crates/hoard-index" }
+hoard-mirror = { path = "crates/hoard-mirror" }
+hoard-net = { path = "crates/hoard-net" }
+hoard-server = { path = "crates/hoard-server" }
+
+# async runtime and HTTP
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "fs", "io-util", "net", "process", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-stream = "0.1"
+futures = "0.3"
+bytes = "1.12"
+http = "1.5"
+axum = { version = "0.8", features = ["http2", "macros"] }
+axum-extra = { version = "0.12", features = ["typed-header"] }
+tower = { version = "0.5", features = ["util", "timeout"] }
+tower-http = { version = "0.7", features = ["trace", "compression-gzip", "compression-zstd", "timeout", "cors", "set-header", "normalize-path", "catch-panic", "request-id", "limit"] }
+http-range-header = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "gzip", "http2"] }
+headers = "0.4"
+mime_guess = "2.0"
+percent-encoding = "2.3"
+url = "2.5"
+rust-embed = { version = "8.12", features = ["include-exclude"] }
+
+# serialization and config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml_ng = "0.10"
+toml = "1.1"
+clap = { version = "4.6", features = ["derive", "env"] }
+dotenvy = "0.15"
+secrecy = { version = "0.10", features = ["serde"] }
+
+# errors and observability
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+indicatif = "0.18"
+
+# storage and discovery
+rusqlite = { version = "0.40", features = ["bundled", "trace"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.35"
+rusqlite_migration = "2.6"
+ignore = "0.4"
+notify = "8.2"
+mdns-sd = "0.16"
+globset = "0.4"
+gix = { version = "0.87", default-features = false, features = ["sha1", "revision", "parallel"] }
+
+# artifact formats and hashing
+sha1 = "0.11"
+sha2 = "0.11"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crc32fast = "1.5"
+hex = "0.4"
+
+# text, search grammar, documents
+winnow = "1.0"
+regex = "1.13"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+humansize = "2.1"
+
+# concurrency and caching
+rayon = "1.12"
+parking_lot = "0.12"
+arc-swap = "1.9"
+moka = { version = "0.12", features = ["future"] }
+jiff = { version = "0.2", features = ["serde"] }
+strum = { version = "0.28", features = ["derive"] }
+
+# testing
+tempfile = "3.27"
+wiremock = "0.6"
+insta = { version = "1.48", features = ["json"] }
+mockall = "0.15"
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "warn"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+todo = "warn"
+
+[package]
+name = "hoard"
+description = "Local HuggingFace-compatible mirror and artifact index for models, datasets and loadouts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+default-run = "hoard"
+
+[[bin]]
+name = "hoard"
+path = "src/main.rs"
+
+[dependencies]
+hoard-core.workspace = true
+hoard-index.workspace = true
+hoard-mirror.workspace = true
+hoard-net.workspace = true
+hoard-server.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+dotenvy.workspace = true
+indicatif.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true

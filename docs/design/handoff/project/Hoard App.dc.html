@@ -1,0 +1,980 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+<style>
+  body { margin: 0; background: oklch(0.185 0.012 70); }
+  * { box-sizing: border-box; }
+  a { color: oklch(0.79 0.155 62); text-decoration: none; }
+  a:hover { color: oklch(0.87 0.13 68); }
+  input { font: inherit; }
+  input::placeholder { color: oklch(0.5 0.012 70); }
+  ::selection { background: oklch(0.5 0.14 55); color: oklch(0.98 0 0); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: oklch(0.215 0.012 70); }
+  ::-webkit-scrollbar-thumb { background: oklch(0.33 0.012 70); }
+  ::-webkit-scrollbar-thumb:hover { background: oklch(0.42 0.012 70); }
+  @keyframes hoardIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  @keyframes hoardToast { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  @keyframes hoardPulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+</style>
+</helmet>
+<div style="--bg:oklch(0.185 0.012 70);--panel:oklch(0.225 0.012 70);--panel2:oklch(0.265 0.012 70);--rule:oklch(0.315 0.012 70);--rule2:oklch(0.26 0.012 70);--text:oklch(0.93 0.008 80);--muted:oklch(0.635 0.012 75);--dim:oklch(0.5 0.012 70);--amb:oklch(0.79 0.155 62);--green:oklch(0.76 0.15 155);--red:oklch(0.68 0.17 25);--sans:'Space Grotesk',system-ui,sans-serif;--mono:'Space Mono',ui-monospace,monospace;background:var(--bg);color:var(--text);font-family:var(--sans);height:100vh;min-width:1180px;display:flex;flex-direction:column;overflow:hidden;-webkit-font-smoothing:antialiased">
+
+  <div style="display:flex;align-items:center;gap:14px;padding:11px 16px;border-bottom:1px solid var(--rule);background:var(--panel);flex:0 0 auto">
+    <span onClick="{{ goHome }}" style="font-family:var(--sans);font-weight:700;font-size:14px;letter-spacing:-0.01em;cursor:pointer">HOARD</span>
+    <div style="display:flex;gap:2px;margin-left:4px">
+      <sc-for list="{{ navTabs }}" as="t" hint-placeholder-count="5">
+        <span onClick="{{ t.onClick }}" style="font-family:var(--mono);font-size:11px;letter-spacing:0.1em;padding:6px 12px;cursor:pointer;border:1px solid {{ t.border }};background:{{ t.bg }};color:{{ t.color }}" style-hover="color:var(--text)">{{ t.label }}</span>
+      </sc-for>
+    </div>
+    <div style="flex:1;display:flex;align-items:center;gap:9px;margin-left:12px;background:var(--bg);border:1px solid {{ searchBorder }};padding:0 10px;height:34px">
+      <span style="color:var(--amb);font-family:var(--mono);font-size:13px">&#9906;</span>
+      <input value="{{ q }}" onChange="{{ onQuery }}" onFocus="{{ onFocus }}" onBlur="{{ onBlur }}" ref="{{ searchRef }}" placeholder="role:lora base:sdxl size:&lt;400mb film grain" spellcheck="false" style="flex:1;background:transparent;border:0;outline:none;color:var(--text);font-family:var(--mono);font-size:12.5px" />
+      <sc-if value="{{ q }}" hint-placeholder-val="{{ true }}">
+        <span onClick="{{ clearQuery }}" style="font-family:var(--mono);font-size:11px;color:var(--dim);cursor:pointer;padding:0 4px" style-hover="color:var(--red)">CLEAR</span>
+      </sc-if>
+      <span style="font-family:var(--mono);font-size:10.5px;letter-spacing:0.12em;color:var(--dim)">{{ searchHint }}</span>
+    </div>
+    <span style="font-family:var(--mono);font-size:11px;letter-spacing:0.1em;color:var(--green);display:flex;align-items:center;gap:6px"><span style="width:6px;height:6px;background:var(--green);border-radius:50%;animation:hoardPulse 2.6s ease-in-out infinite"></span>4 NODES</span>
+    <span onClick="{{ toggleLoadout }}" style="font-family:var(--mono);font-size:11px;letter-spacing:0.1em;color:var(--amb);border:1px solid var(--rule);padding:6px 11px;cursor:pointer" style-hover="background:var(--panel2)">LOADOUT {{ loadoutCount }}</span>
+  </div>
+
+  <sc-if value="{{ tokensShown }}" hint-placeholder-val="{{ true }}">
+    <div style="display:flex;align-items:center;gap:8px;padding:8px 16px;border-bottom:1px solid var(--rule2);background:var(--bg);flex:0 0 auto;flex-wrap:wrap">
+      <span style="font-family:var(--mono);font-size:10px;letter-spacing:0.14em;color:var(--dim)">PARSED</span>
+      <sc-for list="{{ tokens }}" as="tk" hint-placeholder-count="3">
+        <span style="display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11.5px;background:var(--panel2);border:1px solid var(--rule);padding:3px 5px 3px 8px;color:var(--text)">
+          <span style="color:{{ tk.keyColor }}">{{ tk.k }}</span>{{ tk.v }}
+          <span onClick="{{ tk.onRemove }}" style="color:var(--dim);cursor:pointer;padding:0 3px" style-hover="color:var(--red)">&times;</span>
+        </span>
+      </sc-for>
+      <span style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-left:4px">{{ resultLine }}</span>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ isIndex }}" hint-placeholder-val="{{ true }}">
+    <div style="flex:1;display:grid;grid-template-columns:214px minmax(0,1fr) {{ railCol }};min-height:0">
+      <div style="border-right:1px solid var(--rule);background:var(--panel);overflow-y:auto;padding:14px 0 20px">
+        <sc-for list="{{ facets }}" as="f" hint-placeholder-count="4">
+          <div style="padding:0 14px 16px">
+            <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.16em;color:var(--dim);padding-bottom:8px;border-bottom:1px solid var(--rule);margin-bottom:7px">{{ f.title }}</div>
+            <sc-for list="{{ f.items }}" as="it" hint-placeholder-count="5">
+              <div onClick="{{ it.onClick }}" style="display:flex;align-items:center;gap:8px;padding:3.5px 4px;font-family:var(--mono);font-size:12px;cursor:pointer;background:{{ it.bg }}" style-hover="background:var(--panel2)">
+                <span style="width:8px;height:8px;flex:0 0 auto;border:1px solid {{ it.mark }};background:{{ it.fill }}"></span>
+                <span style="color:{{ it.tone }};flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ it.label }}</span>
+                <span style="color:var(--dim);font-size:11px">{{ it.count }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </sc-for>
+        <div style="padding:6px 14px 0;border-top:1px solid var(--rule)">
+          <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.16em;color:var(--dim);padding:12px 0 9px">SAVED SHELVES</div>
+          <sc-for list="{{ shelves }}" as="s" hint-placeholder-count="5">
+            <div onClick="{{ s.onClick }}" style="font-family:var(--mono);font-size:11.5px;padding:4px 4px;color:var(--muted);cursor:pointer;display:flex;justify-content:space-between;gap:8px" style-hover="color:var(--amb);background:var(--panel2)">
+              <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ s.label }}</span>
+              <span style="color:var(--dim)">&rsaquo;</span>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;min-height:0;min-width:0">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 14px;border-bottom:1px solid var(--rule);background:var(--panel);flex:0 0 auto">
+          <span style="font-family:var(--mono);font-size:11px;letter-spacing:0.1em;color:var(--muted)">{{ resultLine }} &middot; SORT {{ sortLabel }}</span>
+          <span style="display:flex;gap:2px">
+            <sc-for list="{{ viewTabs }}" as="v" hint-placeholder-count="2">
+              <span onClick="{{ v.onClick }}" style="font-family:var(--mono);font-size:10.5px;letter-spacing:0.1em;padding:4px 10px;border:1px solid var(--rule);cursor:pointer;background:{{ v.bg }};color:{{ v.color }}">{{ v.label }}</span>
+            </sc-for>
+          </span>
+        </div>
+
+        <sc-if value="{{ isTable }}" hint-placeholder-val="{{ true }}">
+          <div style="flex:1;overflow:auto;min-height:0">
+            <div style="min-width:1010px">
+              <div style="display:grid;grid-template-columns:54px minmax(0,1fr) 100px 96px 62px 76px 84px 104px 92px;position:sticky;top:0;z-index:2;padding:7px 14px;border-bottom:1px solid var(--rule);background:var(--panel);font-family:var(--mono);font-size:10px;letter-spacing:0.13em">
+                <sc-for list="{{ cols }}" as="c" hint-placeholder-count="9">
+                  <span onClick="{{ c.onClick }}" style="cursor:pointer;color:{{ c.color }};text-align:{{ c.align }};padding-right:{{ c.pr }}" style-hover="color:var(--text)">{{ c.label }}{{ c.arrow }}</span>
+                </sc-for>
+              </div>
+              <sc-for list="{{ rows }}" as="r" hint-placeholder-count="14">
+                <div onClick="{{ r.onClick }}" onDoubleClick="{{ r.onOpen }}" style="display:grid;grid-template-columns:54px minmax(0,1fr) 100px 96px 62px 76px 84px 104px 92px;align-items:center;padding:{{ rowPad }} 14px;border-bottom:1px solid var(--rule2);border-left:2px solid {{ r.cursorMark }};font-family:var(--mono);font-size:{{ rowFont }};cursor:pointer;background:{{ r.bg }}" style-hover="background:var(--panel2)">
+                  <span style="display:flex;align-items:center;gap:6px">
+                    <span style="width:3px;height:13px;background:{{ r.color }}"></span>
+                    <span style="font-size:10px;letter-spacing:0.06em;color:var(--muted)">{{ r.role }}</span>
+                  </span>
+                  <span style="color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:14px"><span style="color:var(--dim)">{{ r.org }}</span>{{ r.name }}</span>
+                  <span style="color:var(--muted)">{{ r.base }}</span>
+                  <span style="color:var(--muted)">{{ r.fmt }}</span>
+                  <span style="color:var(--muted)">{{ r.prec }}</span>
+                  <span style="text-align:right;padding-right:14px;color:var(--text)">{{ r.size }}</span>
+                  <span style="color:var(--muted)">{{ r.rev }}</span>
+                  <span style="color:var(--muted)">{{ r.node }}</span>
+                  <span style="text-align:right;font-size:10.5px;letter-spacing:0.08em;color:{{ r.stateColor }}">{{ r.state }}</span>
+                </div>
+              </sc-for>
+              <sc-if value="{{ isEmpty }}" hint-placeholder-val="{{ false }}">
+                <div style="padding:60px 20px;text-align:center;font-family:var(--mono);font-size:12.5px;color:var(--dim);animation:hoardIn 180ms ease-out">
+                  <div style="color:var(--muted);margin-bottom:10px">NO ARTIFACT MATCHES THIS QUERY</div>
+                  <div>drop a token above, or try <span onClick="{{ tryExample }}" style="color:var(--amb);cursor:pointer;border-bottom:1px solid var(--rule)">compat:sdxl-base-1.0 role:lora</span></div>
+                </div>
+              </sc-if>
+            </div>
+          </div>
+        </sc-if>
+
+        <sc-if value="{{ isCards }}" hint-placeholder-val="{{ false }}">
+          <div style="flex:1;overflow:auto;min-height:0;padding:14px;display:grid;grid-template-columns:repeat(auto-fill,minmax(228px,1fr));gap:12px;align-content:start">
+            <sc-for list="{{ rows }}" as="r" hint-placeholder-count="9">
+              <div onClick="{{ r.onClick }}" onDoubleClick="{{ r.onOpen }}" style="border:1px solid {{ r.cardBorder }};background:{{ r.cardBg }};padding:14px 14px 15px;cursor:pointer;display:flex;flex-direction:column;gap:9px;animation:hoardIn 160ms ease-out" style-hover="border-color:var(--amb)">
+                <div style="display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:10px;letter-spacing:0.12em">
+                  <span style="width:3px;height:12px;background:{{ r.color }}"></span>
+                  <span style="color:var(--muted)">{{ r.role }}</span>
+                  <span style="margin-left:auto;color:{{ r.stateColor }}">{{ r.state }}</span>
+                </div>
+                <div style="font-family:var(--sans);font-weight:600;font-size:15px;letter-spacing:-0.01em;color:var(--text);line-height:1.25;word-break:break-word">{{ r.name }}</div>
+                <div style="font-family:var(--mono);font-size:11px;color:var(--dim);line-height:1.7">{{ r.org }}{{ r.base }} &middot; {{ r.prec }} &middot; {{ r.size }}</div>
+                <div style="font-family:var(--mono);font-size:11px;color:var(--muted);border-top:1px dashed var(--rule);padding-top:9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ r.trigger }}</div>
+              </div>
+            </sc-for>
+          </div>
+        </sc-if>
+
+        <div style="display:flex;align-items:center;gap:18px;padding:8px 14px;border-top:1px solid var(--rule);background:var(--panel);font-family:var(--mono);font-size:11px;color:var(--muted);flex:0 0 auto;flex-wrap:wrap">
+          <span><span style="color:var(--amb)">J/K</span> move</span>
+          <span><span style="color:var(--amb)">&crarr;</span> open</span>
+          <span><span style="color:var(--amb)">SPC</span> select</span>
+          <span><span style="color:var(--amb)">L</span> loadout</span>
+          <span><span style="color:var(--amb)">S</span> serve</span>
+          <span><span style="color:var(--amb)">/</span> search</span>
+          <span style="margin-left:auto;color:var(--dim)">{{ selLine }}</span>
+        </div>
+      </div>
+
+      <sc-if value="{{ railOn }}" hint-placeholder-val="{{ true }}">
+        <div style="border-left:1px solid var(--rule);background:var(--panel);overflow-y:auto;padding:16px 16px 24px;display:flex;flex-direction:column;gap:20px">
+          <div>
+            <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.16em;color:var(--dim);margin-bottom:12px">INSPECTOR</div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+              <span style="width:3px;height:16px;background:{{ cur.color }}"></span>
+              <span style="font-family:var(--mono);font-size:10px;letter-spacing:0.12em;color:var(--muted)">{{ cur.role }}</span>
+            </div>
+            <div style="font-family:var(--sans);font-weight:600;font-size:18px;letter-spacing:-0.02em;line-height:1.2;word-break:break-word">{{ cur.name }}</div>
+            <div style="font-family:var(--mono);font-size:11.5px;color:var(--dim);margin-top:6px">{{ cur.path }}</div>
+          </div>
+          <div>
+            <sc-for list="{{ cur.facts }}" as="ft" hint-placeholder-count="6">
+              <div style="display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px dashed var(--rule);font-family:var(--mono);font-size:11.5px">
+                <span style="color:var(--dim)">{{ ft.k }}</span>
+                <span style="color:var(--text);text-align:right">{{ ft.v }}</span>
+              </div>
+            </sc-for>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:6px">
+            <span onClick="{{ openCursor }}" style="font-family:var(--mono);font-size:11.5px;letter-spacing:0.1em;text-align:center;padding:9px;background:var(--amb);color:oklch(0.2 0.03 60);cursor:pointer;font-weight:700" style-hover="background:oklch(0.86 0.14 66)">OPEN REPO &crarr;</span>
+            <span onClick="{{ addCursorToLoadout }}" style="font-family:var(--mono);font-size:11.5px;letter-spacing:0.1em;text-align:center;padding:9px;border:1px solid var(--rule);color:var(--text);cursor:pointer" style-hover="background:var(--panel2)">ADD TO LOADOUT</span>
+            <span onClick="{{ yankCursor }}" style="font-family:var(--mono);font-size:11.5px;letter-spacing:0.1em;text-align:center;padding:9px;border:1px solid var(--rule);color:var(--text);cursor:pointer" style-hover="background:var(--panel2)">YANK PULL COMMAND</span>
+          </div>
+          <div>
+            <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.16em;color:var(--dim);margin-bottom:10px">PLUGS INTO</div>
+            <sc-for list="{{ cur.plugs }}" as="pg" hint-placeholder-count="3">
+              <div onClick="{{ pg.onClick }}" style="font-family:var(--mono);font-size:11.5px;color:var(--muted);padding:4px 0;cursor:pointer" style-hover="color:var(--amb)">{{ pg.label }}</div>
+            </sc-for>
+          </div>
+        </div>
+      </sc-if>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ isDetail }}" hint-placeholder-val="{{ false }}">
+    <div style="flex:1;display:flex;flex-direction:column;min-height:0;animation:hoardIn 200ms ease-out">
+      <div style="display:flex;align-items:center;gap:14px;padding:16px 18px;border-bottom:1px solid var(--rule);background:var(--panel);flex:0 0 auto">
+        <span onClick="{{ goHome }}" style="font-family:var(--mono);font-size:11px;letter-spacing:0.1em;color:var(--muted);border:1px solid var(--rule);padding:6px 10px;cursor:pointer" style-hover="color:var(--amb)">&larr; ESC</span>
+        <span style="width:3px;height:22px;background:{{ d.color }}"></span>
+        <span style="font-family:var(--sans);font-weight:600;font-size:21px;letter-spacing:-0.02em;white-space:nowrap"><span style="color:var(--dim)">{{ d.org }}</span>{{ d.name }}</span>
+        <span style="font-family:var(--mono);font-size:10.5px;letter-spacing:0.12em;color:var(--muted);border:1px solid var(--rule);padding:3px 8px">{{ d.roleFull }}</span>
+        <span style="font-family:var(--mono);font-size:10.5px;letter-spacing:0.12em;color:{{ d.stateColor }};border:1px solid var(--rule);padding:3px 8px">{{ d.stateFull }}</span>
+        <span style="margin-left:auto;font-family:var(--mono);font-size:11.5px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ d.meta }}</span>
+        <span onClick="{{ addCursorToLoadout }}" style="font-family:var(--mono);font-size:11px;letter-spacing:0.1em;padding:7px 11px;border:1px solid var(--rule);cursor:pointer;color:var(--text)" style-hover="background:var(--panel2)">+ LOADOUT</span>
+      </div>
+
+      <div style="display:grid;grid-template-columns:minmax(0,1fr) 340px;flex:1;min-height:0">
+        <div style="display:flex;flex-direction:column;min-height:0;min-width:0">
+          <div style="display:flex;gap:2px;padding:12px 18px 0;flex:0 0 auto">
+            <sc-for list="{{ detailTabs }}" as="t" hint-placeholder-count="5">
+              <span onClick="{{ t.onClick }}" style="font-family:var(--mono);font-size:11px;letter-spacing:0.1em;padding:7px 13px;cursor:pointer;border:1px solid {{ t.border }};border-bottom-color:{{ t.bottom }};color:{{ t.color }};background:{{ t.bg }}" style-hover="color:var(--text)">{{ t.label }}</span>
+            </sc-for>
+            <span style="flex:1;border-bottom:1px solid var(--rule)"></span>
+          </div>
+          <div style="display:flex;align-items:center;gap:12px;padding:10px 18px;border-bottom:1px solid var(--rule);background:var(--panel);flex:0 0 auto">
+            <span style="font-family:var(--mono);font-size:11px;letter-spacing:0.12em;color:var(--dim)">REVISION</span>
+            <span style="font-family:var(--mono);font-size:12px;background:var(--panel2);border:1px solid var(--rule);padding:3px 9px">{{ d.rev }}</span>
+            <span style="font-family:var(--mono);font-size:12px;color:var(--dim)">{{ d.revMeta }}</span>
+            <span onClick="{{ showRefs }}" style="margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--amb);cursor:pointer">SWITCH &#9662;</span>
+          </div>
+
+          <div style="flex:1;overflow-y:auto;min-height:0">
+            <sc-if value="{{ tabFiles }}" hint-placeholder-val="{{ true }}">
+              <div>
+                <sc-for list="{{ d.files }}" as="fl" hint-placeholder-count="8">
+                  <div style="display:grid;grid-template-columns:minmax(0,1fr) 96px 104px 88px;align-items:center;padding:7px 18px;border-bottom:1px solid var(--rule2);font-family:var(--mono);font-size:12.5px" style-hover="background:var(--panel)">
+                    <span style="color:{{ fl.tone }};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:12px">{{ fl.p }}</span>
+                    <span style="color:var(--dim);font-size:11.5px">{{ fl.kind }}</span>
+                    <span style="text-align:right;padding-right:16px">{{ fl.size }}</span>
+                    <span style="text-align:right;font-size:10.5px;letter-spacing:0.08em;color:{{ fl.stColor }}">{{ fl.st }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </sc-if>
+
+            <sc-if value="{{ tabRefs }}" hint-placeholder-val="{{ false }}">
+              <div style="padding:6px 0">
+                <sc-for list="{{ d.refs }}" as="rf" hint-placeholder-count="6">
+                  <div onClick="{{ rf.onClick }}" style="display:grid;grid-template-columns:22px minmax(0,1fr) 110px 150px 84px;align-items:center;gap:10px;padding:9px 18px;border-bottom:1px solid var(--rule2);font-family:var(--mono);font-size:12.5px;cursor:pointer;background:{{ rf.bg }}" style-hover="background:var(--panel2)">
+                    <span style="color:{{ rf.dotColor }}">{{ rf.dot }}</span>
+                    <span style="color:var(--text)">{{ rf.name }}</span>
+                    <span style="color:var(--amb)">{{ rf.sha }}</span>
+                    <span style="color:var(--dim)">{{ rf.when }}</span>
+                    <span style="text-align:right;color:var(--muted);font-size:11px">{{ rf.kind }}</span>
+                  </div>
+                </sc-for>
+                <div style="padding:16px 18px;font-family:var(--mono);font-size:11.5px;color:var(--dim);line-height:1.8">
+                  Refs are read straight from the clone. Pinning a revision in a loadout stores the resolved sha, not the branch name.
+                </div>
+              </div>
+            </sc-if>
+
+            <sc-if value="{{ tabCard }}" hint-placeholder-val="{{ false }}">
+              <div style="padding:22px 18px 40px;display:flex;justify-content:center">
+                <div style="width:100%;max-width:760px;background:var(--panel);border:1px solid var(--rule);animation:hoardIn 180ms ease-out">
+                  <div style="display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--rule);background:var(--panel2);font-family:var(--mono);font-size:11px;letter-spacing:0.1em;color:var(--muted)">
+                    <span style="color:var(--amb)">&#9633;</span>
+                    <span>README.md</span>
+                    <span style="color:var(--dim)">&middot; {{ d.rev }}</span>
+                    <span style="margin-left:auto;color:var(--dim)">{{ d.cardMeta }}</span>
+                  </div>
+                  <div style="padding:26px 30px 34px">
+                    <sc-if value="{{ d.frontmatterOn }}" hint-placeholder-val="{{ true }}">
+                      <div style="border:1px dashed var(--rule);padding:14px 16px;margin-bottom:26px;font-family:var(--mono);font-size:11.5px;line-height:1.8;color:var(--muted)">
+                        <div style="color:var(--dim);letter-spacing:0.12em;font-size:10px;margin-bottom:8px">YAML FRONTMATTER</div>
+                        <sc-for list="{{ d.frontmatter }}" as="fm" hint-placeholder-count="4">
+                          <div><span style="color:var(--amb)">{{ fm.k }}</span>{{ fm.v }}</div>
+                        </sc-for>
+                      </div>
+                    </sc-if>
+                    <sc-for list="{{ d.card }}" as="b" hint-placeholder-count="7">
+                      <sc-if value="{{ b.isH1 }}" hint-placeholder-val="{{ false }}">
+                        <div style="font-family:var(--sans);font-weight:700;font-size:29px;letter-spacing:-0.025em;color:var(--text);margin:0 0 14px;line-height:1.15">{{ b.t }}</div>
+                      </sc-if>
+                      <sc-if value="{{ b.isH2 }}" hint-placeholder-val="{{ false }}">
+                        <div style="font-family:var(--sans);font-weight:600;font-size:17px;letter-spacing:-0.01em;color:var(--text);margin:28px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--rule)">{{ b.t }}</div>
+                      </sc-if>
+                      <sc-if value="{{ b.isP }}" hint-placeholder-val="{{ true }}">
+                        <div style="font-family:var(--sans);font-size:15px;line-height:1.62;color:oklch(0.84 0.008 80);margin:0 0 14px;max-width:66ch">{{ b.t }}</div>
+                      </sc-if>
+                      <sc-if value="{{ b.isLi }}" hint-placeholder-val="{{ false }}">
+                        <div style="display:grid;grid-template-columns:18px minmax(0,1fr);font-family:var(--sans);font-size:14.5px;line-height:1.6;color:oklch(0.84 0.008 80);margin:0 0 7px">
+                          <span style="color:var(--amb);font-family:var(--mono)">&middot;</span>
+                          <span>{{ b.t }}</span>
+                        </div>
+                      </sc-if>
+                      <sc-if value="{{ b.isCode }}" hint-placeholder-val="{{ false }}">
+                        <div style="background:var(--bg);border:1px solid var(--rule);padding:14px 16px;margin:6px 0 18px;font-family:var(--mono);font-size:12px;line-height:1.8;color:var(--text);white-space:pre-wrap;overflow-x:auto">{{ b.t }}</div>
+                      </sc-if>
+                      <sc-if value="{{ b.isQuote }}" hint-placeholder-val="{{ false }}">
+                        <div style="border-left:2px solid var(--amb);padding:2px 0 2px 14px;margin:0 0 16px;font-family:var(--sans);font-size:14.5px;line-height:1.6;color:var(--muted);max-width:64ch">{{ b.t }}</div>
+                      </sc-if>
+                    </sc-for>
+                  </div>
+                </div>
+              </div>
+            </sc-if>
+
+            <sc-if value="{{ tabCompat }}" hint-placeholder-val="{{ false }}">
+              <div>
+                <div style="padding:14px 18px;font-family:var(--mono);font-size:11.5px;color:var(--muted);border-bottom:1px solid var(--rule);background:var(--panel)">
+                  RESOLVED FROM TENSOR KEYS AND RANK &mdash; NOT FROM THE MODEL CARD &middot; <span style="color:var(--amb)">{{ d.compatLine }}</span>
+                </div>
+                <sc-for list="{{ d.compat }}" as="cp" hint-placeholder-count="8">
+                  <div onClick="{{ cp.onClick }}" style="display:grid;grid-template-columns:54px minmax(0,1fr) 110px 96px 92px;align-items:center;padding:7px 18px;border-bottom:1px solid var(--rule2);font-family:var(--mono);font-size:12.5px;cursor:pointer" style-hover="background:var(--panel)">
+                    <span style="display:flex;align-items:center;gap:6px"><span style="width:3px;height:13px;background:{{ cp.color }}"></span><span style="font-size:10px;color:var(--muted)">{{ cp.role }}</span></span>
+                    <span style="color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding-right:12px">{{ cp.name }}</span>
+                    <span style="color:var(--dim)">{{ cp.detail }}</span>
+                    <span style="text-align:right;padding-right:14px">{{ cp.size }}</span>
+                    <span style="text-align:right;font-size:10.5px;letter-spacing:0.08em;color:{{ cp.stateColor }}">{{ cp.state }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </sc-if>
+
+            <sc-if value="{{ tabUsage }}" hint-placeholder-val="{{ false }}">
+              <div style="padding:20px 18px 40px;display:grid;gap:22px;max-width:820px">
+                <div>
+                  <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.16em;color:var(--dim);margin-bottom:10px">LAN ACTIVITY &mdash; LAST 7 DAYS</div>
+                  <div style="display:flex;gap:3px;align-items:flex-end;height:74px;border-bottom:1px solid var(--rule);padding-bottom:2px">
+                    <sc-for list="{{ d.usage }}" as="u" hint-placeholder-count="14">
+                      <span style="flex:1;height:{{ u.h }};background:{{ u.color }}"></span>
+                    </sc-for>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;color:var(--dim);margin-top:7px">
+                    <span>{{ d.usageLeft }}</span>
+                    <span>{{ d.usageRight }}</span>
+                  </div>
+                </div>
+                <div>
+                  <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.16em;color:var(--dim);margin-bottom:10px">RECENT PULLS</div>
+                  <sc-for list="{{ d.pulls }}" as="pl" hint-placeholder-count="4">
+                    <div style="display:grid;grid-template-columns:130px 150px minmax(0,1fr) 100px;gap:12px;padding:6px 0;border-bottom:1px dashed var(--rule);font-family:var(--mono);font-size:12px">
+                      <span style="color:var(--muted)">{{ pl.when }}</span>
+                      <span style="color:var(--text)">{{ pl.who }}</span>
+                      <span style="color:var(--dim)">{{ pl.what }}</span>
+                      <span style="text-align:right;color:var(--green)">{{ pl.rate }}</span>
+                    </div>
+                  </sc-for>
+                </div>
+              </div>
+            </sc-if>
+          </div>
+        </div>
+
+        <div style="border-left:1px solid var(--rule);background:var(--panel);overflow-y:auto;padding:18px 18px 26px;display:flex;flex-direction:column;gap:22px">
+          <div>
+            <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.16em;color:var(--dim);margin-bottom:11px">PULL TO THIS MACHINE</div>
+            <div style="background:var(--bg);border:1px solid var(--rule);padding:12px;font-family:var(--mono);font-size:11.5px;line-height:1.75">
+              <div style="color:var(--dim)"># git, refs preserved</div>
+              <div style="word-break:break-all">{{ d.cloneCmd }}</div>
+              <div style="color:var(--dim);margin-top:8px"># or python, unchanged</div>
+              <div>HF_ENDPOINT=<span style="color:var(--amb)">http://hoard.lan:7099</span></div>
+            </div>
+            <span onClick="{{ yankCursor }}" style="display:block;margin-top:7px;font-family:var(--mono);font-size:11px;letter-spacing:0.1em;text-align:center;padding:8px;border:1px solid var(--rule);cursor:pointer;color:var(--text)" style-hover="background:var(--panel2)">COPY</span>
+          </div>
+          <div>
+            <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.16em;color:var(--dim);margin-bottom:11px">DERIVED FACTS</div>
+            <sc-for list="{{ d.facts }}" as="ft" hint-placeholder-count="6">
+              <div style="display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px dashed var(--rule);font-family:var(--mono);font-size:11.5px">
+                <span style="color:var(--dim)">{{ ft.k }}</span>
+                <span style="color:var(--text);text-align:right">{{ ft.v }}</span>
+              </div>
+            </sc-for>
+          </div>
+          <div>
+            <div style="font-family:var(--mono);font-size:10px;letter-spacing:0.16em;color:var(--dim);margin-bottom:11px">PATHS ON DISK</div>
+            <sc-for list="{{ d.paths }}" as="pt" hint-placeholder-count="3">
+              <div style="font-family:var(--mono);font-size:11.5px;color:var(--muted);padding:4px 0;word-break:break-all">{{ pt.p }} <span style="color:var(--dim)">&middot; {{ pt.node }}</span></div>
+            </sc-for>
+          </div>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ loadoutOpen }}" hint-placeholder-val="{{ false }}">
+    <div onClick="{{ toggleLoadout }}" style="position:fixed;inset:0;background:oklch(0.14 0.01 70 / 0.62);z-index:40;display:flex;justify-content:flex-end">
+      <div onClick="{{ stop }}" style="width:520px;max-width:100%;height:100%;background:var(--panel);border-left:1px solid var(--rule);display:flex;flex-direction:column;animation:hoardIn 200ms ease-out">
+        <div style="display:flex;align-items:baseline;gap:12px;padding:18px;border-bottom:1px solid var(--rule)">
+          <span style="font-family:var(--sans);font-weight:700;font-size:19px;letter-spacing:-0.02em">loadout</span>
+          <span style="font-family:var(--mono);font-size:12px;color:var(--amb)">night-exterior-v3</span>
+          <span onClick="{{ toggleLoadout }}" style="margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--muted);cursor:pointer;border:1px solid var(--rule);padding:5px 9px" style-hover="color:var(--red)">CLOSE</span>
+        </div>
+        <div style="flex:1;overflow-y:auto;min-height:0;padding:14px 18px">
+          <sc-for list="{{ loadout }}" as="l" hint-placeholder-count="5">
+            <div style="display:grid;grid-template-columns:52px minmax(0,1fr) 78px 60px 22px;gap:10px;align-items:center;padding:9px 0;border-bottom:1px dashed var(--rule);font-family:var(--mono);font-size:12.5px">
+              <span style="display:flex;align-items:center;gap:7px"><span style="width:3px;height:13px;background:{{ l.color }}"></span><span style="font-size:10px;color:var(--muted)">{{ l.role }}</span></span>
+              <span style="color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ l.name }}</span>
+              <span style="color:var(--dim)">{{ l.rev }}</span>
+              <span style="text-align:right;color:var(--amb)">{{ l.w }}</span>
+              <span onClick="{{ l.onRemove }}" style="text-align:right;color:var(--dim);cursor:pointer" style-hover="color:var(--red)">&times;</span>
+            </div>
+          </sc-for>
+          <sc-if value="{{ loadoutEmpty }}" hint-placeholder-val="{{ false }}">
+            <div style="padding:40px 0;text-align:center;font-family:var(--mono);font-size:12px;color:var(--dim);line-height:1.9">
+              EMPTY LOADOUT<br />select artifacts in the index and press <span style="color:var(--amb)">L</span>
+            </div>
+          </sc-if>
+        </div>
+        <div style="padding:16px 18px;border-top:1px solid var(--rule)">
+          <div style="background:var(--bg);border:1px solid var(--rule);padding:12px 14px;font-family:var(--mono);font-size:11.5px;line-height:1.8">
+            <div style="color:var(--dim)">$ hoard apply night-exterior-v3 --node laptop</div>
+            <div style="color:var(--green)">{{ applyLine }}</div>
+          </div>
+          <span onClick="{{ applyLoadout }}" style="display:block;margin-top:10px;font-family:var(--mono);font-size:11.5px;font-weight:700;letter-spacing:0.1em;text-align:center;padding:11px;background:var(--amb);color:oklch(0.2 0.03 60);cursor:pointer" style-hover="background:oklch(0.86 0.14 66)">APPLY TO LAPTOP</span>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ toast }}" hint-placeholder-val="{{ false }}">
+    <div style="position:fixed;left:50%;bottom:44px;transform:translateX(-50%);z-index:60;background:var(--panel2);border:1px solid var(--rule);border-left:3px solid var(--amb);padding:11px 18px;font-family:var(--mono);font-size:12px;color:var(--text);animation:hoardToast 180ms ease-out;box-shadow:0 12px 32px oklch(0.12 0.01 70 / 0.5)">{{ toast }}</div>
+  </sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1440,&quot;height&quot;:900},&quot;density&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;Condensed&quot;,&quot;Roomy&quot;],&quot;default&quot;:&quot;Condensed&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Index&quot;},&quot;roleColorMode&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;Color-coded&quot;,&quot;Monochrome&quot;],&quot;default&quot;:&quot;Color-coded&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Index&quot;},&quot;showInspector&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Index&quot;}}">
+const C = {
+  ckpt: "oklch(0.79 0.155 62)", lora: "oklch(0.72 0.15 250)", ctrl: "oklch(0.74 0.15 155)",
+  upsc: "oklch(0.72 0.15 320)", vae: "oklch(0.72 0.14 200)", emb: "oklch(0.74 0.15 100)",
+  ds: "oklch(0.7 0.15 22)", llm: "oklch(0.8 0.02 80)", unk: "oklch(0.6 0.012 75)"
+};
+const ST = {
+  SERVED: "oklch(0.76 0.15 155)", LOCAL: "oklch(0.72 0.012 75)", PULLING: "oklch(0.79 0.155 62)",
+  STALE: "oklch(0.7 0.15 22)", REMOTE: "oklch(0.6 0.012 75)", TRIAGE: "oklch(0.79 0.155 62)"
+};
+const ADAPTER = { lora: 1, ctrl: 1, vae: 1, emb: 1, upsc: 1 };
+// compatibility is directional: adapters resolve against a host checkpoint, never against each other
+function compatible(host, other) {
+  if (!host || !other || host.id === other.id) return false;
+  if (host.k === "ds" || other.k === "ds") return false;
+  const sameBase = other.base === host.base || other.base === "any" || host.base === "any";
+  if (host.k === "ckpt" || host.k === "llm") return !!ADAPTER[other.k] && sameBase;
+  if (ADAPTER[host.k]) return (other.k === "ckpt" || other.k === "llm") && sameBase;
+  return false;
+}
+const A = (id, role, k, org, name, base, fmt, prec, size, bytes, rev, node, state, trigger, path) =>
+  ({ id, role, k, org, name, base, fmt, prec, size, bytes, rev, node, state, trigger, path });
+
+const DATA = [
+  A("film-grain", "LORA", "lora", "kohya/", "film-grain-35mm", "sdxl 1.0", "safetensors", "fp16", "228 MB", 228, "main", "workstation", "SERVED", "film grain, 35mm, halation", "/mnt/vault/loras/film-grain-35mm.safetensors"),
+  A("night-ext", "LORA", "lora", "local/", "night-exterior-v3", "sdxl 1.0", "safetensors", "fp16", "144 MB", 144, "v3", "workstation", "SERVED", "night exterior, sodium light", "/mnt/vault/loras/night-exterior-v3.safetensors"),
+  A("sdxl-base", "CKPT", "ckpt", "stabilityai/", "sdxl-base-1.0", "sdxl 1.0", "diffusers", "fp16", "26.4 GB", 26400, "462c3cb", "vault-nas", "SERVED", "base checkpoint, 1024px", "/mnt/vault/hf/models/stabilityai/sdxl-base-1.0"),
+  A("cn-depth", "CTRL", "ctrl", "lllyasviel/", "control-depth-sdxl", "sdxl 1.0", "safetensors", "fp16", "2.51 GB", 2510, "main", "vault-nas", "SERVED", "depth, midas, zoe", "/mnt/vault/controlnet/control-depth-sdxl.safetensors"),
+  A("cn-canny", "CTRL", "ctrl", "lllyasviel/", "control-canny-sdxl", "sdxl 1.0", "safetensors", "fp16", "2.51 GB", 2510, "main", "vault-nas", "SERVED", "canny edges", "/mnt/vault/controlnet/control-canny-sdxl.safetensors"),
+  A("cn-pose", "CTRL", "ctrl", "thibaud/", "control-openpose-sdxl", "sdxl 1.0", "safetensors", "fp16", "2.51 GB", 2510, "main", "workstation", "LOCAL", "openpose, body, hands", "/srv/models/controlnet/openpose-sdxl.safetensors"),
+  A("ultrasharp", "UPSC", "upsc", "local/", "4x-ultrasharp", "any", "pth", "fp32", "67 MB", 67, "—", "workstation", "LOCAL", "4x upscale, esrgan", "/srv/models/upscale/4x-UltraSharp.pth"),
+  A("remacri", "UPSC", "upsc", "local/", "4x-remacri", "any", "pth", "fp32", "67 MB", 67, "—", "vault-nas", "SERVED", "4x upscale, detail", "/mnt/vault/upscale/4x-Remacri.pth"),
+  A("cyberpunk", "LORA", "lora", "civit/", "cyberpunk-city", "sdxl 1.0", "safetensors", "fp16", "312 MB", 312, "main", "laptop", "LOCAL", "cyberpunk, neon, rain", "~/models/loras/cyberpunk-city.safetensors"),
+  A("flux-dev", "CKPT", "ckpt", "black-forest/", "flux.1-dev", "flux.1", "safetensors", "bf16", "23.8 GB", 23800, "main", "workstation", "SERVED", "flux dev, guidance distilled", "/srv/models/flux/flux1-dev.safetensors"),
+  A("vae-fix", "VAE", "vae", "madebyollin/", "sdxl-vae-fp16-fix", "sdxl 1.0", "safetensors", "fp16", "319 MB", 319, "main", "vault-nas", "SERVED", "fp16 safe vae", "/mnt/vault/vae/sdxl-vae-fp16-fix.safetensors"),
+  A("qwen3", "LLM", "llm", "qwen/", "qwen3-14b-instruct", "qwen3", "gguf", "q4_k_m", "8.42 GB", 8420, "main", "workstation", "SERVED", "instruct, 32k ctx", "/srv/models/gguf/qwen3-14b-instruct-q4_k_m.gguf"),
+  A("llama31", "LLM", "llm", "meta/", "llama-3.1-8b-instruct", "llama 3.1", "safetensors", "bf16", "16.1 GB", 16100, "main", "vault-nas", "SERVED", "instruct, tool use", "/mnt/vault/hf/models/meta/llama-3.1-8b-instruct"),
+  A("prod-studio", "LORA", "lora", "local/", "product-studio-lite", "flux.1", "safetensors", "fp16", "76 MB", 76, "main", "laptop", "STALE", "product shot, softbox", "~/models/loras/product-studio-lite.safetensors"),
+  A("laion", "DS", "ds", "hf/", "laion-aesthetics-subset", "—", "parquet", "—", "412 GB", 412000, "main", "vault-nas", "REMOTE", "2.1M pairs, aesthetic>6.5", "/mnt/vault/hf/datasets/laion-aesthetics-subset"),
+  A("dolma", "DS", "ds", "allenai/", "dolma-sample", "—", "jsonl.gz", "—", "88 GB", 88000, "main", "vault-nas", "LOCAL", "text corpus sample", "/mnt/vault/hf/datasets/allenai/dolma-sample"),
+  A("bad-hands", "EMB", "emb", "local/", "bad-hands-neg", "sd 1.5", "pt", "fp32", "24 KB", 0.024, "—", "laptop", "LOCAL", "negative embedding", "~/models/embeddings/bad-hands-neg.pt"),
+  A("wan22", "CKPT", "ckpt", "wan/", "wan2.2-i2v-14b", "wan 2.2", "safetensors", "bf16", "31.2 GB", 31200, "main", "workstation", "PULLING", "image to video, 14b", "/srv/models/video/wan2.2-i2v-14b.safetensors"),
+  A("ipa-plus", "LORA", "lora", "h94/", "ip-adapter-plus-sdxl", "sdxl 1.0", "safetensors", "fp16", "847 MB", 847, "main", "workstation", "SERVED", "ip-adapter, reference", "/srv/models/ipadapter/ip-adapter-plus-sdxl.safetensors"),
+  A("anime-line", "LORA", "lora", "civit/", "anime-lineart-xl", "sdxl 1.0", "safetensors", "fp16", "144 MB", 144, "main", "vault-nas", "SERVED", "lineart, flat colour", "/mnt/vault/loras/anime-lineart-xl.safetensors"),
+  A("sd15-base", "CKPT", "ckpt", "runwayml/", "stable-diffusion-v1-5", "sd 1.5", "safetensors", "fp16", "4.27 GB", 4270, "main", "vault-nas", "SERVED", "legacy base, 512px", "/mnt/vault/hf/models/runwayml/stable-diffusion-v1-5"),
+  A("mistral", "LLM", "llm", "mistral/", "mistral-small-24b", "mistral", "gguf", "q8_0", "25.1 GB", 25100, "main", "workstation", "LOCAL", "24b, q8", "/srv/models/gguf/mistral-small-24b-q8_0.gguf"),
+  A("motion", "CTRL", "ctrl", "guoyww/", "animatediff-motion-v3", "sd 1.5", "safetensors", "fp16", "1.67 GB", 1670, "main", "vault-nas", "LOCAL", "motion module", "/mnt/vault/motion/mm-v3.safetensors"),
+  A("mystery", "?", "unk", "", "sd_xl_refiner_FINAL_v2.safetensors", "sdxl 1.0?", "safetensors", "fp16", "6.08 GB", 6080, "—", "rig-02", "TRIAGE", "unclassified · 0.71 confidence", "/media/scratch/dl/sd_xl_refiner_FINAL_v2.safetensors"),
+  A("dupe-lora", "LORA", "lora", "civit/", "film-grain-35mm (copy)", "sdxl 1.0", "safetensors", "fp16", "228 MB", 228, "main", "laptop", "LOCAL", "duplicate blob of film-grain-35mm", "~/comfy/models/loras/filmgrain.safetensors"),
+  A("upsc-2x", "UPSC", "upsc", "local/", "2x-anime-sharp", "any", "pth", "fp32", "34 MB", 34, "—", "laptop", "LOCAL", "2x upscale, anime", "~/models/upscale/2x-AnimeSharp.pth")
+];
+
+const CARDS = {
+  "sdxl-base": {
+    frontmatter: [{ k: "license: ", v: "openrail++" }, { k: "tags: ", v: "text-to-image, stable-diffusion" }, { k: "pipeline_tag: ", v: "text-to-image" }],
+    blocks: [
+      ["h1", "SDXL Base 1.0"],
+      ["p", "A latent diffusion model for text-to-image synthesis. This repository holds the base model; a two-stage pipeline pairs it with a refiner that denoises the final steps at high resolution."],
+      ["quote", "Indexed locally on 2024-02-11. Card text is served from the clone at revision 462c3cb — it is not fetched at read time."],
+      ["h2", "Loading"],
+      ["code", "from diffusers import StableDiffusionXLPipeline\n\npipe = StableDiffusionXLPipeline.from_pretrained(\n    \"stabilityai/sdxl-base-1.0\",\n    torch_dtype=torch.float16,\n    variant=\"fp16\",\n)"],
+      ["h2", "Notes from this node"],
+      ["li", "Prefer the fp16 variant: the fp32 unet is present but nothing on the LAN requests it."],
+      ["li", "Use sdxl-vae-fp16-fix for fp16 inference; the bundled 0.9 VAE produces NaNs on some GPUs."],
+      ["li", "The single-file checkpoint and the diffusers layout share blobs after dedupe."],
+      ["h2", "Intended use"],
+      ["p", "Research on generative models, safe deployment of models with potential to generate harmful content, probing limitations and biases, and generation of artworks used in design and creative processes."]
+    ]
+  },
+  "film-grain": {
+    frontmatter: [{ k: "base_model: ", v: "stabilityai/sdxl-base-1.0" }, { k: "tags: ", v: "lora, photography, film" }, { k: "instance_prompt: ", v: "film grain" }],
+    blocks: [
+      ["h1", "Film Grain 35mm"],
+      ["p", "A rank-32 LoRA trained on scanned 35mm stills. Adds grain structure, mild halation and a slight highlight rolloff without shifting composition."],
+      ["h2", "Trigger words"],
+      ["code", "film grain, 35mm, halation\nrecommended weight: 0.35 – 0.55"],
+      ["h2", "Training"],
+      ["li", "612 images, 1024px buckets, 14 epochs, kohya_ss."],
+      ["li", "Network dim 32 / alpha 16, cosine schedule, lr 1e-4."],
+      ["li", "Trained against sdxl-base-1.0 fp16; verified to load against the same tensor keys locally."],
+      ["h2", "Stacking"],
+      ["p", "Plays well under night-exterior-v3 at 0.4 and above cyberpunk-city at 0.25. Above 0.7 the grain begins to eat fine text."]
+    ]
+  },
+  "qwen3": {
+    frontmatter: [{ k: "license: ", v: "apache-2.0" }, { k: "quantized_by: ", v: "local" }, { k: "context_length: ", v: "32768" }],
+    blocks: [
+      ["h1", "Qwen3 14B Instruct — Q4_K_M"],
+      ["p", "A locally quantised GGUF build of the 14B instruct model. Fits a 24 GB card with room for a long context window."],
+      ["h2", "Serve it"],
+      ["code", "llama-server -m $(hoard path qwen/qwen3-14b-instruct) \\\n  --ctx-size 32768 --host 0.0.0.0"],
+      ["h2", "Quantisation table"],
+      ["li", "q4_k_m — 8.42 GB, present on workstation. Default."],
+      ["li", "q8_0 — 15.7 GB, indexed on vault-nas, pull on demand."],
+      ["li", "bf16 source — 29.5 GB, kept for requantisation only."],
+      ["h2", "Provenance"],
+      ["p", "Converted from the bf16 safetensors clone at revision 8f1a2c0. The conversion command and the source sha are recorded in the artifact record, so the build is reproducible without guessing."]
+    ]
+  },
+  "mystery": {
+    frontmatter: null,
+    blocks: [
+      ["h1", "Unclassified artifact"],
+      ["p", "No README, no config, no upstream match. The classifier read the safetensors header and made a guess from tensor shapes; confidence was too low to file it automatically."],
+      ["h2", "What the header says"],
+      ["code", "tensors: 2513\nkeys: conditioner.embedders.0.*, model.diffusion_model.*\nhidden dim: 1280   ·   dtype: F16\nbest guess: sdxl refiner unet   ·   confidence 0.71"],
+      ["h2", "Resolve it"],
+      ["li", "Confirm the guess and the artifact joins the index with role CKPT / base sdxl 1.0."],
+      ["li", "Reject it and the path is remembered as noise so future scans skip it."],
+      ["li", "Either way the file is not moved, renamed or rewritten."],
+      ["quote", "An empty triage queue is the health metric for a node."]
+    ]
+  }
+};
+
+const FILES = {
+  "sdxl-base": [
+    ["model_index.json", "config", "609 B", "PRESENT"],
+    ["unet/diffusion_pytorch_model.fp16.safetensors", "weights", "5.14 GB", "PRESENT"],
+    ["vae/diffusion_pytorch_model.fp16.safetensors", "weights", "167 MB", "PRESENT"],
+    ["text_encoder/model.fp16.safetensors", "weights", "246 MB", "PRESENT"],
+    ["text_encoder_2/model.fp16.safetensors", "weights", "1.39 GB", "PRESENT"],
+    ["sd_xl_base_1.0.safetensors", "single-file", "6.94 GB", "DEDUPED"],
+    ["sd_xl_base_1.0_0.9vae.safetensors", "single-file", "6.94 GB", "LFS PTR"],
+    ["tokenizer/ · scheduler/ · README.md", "9 files", "1.8 MB", "PRESENT"]
+  ],
+  default: [
+    ["README.md", "card", "4.1 KB", "PRESENT"],
+    ["config.json", "config", "812 B", "PRESENT"],
+    ["model.safetensors", "weights", "—", "PRESENT"],
+    [".gitattributes", "git", "1.5 KB", "PRESENT"]
+  ]
+};
+
+class Component extends DCLogic {
+  state = {
+    q: "role:lora base:sdxl", focused: false, cursor: 0, sel: [],
+    view: "index", viewMode: "TABLE", repo: null, tab: "FILES", rev: null,
+    sortKey: "used", sortDir: 1, loadout: ["sdxl-base", "night-ext", "film-grain", "cn-depth", "vae-fix"],
+    loadoutOpen: false, toast: null, applied: false
+  };
+
+  componentDidMount() {
+    this._key = e => this.onKey(e);
+    window.addEventListener("keydown", this._key);
+  }
+  componentWillUnmount() {
+    window.removeEventListener("keydown", this._key);
+    clearTimeout(this._t);
+  }
+
+  flash(msg) {
+    clearTimeout(this._t);
+    this.setState({ toast: msg });
+    this._t = setTimeout(() => this.setState({ toast: null }), 2400);
+  }
+
+  onKey(e) {
+    const tag = (e.target && e.target.tagName) || "";
+    const typing = tag === "INPUT" || tag === "TEXTAREA";
+    if (e.key === "Escape") {
+      if (typing) { e.target.blur(); return; }
+      if (this.state.loadoutOpen) return this.setState({ loadoutOpen: false });
+      if (this.state.view === "detail") return this.setState({ view: "index" });
+      return;
+    }
+    if (typing) return;
+    const list = this.results();
+    if (!list.length && "jkJK".indexOf(e.key) < 0) { /* fallthrough */ }
+    const k = e.key;
+    if (k === "/" ) { e.preventDefault(); this._input && this._input.focus(); return; }
+    if (this.state.view === "detail") {
+      const tabs = ["FILES", "REFS", "CARD", "COMPAT", "USAGE"];
+      if (k === "]" || k === "[") {
+        e.preventDefault();
+        const i = tabs.indexOf(this.state.tab);
+        const n = (i + (k === "]" ? 1 : tabs.length - 1)) % tabs.length;
+        this.setState({ tab: tabs[n] });
+      }
+      if (k === "l" || k === "L") this.addToLoadout(this.state.repo);
+      return;
+    }
+    if (!list.length) return;
+    if (k === "j" || k === "J" || k === "ArrowDown") {
+      e.preventDefault();
+      this.setState(s => ({ cursor: Math.min(s.cursor + 1, list.length - 1) }));
+    } else if (k === "k" || k === "K" || k === "ArrowUp") {
+      e.preventDefault();
+      this.setState(s => ({ cursor: Math.max(s.cursor - 1, 0) }));
+    } else if (k === "Enter") {
+      e.preventDefault();
+      this.open(list[Math.min(this.state.cursor, list.length - 1)].id);
+    } else if (k === " ") {
+      e.preventDefault();
+      const id = list[Math.min(this.state.cursor, list.length - 1)].id;
+      this.setState(s => ({ sel: s.sel.includes(id) ? s.sel.filter(x => x !== id) : s.sel.concat(id) }));
+    } else if (k === "l" || k === "L") {
+      const id = list[Math.min(this.state.cursor, list.length - 1)].id;
+      this.addToLoadout(id);
+    } else if (k === "s" || k === "S") {
+      const a = list[Math.min(this.state.cursor, list.length - 1)];
+      this.flash("served " + a.name + " → http://hoard.lan/" + a.org + a.name);
+    } else if (k === "y" || k === "Y") {
+      this.yank();
+    }
+  }
+
+  parse(q) {
+    const out = [];
+    (q.match(/[^\s"]+|"[^"]*"/g) || []).forEach(raw => {
+      const t = raw.replace(/"/g, "");
+      const i = t.indexOf(":");
+      if (i > 0) out.push({ k: t.slice(0, i + 1), v: t.slice(i + 1), key: t.slice(0, i).toLowerCase(), raw });
+      else out.push({ k: "", v: t, key: "text", raw });
+    });
+    return out;
+  }
+
+  matchToken(a, t) {
+    const v = (t.v || "").toLowerCase();
+    const any = v.split(",").filter(Boolean);
+    const has = s => any.some(x => (s || "").toLowerCase().includes(x));
+    switch (t.key) {
+      case "role": {
+        const alias = {
+          checkpoint: "ckpt", ckpt: "ckpt", base: "ckpt", model: "ckpt",
+          lora: "lora", lycoris: "lora", locon: "lora", adapter: "lora", "ip-adapter": "lora", ipa: "lora",
+          controlnet: "ctrl", ctrl: "ctrl", control: "ctrl", motion: "ctrl",
+          upscaler: "upsc", upsc: "upsc", upscale: "upsc", esrgan: "upsc",
+          vae: "vae", embedding: "emb", emb: "emb", textualinversion: "emb",
+          llm: "llm", "language model": "llm", text: "llm",
+          dataset: "ds", ds: "ds", data: "ds",
+          "?": "unk", unknown: "unk", unclassified: "unk", triage: "unk"
+        };
+        return any.some(x => {
+          const k = alias[x] || alias[x.replace(/[\s_-]/g, "")];
+          if (k) return a.k === k;
+          return a.role.toLowerCase() === x || a.k === x || x.startsWith(a.k);
+        });
+      }
+      case "base": {
+        const flat = (a.base || "").toLowerCase().replace(/[\s.]/g, "");
+        return any.some(x => flat.includes(x.replace(/[\s.]/g, "")));
+      }
+      case "fmt": case "format": return has(a.fmt);
+      case "prec": case "precision": return has(a.prec);
+      case "node": return has(a.node);
+      case "state": return has(a.state);
+      case "rev": case "tag": return has(a.rev);
+      case "dupe": return /copy|duplicate/i.test(a.name + a.trigger);
+      case "compat": {
+        const target = DATA.find(x => (x.org + x.name).toLowerCase().includes(v) || x.name.toLowerCase().includes(v));
+        if (!target) return false;
+        return compatible(target, a);
+      }
+      case "size": {
+        const m = v.match(/^([<>])\s*([\d.]+)\s*(kb|mb|gb|tb)?$/);
+        if (!m) return true;
+        const mult = { kb: 0.001, mb: 1, gb: 1000, tb: 1000000 }[m[3] || "mb"];
+        const n = parseFloat(m[2]) * mult;
+        return m[1] === "<" ? a.bytes < n : a.bytes > n;
+      }
+      default:
+        return (a.org + a.name + " " + a.base + " " + a.trigger + " " + a.role + " " + a.node).toLowerCase().includes(v);
+    }
+  }
+
+  results(exceptKey) {
+    const tokens = this.parse(this.state.q).filter(t => !t.raw.startsWith("-"));
+    const negs = this.parse(this.state.q).filter(t => t.raw.startsWith("-"))
+      .map(t => this.parse(t.raw.slice(1))[0]);
+    let list = DATA.filter(a =>
+      tokens.every(t => (exceptKey && t.key === exceptKey) || this.matchToken(a, t)) &&
+      negs.every(t => !this.matchToken(a, t))
+    );
+    const { sortKey, sortDir } = this.state;
+    const cmp = {
+      role: (x, y) => x.role.localeCompare(y.role),
+      name: (x, y) => (x.org + x.name).localeCompare(y.org + y.name),
+      base: (x, y) => x.base.localeCompare(y.base),
+      fmt: (x, y) => x.fmt.localeCompare(y.fmt),
+      prec: (x, y) => x.prec.localeCompare(y.prec),
+      size: (x, y) => x.bytes - y.bytes,
+      rev: (x, y) => x.rev.localeCompare(y.rev),
+      node: (x, y) => x.node.localeCompare(y.node),
+      state: (x, y) => x.state.localeCompare(y.state),
+      used: () => 0
+    }[sortKey] || (() => 0);
+    return sortKey === "used" ? list : list.slice().sort((x, y) => cmp(x, y) * sortDir);
+  }
+
+  setQ(q) { this.setState({ q, cursor: 0 }); }
+
+  toggleToken(tok) {
+    const cur = this.state.q.trim();
+    const has = cur.split(/\s+/).includes(tok);
+    const next = has ? cur.split(/\s+/).filter(t => t !== tok).join(" ")
+                     : (cur ? cur + " " + tok : tok);
+    this.setQ(next);
+  }
+
+  open(id) { this.setState({ view: "detail", repo: id, tab: "FILES", rev: null }); }
+
+  addToLoadout(id) {
+    if (!id) return;
+    const a = DATA.find(x => x.id === id);
+    if (this.state.loadout.includes(id)) { this.flash(a.name + " is already in the loadout"); return; }
+    this.setState(s => ({ loadout: s.loadout.concat(id), applied: false }));
+    this.flash("+ " + a.name + " pinned at " + (a.rev === "—" ? "content hash" : a.rev));
+  }
+
+  yank() {
+    const a = this.cursorArtifact();
+    if (!a) return;
+    this.flash("copied: git clone http://hoard.lan/" + a.org + a.name);
+  }
+
+  cursorArtifact() {
+    if (this.state.view === "detail") return DATA.find(x => x.id === this.state.repo);
+    const list = this.results();
+    return list[Math.min(this.state.cursor, Math.max(list.length - 1, 0))];
+  }
+
+  facts(a) {
+    if (!a) return [];
+    const base = [
+      { k: "role", v: a.role.toLowerCase() + (a.k === "unk" ? " · guess" : "") },
+      { k: "base", v: a.base },
+      { k: "format", v: a.fmt + " · " + a.prec },
+      { k: "size", v: a.size },
+      { k: "node", v: a.node },
+      { k: "blob", v: "sha256:" + a.id.slice(0, 4) + "9f…41ab" }
+    ];
+    if (a.k === "lora") base.push({ k: "rank / alpha", v: "32 / 16" });
+    if (a.k === "llm") base.push({ k: "context", v: "32 768" });
+    if (a.k === "ckpt") base.push({ k: "resolution", v: a.base === "sd 1.5" ? "512 × 512" : "1024 × 1024" });
+    return base;
+  }
+
+  renderVals() {
+    const p = this.props, s = this.state;
+    const dense = (p.density ?? "Condensed") === "Condensed";
+    const coded = (p.roleColorMode ?? "Color-coded") === "Color-coded";
+    const railOn = (p.showInspector ?? true) && s.view === "index";
+    const col = k => (coded ? C[k] || C.unk : C.unk);
+    const list = this.results();
+    const cursor = Math.min(s.cursor, Math.max(list.length - 1, 0));
+    const cur = list[cursor];
+
+    const facetDef = [
+      ["ROLE", "role", [["lora", "role:lora"], ["ckpt", "role:ckpt"], ["ctrl", "role:ctrl"], ["upsc", "role:upsc"], ["vae", "role:vae"], ["emb", "role:emb"], ["llm", "role:llm"], ["ds", "role:ds"], ["?", "role:?"]]],
+      ["BASE ARCHITECTURE", "base", [["sdxl 1.0", "base:sdxl"], ["flux.1", "base:flux"], ["sd 1.5", "base:sd15"], ["wan 2.2", "base:wan"], ["llama 3.1", "base:llama"], ["qwen3", "base:qwen"]]],
+      ["FORMAT · PRECISION", "fmt", [["safetensors", "fmt:safetensors"], ["gguf", "fmt:gguf"], ["diffusers", "fmt:diffusers"], ["fp16", "prec:fp16"], ["bf16", "prec:bf16"], ["q4_k_m", "prec:q4"]]],
+      ["NODE", "node", [["workstation", "node:workstation"], ["vault-nas", "node:vault"], ["laptop", "node:laptop"], ["rig-02", "node:rig-02"]]]
+    ];
+    const qTokens = s.q.trim().split(/\s+/);
+    const facets = facetDef.map(([title, key, items]) => ({
+      title,
+      items: items.map(([label, tok]) => {
+        const on = qTokens.includes(tok);
+        const pool = this.results(key);
+        const t = this.parse(tok)[0];
+        const count = pool.filter(a => this.matchToken(a, t)).length;
+        return {
+          label, count: count || "—",
+          onClick: () => this.toggleToken(tok),
+          mark: on ? "var(--amb)" : "var(--rule)",
+          fill: on ? "var(--amb)" : "transparent",
+          tone: on ? "var(--text)" : (count ? "var(--muted)" : "var(--dim)"),
+          bg: on ? "var(--panel2)" : "transparent"
+        };
+      })
+    }));
+
+    const shelfDefs = [
+      ["sdxl · lora · small", "role:lora base:sdxl size:<400mb"],
+      ["flux workhorse", "base:flux"],
+      ["quantised llm", "role:llm fmt:gguf"],
+      ["cold + duplicate", "dupe:true"],
+      ["triage queue", "role:?"],
+      ["everything on laptop", "node:laptop"]
+    ];
+
+    const stCol = st => ST[st.split(" ")[0]] || "var(--muted)";
+    const rows = list.map((a, i) => ({
+      role: a.role, org: a.org, name: a.name, base: a.base, fmt: a.fmt, prec: a.prec,
+      size: a.size, rev: a.rev, node: a.node, state: a.state === "PULLING" ? "PULLING 64%" : a.state,
+      trigger: a.trigger, color: col(a.k), stateColor: stCol(a.state),
+      bg: i === cursor ? "oklch(0.27 0.02 62)" : (s.sel.includes(a.id) ? "oklch(0.245 0.012 70)" : "transparent"),
+      cardBg: i === cursor ? "oklch(0.25 0.015 65)" : "var(--panel)",
+      cardBorder: i === cursor ? "var(--amb)" : "var(--rule)",
+      cursorMark: i === cursor ? "var(--amb)" : (s.sel.includes(a.id) ? "var(--rule)" : "transparent"),
+      onClick: () => this.setState({ cursor: i }),
+      onOpen: () => this.open(a.id)
+    }));
+
+    const colDefs = [["ROLE", "role", "left", "0"], ["NAME", "name", "left", "14px"], ["BASE", "base", "left", "0"], ["FORMAT", "fmt", "left", "0"], ["PREC", "prec", "left", "0"], ["SIZE", "size", "right", "14px"], ["REVISION", "rev", "left", "0"], ["NODE", "node", "left", "0"], ["STATE", "state", "right", "0"]];
+
+    const repo = DATA.find(x => x.id === s.repo) || DATA[0];
+    const card = CARDS[repo.id] || {
+      frontmatter: [{ k: "base_model: ", v: repo.base }, { k: "tags: ", v: repo.role.toLowerCase() + ", local" }],
+      blocks: [
+        ["h1", repo.name],
+        ["p", "No upstream card was recovered for this artifact, so this page is generated from the index record: header metadata, hash, and everything the LAN has observed about it."],
+        ["h2", "What we know"],
+        ["li", "Role " + repo.role.toLowerCase() + ", inferred from tensor shape signatures."],
+        ["li", "Base " + repo.base + ", matched on tensor key prefixes."],
+        ["li", "Trigger words and notes: " + repo.trigger + "."],
+        ["h2", "Pull it"],
+        ["code", "git clone http://hoard.lan/" + repo.org + repo.name],
+        ["quote", "Write a README.md into the clone and it is served from here, with revisions, like any other file."]
+      ]
+    };
+    const blocks = card.blocks.map(([t, text]) => ({
+      isH1: t === "h1", isH2: t === "h2", isP: t === "p", isLi: t === "li", isCode: t === "code", isQuote: t === "quote", t: text
+    }));
+    const refs = [
+      ["main", "462c3cb", "4 months ago", "branch", "&#9679;"],
+      ["v3", "a1f9e02", "2 months ago", "branch", "&#9679;"],
+      ["refiner-split", "77bd410", "9 months ago", "branch", "&#9679;"],
+      ["paper-repro", "1c40aa8", "1 year ago", "tag", "&#9866;"],
+      ["fp16-only", "e0b91d4", "1 year ago", "tag", "&#9866;"]
+    ].map(([name, sha, when, kind, dot]) => ({
+      name, sha, when, kind, dot: kind === "tag" ? "⊢" : "●",
+      dotColor: (s.rev || "main") === name ? "var(--amb)" : "var(--dim)",
+      bg: (s.rev || "main") === name ? "oklch(0.27 0.02 62)" : "transparent",
+      onClick: () => { this.setState({ rev: name, tab: "FILES" }); this.flash("checked out " + name + " · " + sha); }
+    }));
+    const files = (FILES[repo.id] || FILES.default).map(([pth, kind, size, st]) => ({
+      p: pth, kind, size: size === "—" ? repo.size : size, st,
+      stColor: st === "PRESENT" ? "var(--green)" : st === "DEDUPED" ? "var(--amb)" : "var(--dim)",
+      tone: st === "LFS PTR" ? "var(--muted)" : "var(--text)"
+    }));
+    const compat = DATA.filter(a => compatible(repo, a))
+      .map(a => ({
+        role: a.role, name: a.org + a.name, size: a.size, state: a.state === "PULLING" ? "PULLING" : a.state,
+        detail: a.k === "lora" ? "rank 32 · w 0.4" : a.prec, color: col(a.k), stateColor: stCol(a.state),
+        onClick: () => this.open(a.id)
+      }));
+    const usage = [42, 18, 61, 9, 77, 33, 88, 24, 51, 12, 69, 95, 40, 27].map((h, i) => ({
+      h: h + "%", color: h > 70 ? "var(--amb)" : i % 2 ? "var(--panel2)" : "var(--rule)"
+    }));
+
+    const detailTabs = ["FILES", "REFS", "CARD", "COMPAT", "USAGE"].map(label => ({
+      label, onClick: () => this.setState({ tab: label }),
+      border: s.tab === label ? "var(--rule)" : "transparent",
+      bottom: s.tab === label ? "var(--bg)" : "var(--rule)",
+      color: s.tab === label ? "var(--amb)" : "var(--dim)",
+      bg: s.tab === label ? "var(--bg)" : "transparent"
+    }));
+
+    const loadout = s.loadout.map(id => {
+      const a = DATA.find(x => x.id === id) || {};
+      const w = a.k === "lora" ? "0.55" : a.k === "ctrl" ? "0.70" : a.k === "upsc" ? "2.0×" : "—";
+      return { role: a.role, name: a.name, rev: a.rev, w, color: col(a.k), onRemove: () => this.setState(st => ({ loadout: st.loadout.filter(x => x !== id), applied: false })) };
+    });
+
+    return {
+      q: s.q,
+      onQuery: e => this.setQ(e.target.value),
+      onFocus: () => this.setState({ focused: true }),
+      onBlur: () => this.setState({ focused: false }),
+      searchRef: el => { this._input = el; },
+      searchBorder: s.focused ? "var(--amb)" : "var(--rule)",
+      searchHint: s.focused ? "ESC" : "/",
+      clearQuery: () => this.setQ(""),
+      tryExample: () => this.setQ("compat:sdxl-base-1.0 role:lora"),
+
+      navTabs: ["INDEX", "SHELVES", "NODES", "SCANS", "JOBS"].map((label, i) => ({
+        label,
+        onClick: () => (i === 0 ? this.setState({ view: "index" }) : this.flash(label.toLowerCase() + " — not in this prototype")),
+        border: i === 0 ? "var(--rule)" : "transparent",
+        bg: i === 0 ? "var(--bg)" : "transparent",
+        color: i === 0 ? "var(--amb)" : "var(--dim)"
+      })),
+      goHome: () => this.setState({ view: "index" }),
+
+      tokens: this.parse(s.q).map(t => ({
+        k: t.k || "~", v: t.v,
+        keyColor: t.key === "text" ? "var(--dim)" : "var(--amb)",
+        onRemove: () => this.setQ(s.q.split(/\s+/).filter(x => x !== t.raw).join(" "))
+      })),
+      tokensShown: s.q.trim().length > 0,
+      resultLine: list.length + " ARTIFACTS · " + new Set(list.map(a => a.node)).size + " NODES",
+      selLine: s.sel.length ? s.sel.length + " selected" : "double-click a row to open it",
+
+      isIndex: s.view === "index",
+      isDetail: s.view === "detail",
+      isTable: s.viewMode === "TABLE",
+      isCards: s.viewMode === "CARDS",
+      isEmpty: list.length === 0,
+      railOn, railCol: railOn ? "288px" : "0px",
+      rowPad: dense ? "5px" : "10px",
+      rowFont: dense ? "12.5px" : "13.5px",
+      viewTabs: ["TABLE", "CARDS"].map(label => ({
+        label, onClick: () => this.setState({ viewMode: label }),
+        bg: s.viewMode === label ? "var(--bg)" : "transparent",
+        color: s.viewMode === label ? "var(--amb)" : "var(--dim)"
+      })),
+      cols: colDefs.map(([label, key, align, pr]) => ({
+        label, align, pr,
+        arrow: s.sortKey === key ? (s.sortDir > 0 ? " ↑" : " ↓") : "",
+        color: s.sortKey === key ? "var(--amb)" : "var(--dim)",
+        onClick: () => this.setState(st => ({ sortKey: key, sortDir: st.sortKey === key ? -st.sortDir : 1, cursor: 0 }))
+      })),
+      rows, facets, detailTabs,
+      sortLabel: s.sortKey.toUpperCase() + (s.sortKey === "used" ? "" : (s.sortDir > 0 ? " ↑" : " ↓")),
+      shelves: shelfDefs.map(([label, q]) => ({ label, onClick: () => this.setQ(q) })),
+
+      cur: cur ? {
+        name: cur.name, role: cur.role, color: col(cur.k), path: cur.path,
+        facts: this.facts(cur),
+        plugs: DATA.filter(a => compatible(cur, a)).slice(0, 4)
+          .map(a => ({ label: a.role.toLowerCase() + " · " + a.name, onClick: () => this.open(a.id) }))
+      } : { name: "—", role: "", color: "transparent", path: "no match", facts: [], plugs: [] },
+      openCursor: () => cur && this.open(cur.id),
+      addCursorToLoadout: () => this.addToLoadout(s.view === "detail" ? repo.id : cur && cur.id),
+      yankCursor: () => this.yank(),
+
+      d: {
+        org: repo.org, name: repo.name, color: col(repo.k),
+        roleFull: { ckpt: "CHECKPOINT", lora: "LORA", ctrl: "CONTROLNET", upsc: "UPSCALER", vae: "VAE", emb: "EMBEDDING", llm: "LANGUAGE MODEL", ds: "DATASET", unk: "UNCLASSIFIED" }[repo.k],
+        stateFull: repo.state === "SERVED" ? "SERVED · hoard.lan" : repo.state === "PULLING" ? "PULLING 64%" : repo.state,
+        stateColor: stCol(repo.state),
+        meta: repo.path + " · " + repo.size + " · last used 2h ago",
+        rev: "refs/heads/" + (s.rev || (repo.rev === "—" ? "main" : repo.rev)),
+        revMeta: "462c3cb · " + files.length + " files · 3 branches · 2 tags",
+        cardMeta: "4.1 KB · 118 lines",
+        frontmatter: card.frontmatter || [], frontmatterOn: !!card.frontmatter,
+        card: blocks, files, refs, compat, usage,
+        compatLine: ADAPTER[repo.k]
+          ? compat.length + " host checkpoints accept " + repo.name
+          : compat.length + " adapters resolve against " + repo.name,
+        usageLeft: "aug 28", usageRight: "38 pulls · 3 clients",
+        cloneCmd: "git clone http://hoard.lan/" + repo.org + repo.name,
+        facts: this.facts(repo),
+        paths: [
+          { p: repo.path, node: repo.node },
+          { p: "~/comfy/models/" + repo.k + "/" + repo.name, node: "laptop · symlink" }
+        ]
+      },
+      tabFiles: s.tab === "FILES", tabRefs: s.tab === "REFS", tabCard: s.tab === "CARD",
+      tabCompat: s.tab === "COMPAT", tabUsage: s.tab === "USAGE",
+      showRefs: () => this.setState({ tab: "REFS" }),
+
+      loadout, loadoutEmpty: loadout.length === 0, loadoutCount: s.loadout.length,
+      loadoutOpen: s.loadoutOpen,
+      toggleLoadout: () => this.setState(st => ({ loadoutOpen: !st.loadoutOpen })),
+      stop: e => e.stopPropagation(),
+      applyLine: s.applied
+        ? "→ done · " + s.loadout.length + " artifacts resolved, symlinks written for comfyui"
+        : "→ " + Math.max(s.loadout.length - 2, 0) + " present, 2 pulling over LAN (1.2 GB/s)",
+      applyLoadout: () => { this.setState({ applied: true }); this.flash("applied to laptop · symlinks written for comfyui"); },
+      toast: s.toast
+    };
+  }
+}
+</script>
+</body>
+</html>
