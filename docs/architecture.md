@@ -165,7 +165,8 @@ hoard/
       src/
         state.rs  error.rs  layers.rs  assets.rs
         hub/                 Hub-compatible routes
-        git/                 git smart HTTP and LFS routes
+          mod.rs  meta.rs  files.rs  proxy.rs
+        git/                 git smart HTTP and LFS routes (mod.rs)
         api/                 /api/v1: search, artifacts, repos, readme, shelves, loadouts,
                              triage, sources, jobs, nodes, usage, link, apply, stats
         ui/                  embedded web/ and index.html fallback

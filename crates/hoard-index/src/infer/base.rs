@@ -1,7 +1,8 @@
 use hoard_core::{Base, Evidence, EvidenceSource, Role, TensorSample, TensorSummary};
 
 use super::rules::{
-    self, BASE_ALIASES, BASE_RULES, CROSS_ATTENTION_DIMS, CROSS_ATTENTION_KEYS, PROJECTION_KEYS,
+    self, BASE_ALIASES, BASE_RULES, CROSS_ATTENTION_DIMS, CROSS_ATTENTION_KEYS, KeyMatch,
+    PROJECTION_KEYS, UNET_BODY_KEYS,
 };
 use super::{Accumulator, InferInput};
 
@@ -16,7 +17,7 @@ pub(crate) struct BaseVerdict {
 /// The family token a known spelling names, `sdxl_base_v1-0` and `StableDiffusionXLPipeline`
 /// both landing on `sdxl`. `None` when the spelling names nothing the table knows.
 pub(crate) fn alias_base(raw: &str) -> Option<Base> {
-    let normalized = Base::new(raw);
+    let normalized = Base::new(raw.rsplit(['/', '\\']).next().unwrap_or(raw));
     BASE_ALIASES
         .iter()
         .find(|(pattern, _)| normalized.as_str().contains(pattern))
@@ -107,11 +108,15 @@ fn tensor_rules(tensors: &TensorSummary, bases: &mut Accumulator<Base>) {
 }
 
 fn cross_attention_rule(tensors: &TensorSummary, bases: &mut Accumulator<Base>) {
+    let in_unet = KeyMatch::AnyOf(UNET_BODY_KEYS).matches(tensors);
     let tiers = [
-        (CROSS_ATTENTION_KEYS, rules::TENSOR_PATTERN),
-        (PROJECTION_KEYS, rules::TENSOR_WEAK),
+        (CROSS_ATTENTION_KEYS, rules::TENSOR_PATTERN, in_unet),
+        (PROJECTION_KEYS, rules::TENSOR_WEAK, true),
     ];
-    for (keys, confidence) in tiers {
+    for (keys, confidence, allowed) in tiers {
+        if !allowed {
+            continue;
+        }
         let found = tensors
             .samples
             .iter()
@@ -163,19 +168,17 @@ fn metadata_rules(
         );
     }
     if let Some(raw) = tensors.metadata.get("general.architecture") {
-        let base = canonical_base(raw);
-        if !base.is_empty() {
-            bases.push(
-                base.clone(),
-                Evidence::new(
-                    "base",
-                    base.as_str(),
-                    EvidenceSource::Metadata,
-                    rules::METADATA_STRONG,
-                )
-                .with_detail(format!("general.architecture {raw}")),
-            );
-        }
+        record(
+            bases,
+            labels,
+            BaseClaim {
+                base: canonical_base(raw),
+                raw,
+                key: "general.architecture",
+                source: EvidenceSource::Metadata,
+                confidence: rules::METADATA_STRONG,
+            },
+        );
     }
     if let Some((base, raw)) = tensors
         .metadata
@@ -194,11 +197,6 @@ fn metadata_rules(
             },
         );
     }
-    if let Some(name) = tensors.metadata.get("general.name")
-        && let Some((base, _)) = bases.best()
-    {
-        labels.push((base, name.clone(), rules::METADATA_STRONG));
-    }
 }
 
 fn config_rules(
@@ -206,6 +204,9 @@ fn config_rules(
     bases: &mut Accumulator<Base>,
     labels: &mut Vec<(Base, String, f32)>,
 ) {
+    if !input.config_describes_tensors() {
+        return;
+    }
     if let Some((base, raw)) = input
         .config_str("_class_name")
         .and_then(|raw| alias_base(raw).map(|base| (base, raw)))
@@ -370,6 +371,110 @@ mod tests {
         assert_eq!(canonical_base("SD_V2.1"), Base::new("sd21"));
         assert_eq!(canonical_base("flux.1-dev"), Base::new("flux"));
         assert_eq!(canonical_base("qwen2"), Base::new("qwen2"));
+    }
+
+    #[test]
+    fn a_cross_attention_width_names_a_family_only_inside_a_unet() {
+        let unet = tensors(&[
+            (
+                "input_blocks.4.1.transformer_blocks.0.attn2.to_k.weight",
+                &[320, 768],
+            ),
+            ("time_embed.0.weight", &[1280, 320]),
+        ]);
+        let path = Path::new("/models/checkpoints/model.safetensors");
+        let verdict = infer_base(
+            &input(path, "model.safetensors").with_tensors(&unet),
+            Role::Ckpt,
+        );
+        assert_eq!(verdict.base, Base::new("sd15"));
+
+        let transformer = tensors(&[
+            ("blocks.0.attn2.to_k.weight", &[2048, 1024]),
+            ("blocks.0.attn1.to_k.weight", &[2048, 2048]),
+        ]);
+        let verdict = infer_base(
+            &input(path, "model.safetensors").with_tensors(&transformer),
+            Role::Ckpt,
+        );
+        assert!(
+            verdict.base.is_empty(),
+            "a hidden width outside a unet names nothing, found {}",
+            verdict.base.as_str()
+        );
+    }
+
+    #[test]
+    fn a_config_that_describes_another_model_names_no_base() {
+        let config = json!({
+            "model_type": "gemma3",
+            "text_config": {"hidden_size": 3840},
+            "vision_config": {"hidden_size": 1152},
+        });
+        let clip = tensors(&[
+            (
+                "text_model.embeddings.token_embedding.weight",
+                &[49408, 768],
+            ),
+            ("text_model.encoder.layers.0.mlp.fc1.weight", &[3072, 768]),
+            ("text_model.encoder.layers.1.mlp.fc1.weight", &[3072, 768]),
+        ]);
+        let path = Path::new("/models/text_encoders/clip_l.safetensors");
+        let verdict = infer_base(
+            &input(path, "clip_l.safetensors")
+                .with_tensors(&clip)
+                .with_config(&config),
+            Role::Ckpt,
+        );
+        assert!(verdict.base.is_empty());
+
+        let gemma = tensors(&[
+            ("model.embed_tokens.weight", &[262208, 3840]),
+            ("model.layers.0.mlp.gate_proj.weight", &[15360, 3840]),
+        ]);
+        let path = Path::new("/models/text_encoders/gemma_3_12B_it.safetensors");
+        let verdict = infer_base(
+            &input(path, "gemma_3_12B_it.safetensors")
+                .with_tensors(&gemma)
+                .with_config(&config),
+            Role::Llm,
+        );
+        assert_eq!(verdict.base, Base::new("gemma3"));
+    }
+
+    #[test]
+    fn a_gguf_labels_its_base_with_the_architecture_not_the_model_name() {
+        let summary = with_metadata(
+            tensors(&[("blk.0.attn_q.weight", &[4096, 4096])]),
+            &[
+                ("general.architecture", "nemotron_h"),
+                ("general.name", "Lmstudio Community_NVIDIA Nemotron 3"),
+            ],
+        );
+        let path = Path::new("/models/llm/nemotron.gguf");
+        let verdict = infer_base(
+            &input(path, "nemotron.gguf").with_tensors(&summary),
+            Role::Llm,
+        );
+        assert_eq!(verdict.base, Base::new("nemotronh"));
+        assert_eq!(verdict.label.as_deref(), Some("nemotron_h"));
+    }
+
+    #[test]
+    fn a_training_path_in_the_model_name_never_names_the_family() {
+        let summary = with_metadata(
+            tensors(&[("lora_unet_blocks_0_proj.lora_down.weight", &[16, 3072])]),
+            &[(
+                "ss_sd_model_name",
+                r"D:lux-aki\ComfyUI\models\diffusion_modelsnima_baseV10.safetensors",
+            )],
+        );
+        let path = Path::new("/models/loras/style.safetensors");
+        let verdict = infer_base(
+            &input(path, "style.safetensors").with_tensors(&summary),
+            Role::Lora,
+        );
+        assert!(verdict.base.is_empty());
     }
 
     #[test]

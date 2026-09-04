@@ -19,6 +19,9 @@ pub const CONFLICT: f32 = 0.5;
 pub enum KeyMatch {
     Prefix(&'static str),
     Fragment(&'static str),
+    /// A leading key segment as the prefix histogram records it. The histogram sees every
+    /// tensor, so a segment term survives a header far too large to sample whole.
+    Segment(&'static str),
     AnyOf(&'static [KeyMatch]),
     AllOf(&'static [KeyMatch]),
 }
@@ -28,6 +31,7 @@ impl KeyMatch {
         match self {
             KeyMatch::Prefix(prefix) => tensors.has_prefix(prefix),
             KeyMatch::Fragment(fragment) => tensors.has_fragment(fragment),
+            KeyMatch::Segment(name) => tensors.key_prefixes.iter().any(|(key, _)| key == name),
             KeyMatch::AnyOf(terms) => terms.iter().any(|term| term.matches(tensors)),
             KeyMatch::AllOf(terms) => terms.iter().all(|term| term.matches(tensors)),
         }
@@ -62,6 +66,7 @@ pub const MOTION_KEYS: &[KeyMatch] = &[
 
 pub const CONTROLNET_KEYS: &[KeyMatch] = &[
     KeyMatch::Prefix("control_model."),
+    KeyMatch::Prefix("control_"),
     KeyMatch::Fragment("input_hint_block"),
     KeyMatch::Fragment("zero_convs"),
     KeyMatch::Fragment("controlnet_cond_embedding"),
@@ -92,10 +97,21 @@ pub const DIT_STREAM_KEYS: &[KeyMatch] = &[
     KeyMatch::Fragment("context_embedder"),
 ];
 
+/// Wan patches its video latents and projects the timestep per block, and a patch
+/// embedding on its own is any vision tower at all.
 pub const VIDEO_DIT_KEYS: &[KeyMatch] = &[
-    KeyMatch::Fragment("patch_embedding"),
     KeyMatch::Fragment("time_projection"),
-    KeyMatch::Fragment("time_embedding."),
+    KeyMatch::Segment("time_projection"),
+    KeyMatch::Fragment("cross_attn.k_img"),
+    KeyMatch::Fragment("img_emb."),
+    KeyMatch::AllOf(&[
+        KeyMatch::Fragment("patch_embedding"),
+        KeyMatch::AnyOf(&[
+            KeyMatch::Fragment("time_embedding."),
+            KeyMatch::Segment("time_embedding"),
+            KeyMatch::Segment("text_embedding"),
+        ]),
+    ]),
 ];
 
 pub const ESRGAN_KEYS: &[KeyMatch] = &[
@@ -131,6 +147,117 @@ pub const EMBEDDING_KEYS: &[KeyMatch] = &[
     KeyMatch::Fragment("emb_params"),
 ];
 
+/// Autoencoder bodies. The encoder and decoder halves stand at the top of a standalone
+/// VAE's key space, which is what separates one from a checkpoint that merely holds one.
+pub const AUTOENCODER_KEYS: &[KeyMatch] = &[
+    KeyMatch::Prefix("first_stage_model."),
+    KeyMatch::Fragment("post_quant_conv"),
+    KeyMatch::AllOf(&[
+        KeyMatch::Fragment("decoder.up_blocks"),
+        KeyMatch::Fragment("encoder.down_blocks"),
+    ]),
+    KeyMatch::AllOf(&[KeyMatch::Segment("encoder"), KeyMatch::Segment("decoder")]),
+    KeyMatch::AllOf(&[KeyMatch::Prefix("encoder."), KeyMatch::Prefix("decoder.")]),
+];
+
+/// The transformer body every diffusion transformer keeps its layers in.
+pub const BLOCK_BODY_KEYS: &[KeyMatch] = &[
+    KeyMatch::Segment("blocks"),
+    KeyMatch::Segment("layers"),
+    KeyMatch::Fragment("blocks."),
+    KeyMatch::Fragment("layers."),
+];
+
+/// Timestep conditioning, which separates a diffusion transformer from a language model.
+pub const TIMESTEP_KEYS: &[KeyMatch] = &[
+    KeyMatch::Fragment("t_embedder"),
+    KeyMatch::Fragment("t_embedding"),
+    KeyMatch::Fragment("time_embedding"),
+    KeyMatch::Fragment("time_embed"),
+    KeyMatch::Fragment("timestep_embed"),
+    KeyMatch::Fragment("time_in."),
+    KeyMatch::Fragment("time_text_embed"),
+    KeyMatch::Segment("adaln_t"),
+    KeyMatch::Segment("t_embedder"),
+    KeyMatch::Segment("t_embedding"),
+    KeyMatch::Segment("time_embedding"),
+];
+
+/// Adaptive layer norm modulation, the conditioning path of every DiT lineage.
+pub const ADALN_KEYS: &[KeyMatch] = &[
+    KeyMatch::Fragment("adaLN"),
+    KeyMatch::Fragment("adaln"),
+    KeyMatch::Fragment("modulation"),
+    KeyMatch::Segment("adaLN_modulation"),
+];
+
+/// Z-Image refines the noise and the caption stream before its own blocks, which no other
+/// transformer does.
+pub const REFINER_KEYS: &[KeyMatch] = &[
+    KeyMatch::AllOf(&[
+        KeyMatch::Segment("noise_refiner"),
+        KeyMatch::Segment("context_refiner"),
+    ]),
+    KeyMatch::AllOf(&[
+        KeyMatch::Fragment("noise_refiner."),
+        KeyMatch::Fragment("context_refiner."),
+    ]),
+];
+
+/// The Krea 2 block layout: gated attention and mlp projections beside a text fusion stack.
+pub const KREA_KEYS: &[KeyMatch] = &[
+    KeyMatch::Segment("txtfusion"),
+    KeyMatch::Fragment("txtfusion."),
+    KeyMatch::AllOf(&[
+        KeyMatch::Fragment("attn.wq"),
+        KeyMatch::Fragment("attn.gate"),
+        KeyMatch::Fragment("mlp.gate"),
+    ]),
+];
+
+/// Wan names both attentions of a block and projects each through a single letter.
+pub const WAN_BLOCK_KEYS: &[KeyMatch] = &[KeyMatch::AllOf(&[
+    KeyMatch::Fragment("self_attn.q."),
+    KeyMatch::Fragment("cross_attn.k."),
+    KeyMatch::Fragment("ffn."),
+])];
+
+/// Text encoder bodies that stand alone as a file: CLIP and the T5 family.
+pub const TEXT_ENCODER_BODY_KEYS: &[KeyMatch] = &[
+    KeyMatch::Fragment("text_model.encoder"),
+    KeyMatch::Fragment("SelfAttention"),
+    KeyMatch::Fragment("DenseReluDense"),
+    KeyMatch::AllOf(&[KeyMatch::Segment("encoder"), KeyMatch::Segment("shared")]),
+];
+
+/// Super resolution bodies beyond ESRGAN: PLKSR, MoSR, SwinIR, Swin2SR and DAT each name
+/// their trunk, and most of them name their upsampler.
+pub const UPSCALER_BODY_KEYS: &[KeyMatch] = &[
+    KeyMatch::Segment("feats"),
+    KeyMatch::AllOf(&[KeyMatch::Segment("gblocks"), KeyMatch::Segment("upsampler")]),
+    KeyMatch::AllOf(&[
+        KeyMatch::AnyOf(&[KeyMatch::Segment("layers"), KeyMatch::Segment("body")]),
+        KeyMatch::Segment("conv_before_upsample"),
+    ]),
+    KeyMatch::Segment("before_RG"),
+    KeyMatch::AllOf(&[
+        KeyMatch::Segment("res_blocks"),
+        KeyMatch::AnyOf(&[
+            KeyMatch::Segment("upsampler"),
+            KeyMatch::Segment("post_upsample_res_blocks"),
+        ]),
+    ]),
+    KeyMatch::Segment("RRDB_trunk"),
+    KeyMatch::AllOf(&[
+        KeyMatch::Segment("conv_first"),
+        KeyMatch::Segment("conv_body"),
+    ]),
+    KeyMatch::AllOf(&[
+        KeyMatch::Segment("conv_first"),
+        KeyMatch::Segment("conv_up1"),
+    ]),
+];
+
 const NOT_LORA: &[KeyMatch] = &[KeyMatch::AnyOf(LORA_KEYS)];
 
 const NOT_ADAPTER: &[KeyMatch] = &[
@@ -139,10 +266,46 @@ const NOT_ADAPTER: &[KeyMatch] = &[
     KeyMatch::AnyOf(MOTION_KEYS),
 ];
 
-const NOT_DIFFUSION_OR_TEXT: &[KeyMatch] = &[
+/// A standalone autoencoder holds nothing else: no denoiser group, no training state.
+const NOT_A_WHOLE_MODEL: &[KeyMatch] = &[
     KeyMatch::AnyOf(DIFFUSION_KEYS),
     KeyMatch::AnyOf(TEXT_ENCODER_KEYS),
     KeyMatch::AnyOf(LORA_KEYS),
+    KeyMatch::Segment("model"),
+    KeyMatch::Segment("model_ema"),
+    KeyMatch::Segment("net"),
+    KeyMatch::Segment("state_dict"),
+    KeyMatch::Segment("optimizer_states"),
+];
+
+/// A body that stands for the whole file carries no adapter and no denoiser group.
+const NOT_ADAPTER_OR_DIFFUSION: &[KeyMatch] = &[
+    KeyMatch::AnyOf(LORA_KEYS),
+    KeyMatch::AnyOf(CONTROLNET_KEYS),
+    KeyMatch::AnyOf(MOTION_KEYS),
+    KeyMatch::AnyOf(DIFFUSION_KEYS),
+];
+
+/// A super resolution body is the whole file: no adapter, no denoiser, no text encoder.
+const NOT_ADAPTER_OR_MODEL: &[KeyMatch] = &[
+    KeyMatch::AnyOf(LORA_KEYS),
+    KeyMatch::AnyOf(CONTROLNET_KEYS),
+    KeyMatch::AnyOf(MOTION_KEYS),
+    KeyMatch::AnyOf(DIFFUSION_KEYS),
+    KeyMatch::AnyOf(TEXT_ENCODER_KEYS),
+];
+
+/// A diffusion transformer carries no autoencoder of its own; a flow decoder that does is
+/// an autoencoder however transformer shaped its blocks are.
+const NOT_ADAPTER_OR_AUTOENCODER: &[KeyMatch] = &[
+    KeyMatch::AnyOf(LORA_KEYS),
+    KeyMatch::AnyOf(CONTROLNET_KEYS),
+    KeyMatch::AnyOf(MOTION_KEYS),
+    KeyMatch::AnyOf(AUTOENCODER_KEYS),
+    KeyMatch::AllOf(&[
+        KeyMatch::Fragment("encoder."),
+        KeyMatch::Fragment("decoder."),
+    ]),
 ];
 
 /// A role verdict drawn from tensor keys alone. A rule fires when every `require` term
@@ -171,7 +334,9 @@ impl RoleRule {
     }
 }
 
-const ESRGAN_MAX_TENSORS: u32 = 600;
+/// A bare `model.0.weight` says little on its own, so the rule that reads it only speaks
+/// for files small enough to be a super resolution network.
+const SEQUENTIAL_MAX_TENSORS: u32 = 4096;
 const EMBEDDING_MAX_TENSORS: u32 = 4;
 
 pub const ROLE_RULES: &[RoleRule] = &[
@@ -214,18 +379,11 @@ pub const ROLE_RULES: &[RoleRule] = &[
     RoleRule {
         role: Role::Vae,
         sub_role: None,
-        require: &[KeyMatch::AnyOf(&[
-            KeyMatch::Prefix("first_stage_model."),
-            KeyMatch::Fragment("post_quant_conv"),
-            KeyMatch::AllOf(&[
-                KeyMatch::Fragment("decoder.up_blocks"),
-                KeyMatch::Fragment("encoder.down_blocks"),
-            ]),
-        ])],
-        forbid: NOT_DIFFUSION_OR_TEXT,
+        require: &[KeyMatch::AnyOf(AUTOENCODER_KEYS)],
+        forbid: NOT_A_WHOLE_MODEL,
         max_tensors: None,
         confidence: TENSOR_STRONG,
-        detail: "autoencoder keys without diffusion or text encoder keys",
+        detail: "an encoder and a decoder and nothing else",
     },
     RoleRule {
         role: Role::Ckpt,
@@ -238,6 +396,67 @@ pub const ROLE_RULES: &[RoleRule] = &[
         max_tensors: None,
         confidence: TENSOR_STRONG,
         detail: "diffusion model keys with text encoder keys",
+    },
+    RoleRule {
+        role: Role::Ckpt,
+        sub_role: None,
+        require: &[KeyMatch::AnyOf(DIFFUSION_KEYS)],
+        forbid: NOT_ADAPTER,
+        max_tensors: None,
+        confidence: TENSOR_PATTERN,
+        detail: "a diffusion model group holding the whole file",
+    },
+    RoleRule {
+        role: Role::Ckpt,
+        sub_role: None,
+        require: &[
+            KeyMatch::Segment("first_stage_model"),
+            KeyMatch::AnyOf(&[KeyMatch::Segment("model"), KeyMatch::Segment("model_ema")]),
+        ],
+        forbid: NOT_LORA,
+        max_tensors: None,
+        confidence: TENSOR_PATTERN,
+        detail: "latent diffusion autoencoder and denoiser groups",
+    },
+    RoleRule {
+        role: Role::Ckpt,
+        sub_role: None,
+        require: &[
+            KeyMatch::AnyOf(BLOCK_BODY_KEYS),
+            KeyMatch::AnyOf(TIMESTEP_KEYS),
+            KeyMatch::AnyOf(ADALN_KEYS),
+        ],
+        forbid: NOT_ADAPTER_OR_AUTOENCODER,
+        max_tensors: None,
+        confidence: TENSOR_PATTERN,
+        detail: "transformer blocks with timestep conditioning and adaptive layer norm",
+    },
+    RoleRule {
+        role: Role::Ckpt,
+        sub_role: None,
+        require: &[KeyMatch::AnyOf(REFINER_KEYS)],
+        forbid: NOT_ADAPTER,
+        max_tensors: None,
+        confidence: TENSOR_PATTERN,
+        detail: "noise and context refiners ahead of the transformer blocks",
+    },
+    RoleRule {
+        role: Role::Ckpt,
+        sub_role: None,
+        require: &[KeyMatch::AnyOf(KREA_KEYS), KeyMatch::AnyOf(BLOCK_BODY_KEYS)],
+        forbid: NOT_ADAPTER,
+        max_tensors: None,
+        confidence: TENSOR_PATTERN,
+        detail: "gated transformer blocks with a text fusion stack",
+    },
+    RoleRule {
+        role: Role::Ckpt,
+        sub_role: None,
+        require: &[KeyMatch::AnyOf(TEXT_ENCODER_BODY_KEYS)],
+        forbid: NOT_ADAPTER_OR_DIFFUSION,
+        max_tensors: None,
+        confidence: TENSOR_PATTERN,
+        detail: "a text encoder body holding the whole file",
     },
     RoleRule {
         role: Role::Ckpt,
@@ -305,8 +524,8 @@ pub const ROLE_RULES: &[RoleRule] = &[
         role: Role::Upsc,
         sub_role: None,
         require: &[KeyMatch::AnyOf(ESRGAN_KEYS)],
-        forbid: NOT_ADAPTER,
-        max_tensors: Some(ESRGAN_MAX_TENSORS),
+        forbid: NOT_ADAPTER_OR_MODEL,
+        max_tensors: None,
         confidence: TENSOR_PATTERN,
         detail: "esrgan residual dense blocks",
     },
@@ -314,17 +533,26 @@ pub const ROLE_RULES: &[RoleRule] = &[
         role: Role::Upsc,
         sub_role: None,
         require: &[KeyMatch::AnyOf(SWINIR_KEYS)],
-        forbid: NOT_ADAPTER,
-        max_tensors: Some(ESRGAN_MAX_TENSORS),
+        forbid: NOT_ADAPTER_OR_MODEL,
+        max_tensors: None,
         confidence: TENSOR_PATTERN,
         detail: "swinir residual groups",
     },
     RoleRule {
         role: Role::Upsc,
         sub_role: None,
+        require: &[KeyMatch::AnyOf(UPSCALER_BODY_KEYS)],
+        forbid: NOT_ADAPTER_OR_MODEL,
+        max_tensors: None,
+        confidence: TENSOR_PATTERN,
+        detail: "a super resolution trunk with its upsampler",
+    },
+    RoleRule {
+        role: Role::Upsc,
+        sub_role: None,
         require: &[KeyMatch::Prefix("model.0.weight")],
-        forbid: NOT_ADAPTER,
-        max_tensors: Some(ESRGAN_MAX_TENSORS),
+        forbid: NOT_ADAPTER_OR_MODEL,
+        max_tensors: Some(SEQUENTIAL_MAX_TENSORS),
         confidence: TENSOR_SHAPE,
         detail: "sequential upscaler body",
     },
@@ -365,8 +593,7 @@ pub const BASE_RULES: &[BaseRule] = &[
         require: &[KeyMatch::AnyOf(&[
             KeyMatch::Fragment("double_blocks"),
             KeyMatch::Fragment("single_blocks"),
-            KeyMatch::Fragment("img_in."),
-            KeyMatch::Fragment("txt_in."),
+            KeyMatch::Fragment("single_transformer_blocks"),
         ])],
         forbid: &[KeyMatch::Fragment("joint_blocks")],
         confidence: TENSOR_PATTERN,
@@ -389,16 +616,32 @@ pub const BASE_RULES: &[BaseRule] = &[
                 KeyMatch::Fragment("self_attn."),
                 KeyMatch::Fragment("cross_attn."),
             ]),
-            KeyMatch::AnyOf(&[
-                KeyMatch::Fragment("patch_embedding"),
-                KeyMatch::Fragment("time_projection"),
-                KeyMatch::Fragment("cross_attn.k_img"),
-                KeyMatch::Fragment("img_emb."),
-            ]),
+            KeyMatch::AnyOf(VIDEO_DIT_KEYS),
         ],
         forbid: &[],
         confidence: TENSOR_PATTERN,
         detail: "wan self and cross attention blocks",
+    },
+    BaseRule {
+        base: "wan",
+        require: &[KeyMatch::AnyOf(WAN_BLOCK_KEYS)],
+        forbid: &[],
+        confidence: TENSOR_PATTERN,
+        detail: "wan single letter attention projections beside a feed forward",
+    },
+    BaseRule {
+        base: "zimage",
+        require: &[KeyMatch::AnyOf(REFINER_KEYS)],
+        forbid: &[],
+        confidence: TENSOR_PATTERN,
+        detail: "z-image noise and context refiners",
+    },
+    BaseRule {
+        base: "krea2",
+        require: &[KeyMatch::AnyOf(KREA_KEYS)],
+        forbid: &[],
+        confidence: TENSOR_PATTERN,
+        detail: "krea gated blocks with a text fusion stack",
     },
     BaseRule {
         base: "sdxl",
@@ -438,8 +681,22 @@ pub const PROJECTION_KEYS: &[&str] = &[
     "clip_g",
     "clip_l",
     "context_embedder",
-    "to_k.weight",
-    "to_v.weight",
+];
+
+/// The unet layout the cross-attention width table describes. Outside one, a projection of
+/// the same width is any hidden size at all and names no family.
+pub const UNET_BODY_KEYS: &[KeyMatch] = &[
+    KeyMatch::Fragment("input_blocks"),
+    KeyMatch::Fragment("output_blocks"),
+    KeyMatch::Fragment("middle_block"),
+    KeyMatch::Fragment("down_blocks"),
+    KeyMatch::Fragment("up_blocks"),
+    KeyMatch::Fragment("mid_block"),
+    KeyMatch::Fragment("time_embed"),
+    KeyMatch::Fragment("label_emb"),
+    KeyMatch::Fragment("add_embedding"),
+    KeyMatch::Fragment("to_k_ip"),
+    KeyMatch::Fragment("to_v_ip"),
 ];
 
 /// Known tool layouts. A folder never decides a role on its own; it only guesses.
@@ -567,21 +824,231 @@ mod tests {
     use super::*;
 
     fn summary(names: &[&str]) -> TensorSummary {
+        let samples: Vec<TensorSample> = names
+            .iter()
+            .map(|name| TensorSample {
+                name: (*name).to_owned(),
+                dtype: "F16".to_owned(),
+                shape: vec![4, 4],
+            })
+            .collect();
         TensorSummary {
-            tensor_count: names.len() as u32,
+            tensor_count: samples.len() as u32,
             params: 0,
             dtypes: BTreeMap::new(),
-            key_prefixes: Vec::new(),
-            samples: names
-                .iter()
-                .map(|name| TensorSample {
-                    name: (*name).to_owned(),
-                    dtype: "F16".to_owned(),
-                    shape: vec![4, 4],
-                })
-                .collect(),
+            key_prefixes: crate::sniff::prefix_histogram(&samples),
+            samples,
             metadata: BTreeMap::new(),
         }
+    }
+
+    fn role_of(names: &[&str]) -> Vec<(Role, &'static str)> {
+        let tensors = summary(names);
+        ROLE_RULES
+            .iter()
+            .filter(|rule| rule.matches(&tensors))
+            .map(|rule| (rule.role, rule.detail))
+            .collect()
+    }
+
+    fn bases_of(names: &[&str]) -> Vec<&'static str> {
+        let tensors = summary(names);
+        BASE_RULES
+            .iter()
+            .filter(|rule| rule.matches(&tensors))
+            .map(|rule| rule.base)
+            .collect()
+    }
+
+    fn takes_role(names: &[&str], role: Role) -> bool {
+        role_of(names).iter().any(|(found, _)| *found == role)
+    }
+
+    #[test]
+    fn a_segment_term_reads_the_prefix_histogram_not_the_sampled_names() {
+        let tensors = summary(&["decoder.up.0.conv.weight"]);
+        assert!(KeyMatch::Segment("decoder").matches(&tensors));
+        assert!(!KeyMatch::Segment("up").matches(&tensors));
+        assert!(KeyMatch::Fragment("up.0").matches(&tensors));
+    }
+
+    #[test]
+    fn an_encoder_and_a_decoder_alone_are_an_autoencoder() {
+        let vae = &[
+            "conv1.weight",
+            "decoder.conv1.weight",
+            "encoder.conv1.weight",
+        ];
+        assert!(takes_role(vae, Role::Vae));
+        assert!(!takes_role(vae, Role::Ckpt));
+
+        let checkpoint = &[
+            "model.diffusion_model.input_blocks.0.0.weight",
+            "cond_stage_model.transformer.text_model.encoder.layers.0.mlp.fc1.weight",
+            "first_stage_model.decoder.conv_in.weight",
+            "first_stage_model.encoder.conv_in.weight",
+        ];
+        assert!(takes_role(checkpoint, Role::Ckpt));
+        assert!(!takes_role(checkpoint, Role::Vae));
+
+        let training_state = &[
+            "model.decoder.conv_in.weight",
+            "model.encoder.conv_in.weight",
+            "state_dict.step",
+        ];
+        assert!(!takes_role(training_state, Role::Vae));
+    }
+
+    #[test]
+    fn a_diffusion_model_group_is_a_checkpoint_on_its_own() {
+        assert!(takes_role(
+            &["model.diffusion_model.transformer_blocks.0.attn.to_k.weight"],
+            Role::Ckpt
+        ));
+        assert!(!takes_role(
+            &["diffusion_model.blocks.0.cross_attn.k.lora_down.weight"],
+            Role::Ckpt
+        ));
+    }
+
+    #[test]
+    fn a_latent_diffusion_pickle_is_a_checkpoint_from_its_groups_alone() {
+        assert!(takes_role(
+            &[
+                "first_stage_model.decoder.conv_in.weight",
+                "model.diffusion_modelinput_blocks",
+                "model_ema.decay",
+            ],
+            Role::Ckpt
+        ));
+    }
+
+    #[test]
+    fn adaptive_layer_norm_and_a_timestep_make_a_diffusion_transformer() {
+        let dit = &[
+            "layers.0.adaLN_modulation.0.weight",
+            "layers.0.attention.qkv.weight",
+            "t_embedder.mlp.0.weight",
+        ];
+        assert!(takes_role(dit, Role::Ckpt));
+
+        let flow_autoencoder = &[
+            "pipeline.blocks.0.adaLN_modulation.1.weight",
+            "pipeline.t_embedder.mlp.0.weight",
+            "pipeline.encoder.down.0.conv.weight",
+            "pipeline.decoder.up.0.conv.weight",
+        ];
+        assert!(!takes_role(flow_autoencoder, Role::Ckpt));
+
+        let language_model = &["model.layers.0.self_attn.q_proj.weight", "lm_head.weight"];
+        assert!(!takes_role(language_model, Role::Ckpt));
+    }
+
+    #[test]
+    fn a_text_encoder_body_stands_for_the_whole_file() {
+        assert!(takes_role(
+            &["text_model.encoder.layers.0.mlp.fc1.weight"],
+            Role::Ckpt
+        ));
+        assert!(takes_role(
+            &[
+                "encoder.block.0.layer.0.SelfAttention.k.weight",
+                "shared.weight",
+            ],
+            Role::Ckpt
+        ));
+    }
+
+    #[test]
+    fn every_super_resolution_body_is_an_upscaler() {
+        let bodies: [&[&str]; 6] = [
+            &["feats.0.weight", "to_img.weight"],
+            &["gblocks.0.weight", "upsampler.0.weight"],
+            &[
+                "layers.0.residual_group.blocks.0.attn.qkv.weight",
+                "conv_before_upsample.0.weight",
+            ],
+            &["before_RG.1.weight", "layers.0.blocks.0.attn.qkv.weight"],
+            &["RRDB_trunk.0.RDB1.conv1.weight", "trunk_conv.weight"],
+            &["conv_first.weight", "conv_body.0.rdb1.conv1.weight"],
+        ];
+        for body in bodies {
+            assert!(takes_role(body, Role::Upsc), "{body:?} is an upscaler");
+        }
+        assert!(takes_role(
+            &["res_blocks.0.conv.weight", "upsampler.weight"],
+            Role::Upsc
+        ));
+    }
+
+    #[test]
+    fn a_super_resolution_body_is_not_capped_by_its_tensor_count() {
+        let mut tensors = summary(&["RRDB_trunk.0.RDB1.conv1.weight"]);
+        tensors.tensor_count = 4096;
+        let rule = ROLE_RULES
+            .iter()
+            .find(|rule| rule.detail == "esrgan residual dense blocks")
+            .expect("the esrgan rule exists");
+        assert!(rule.matches(&tensors));
+    }
+
+    #[test]
+    fn a_control_prefixed_module_is_a_controlnet() {
+        assert!(takes_role(
+            &[
+                "control_layers.0.attention.qkv.weight",
+                "control_noise_refiner.0.attention.qkv.weight",
+            ],
+            Role::Ctrl
+        ));
+    }
+
+    #[test]
+    fn base_rules_name_only_the_architecture_they_recognize() {
+        assert_eq!(
+            bases_of(&["double_blocks.0.img_attn.qkv.weight"]),
+            vec!["flux"]
+        );
+        assert!(
+            bases_of(&[
+                "model.diffusion_model.img_in.weight",
+                "model.diffusion_model.txt_in.weight",
+                "model.diffusion_model.transformer_blocks.0.attn.to_k.weight",
+            ])
+            .is_empty(),
+            "an image and a text input alone are shared by every mmdit"
+        );
+        assert_eq!(
+            bases_of(&[
+                "noise_refiner.0.attention.qkv.weight",
+                "context_refiner.0.attention.qkv.weight",
+            ]),
+            vec!["zimage"]
+        );
+        assert_eq!(
+            bases_of(&[
+                "blocks.0.attn.wq.weight",
+                "blocks.0.attn.gate.weight",
+                "blocks.0.mlp.gate.weight",
+            ]),
+            vec!["krea2"]
+        );
+        assert_eq!(
+            bases_of(&[
+                "diffusion_model.blocks.0.self_attn.q.lora_down.weight",
+                "diffusion_model.blocks.0.cross_attn.k.lora_down.weight",
+                "diffusion_model.blocks.0.ffn.0.lora_down.weight",
+            ]),
+            vec!["wan"]
+        );
+        assert!(
+            bases_of(&[
+                "vision_model.embeddings.patch_embedding.weight",
+                "vision_model.encoder.layers.0.self_attn.k_proj.weight",
+            ])
+            .is_empty(),
+            "a vision tower is not a video transformer"
+        );
     }
 
     #[test]
@@ -645,7 +1112,7 @@ mod tests {
             .expect("the sequential body rule exists");
         let mut small = summary(&["model.0.weight"]);
         assert!(body_rule.matches(&small));
-        small.tensor_count = ESRGAN_MAX_TENSORS + 1;
+        small.tensor_count = SEQUENTIAL_MAX_TENSORS + 1;
         assert!(!body_rule.matches(&small));
     }
 

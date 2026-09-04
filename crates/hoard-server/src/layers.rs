@@ -1,11 +1,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use axum::http::{HeaderName, HeaderValue, Request, StatusCode};
+use axum::http::{
+    Extensions, HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Version, header,
+};
 use tower_http::LatencyUnit;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
-use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+use tower_http::compression::predicate::{Predicate, SizeAbove};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{
@@ -36,18 +38,59 @@ impl MakeRequestId for MakeCountingRequestId {
 /// Body limit for the mutating `/api/v1` routes; file bytes are never uploaded to hoard.
 pub const REQUEST_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
-/// Compression for text responses only. Weights are already incompressible and running
-/// them through gzip would burn CPU on every LAN pull for nothing.
+/// The smallest response worth compressing.
+const MIN_COMPRESS_BYTES: u64 = 256;
+
+/// A predicate over the response headers, which the closure impl of [`Predicate`] accepts.
+type MediaPredicate = fn(StatusCode, Version, &HeaderMap, &Extensions) -> bool;
+
+/// Compression for text responses only, chosen by an allowlist rather than a list of
+/// exclusions.
+///
+/// Weights, packfiles and cached blocks are already incompressible, so compressing them
+/// spends CPU on every LAN pull for nothing. It is not only wasteful: gzip applied to the
+/// streamed `git upload-pack` result truncated the body, which broke `git clone` outright.
+/// An allowlist cannot regress that way when a new binary content type appears.
 pub fn compression() -> CompressionLayer<impl Predicate + Send + Sync + 'static> {
-    let predicate = DefaultPredicate::new()
-        .and(NotForContentType::new("application/octet-stream"))
-        .and(NotForContentType::new("binary/octet-stream"))
-        .and(NotForContentType::new("multipart/byteranges"))
-        .and(NotForContentType::new("application/x-safetensors"));
+    let predicate = SizeAbove::new(MIN_COMPRESS_BYTES).and(is_text_response as MediaPredicate);
     CompressionLayer::new()
         .gzip(true)
         .zstd(true)
         .compress_when(predicate)
+}
+
+fn is_text_response(
+    _status: StatusCode,
+    _version: Version,
+    headers: &HeaderMap,
+    _extensions: &Extensions,
+) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or(value)
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .is_some_and(|media| is_text_media(&media))
+}
+
+fn is_text_media(media: &str) -> bool {
+    media.starts_with("text/")
+        || media.ends_with("+json")
+        || media.ends_with("+xml")
+        || matches!(
+            media,
+            "application/json"
+                | "application/javascript"
+                | "application/xml"
+                | "application/x-ndjson"
+                | "application/toml"
+        )
 }
 
 pub fn tracing_layer()
@@ -94,6 +137,39 @@ pub fn metadata_timeout(seconds: u64) -> TimeoutLayer {
 mod tests {
     use super::*;
     use axum::body::Body;
+
+    #[test]
+    fn only_text_media_types_are_compressed() {
+        for media in [
+            "text/html",
+            "text/plain; charset=utf-8",
+            "application/json",
+            "application/vnd.api+json",
+            "image/svg+xml",
+        ] {
+            assert!(is_text_media(media), "{media} should compress");
+        }
+        for media in [
+            "application/octet-stream",
+            "application/x-git-upload-pack-result",
+            "application/x-git-upload-pack-advertisement",
+            "multipart/byteranges",
+            "image/png",
+            "font/woff2",
+        ] {
+            assert!(!is_text_media(media), "{media} must not compress");
+        }
+    }
+
+    #[test]
+    fn a_response_without_a_content_type_is_not_compressed() {
+        assert!(!is_text_response(
+            StatusCode::OK,
+            Version::HTTP_11,
+            &HeaderMap::new(),
+            &Extensions::new()
+        ));
+    }
 
     #[test]
     fn request_ids_are_unique_and_hex() {

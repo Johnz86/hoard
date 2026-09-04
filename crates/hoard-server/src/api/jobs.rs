@@ -11,7 +11,7 @@ use hoard_index::scan::ScanOptions;
 use hoard_index::store::job::{JobRow, JobState};
 use hoard_index::store::{blob, job, node, source};
 
-use crate::api::common::{PROBE_LIMIT, authorize};
+use crate::api::common::authorize;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -72,7 +72,7 @@ pub async fn sources(State(state): State<AppState>) -> ApiResult<Json<Vec<Source
     let rows = state
         .store()
         .call(|conn| {
-            let pending = blob::unhashed_blobs(conn, PROBE_LIMIT)?.len() as u64;
+            let pending = blob::pending_hash_count(conn)?;
             let mut out = Vec::new();
             for record in source::list_sources(conn)? {
                 out.push(SourceView {

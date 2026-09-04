@@ -11,6 +11,7 @@ pub mod state;
 pub mod ui;
 
 use std::future::Future;
+use std::net::SocketAddr;
 
 use axum::Router;
 use tokio::net::TcpListener;
@@ -32,6 +33,8 @@ pub fn app(state: AppState) -> Router {
 
     Router::new()
         .merge(api::routes().layer(timeout))
+        .merge(git::routes())
+        .merge(hub::routes())
         .merge(ui::routes())
         .layer(layers::compression())
         .layer(layers::cors())
@@ -45,13 +48,19 @@ pub fn app(state: AppState) -> Router {
 
 /// Serves the application until `shutdown` resolves.
 ///
+/// The peer address is carried into the request so the usage log can name which machine
+/// pulled a file, which is what the USAGE tab's `who` column shows.
+///
 /// Graceful shutdown is not a nicety here: a block download interrupted mid-write would
 /// leave a partial block in the cache, so in-flight writes are allowed to finish.
 pub async fn serve<F>(listener: TcpListener, state: AppState, shutdown: F) -> std::io::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown)
-        .await
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
 }

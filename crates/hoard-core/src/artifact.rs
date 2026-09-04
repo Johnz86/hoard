@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
@@ -202,7 +203,7 @@ pub struct TensorSummary {
 }
 
 impl TensorSummary {
-    /// The dtype carrying the most tensors, which decides the PREC column.
+    /// The dtype carrying the most tensors, whatever it holds.
     pub fn dominant_dtype(&self) -> Option<&str> {
         self.dtypes
             .iter()
@@ -210,8 +211,26 @@ impl TensorSummary {
             .map(|(dtype, _)| dtype.as_str())
     }
 
+    /// The precision the PREC column shows: the dominant weight dtype, which skips the
+    /// index and mask tensors a model carries beside its weights. Ties go to the narrower
+    /// float, which is where a mixed file keeps its bulk weights. A file of nothing but
+    /// integers still reports what it holds.
     pub fn precision(&self) -> Option<Precision> {
-        self.dominant_dtype().map(Precision::from_dtype)
+        let weight_dtype = self
+            .dtypes
+            .iter()
+            .filter(|(dtype, _)| !is_index_dtype(dtype))
+            .min_by_key(|(dtype, count)| {
+                (
+                    Reverse(**count),
+                    float_bits(dtype).unwrap_or_default(),
+                    dtype.as_str(),
+                )
+            })
+            .map(|(dtype, _)| dtype.as_str());
+        weight_dtype
+            .or_else(|| self.dominant_dtype())
+            .map(Precision::from_dtype)
     }
 
     /// True when any tensor key starts with the given prefix.
@@ -246,6 +265,24 @@ impl TensorSummary {
             .iter()
             .find(|sample| sample.name.contains(fragment))
     }
+}
+
+/// The width of a float dtype, and `None` for every other spelling.
+fn float_bits(dtype: &str) -> Option<u32> {
+    match Precision::from_dtype(dtype).as_str() {
+        "fp8" => Some(8),
+        "fp16" | "bf16" => Some(16),
+        "fp32" => Some(32),
+        "fp64" => Some(64),
+        _ => None,
+    }
+}
+
+/// True for the index, offset and mask dtypes a model carries beside its weights. A
+/// quantization scheme is not one of them: it is what the weights themselves are stored in.
+fn is_index_dtype(dtype: &str) -> bool {
+    let precision = Precision::from_dtype(dtype);
+    precision.as_str().starts_with("int") || precision.as_str() == "bool"
 }
 
 /// A blob interpreted. One blob yields one artifact per sniff version; the same bytes on
@@ -311,6 +348,60 @@ mod tests {
         assert_eq!(Precision::from_dtype("F8_E4M3").as_str(), "fp8");
         assert!(Precision::new("Q4_K_M").is_quantized());
         assert!(!Precision::new("fp16").is_quantized());
+    }
+
+    fn summary_of(dtypes: &[(&str, u32)]) -> TensorSummary {
+        TensorSummary {
+            dtypes: dtypes
+                .iter()
+                .map(|(dtype, count)| ((*dtype).to_owned(), *count))
+                .collect(),
+            ..TensorSummary::default()
+        }
+    }
+
+    #[test]
+    fn index_tensors_never_decide_the_precision() {
+        let swinir = summary_of(&[("F32", 1), ("I64", 1)]);
+        assert_eq!(swinir.dominant_dtype(), Some("I64"));
+        assert_eq!(
+            swinir.precision().map(|value| value.as_str().to_owned()),
+            Some("fp32".to_owned())
+        );
+
+        let mixed = summary_of(&[("BF16", 283), ("F32", 170), ("U8", 340)]);
+        assert_eq!(
+            mixed.precision().map(|value| value.as_str().to_owned()),
+            Some("bf16".to_owned())
+        );
+
+        let integers = summary_of(&[("I8", 8), ("U8", 4)]);
+        assert_eq!(
+            integers.precision().map(|value| value.as_str().to_owned()),
+            Some("int8".to_owned())
+        );
+
+        let quantized = summary_of(&[("Q4_K", 2), ("Q6_K", 1), ("F32", 1)]);
+        assert_eq!(
+            quantized.precision().map(|value| value.as_str().to_owned()),
+            Some("q4_k".to_owned())
+        );
+
+        assert_eq!(TensorSummary::default().precision(), None);
+    }
+
+    #[test]
+    fn a_tie_between_floats_reports_the_narrower_one() {
+        let ldsr = summary_of(&[("F32", 1), ("F64", 1)]);
+        assert_eq!(
+            ldsr.precision().map(|value| value.as_str().to_owned()),
+            Some("fp32".to_owned())
+        );
+        let scaled = summary_of(&[("BF16", 2), ("F8_E4M3", 2)]);
+        assert_eq!(
+            scaled.precision().map(|value| value.as_str().to_owned()),
+            Some("fp8".to_owned())
+        );
     }
 
     #[test]

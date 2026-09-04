@@ -137,6 +137,9 @@ fn architecture_rule(tensors: &TensorSummary, roles: &mut Accumulator<Role>) {
 }
 
 fn config_rules(input: &InferInput<'_>, roles: &mut Accumulator<Role>) {
+    if !input.config_describes_tensors() {
+        return;
+    }
     if let Some(class_name) = input.config_str("_class_name") {
         let normalized = class_name.to_ascii_lowercase();
         let matched = CLASS_NAME_ROLES
@@ -393,6 +396,36 @@ mod tests {
         );
         assert_eq!(verdict.role, Role::Llm);
         assert!(verdict.confidence >= rules::CONFIG_STRONG);
+    }
+
+    #[test]
+    fn a_config_describing_another_model_never_names_this_ones_role() {
+        let config = json!({
+            "model_type": "gemma3",
+            "architectures": ["Gemma3ForConditionalGeneration"],
+            "text_config": {"hidden_size": 3840, "num_hidden_layers": 48},
+        });
+        let summary = tensors(&[
+            (
+                "text_model.embeddings.token_embedding.weight",
+                &[49408, 768],
+            ),
+            ("text_model.encoder.layers.0.mlp.fc1.weight", &[3072, 768]),
+        ]);
+        let path = Path::new("/models/text_encoders/clip_l.safetensors");
+        let verdict = infer_role(
+            &input(path, "clip_l.safetensors")
+                .with_tensors(&summary)
+                .with_config(&config),
+        );
+        assert_eq!(verdict.role, Role::Ckpt);
+        assert!(
+            verdict
+                .evidence
+                .iter()
+                .all(|item| item.source != EvidenceSource::Config),
+            "a config for another model records no evidence"
+        );
     }
 
     #[test]

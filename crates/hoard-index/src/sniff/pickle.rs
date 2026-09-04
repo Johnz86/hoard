@@ -92,16 +92,21 @@ impl Evidence {
 
     fn into_summary(self, scanned: Vec<String>) -> TensorSummary {
         let mut classes = BTreeSet::new();
+        let mut groups = BTreeSet::new();
         let mut keys = Vec::new();
         for text in scanned {
             if text.ends_with("Storage") {
                 classes.insert(text);
+            } else if is_group_name(&text) {
+                groups.insert(text);
             } else if is_tensor_key(&text) && keys.len() < MAX_KEYS {
                 keys.push(text);
             }
         }
         keys.sort_unstable();
         keys.dedup();
+        drop_module_paths(&mut keys);
+        let copies = state_dict_copies(&groups, &keys);
 
         let single_class = classes.len() == 1;
         let dtype = match classes.first() {
@@ -119,11 +124,8 @@ impl Evidence {
         let key_prefixes = prefix_histogram(&samples);
         samples.truncate(MAX_SAMPLES);
 
-        let count = if single_class {
-            self.storage_count.max(1)
-        } else {
-            1
-        };
+        let tensor_count = self.storage_count / copies;
+        let count = if single_class { tensor_count.max(1) } else { 1 };
         let dtypes: BTreeMap<String, u32> = classes
             .iter()
             .map(|class| (storage_dtype(class), count))
@@ -147,7 +149,7 @@ impl Evidence {
         }
 
         TensorSummary {
-            tensor_count: self.storage_count,
+            tensor_count,
             params: 0,
             dtypes,
             key_prefixes,
@@ -434,6 +436,52 @@ const NOT_KEYS: [&str; 9] = [
     "_metadata",
 ];
 
+/// The top level names a training checkpoint gives a state dict, an EMA copy of one
+/// standing beside the copy it shadows.
+const STATE_DICT_GROUPS: [(&str, &str); 3] = [
+    ("params", "params_ema"),
+    ("state_dict", "ema_state_dict"),
+    ("model", "model_ema"),
+];
+
+fn is_group_name(text: &str) -> bool {
+    STATE_DICT_GROUPS
+        .iter()
+        .any(|(plain, ema)| text == *plain || text == *ema)
+}
+
+/// How many copies of one state dict the archive stores. A checkpoint that carries an EMA
+/// copy under a second group name lists every storage twice, and both copies spell their
+/// keys the same way, so the recovered keys describe one of them.
+fn state_dict_copies(groups: &BTreeSet<String>, keys: &[String]) -> u32 {
+    let duplicated = STATE_DICT_GROUPS.iter().any(|(plain, ema)| {
+        groups.contains(*plain)
+            && groups.contains(*ema)
+            && !keys.iter().any(|key| is_child_of(key, ema))
+    });
+    if duplicated { 2 } else { 1 }
+}
+
+/// Drops the module paths a torch `_metadata` map carries, which are the ancestors of the
+/// tensor keys beside them and never tensors themselves.
+fn drop_module_paths(keys: &mut Vec<String>) {
+    let mut kept = Vec::with_capacity(keys.len());
+    for (index, key) in keys.iter().enumerate() {
+        let has_child = keys[index + 1..]
+            .iter()
+            .take_while(|next| next.starts_with(key.as_str()))
+            .any(|next| is_child_of(next, key));
+        if !has_child {
+            kept.push(key.clone());
+        }
+    }
+    *keys = kept;
+}
+
+fn is_child_of(key: &str, parent: &str) -> bool {
+    key.starts_with(parent) && key.as_bytes().get(parent.len()) == Some(&b'.')
+}
+
 fn is_tensor_key(text: &str) -> bool {
     if !(3..=MAX_KEY_CHARS).contains(&text.len()) {
         return false;
@@ -683,6 +731,85 @@ mod tests {
             Some("pickle")
         );
         assert!(summary.has_prefix("model"));
+    }
+
+    fn ema_pickle() -> Vec<u8> {
+        let mut bytes = vec![0x80, 0x02, b'}', b'q', 0x00];
+        short_unicode(&mut bytes, "torch._utils");
+        short_unicode(&mut bytes, "_rebuild_tensor_v2");
+        short_unicode(&mut bytes, "FloatStorage");
+        short_unicode(&mut bytes, "params");
+        short_unicode(&mut bytes, "layers.0.residual_group.blocks.0.attn.qkv");
+        short_unicode(
+            &mut bytes,
+            "layers.0.residual_group.blocks.0.attn.qkv.weight",
+        );
+        short_unicode(&mut bytes, "params_ema");
+        short_unicode(
+            &mut bytes,
+            "layers.0.residual_group.blocks.0.attn.qkv.weight",
+        );
+        bytes.push(b'.');
+        bytes
+    }
+
+    #[test]
+    fn module_paths_are_not_counted_as_tensors() {
+        let dir = TempDir::new().expect("temp dir");
+        let bytes = zip(&[
+            ("archive/data.pkl", &ema_pickle()),
+            ("archive/data/0", &[0u8; 4]),
+            ("archive/data/1", &[0u8; 4]),
+            ("archive/version", b"3\n"),
+        ]);
+        let path = write(&dir, "swinir.pth", &bytes);
+        let summary = summarize(&path, bytes.len() as u64).expect("archive is listed");
+        let names: Vec<&str> = summary
+            .samples
+            .iter()
+            .map(|sample| sample.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["layers.0.residual_group.blocks.0.attn.qkv.weight"]
+        );
+        assert!(
+            summary
+                .key_prefixes
+                .iter()
+                .all(|(_, count)| *count <= summary.tensor_count),
+            "a prefix can never carry more tensors than the file holds"
+        );
+    }
+
+    #[test]
+    fn an_ema_copy_of_the_same_state_dict_is_counted_once() {
+        let dir = TempDir::new().expect("temp dir");
+        let bytes = zip(&[
+            ("archive/data.pkl", &ema_pickle()),
+            ("archive/data/0", &[0u8; 4]),
+            ("archive/data/1", &[0u8; 4]),
+            ("archive/version", b"3\n"),
+        ]);
+        let path = write(&dir, "swinir.pth", &bytes);
+        let summary = summarize(&path, bytes.len() as u64).expect("archive is listed");
+        assert_eq!(summary.tensor_count, 1);
+        assert_eq!(summary.dtypes.get("F32"), Some(&1));
+    }
+
+    #[test]
+    fn an_ema_group_with_its_own_keys_is_not_a_duplicate() {
+        let groups = BTreeSet::from(["model".to_owned(), "model_ema".to_owned()]);
+        let distinct = vec![
+            "model.diffusion_model.out.weight".to_owned(),
+            "model_ema.diffusion_modelout".to_owned(),
+            "model_ema.decay".to_owned(),
+        ];
+        assert_eq!(state_dict_copies(&groups, &distinct), 1);
+        assert_eq!(
+            state_dict_copies(&groups, &["model.out.weight".to_owned()]),
+            2
+        );
     }
 
     #[test]

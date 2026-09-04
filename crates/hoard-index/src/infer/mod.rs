@@ -12,6 +12,7 @@ mod role;
 pub mod rules;
 mod trigger;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use hoard_core::{ArtifactFormat, Base, Evidence, Precision, Role, SubRole, TensorSummary};
@@ -81,6 +82,30 @@ impl<'a> InferInput<'a> {
             .and_then(serde_json::Value::as_u64)
     }
 
+    /// True when the config in hand describes the file in hand. A scan hands every file of
+    /// a directory the one config it found there, so a config whose declared hidden width
+    /// is neither the width this file is built around nor a dimension of its largest
+    /// tensor is describing a different model and says nothing about this one.
+    pub(crate) fn config_describes_tensors(&self) -> bool {
+        let (Some(tensors), Some(config)) = (self.tensors, self.config) else {
+            return true;
+        };
+        let declared = declared_widths(config);
+        if declared.is_empty() {
+            return true;
+        }
+        let Some(width) = dominant_width(tensors) else {
+            return true;
+        };
+        let largest = tensors
+            .samples
+            .iter()
+            .max_by_key(|sample| sample.element_count())
+            .map(|sample| sample.shape.as_slice())
+            .unwrap_or_default();
+        declared.contains(&width) || largest.iter().any(|dim| declared.contains(dim))
+    }
+
     pub(crate) fn frontmatter_value(&self, key: &str) -> Option<&'a str> {
         self.frontmatter.and_then(|pairs| {
             pairs
@@ -89,6 +114,50 @@ impl<'a> InferInput<'a> {
                 .map(|(_, value)| value.as_str())
         })
     }
+}
+
+/// Hidden widths start well above the kernel and head dimensions a shape also carries.
+const MIN_HIDDEN_WIDTH: u64 = 64;
+
+/// The width the file itself is built around: the dimension the most tensors share, which
+/// for every transformer is its hidden size.
+fn dominant_width(tensors: &TensorSummary) -> Option<u64> {
+    let mut counts: BTreeMap<u64, u32> = BTreeMap::new();
+    for sample in &tensors.samples {
+        let dims: BTreeSet<u64> = sample
+            .shape
+            .iter()
+            .copied()
+            .filter(|dim| *dim >= MIN_HIDDEN_WIDTH)
+            .collect();
+        for dim in dims {
+            *counts.entry(dim).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(dim, count)| (*count, *dim))
+        .map(|(dim, _)| dim)
+}
+
+/// The hidden widths a config declares, its nested sub-model configs included.
+fn declared_widths(config: &serde_json::Value) -> Vec<u64> {
+    const WIDTH_KEYS: [&str; 2] = ["hidden_size", "d_model"];
+    let mut widths = Vec::new();
+    let mut push_from = |value: &serde_json::Value| {
+        for key in WIDTH_KEYS {
+            if let Some(width) = value.get(key).and_then(serde_json::Value::as_u64) {
+                widths.push(width);
+            }
+        }
+    };
+    push_from(config);
+    if let Some(entries) = config.as_object() {
+        for value in entries.values().filter(|value| value.is_object()) {
+            push_from(value);
+        }
+    }
+    widths
 }
 
 /// Every fact inference recovered, each one named by an entry in `evidence`.
@@ -238,30 +307,20 @@ pub(crate) mod fixtures {
     pub(crate) fn tensors(samples: &[(&str, &[u64])]) -> TensorSummary {
         let mut dtypes = BTreeMap::new();
         dtypes.insert("F16".to_owned(), samples.len() as u32);
-        let mut prefixes: Vec<(String, u32)> = Vec::new();
-        for (name, _) in samples {
-            let head = name.split(['.', '_']).next().unwrap_or(name).to_owned();
-            match prefixes.iter_mut().find(|(key, _)| *key == head) {
-                Some((_, count)) => *count += 1,
-                None => prefixes.push((head, 1)),
-            }
-        }
+        let samples: Vec<TensorSample> = samples
+            .iter()
+            .map(|(name, shape)| TensorSample {
+                name: (*name).to_owned(),
+                dtype: "F16".to_owned(),
+                shape: shape.to_vec(),
+            })
+            .collect();
         TensorSummary {
             tensor_count: samples.len() as u32,
-            params: samples
-                .iter()
-                .map(|(_, shape)| shape.iter().product::<u64>())
-                .sum(),
+            params: samples.iter().map(TensorSample::element_count).sum(),
             dtypes,
-            key_prefixes: prefixes,
-            samples: samples
-                .iter()
-                .map(|(name, shape)| TensorSample {
-                    name: (*name).to_owned(),
-                    dtype: "F16".to_owned(),
-                    shape: shape.to_vec(),
-                })
-                .collect(),
+            key_prefixes: crate::sniff::prefix_histogram(&samples),
+            samples,
             metadata: BTreeMap::new(),
         }
     }
@@ -476,6 +535,47 @@ pub(crate) mod fixtures {
         )
     }
 
+    pub(crate) fn z_image_checkpoint() -> TensorSummary {
+        tensors(&[
+            ("cap_embedder.0.weight", &[2560]),
+            ("context_refiner.0.attention.qkv.weight", &[11520, 3840]),
+            ("noise_refiner.0.attention.qkv.weight", &[11520, 3840]),
+            ("layers.0.adaLN_modulation.0.weight", &[15360, 256]),
+            ("layers.0.attention.qkv.weight", &[11520, 3840]),
+            ("t_embedder.mlp.0.weight", &[256, 256]),
+            ("final_layer.linear.bias", &[64]),
+        ])
+    }
+
+    pub(crate) fn video_vae() -> TensorSummary {
+        tensors(&[
+            ("conv1.weight", &[32, 32, 1, 1, 1]),
+            ("decoder.conv1.weight", &[384, 16, 3, 3, 3]),
+            (
+                "decoder.upsamples.0.residual.2.weight",
+                &[384, 384, 3, 3, 3],
+            ),
+            ("encoder.conv1.weight", &[96, 3, 3, 3, 3]),
+            (
+                "encoder.downsamples.0.residual.2.weight",
+                &[96, 96, 3, 3, 3],
+            ),
+        ])
+    }
+
+    pub(crate) fn swinir_upscaler() -> TensorSummary {
+        tensors(&[
+            ("conv_first.weight", &[180, 3, 3, 3]),
+            ("conv_after_body.weight", &[180, 180, 3, 3]),
+            ("conv_before_upsample.0.weight", &[64, 180, 3, 3]),
+            (
+                "layers.0.residual_group.blocks.0.attn.qkv.weight",
+                &[540, 180],
+            ),
+            ("upsample.0.weight", &[720, 64, 3, 3]),
+        ])
+    }
+
     pub(crate) fn ip_adapter() -> TensorSummary {
         tensors(&[
             ("image_proj.proj.weight", &[8192, 1024]),
@@ -510,6 +610,63 @@ mod tests {
         assert!(combine(&[rules::TENSOR_SHAPE]) > 0.85);
         assert!(combine(&[rules::FOLDER_HINT]) < ROLE_FLOOR);
         assert!(combine(&[rules::FOLDER_HINT, rules::FOLDER_HINT]) < 0.85);
+    }
+
+    #[test]
+    fn a_shard_is_described_by_the_config_of_its_own_repository() {
+        let config = serde_json::json!({"model_type": "gpt_oss", "hidden_size": 2880});
+        let expert_shard = fixtures::tensors(&[
+            (
+                "model.layers.14.mlp.experts.gate_up_proj_blocks",
+                &[128, 5760, 90, 16],
+            ),
+            ("model.layers.14.input_layernorm.weight", &[2880]),
+            ("model.layers.15.input_layernorm.weight", &[2880]),
+        ]);
+        let path = Path::new("/cache/gpt-oss/model-00007-of-00014.safetensors");
+        let input = InferInput::new(
+            ArtifactFormat::Safetensors,
+            path,
+            "model-00007-of-00014.safetensors",
+            9_000_000_000,
+        )
+        .with_tensors(&expert_shard)
+        .with_config(&config);
+        assert!(input.config_describes_tensors());
+
+        let other_model = fixtures::tensors(&[
+            (
+                "text_model.embeddings.token_embedding.weight",
+                &[49408, 768],
+            ),
+            ("text_model.encoder.layers.0.mlp.fc1.weight", &[3072, 768]),
+        ]);
+        let input = InferInput::new(
+            ArtifactFormat::Safetensors,
+            path,
+            "clip_l.safetensors",
+            246_000_000,
+        )
+        .with_tensors(&other_model)
+        .with_config(&config);
+        assert!(!input.config_describes_tensors());
+    }
+
+    #[test]
+    fn a_file_without_a_config_or_without_tensors_is_never_contradicted() {
+        let path = Path::new("/models/llm/config.json");
+        let config = serde_json::json!({"hidden_size": 4096});
+        assert!(
+            InferInput::new(ArtifactFormat::Transformers, path, "config.json", 4096)
+                .with_config(&config)
+                .config_describes_tensors()
+        );
+        let summary = fixtures::tensors(&[("weight", &[4, 4])]);
+        assert!(
+            InferInput::new(ArtifactFormat::Safetensors, path, "model.safetensors", 64)
+                .with_tensors(&summary)
+                .config_describes_tensors()
+        );
     }
 
     #[test]
@@ -690,6 +847,36 @@ mod acceptance {
                 base: "llama",
             },
             Case {
+                label: "z-image checkpoint",
+                tensors: fixtures::z_image_checkpoint(),
+                path: "/models/diffusion_models/z_image_turbo_bf16.safetensors",
+                file_name: "z_image_turbo_bf16.safetensors",
+                size: 12_800_000_000,
+                role: Role::Ckpt,
+                sub_role: None,
+                base: "zimage",
+            },
+            Case {
+                label: "video vae",
+                tensors: fixtures::video_vae(),
+                path: "/models/vae/wan_2.1_vae.safetensors",
+                file_name: "wan_2.1_vae.safetensors",
+                size: 254_000_000,
+                role: Role::Vae,
+                sub_role: None,
+                base: "",
+            },
+            Case {
+                label: "swinir upscaler",
+                tensors: fixtures::swinir_upscaler(),
+                path: "/models/upscale_models/SwinIR-M_x2.pth",
+                file_name: "SwinIR-M_x2.pth",
+                size: 44_000_000,
+                role: Role::Upsc,
+                sub_role: None,
+                base: Base::ANY,
+            },
+            Case {
                 label: "ip-adapter",
                 tensors: fixtures::ip_adapter(),
                 path: "/models/ipadapter/ip-adapter-plus_sdxl.safetensors",
@@ -855,9 +1042,6 @@ mod acceptance {
         );
         assert_eq!(inference.context, Some(8192));
         assert_eq!(inference.base, Base::new("llama"));
-        assert_eq!(
-            inference.base_label.as_deref(),
-            Some("Meta-Llama-3-8B-Instruct")
-        );
+        assert_eq!(inference.base_label.as_deref(), Some("llama"));
     }
 }

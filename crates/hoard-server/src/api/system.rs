@@ -9,7 +9,7 @@ use hoard_core::format_size;
 use hoard_index::store::row::FacetBucket;
 use hoard_index::store::{artifact, node, repo, search_exec, setting, source};
 
-use crate::api::common::{PROBE_LIMIT, authorize};
+use crate::api::common::authorize;
 use crate::error::ApiResult;
 use crate::state::AppState;
 
@@ -143,7 +143,7 @@ pub async fn stats(State(state): State<AppState>) -> ApiResult<Json<StatsView>> 
                 artifacts: search_exec::count_rows(conn, "", &[])?,
                 blobs: sources.iter().map(|record| record.blob_count).sum(),
                 repos: repos.len() as u64,
-                triage: artifact::triage_queue(conn, PROBE_LIMIT)?.len() as u64,
+                triage: artifact::triage_count(conn)?,
                 indexed_bytes,
                 indexed_bytes_human: format_size(indexed_bytes),
                 roles: search_exec::facet_counts(conn, "role", "", &[])?,

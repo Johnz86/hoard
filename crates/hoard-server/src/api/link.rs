@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use hoard_core::{ArtifactId, Role, ShelfId};
 use hoard_index::IndexError;
 use hoard_index::search::{SortKey, SortSpec, compile, parse};
+use hoard_index::store::projection::{NewProjection, record_projection};
 use hoard_index::store::{search_exec, shelf};
 
 use crate::api::common::{authorize, clamp_limit, compile_context};
@@ -129,6 +130,8 @@ pub async fn link(
             }
         }
     }
+    record(&state, &profile, &written).await?;
+
     Ok(Json(LinkView {
         profile,
         dir: dir.to_string_lossy().into_owned(),
@@ -136,6 +139,35 @@ pub async fn link(
         written,
         skipped,
     }))
+}
+
+/// Records the links this projection wrote, so PATHS ON DISK can tell a file hoard linked
+/// from a file that was always there, and a later projection can replace its own links.
+async fn record(state: &AppState, profile: &str, written: &[LinkRow]) -> ApiResult<()> {
+    if written.is_empty() {
+        return Ok(());
+    }
+    let entries: Vec<NewProjection> = written
+        .iter()
+        .map(|row| NewProjection {
+            link_path: row.link.clone(),
+            target_path: row.target.clone(),
+            profile: profile.to_owned(),
+            artifact_id: Some(row.artifact_id),
+        })
+        .collect();
+    state
+        .store()
+        .call_mut(move |conn| {
+            let transaction = conn.transaction()?;
+            for entry in &entries {
+                record_projection(&transaction, entry)?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await?;
+    Ok(())
 }
 
 /// Replaces an existing link rather than failing, so a projection can be re-run.

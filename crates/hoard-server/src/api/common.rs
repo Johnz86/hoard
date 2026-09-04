@@ -29,9 +29,6 @@ pub const DEFAULT_LIMIT: u32 = 100;
 const MAX_LIMIT: u32 = 500;
 /// How many compatible artifacts the inspector's PLUGS INTO list shows.
 pub const PLUGS_INTO_LIMIT: u32 = 4;
-/// How far a bounded probe of an unbounded table reads before it reports a saturated count.
-pub const PROBE_LIMIT: u32 = 10_000;
-
 pub const MIDDOT: &str = "\u{b7}";
 const TIMES: &str = "\u{d7}";
 

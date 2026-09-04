@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn projections_round_trip_and_replace_by_link_path() {
         let store = Store::open_in_memory().expect("store opens");
-        let mut conn = store.write().expect("writer");
+        let conn = store.write().expect("writer");
 
         let first = record_projection(
             &conn,
@@ -164,7 +164,7 @@ mod tests {
 
         assert!(remove_projection(&conn, "/models/loras/a.safetensors").expect("removed"));
         assert!(!remove_projection(&conn, "/models/loras/a.safetensors").expect("already gone"));
-        assert_eq!(clear_profile(&mut conn, "comfyui").expect("cleared"), 1);
+        assert_eq!(clear_profile(&conn, "comfyui").expect("cleared"), 1);
         assert!(list_projections(&conn, None).expect("listed").is_empty());
     }
 }
