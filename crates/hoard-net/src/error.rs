@@ -27,8 +27,16 @@ pub enum NetError {
     #[error("peer {peer} sent a digest hoard cannot read: {reason}")]
     BadDigest { peer: String, reason: String },
 
-    #[error("pulled bytes did not match the expected sha256")]
-    HashMismatch,
+    #[error("cursor {0:?} is not a digest cursor")]
+    BadCursor(String),
+
+    #[error("{path} from {peer} hashes to {actual} but the index promised {expected}")]
+    HashMismatch {
+        peer: String,
+        path: String,
+        expected: String,
+        actual: String,
+    },
 
     #[error("config error: {0}")]
     Config(String),

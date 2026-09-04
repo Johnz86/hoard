@@ -45,7 +45,9 @@ pub struct DigestEntry {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DigestPage {
     pub rows: Vec<DigestEntry>,
-    /// The artifact row every row of this page is at or below, when more pages remain.
+    /// The highest artifact row this page reached, which is where the next one starts.
+    /// A page that returned nothing has nowhere new to point, so a reader that asks again
+    /// from the same place is asking for what has been added since.
     pub next: Option<i64>,
     pub total: u64,
 }
@@ -79,7 +81,6 @@ pub fn collect(conn: &Connection, since: Option<i64>, limit: u32) -> Result<Dige
     };
     let rows = search_exec::query_rows(conn, where_sql, &params, DIGEST_ORDER, limit, 0)?;
     let highest = rows.last().map(|row| row.artifact_id.get());
-    let complete = rows.len() < limit as usize;
     Ok(DigestPage {
         rows: rows
             .iter()
@@ -96,10 +97,7 @@ pub fn collect(conn: &Connection, since: Option<i64>, limit: u32) -> Result<Dige
                 })
             })
             .collect(),
-        next: match complete {
-            true => None,
-            false => highest,
-        },
+        next: highest,
         total: search_exec::count_rows(conn, DIGEST_WHERE, &[])?,
     })
 }
@@ -282,11 +280,11 @@ mod tests {
         loop {
             let page = collect(&conn, cursor, 3).expect("page reads");
             assert_eq!(page.total, 7);
-            seen.extend(page.rows.iter().map(|row| row.sha256));
-            match page.next {
-                Some(bound) => cursor = Some(bound),
-                None => break,
+            if page.rows.is_empty() {
+                break;
             }
+            seen.extend(page.rows.iter().map(|row| row.sha256));
+            cursor = page.next;
         }
         let mut unique = seen.clone();
         unique.sort_unstable();
@@ -301,15 +299,16 @@ mod tests {
         let conn = store.read().expect("reader");
         let first = collect(&conn, None, 100).expect("first page");
         assert_eq!(first.rows.len(), 2);
-        assert_eq!(first.next, None);
 
         let highest = search_exec::query_rows(&conn, DIGEST_WHERE, &[], "artifact_id DESC", 1, 0)
             .expect("rows")
             .first()
             .map(|row| row.artifact_id.get())
             .expect("at least one artifact");
+        assert_eq!(first.next, Some(highest));
         let after = collect(&conn, Some(highest), 100).expect("second page");
         assert!(after.rows.is_empty());
+        assert_eq!(after.next, None);
         assert_eq!(after.total, 2);
     }
 

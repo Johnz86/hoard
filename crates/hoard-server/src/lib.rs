@@ -20,6 +20,46 @@ pub use config::HoardConfig;
 pub use error::{ApiError, ApiResult, HubError, HubResult};
 pub use state::AppState;
 
+/// Starts LAN discovery and index gossip for this node.
+///
+/// Federation is never allowed to fail a server: a machine with no multicast, no peers or
+/// no network at all logs and serves on, because the Hub and git faces are useful alone.
+pub async fn start_gossip(state: &AppState) -> Option<hoard_net::GossipHandle> {
+    let config = state.config();
+    let local = match state
+        .store()
+        .call(hoard_index::store::node::local_node)
+        .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::warn!(%error, "this node is not recorded yet; federation is off");
+            return None;
+        }
+    };
+    let identity =
+        match hoard_net::NodeIdentity::new(local.node_id, &config.node.name, state.public_url()) {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::warn!(%error, "this node cannot advertise itself; federation is off");
+                return None;
+            }
+        };
+    let mode = match config.node.discovery {
+        config::Discovery::Mdns => hoard_net::DiscoveryMode::Mdns,
+        config::Discovery::Static => hoard_net::DiscoveryMode::Static,
+        config::Discovery::None => hoard_net::DiscoveryMode::None,
+    };
+    let token = std::env::var("HOARD_NODE_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let gossip = hoard_net::GossipConfig::new(identity)
+        .with_discovery(mode)
+        .with_statics(config.peers.statics.clone())
+        .with_token(token);
+    Some(hoard_net::spawn(state.store().clone(), gossip))
+}
+
 /// Builds the whole application.
 ///
 /// Route order is load bearing. The hoard API and the Hub API both live under `/api`, and

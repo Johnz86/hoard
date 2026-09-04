@@ -131,7 +131,7 @@ hoard/
           schema.sql  migrations.rs  pool.rs
           node.rs  source.rs  blob.rs  artifact.rs  repo.rs  revision.rs  entry.rs
           shelf.rs  loadout.rs  job.rs  usage.rs  overrides.rs  setting.rs
-          projection.rs  search_exec.rs  row.rs
+          projection.rs  search_exec.rs  row.rs  digest.rs
         search/
           grammar.rs         winnow parser
           token.rs           token kinds and the parsed strip
@@ -162,6 +162,12 @@ hoard/
         ingest.rs            completed cache entries into the index
         usage.rs             served-request log
     hoard-net/               node identity, mDNS discovery, digest gossip, peer pulls
+      src/
+        identity.rs          NodeId, name, advertised URL and the _hoard._tcp TXT record
+        discovery.rs         mDNS advertise and browse, with the static peer list as peer
+        digest.rs            the compact index digest, its cursors and how one is applied
+        peer.rs              the peer client, pulls through the Hub face, state derivation
+        error.rs             NetError
     hoard-server/            axum wiring only
       src/
         state.rs  error.rs  layers.rs  assets.rs

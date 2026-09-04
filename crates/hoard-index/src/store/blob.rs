@@ -154,6 +154,22 @@ pub fn refresh_all_path_counts(conn: &Connection) -> Result<usize> {
 ///
 /// Counted in SQL rather than by listing rows: a cold disk can leave hundreds of thousands
 /// of blobs unhashed, and the SCANS tab only needs the number.
+/// How many blobs this node actually holds, and how many bytes they occupy.
+///
+/// Counted from the entries present on the local node rather than from scan totals, so
+/// bytes that arrived by a peer pull or an upstream ingest are included and a node with no
+/// sources of its own does not report that it holds nothing.
+pub fn local_totals(conn: &Connection) -> Result<(u64, u64)> {
+    let (blobs, bytes): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM blob WHERE EXISTS ( \
+             SELECT 1 FROM entry e JOIN node n ON n.id = e.node_id \
+             WHERE e.blob_id = blob.id AND e.present = 1 AND n.is_self = 1)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok((to_u64(blobs), to_u64(bytes)))
+}
+
 pub fn pending_hash_count(conn: &Connection) -> Result<u64> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM blob WHERE sha256 IS NULL",

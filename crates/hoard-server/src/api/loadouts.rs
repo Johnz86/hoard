@@ -1,3 +1,6 @@
+use std::path::{Path as StdPath, PathBuf};
+use std::sync::Arc;
+
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -5,15 +8,19 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use hoard_core::{
-    ArtifactId, Loadout, LoadoutId, LoadoutPin, LoadoutSlot, LoadoutViolation, PinResolution,
-    RepoId, Role, State as ArtifactState, format_size,
+    ArtifactId, JobId, Loadout, LoadoutId, LoadoutPin, LoadoutSlot, LoadoutViolation,
+    PinResolution, RepoId, Role, State as ArtifactState, format_size,
 };
 use hoard_index::IndexError;
+use hoard_index::store::projection::{NewProjection, record_projection};
 use hoard_index::store::row::{SearchRow, SqlValue};
 use hoard_index::store::{blob, job, loadout, node, search_exec};
+use hoard_net::identity::NodeIdentity;
+use hoard_net::{PullRequest, Puller};
 
 use crate::api::artifacts::artifact_id;
 use crate::api::common::{Conn, authorize, require_row};
+use crate::api::link;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -21,6 +28,10 @@ use crate::state::AppState;
 const APPLY_KIND: &str = "apply";
 /// The slot an upscaler occupies, which is the one that reads a factor rather than a weight.
 const FACTOR_SLOT: LoadoutSlot = LoadoutSlot::Upscaler;
+/// The tool layout an apply writes when none is named.
+const DEFAULT_PROFILE: &str = "comfyui";
+/// Where a profile's links land under the data directory when the caller names no place.
+const PROFILE_DIR: &str = "profiles";
 
 /// One line of the loadout drawer, with whether the target node can satisfy it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -115,6 +126,9 @@ pub struct ApplyBody {
     pub node: Option<String>,
     #[serde(default)]
     pub profile: Option<String>,
+    /// Where the layout is written; the node's own `profiles/<profile>` by default.
+    #[serde(default)]
+    pub dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -269,7 +283,13 @@ pub async fn apply(
         .filter(|value| !value.is_empty())
         .unwrap_or(state.node_name())
         .to_owned();
-    let profile = body.profile.clone().unwrap_or_else(|| "comfyui".to_owned());
+    let profile = body
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_PROFILE)
+        .to_ascii_lowercase();
     let node_name = target.clone();
     let (view, job_id) = state
         .store()
@@ -285,52 +305,358 @@ pub async fn apply(
         .await?;
 
     let preview = view.apply_preview.clone();
-    let phase = format!(
-        "{} present, {} pulling, {} missing for {profile}",
-        preview.present, preview.pulling, preview.missing
-    );
+    let dir = body
+        .dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| profile_dir(&state, &profile));
+    let local = target == state.node_name();
     let background = state.clone();
-    let settle = preview.clone();
     tokio::spawn(async move {
-        let outcome = background
-            .store()
-            .call_mut(move |conn| {
-                job::update_job(
-                    conn,
-                    job_id,
-                    &job::JobProgress {
-                        phase: Some(phase),
-                        progress: match settle.present + settle.pulling + settle.missing {
-                            0 => 1.0,
-                            total => {
-                                f32::from(u16::try_from(settle.present).unwrap_or(u16::MAX))
-                                    / f32::from(u16::try_from(total).unwrap_or(u16::MAX))
-                            }
-                        },
-                        bytes: settle.bytes,
-                        total: Some(settle.bytes),
-                        rate_bps: None,
-                    },
-                )?;
-                match settle.missing {
-                    0 => job::finish_job(conn, job_id),
-                    missing => job::fail_job(
-                        conn,
-                        job_id,
-                        &format!("{missing} pinned lines are not on this LAN"),
-                    ),
-                }
-            })
-            .await;
-        if let Err(error) = outcome {
-            tracing::error!(%error, "the apply job could not be settled");
+        let settled = match local {
+            true => run_apply(&background, id, job_id, &profile, &dir).await,
+            false => report_only(&background, job_id, &preview, &profile).await,
+        };
+        if let Err(error) = settled {
+            tracing::error!(code = error.code(), "the apply job could not be settled");
         }
     });
     Ok(Json(ApplyStarted {
         job_id,
         node: target,
-        apply_preview: preview,
+        apply_preview: view.apply_preview,
     }))
+}
+
+/// Applying a loadout to a different node is a resolution report: only the node that owns
+/// the disk can pull to it and write its links.
+async fn report_only(
+    state: &AppState,
+    job: JobId,
+    preview: &ApplyPreview,
+    profile: &str,
+) -> ApiResult<()> {
+    let phase = format!(
+        "{} present, {} elsewhere, {} missing for {profile}",
+        preview.present, preview.pulling, preview.missing
+    );
+    let bytes = preview.bytes;
+    let missing = preview.missing;
+    state
+        .store()
+        .call_mut(move |conn| {
+            job::update_job(
+                conn,
+                job,
+                &job::JobProgress {
+                    phase: Some(phase),
+                    progress: 1.0,
+                    bytes,
+                    total: Some(bytes),
+                    rate_bps: None,
+                },
+            )?;
+            match missing {
+                0 => job::finish_job(conn, job),
+                missing => job::fail_job(
+                    conn,
+                    job,
+                    &format!("{missing} pinned lines are not on this LAN"),
+                ),
+            }
+        })
+        .await?;
+    Ok(())
+}
+
+/// Pulls what only a peer has, then writes the profile's links for every line that landed.
+async fn run_apply(
+    state: &AppState,
+    id: LoadoutId,
+    job: JobId,
+    profile: &str,
+    dir: &StdPath,
+) -> ApiResult<()> {
+    let plan = plan_of(state, id).await?;
+    let total = plan.len().max(1) as f32;
+    let puller = puller(state)?;
+    let mut ready: Vec<ReadyLine> = Vec::new();
+    let mut missing = Vec::new();
+    let mut bytes = 0u64;
+
+    for (index, line) in plan.iter().enumerate() {
+        let phase = format!("{} ({profile})", line.name);
+        let progress = index as f32 / total;
+        let pulled = bytes;
+        state
+            .store()
+            .call_mut(move |conn| {
+                job::update_job(
+                    conn,
+                    job,
+                    &job::JobProgress {
+                        phase: Some(phase),
+                        progress,
+                        bytes: pulled,
+                        total: None,
+                        rate_bps: None,
+                    },
+                )
+            })
+            .await?;
+        match line.source.clone() {
+            LineSource::Held(path) => ready.push(ReadyLine {
+                artifact: line.artifact,
+                role: line.role,
+                name: line.name.clone(),
+                target: path,
+            }),
+            LineSource::Peer(request) => match puller.pull(&request, None).await {
+                Ok(outcome) => {
+                    bytes += outcome.size;
+                    ready.push(ReadyLine {
+                        artifact: outcome.artifact,
+                        role: line.role,
+                        name: line.name.clone(),
+                        target: outcome.abs_path.to_string_lossy().into_owned(),
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(line = %line.name, %error, "a pinned line could not be pulled");
+                    missing.push(line.name.clone());
+                }
+            },
+            LineSource::Nowhere => missing.push(line.name.clone()),
+        }
+    }
+
+    let written = write_links(state, profile, dir, &ready).await?;
+    let phase = format!("{written} links written to {}", dir.display());
+    state
+        .store()
+        .call_mut(move |conn| {
+            job::update_job(
+                conn,
+                job,
+                &job::JobProgress {
+                    phase: Some(phase),
+                    progress: 1.0,
+                    bytes,
+                    total: Some(bytes),
+                    rate_bps: None,
+                },
+            )?;
+            match missing.is_empty() {
+                true => job::finish_job(conn, job),
+                false => job::fail_job(
+                    conn,
+                    job,
+                    &format!("{} pinned lines are not on this LAN", missing.len()),
+                ),
+            }
+        })
+        .await?;
+    Ok(())
+}
+
+/// The puller an apply pulls with, aimed at this node's own data directory.
+fn puller(state: &AppState) -> ApiResult<Puller> {
+    Puller::new(
+        state.store().clone(),
+        Arc::clone(state.mirror()),
+        state
+            .config()
+            .server
+            .data_dir
+            .join(hoard_net::peer::PULL_DIR),
+        state.config().node.serve,
+        state.config().index.triage_confidence,
+    )
+    .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+fn profile_dir(state: &AppState, profile: &str) -> PathBuf {
+    state
+        .config()
+        .server
+        .data_dir
+        .join(PROFILE_DIR)
+        .join(profile)
+}
+
+/// Where one line's bytes are coming from.
+#[derive(Debug, Clone)]
+enum LineSource {
+    /// Already on this node, at this path.
+    Held(String),
+    /// Only a peer has it; this is the pull that would fetch it.
+    Peer(Box<PullRequest>),
+    Nowhere,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedLine {
+    artifact: ArtifactId,
+    role: Role,
+    name: String,
+    source: LineSource,
+}
+
+#[derive(Debug, Clone)]
+struct ReadyLine {
+    artifact: ArtifactId,
+    role: Role,
+    name: String,
+    target: String,
+}
+
+/// Resolves every pinned line against the index and the peers the index knows.
+async fn plan_of(state: &AppState, id: LoadoutId) -> ApiResult<Vec<PlannedLine>> {
+    let plan = state
+        .store()
+        .call(move |conn| {
+            let document = loadout::loadout(conn, id)?.parse()?;
+            let mut lines = Vec::with_capacity(document.len());
+            for (_, pin) in document.pins() {
+                lines.push(plan_line(conn, pin)?);
+            }
+            Ok(lines)
+        })
+        .await?;
+    Ok(plan)
+}
+
+fn plan_line(conn: &Conn, pin: &LoadoutPin) -> Result<PlannedLine, IndexError> {
+    let local = node::local_node(conn)?;
+    let candidates = resolve_pin(conn, pin)?;
+    let held = candidates
+        .iter()
+        .find(|row| row.node == local.name && row.state.has_bytes() && row.abs_path.is_some());
+    let elsewhere = candidates
+        .iter()
+        .find(|row| row.node != local.name && row.blob_sha256.is_some());
+    let row = held.or(elsewhere).or_else(|| candidates.first());
+    let name = row.map_or_else(
+        || pin.display_name().to_owned(),
+        |row| file_name(&row.path).to_owned(),
+    );
+    let source = match (held, elsewhere) {
+        (Some(row), _) => LineSource::Held(row.abs_path.clone().unwrap_or_default()),
+        (None, Some(row)) => match pull_request(conn, row)? {
+            Some(request) => LineSource::Peer(Box::new(request)),
+            None => LineSource::Nowhere,
+        },
+        (None, None) => LineSource::Nowhere,
+    };
+    Ok(PlannedLine {
+        artifact: row.map_or(ArtifactId::new(0), |row| row.artifact_id),
+        role: row.map_or(Role::Unk, |row| row.role),
+        name,
+        source,
+    })
+}
+
+/// The pull that would fetch one row from the node holding it.
+fn pull_request(conn: &Conn, row: &SearchRow) -> Result<Option<PullRequest>, IndexError> {
+    let Some(sha256) = row.blob_sha256 else {
+        return Ok(None);
+    };
+    let Some(owner) = node::node_by_name(conn, &row.node)? else {
+        return Ok(None);
+    };
+    let Some(url) = owner.url.as_deref() else {
+        return Ok(None);
+    };
+    let Some(revision) = row.revision_sha else {
+        return Ok(None);
+    };
+    let peer = NodeIdentity::new(owner.node_id.clone(), owner.name.clone(), url)
+        .map_err(|error| IndexError::Config(error.to_string()))?;
+    let repo = RepoId::parse_qualified(&row.repo)?;
+    Ok(Some(PullRequest::new(
+        peer,
+        repo,
+        revision,
+        row.path.clone(),
+        sha256,
+        row.size,
+    )))
+}
+
+/// Writes the profile's layout and records what it wrote, so PATHS ON DISK can tell a link
+/// hoard made from a file that was always there.
+async fn write_links(
+    state: &AppState,
+    profile: &str,
+    dir: &StdPath,
+    lines: &[ReadyLine],
+) -> ApiResult<usize> {
+    let mut written = Vec::new();
+    for line in lines {
+        if line.target.is_empty() {
+            continue;
+        }
+        let link = dir
+            .join(link::directory(profile, line.role))
+            .join(&line.name);
+        match link_file(StdPath::new(&line.target), &link).await {
+            Ok(()) => written.push(NewProjection {
+                link_path: link.to_string_lossy().into_owned(),
+                target_path: line.target.clone(),
+                profile: profile.to_owned(),
+                artifact_id: Some(line.artifact),
+            }),
+            Err(error) => {
+                tracing::warn!(link = %link.display(), %error, "an apply link was not written");
+            }
+        }
+    }
+    let count = written.len();
+    if count > 0 {
+        state
+            .store()
+            .call_mut(move |conn| {
+                let transaction = conn.transaction()?;
+                for projection in &written {
+                    record_projection(&transaction, projection)?;
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+            .await?;
+    }
+    Ok(count)
+}
+
+/// Replaces an existing link rather than failing, so an apply can be re-run.
+#[cfg(unix)]
+async fn link_file(target: &StdPath, link: &StdPath) -> std::io::Result<()> {
+    if let Some(parent) = link.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    if tokio::fs::read_link(link)
+        .await
+        .is_ok_and(|current| current == target)
+    {
+        return Ok(());
+    }
+    let _ = tokio::fs::remove_file(link).await;
+    tokio::fs::symlink(target, link).await
+}
+
+#[cfg(not(unix))]
+async fn link_file(_target: &StdPath, _link: &StdPath) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "hoard writes projections as symlinks, which this platform does not offer",
+    ))
+}
+
+fn file_name(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    trimmed.rsplit('/').next().unwrap_or(trimmed)
 }
 
 pub async fn export(
@@ -413,6 +739,9 @@ fn preview_of(items: &[LoadoutItem]) -> ApplyPreview {
 }
 
 /// Resolves one pinned line: by content hash first, then by repository, commit and path.
+///
+/// A row filed against another node is REMOTE from here, which is exactly what "elsewhere"
+/// means: that node holds the bytes and this one does not.
 fn item_of(
     conn: &Conn,
     slot: LoadoutSlot,
@@ -423,7 +752,9 @@ fn item_of(
     let held = candidates
         .iter()
         .find(|row| row.node == node_name && row.state.has_bytes());
-    let elsewhere = candidates.iter().find(|row| row.state.has_bytes());
+    let elsewhere = candidates
+        .iter()
+        .find(|row| row.node != node_name && row.blob_sha256.is_some());
     let resolution = match (held, elsewhere) {
         (Some(_), _) => PinResolution::Present,
         (None, Some(row)) => PinResolution::Elsewhere {
@@ -541,4 +872,104 @@ fn comfy_script(view: &LoadoutView) -> String {
 fn loadout_id(raw: &str) -> ApiResult<LoadoutId> {
     raw.parse()
         .map_err(|_| ApiError::not_found(format!("loadout {raw}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use hoard_core::{CommitSha, NodeId, RepoType, Sha256};
+    use hoard_index::store::Store;
+    use hoard_index::store::node::{NewNode, upsert_node};
+    use serde_json::json;
+
+    use super::*;
+
+    /// One `search_row` as the peer holding it would be reported, built through the shape
+    /// the API already serializes so the test cannot drift from the view.
+    fn row(node: &str, sha256: Option<Sha256>) -> SearchRow {
+        serde_json::from_value(json!({
+            "artifact_id": 1, "blob_id": 1,
+            "blob_sha256": sha256.map(Sha256::to_hex),
+            "role": "lora", "sub_role": null, "role_confidence": 0.98,
+            "org": "kohya", "name": "film-grain", "base": "sdxl", "base_label": "SDXL 1.0",
+            "format": "safetensors", "precision": "fp16", "quant": null,
+            "size": 239_075_328u64, "rank": 32, "alpha": 16.0, "params": null, "context": null,
+            "revision": "main", "revision_sha": CommitSha::from_bytes([3u8; 20]).to_hex(),
+            "node": node, "state": "remote", "pull_progress": null, "trigger": null,
+            "path": "loras/film-grain.safetensors", "abs_path": null,
+            "path_count": 1, "dupe": false, "triage": false, "last_used": null,
+            "repo": "models/kohya/film-grain", "repo_id": 1, "entry_id": 1,
+            "source": null, "is_symlink": false, "lfs_pointer": false
+        }))
+        .expect("a search row parses")
+    }
+
+    fn store_with_peer(url: Option<&str>) -> Store {
+        let store = Store::open_in_memory().expect("store opens");
+        let conn = store.write().expect("writer");
+        upsert_node(
+            &conn,
+            &NewNode::local(NodeId::new("workstation-1").expect("id"), "workstation"),
+        )
+        .expect("local node");
+        upsert_node(
+            &conn,
+            &NewNode {
+                node_id: NodeId::new("laptop-1").expect("id"),
+                name: "laptop".to_owned(),
+                url: url.map(str::to_owned),
+                is_self: false,
+            },
+        )
+        .expect("peer node");
+        drop(conn);
+        store
+    }
+
+    #[test]
+    fn a_link_is_named_after_the_file_the_pin_points_at() {
+        assert_eq!(
+            file_name("loras/film-grain.safetensors"),
+            "film-grain.safetensors"
+        );
+        assert_eq!(file_name("model.gguf"), "model.gguf");
+        assert_eq!(file_name("a/b/"), "b");
+    }
+
+    #[test]
+    fn a_row_on_a_reachable_peer_becomes_a_pull() {
+        let store = store_with_peer(Some("http://laptop.lan:7099"));
+        let conn = store.read().expect("reader");
+        let sha256 = Sha256::from_bytes([9u8; 32]);
+        let request = pull_request(&conn, &row("laptop", Some(sha256)))
+            .expect("resolution runs")
+            .expect("a reachable peer is pullable");
+        assert_eq!(request.sha256, sha256);
+        assert_eq!(request.peer.url().as_str(), "http://laptop.lan:7099/");
+        assert_eq!(
+            request.repo,
+            RepoId::new(RepoType::Models, Some("kohya".to_owned()), "film-grain")
+        );
+        assert_eq!(request.path, "loras/film-grain.safetensors");
+        assert_eq!(request.revision, CommitSha::from_bytes([3u8; 20]));
+    }
+
+    #[test]
+    fn a_row_without_a_hash_or_an_address_is_not_pullable() {
+        let store = store_with_peer(Some("http://laptop.lan:7099"));
+        let conn = store.read().expect("reader");
+        assert!(
+            pull_request(&conn, &row("laptop", None))
+                .expect("resolution runs")
+                .is_none()
+        );
+        drop(conn);
+
+        let store = store_with_peer(None);
+        let conn = store.read().expect("reader");
+        assert!(
+            pull_request(&conn, &row("laptop", Some(Sha256::from_bytes([9u8; 32]))))
+                .expect("resolution runs")
+                .is_none()
+        );
+    }
 }

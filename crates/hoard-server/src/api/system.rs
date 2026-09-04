@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use hoard_core::format_size;
 use hoard_index::store::row::FacetBucket;
-use hoard_index::store::{artifact, node, repo, search_exec, setting, source};
+use hoard_index::store::{artifact, blob, node, repo, search_exec, setting};
 
 use crate::api::common::authorize;
 use crate::error::ApiResult;
@@ -136,12 +136,11 @@ pub async fn stats(State(state): State<AppState>) -> ApiResult<Json<StatsView>> 
     let counts = state
         .store()
         .call(move |conn| {
-            let sources = source::list_sources(conn)?;
-            let indexed_bytes = sources.iter().map(|record| record.byte_count).sum();
+            let (local_blobs, indexed_bytes) = blob::local_totals(conn)?;
             let repos = repo::list_repos(conn, &repo::RepoFilter::default(), None, u32::MAX)?;
             Ok(StatsView {
                 artifacts: search_exec::count_rows(conn, "", &[])?,
-                blobs: sources.iter().map(|record| record.blob_count).sum(),
+                blobs: local_blobs,
                 repos: repos.len() as u64,
                 triage: artifact::triage_count(conn)?,
                 indexed_bytes,

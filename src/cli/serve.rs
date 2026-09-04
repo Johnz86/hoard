@@ -28,10 +28,14 @@ pub async fn run(context: Context, bind: Option<String>) -> Result<()> {
         .await
         .with_context(|| format!("binding {address}"))?;
 
+    let gossip = hoard_server::start_gossip(&state).await;
     tracing::info!(node = %node, %address, url = %public, offline, "hoard is serving");
     hoard_server::serve(listener, state, shutdown())
         .await
         .context("serving")?;
+    if let Some(gossip) = gossip {
+        gossip.shutdown().await;
+    }
     tracing::info!("hoard has stopped");
     Ok(())
 }

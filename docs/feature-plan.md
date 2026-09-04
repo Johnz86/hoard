@@ -18,8 +18,8 @@ speak. Sources: `docs/use-case.md` (brief), `docs/design/ui-spec.md` and
 | 5 | Hub face, local serving | done | M2 Speak git |
 | 6 | Git face and repo detail | done | M2 |
 | 7 | Upstream proxy and block cache | done | M3 Cross the LAN |
-| 8 | Nodes: discovery, gossip, peer pulls | todo | M3 |
-| 9 | Shelves, loadouts, projection, usage | partial | M4 Make it usable |
+| 8 | Nodes: discovery, gossip, peer pulls | done | M3 |
+| 9 | Shelves, loadouts, projection, usage | done | M4 Make it usable |
 | 10 | Live index and polish | partial | M4 |
 
 Tick a phase only when its acceptance check passes and `/hoard-verify` is clean.
@@ -30,10 +30,15 @@ byte-identical through `HF_ENDPOINT` with an isolated `HF_HOME` so the client co
 answer itself; `git clone` with branches, tag and history intact; and a second node in
 offline mode serving a proxied repo from the cached documents alone.
 
-Phase 9 is partial: shelves, loadouts, the usage log and `hoard link` projection all work,
-but `hoard apply` resolves and reports without pulling from a peer, which needs Phase 8.
+Phase 8 was accepted with two nodes on separate data directories: mDNS found each other
+within a second on this network, the second listed the first's artifacts as REMOTE, and an
+apply pulled one whose sha256 matched the origin byte for byte before it became local and
+searchable. The static `[peers]` path was verified independently, because mDNS is blocked
+on many networks.
+
 Phase 10 is partial: the `notify` watcher, PyTorch zip key extraction and dataset sniffing
-are in; the TREE and DISK views are not.
+are in; the TREE and DISK views are not. `docs/design/ui-spec.md` records them as named in
+the proposal but absent from the prototype, so there is no design to build them from.
 
 ## Goals
 
