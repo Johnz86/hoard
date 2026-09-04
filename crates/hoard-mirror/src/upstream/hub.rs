@@ -23,6 +23,7 @@ use crate::model::HubTimestamp;
 use crate::upstream::client::{
     Authorization, IDENTITY_ENCODING, ProxyResponse, UpstreamClient, UpstreamRequest,
 };
+use crate::upstream::meta::MetaRequest;
 
 /// The header carrying the commit a resolve answered from.
 pub const HEADER_REPO_COMMIT: &str = "x-repo-commit";
@@ -332,6 +333,23 @@ impl Hub {
         self.client
             .pass_through(UpstreamRequest::get(&url).with_auth(auth))
             .await
+    }
+
+    /// Forwards one metadata request and returns the answer verbatim.
+    ///
+    /// Exactly one upstream call: the route the client asked for, carrying its query and
+    /// its body, without the visibility probe olah sent first.
+    pub async fn metadata(&self, request: &MetaRequest<'_>) -> Result<ProxyResponse> {
+        let url = self.api_url(request.repo, &request.kind.suffix())?;
+        let mut upstream =
+            UpstreamRequest::new(request.kind.method(), &url).with_auth(request.auth);
+        if let Some(query) = request.kind.query() {
+            upstream = upstream.with_query(query);
+        }
+        if let Some(body) = request.kind.body()? {
+            upstream = upstream.with_body(body);
+        }
+        self.client.pass_through(upstream).await
     }
 
     /// `GET /api/whoami-v2`, so `hf auth whoami` answers through the mirror.

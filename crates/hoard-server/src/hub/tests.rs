@@ -7,6 +7,7 @@ use jiff::Timestamp;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use hoard_core::{
     ArtifactFormat, ArtifactId, BlobId, CommitSha, NodeId, RepoId, RepoRowId, RepoType, RevisionId,
@@ -22,6 +23,7 @@ use hoard_index::store::repo::{NewRepo, upsert_repo};
 use hoard_index::store::revision::{NewRevision, RefKind, upsert_ref, upsert_revision};
 use hoard_index::store::source::upsert_source;
 use hoard_index::store::usage::{UsageDay, usage_days};
+use hoard_mirror::access::AccessRule;
 
 use crate::api::common::Conn;
 use crate::config::HoardConfig;
@@ -77,6 +79,20 @@ fn seeded() -> World {
         state: AppState::new(config, store).expect("state builds"),
         _dir: dir,
     }
+}
+
+/// The same node with an upstream it is allowed to proxy and cache, for the routes that
+/// fall through to the mirror.
+fn mirrored(upstream: &str) -> World {
+    let mut world = seeded();
+    let mut config = world.state.config().clone();
+    config.mirror.offline = false;
+    config.mirror.upstream = upstream.to_owned();
+    config.mirror.proxy = vec![AccessRule::glob("*", true), AccessRule::glob("*/*", true)];
+    config.mirror.cache = vec![AccessRule::glob("*", true), AccessRule::glob("*/*", true)];
+    let store = world.state.store().clone();
+    world.state = AppState::new(config, store).expect("state builds");
+    world
 }
 
 fn at() -> Timestamp {
@@ -890,4 +906,180 @@ async fn an_authorization_header_is_accepted_and_never_required() {
         .expect("request");
     let answer = send(&world.state, request).await;
     assert_eq!(answer.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_repo_the_index_does_not_hold_is_proxied_in_one_upstream_request() {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/api/models/bigscience/bloom-560m",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-repo-commit", "11f4b3c2d1e09876543210fedcba9876543210ab")
+                .set_body_json(json!({
+                    "id": "bigscience/bloom-560m",
+                    "sha": "11f4b3c2d1e09876543210fedcba9876543210ab",
+                    "siblings": [{ "rfilename": "config.json" }],
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let world = mirrored(&server.uri());
+
+    let first = get(&world.state, "/api/models/bigscience/bloom-560m").await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert_eq!(first.json()["id"], json!("bigscience/bloom-560m"));
+    assert_eq!(
+        first.header("x-repo-commit"),
+        Some("11f4b3c2d1e09876543210fedcba9876543210ab")
+    );
+
+    let cached = get(&world.state, "/api/models/bigscience/bloom-560m").await;
+    assert_eq!(cached.status, StatusCode::OK);
+    assert_eq!(
+        cached.json(),
+        first.json(),
+        "the second answer is the cached document"
+    );
+
+    let document = world
+        .state
+        .cache()
+        .layout()
+        .revision_meta(
+            &RepoId::new(
+                RepoType::Models,
+                Some("bigscience".to_owned()),
+                "bloom-560m",
+            ),
+            &"11f4b3c2d1e09876543210fedcba9876543210ab"
+                .parse::<CommitSha>()
+                .expect("sha parses"),
+        )
+        .expect("path builds");
+    assert!(document.exists(), "{}", document.display());
+}
+
+#[tokio::test]
+async fn a_locally_held_repo_is_answered_without_asking_the_upstream() {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let world = mirrored(&server.uri());
+
+    for route in [
+        "/api/models/kohya/film-grain-35mm",
+        "/api/models/kohya/film-grain-35mm/revision/main",
+        "/api/models/kohya/film-grain-35mm/tree/main",
+        "/api/models/kohya/film-grain-35mm/commits/main",
+    ] {
+        assert_eq!(
+            get(&world.state, route).await.status,
+            StatusCode::OK,
+            "{route}"
+        );
+    }
+    let paths = post(
+        &world.state,
+        "/api/models/kohya/film-grain-35mm/paths-info/main",
+        "application/json",
+        "{\"paths\":[\"config.json\"]}",
+    )
+    .await;
+    assert_eq!(paths.status, StatusCode::OK);
+    assert_eq!(paths.column("path"), vec!["config.json"]);
+}
+
+#[tokio::test]
+async fn a_proxied_paths_info_forwards_the_posted_paths() {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(
+            "/api/models/bigscience/bloom-560m/paths-info/main",
+        ))
+        .and(wiremock::matchers::body_json(
+            json!({ "paths": ["config.json"] }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "type": "file", "oid": "aa", "size": 665, "path": "config.json" },
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let world = mirrored(&server.uri());
+
+    let answer = post(
+        &world.state,
+        "/api/models/bigscience/bloom-560m/paths-info/main",
+        "application/json",
+        "{\"paths\":[\"config.json\"]}",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK);
+    assert_eq!(answer.column("path"), vec!["config.json"]);
+}
+
+#[tokio::test]
+async fn a_proxied_tree_carries_its_query_upstream() {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            "/api/models/bigscience/bloom-560m/tree/main/unet",
+        ))
+        .and(wiremock::matchers::query_param("recursive", "true"))
+        .and(wiremock::matchers::query_param("expand", "false"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            { "type": "file", "oid": "aa", "size": 1, "path": "unet/a.bin" },
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let world = mirrored(&server.uri());
+
+    let answer = get(
+        &world.state,
+        "/api/models/bigscience/bloom-560m/tree/main/unet?recursive=1&expand=false",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK);
+    assert_eq!(answer.column("path"), vec!["unet/a.bin"]);
+}
+
+#[tokio::test]
+async fn an_upstream_answer_is_forwarded_verbatim_including_its_status() {
+    let server = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(
+            ResponseTemplate::new(401)
+                .insert_header("x-error-code", "RepoNotFound")
+                .set_body_json(json!({ "error": "Repository not found" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let world = mirrored(&server.uri());
+
+    let answer = get(&world.state, "/api/models/nobody/nothing").await;
+    assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(answer.header("x-error-code"), Some("RepoNotFound"));
+    assert_eq!(answer.json(), json!({ "error": "Repository not found" }));
+}
+
+#[tokio::test]
+async fn offline_metadata_is_the_documented_repo_not_found() {
+    let world = seeded();
+    let answer = get(
+        &world.state,
+        "/api/models/bigscience/bloom-560m/commits/main",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(answer.header("x-error-code"), Some("RepoNotFound"));
+    assert_eq!(answer.json(), json!({ "error": "Repository not found" }));
 }

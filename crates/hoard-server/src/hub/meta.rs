@@ -1,8 +1,9 @@
 //! Repository metadata: repo info, tree, paths-info, commits and the listing endpoints.
 //!
-//! Every one of these is answered from the index in a single query, which is the whole
-//! point of holding an index: a repository this node already has never costs a network
-//! round trip to describe.
+//! A repository this node holds is answered from the index in a single query, which is the
+//! whole point of holding an index: describing it never costs a network round trip. A
+//! repository the index does not know falls through to the mirror, which forwards the route
+//! upstream in one request and files the answer in the metadata cache.
 
 use axum::Json;
 use axum::body::Bytes;
@@ -15,10 +16,13 @@ use hoard_core::{CommitSha, RepoId, RepoType};
 use hoard_index::store::node::local_node;
 use hoard_index::store::repo::repo_by_qualified;
 use hoard_index::store::revision::resolve_revision;
+use hoard_mirror::MirrorError;
 use hoard_mirror::local::index_repo::{self, MAX_COMMITS, RepoListQuery};
+use hoard_mirror::upstream::{MetaKind, MetaRequest};
 
 use crate::error::{HubError, HubResult};
-use crate::hub::{PathParams, param, path_of, repo_of, revision_of};
+use crate::hub::proxy::forward;
+use crate::hub::{PathParams, authorization, param, path_of, repo_of, revision_of};
 use crate::state::AppState;
 
 /// The header every response that resolved a revision carries.
@@ -73,11 +77,20 @@ struct PathsInfoBody {
 pub(crate) async fn repo_info(
     State(state): State<AppState>,
     RoutePath(params): RoutePath<PathParams>,
+    headers: HeaderMap,
 ) -> HubResult<Response> {
     let repo = repo_of(&params)?;
-    let info = index_repo::repo_info(state.store(), &repo, revision_of(&params)).await?;
-    let commit = info.sha.parse::<CommitSha>().ok();
-    json(&info, commit)
+    match index_repo::repo_info(state.store(), &repo, revision_of(&params)).await {
+        Ok(info) => {
+            let commit = info.sha.parse::<CommitSha>().ok();
+            json(&info, commit)
+        }
+        Err(MirrorError::RepoNotFound(_)) => {
+            let revision = params.get("revision").map(String::as_str);
+            proxied(&state, &repo, MetaKind::RepoInfo { revision }, &headers).await
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// `HEAD`, `GET /api/{repo_type}/{ref}/tree/{revision}/{path}`.
@@ -85,10 +98,20 @@ pub(crate) async fn tree(
     State(state): State<AppState>,
     RoutePath(params): RoutePath<PathParams>,
     Query(query): Query<TreeParams>,
+    headers: HeaderMap,
 ) -> HubResult<Response> {
     let repo = repo_of(&params)?;
     let path = path_of(&params)?;
-    let sha = revision_sha(&state, &repo, revision_of(&params)).await?;
+    let revision = revision_of(&params);
+    let Some(sha) = local_sha(&state, &repo, revision).await? else {
+        let kind = MetaKind::Tree {
+            revision,
+            path,
+            recursive: query.recursive(),
+            expand: query.expand(),
+        };
+        return proxied(&state, &repo, kind, &headers).await;
+    };
     let entries = index_repo::tree(
         state.store(),
         &repo,
@@ -104,7 +127,8 @@ pub(crate) async fn tree(
 /// `HEAD`, `POST /api/{repo_type}/{ref}/paths-info/{revision}`.
 ///
 /// A `HEAD` carries no body and so names no paths; it answers with the headers a `POST`
-/// would return, which is what a client probing the route is asking for.
+/// would return, which is what a client probing the route is asking for, and never asks an
+/// upstream about paths nobody named.
 pub(crate) async fn paths_info(
     State(state): State<AppState>,
     method: Method,
@@ -113,11 +137,19 @@ pub(crate) async fn paths_info(
     body: Bytes,
 ) -> HubResult<Response> {
     let repo = repo_of(&params)?;
-    let sha = revision_sha(&state, &repo, revision_of(&params)).await?;
+    let revision = revision_of(&params);
+    let local = local_sha(&state, &repo, revision).await?;
     if method == Method::HEAD {
-        return json(&Vec::<serde_json::Value>::new(), Some(sha));
+        return json(&Vec::<serde_json::Value>::new(), local);
     }
     let paths = requested_paths(&headers, &body)?;
+    let Some(sha) = local else {
+        let kind = MetaKind::PathsInfo {
+            revision,
+            paths: &paths,
+        };
+        return proxied(&state, &repo, kind, &headers).await;
+    };
     let entries = index_repo::paths_info(state.store(), &repo, &sha, &paths).await?;
     json(&entries, Some(sha))
 }
@@ -126,9 +158,13 @@ pub(crate) async fn paths_info(
 pub(crate) async fn commits(
     State(state): State<AppState>,
     RoutePath(params): RoutePath<PathParams>,
+    headers: HeaderMap,
 ) -> HubResult<Response> {
     let repo = repo_of(&params)?;
-    let sha = revision_sha(&state, &repo, revision_of(&params)).await?;
+    let revision = revision_of(&params);
+    let Some(sha) = local_sha(&state, &repo, revision).await? else {
+        return proxied(&state, &repo, MetaKind::Commits { revision }, &headers).await;
+    };
     let commits = index_repo::commits(state.store(), &repo, &sha, MAX_COMMITS).await?;
     json(&commits, Some(sha))
 }
@@ -155,11 +191,16 @@ pub(crate) async fn list(
     json(&repos, None)
 }
 
-/// The commit a revision names, resolved against the index alone.
+/// The commit a revision names in the index.
 ///
-/// The metadata routes serve what this node holds, so a repository the index does not know
-/// is the documented 401 rather than a network round trip that would answer the same way.
-async fn revision_sha(state: &AppState, repo: &RepoId, revision: &str) -> HubResult<CommitSha> {
+/// `None` means this node does not hold the repository at all, which is what sends a route
+/// upstream. A repository it does hold answers for itself, including the documented
+/// `RevisionNotFound` when the revision is the part it does not have.
+async fn local_sha(
+    state: &AppState,
+    repo: &RepoId,
+    revision: &str,
+) -> HubResult<Option<CommitSha>> {
     let qualified = repo.qualified();
     let wanted = revision.to_owned();
     let resolved = state
@@ -175,10 +216,26 @@ async fn revision_sha(state: &AppState, repo: &RepoId, revision: &str) -> HubRes
         })
         .await?;
     match resolved {
-        Some(Ok(sha)) => Ok(sha),
+        Some(Ok(sha)) => Ok(Some(sha)),
         Some(Err(_)) => Err(HubError::revision_not_found(revision)),
-        None => Err(HubError::repo_not_found()),
+        None => Ok(None),
     }
+}
+
+/// One metadata route forwarded to the mirror, which answers it from the metadata cache or
+/// from one upstream request and returns what the upstream said.
+async fn proxied(
+    state: &AppState,
+    repo: &RepoId,
+    kind: MetaKind<'_>,
+    headers: &HeaderMap,
+) -> HubResult<Response> {
+    let auth = authorization(headers);
+    let answer = state
+        .mirror()
+        .metadata(MetaRequest::new(repo, kind).with_auth(auth.as_ref()))
+        .await?;
+    forward(answer)
 }
 
 /// The paths a paths-info request named, as a form or as the JSON body the `hf` client

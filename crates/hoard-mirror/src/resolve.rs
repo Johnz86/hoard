@@ -5,6 +5,7 @@
 //! response says about them. `hoard-server` turns a [`FileAnswer`] into an HTTP response and
 //! adds nothing of its own.
 
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -17,18 +18,22 @@ use hoard_core::{CommitSha, RepoId, Sha256, clean_repo_path};
 use hoard_index::store::Store;
 use serde_json::Value;
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Mutex;
 use url::Url;
 
 use crate::access::AccessPolicy;
-use crate::cache::{BlockCache, CacheEntry, body_path};
+use crate::cache::meta::{
+    CACHEABLE_STATUS, MetaEnvelope, fresh, read_meta_array, read_meta_document, write_meta_document,
+};
+use crate::cache::{BlockCache, CacheEntry, CacheLayout, body_path};
 use crate::error::{MirrorError, Result};
 use crate::ingest::{CachedFile, IngestOutcome, ingest_cached_file};
 use crate::local::index_repo::{self, FileLocation, read_index, repo_row, revision_row};
 use crate::model::HubTimestamp;
 use crate::upstream::client::{Authorization, ProxyResponse};
-use crate::upstream::hub::{BlockFetch, Hub, anonymous_whoami, quoted};
+use crate::upstream::hub::{BlockFetch, HEADER_REPO_COMMIT, Hub, anonymous_whoami, quoted};
+use crate::upstream::meta::{DEFAULT_REVISION, MetaRequest};
 use crate::upstream::range::{
     ByteRange, RangeOutcome, multipart_boundary, multipart_content_length, multipart_content_type,
     multipart_part_header, multipart_terminator, parse_ranges, unsatisfied_content_range,
@@ -40,6 +45,10 @@ pub const REVISION_TTL: Duration = Duration::from_secs(300);
 /// How many resolved revisions are remembered in memory.
 pub const REVISION_CACHE_CAPACITY: u64 = 4_096;
 
+/// How long a cached metadata document answers for while this node is online. Offline, or
+/// under a proxy rule that denies the repository, a document is served whatever its age.
+pub const METADATA_TTL: Duration = REVISION_TTL;
+
 /// The read size of a file served straight off the filesystem.
 const LOCAL_READ: u64 = 1024 * 1024;
 
@@ -47,7 +56,6 @@ const LOCAL_READ: u64 = 1024 * 1024;
 /// block that will be thrown away.
 const UNCACHED_READ: u64 = 8 * 1024 * 1024;
 
-const DEFAULT_REVISION: &str = "main";
 const OCTET_STREAM: &str = "application/octet-stream";
 const REVISION_META_FILE: &str = "meta_get.json";
 const SHA256_HEX_LEN: usize = 64;
@@ -426,6 +434,140 @@ impl Mirror {
         Ok(())
     }
 
+    /// The metadata routes hoard forwards rather than answers: repo info, tree, paths-info
+    /// and commits.
+    ///
+    /// The documented order in exactly one upstream call: the cached document while it is
+    /// fresh, then the upstream when the rules and the network allow it, then the cached
+    /// document at any age. The commit the answer is filed under is read out of the answer
+    /// itself, so proxying one never costs a second lookup.
+    pub async fn metadata(&self, request: MetaRequest<'_>) -> Result<ProxyResponse> {
+        let subject = request.repo.reference();
+        let live = self.access.proxy_allowed(&subject) && !self.is_offline();
+        if let Some(answer) = self
+            .cached_metadata(&request, live.then_some(METADATA_TTL))
+            .await?
+        {
+            return Ok(answer);
+        }
+        if !live {
+            return Err(MirrorError::RepoNotFound(subject));
+        }
+        let response = self.upstream.metadata(&request).await?;
+        self.remember_metadata(&request, &response).await;
+        Ok(response)
+    }
+
+    /// The documents this request is cached as, served as one answer when every one of them
+    /// is present and no older than `max_age`.
+    async fn cached_metadata(
+        &self,
+        request: &MetaRequest<'_>,
+        max_age: Option<Duration>,
+    ) -> Result<Option<ProxyResponse>> {
+        let Some(sha) = self.metadata_sha(request.repo, request.revision()).await else {
+            return Ok(None);
+        };
+        let documents = request
+            .kind
+            .documents(self.cache.layout(), request.repo, &sha)?;
+        let cached = if request.kind.is_split_by_path() {
+            read_meta_array(&documents, max_age).await?
+        } else {
+            match documents.first() {
+                Some(path) => fresh(read_meta_document(path).await?, max_age),
+                None => None,
+            }
+        };
+        Ok(cached.map(|cached| {
+            ProxyResponse {
+                status: cached.envelope.status_code,
+                headers: cached.envelope.header_pairs(),
+                body: cached.body,
+            }
+            .without_xet_headers()
+        }))
+    }
+
+    /// The commit a metadata document is filed under, found without asking the network: the
+    /// revision itself when it names one, then what an earlier lookup resolved, then the
+    /// newest revision the cache holds.
+    async fn metadata_sha(&self, repo: &RepoId, revision: &str) -> Option<CommitSha> {
+        if let Ok(sha) = revision.parse::<CommitSha>() {
+            return Some(sha);
+        }
+        if let Some(sha) = self.revisions.get(&revision_key(repo, revision)).await {
+            return Some(sha);
+        }
+        self.cached_revision(repo, revision).await
+    }
+
+    /// Files a proxied answer under the commit it reports and remembers that commit, so the
+    /// routes a client calls next find their documents without a lookup of their own.
+    async fn remember_metadata(&self, request: &MetaRequest<'_>, response: &ProxyResponse) {
+        if response.status != CACHEABLE_STATUS {
+            return;
+        }
+        let Some(sha) = self.answered_commit(request, response).await else {
+            return;
+        };
+        self.revisions
+            .insert(revision_key(request.repo, request.revision()), sha)
+            .await;
+        if !self.access.cache_allowed(&request.repo.reference()) {
+            return;
+        }
+        if let Err(error) = self.write_metadata(request, response, &sha).await {
+            tracing::warn!(
+                repo = %request.repo.qualified(),
+                %error,
+                "metadata was not cached"
+            );
+        }
+    }
+
+    /// Which commit an upstream answered at: the header it carries, the `sha` of a repo
+    /// info document, or whatever the request was already keyed to.
+    async fn answered_commit(
+        &self,
+        request: &MetaRequest<'_>,
+        response: &ProxyResponse,
+    ) -> Option<CommitSha> {
+        if let Some(sha) = response
+            .header(HEADER_REPO_COMMIT)
+            .and_then(|value| value.parse::<CommitSha>().ok())
+        {
+            return Some(sha);
+        }
+        if let Some(sha) = serde_json::from_slice::<Value>(&response.body)
+            .ok()
+            .as_ref()
+            .and_then(|document| document.get("sha"))
+            .and_then(Value::as_str)
+            .and_then(|sha| sha.parse::<CommitSha>().ok())
+        {
+            return Some(sha);
+        }
+        self.metadata_sha(request.repo, request.revision()).await
+    }
+
+    async fn write_metadata(
+        &self,
+        request: &MetaRequest<'_>,
+        response: &ProxyResponse,
+        sha: &CommitSha,
+    ) -> Result<()> {
+        let layout = self.cache.layout();
+        if request.kind.is_split_by_path() {
+            return write_paths_info(layout, request.repo, sha, &response.body).await;
+        }
+        let envelope = MetaEnvelope::upstream(response.status, &response.headers);
+        for path in request.kind.documents(layout, request.repo, sha)? {
+            write_meta_document(&path, &envelope, &response.body).await?;
+        }
+        Ok(())
+    }
+
     /// Resolves a branch, tag or sha in the documented order: the index, then the upstream
     /// when it is reachable and the rules allow it, then whatever revision the metadata
     /// cache last saw.
@@ -445,7 +587,7 @@ impl Mirror {
                 source: RevisionSource::Index,
             });
         }
-        let key = format!("{}@{wanted}", repo.qualified());
+        let key = revision_key(repo, wanted);
         if let Some(sha) = self.revisions.get(&key).await {
             return Ok(Resolution {
                 sha,
@@ -465,12 +607,7 @@ impl Mirror {
         }
         if self.is_offline() {
             return self.cached_revision(repo, wanted).await.map_or_else(
-                || {
-                    Err(MirrorError::Offline(format!(
-                        "{}@{wanted}",
-                        repo.qualified()
-                    )))
-                },
+                || Err(MirrorError::Offline(revision_key(repo, wanted))),
                 |sha| {
                     Ok(Resolution {
                         sha,
@@ -622,15 +759,7 @@ impl Mirror {
         body: &Bytes,
     ) -> Result<()> {
         let path = self.cache.layout().revision_meta(repo, sha)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let envelope = serde_json::json!({
-            "status_code": 200,
-            "headers": { "content-type": "application/json" },
-        });
-        write_atomic(&path, &serde_json::to_vec(&envelope)?).await?;
-        write_atomic(&body_path(&path), body).await
+        write_meta_document(&path, &MetaEnvelope::json(CACHEABLE_STATUS), body).await
     }
 
     async fn local_answer(&self, repo: &RepoId, sha: &CommitSha, path: &str) -> Option<FileAnswer> {
@@ -821,13 +950,35 @@ fn guess_content_type(path: &str) -> String {
         .map_or_else(|| OCTET_STREAM.to_owned(), |mime| mime.to_string())
 }
 
-async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temp = path.with_extension("tmp");
-    let mut file = fs::File::create(&temp).await?;
-    file.write_all(bytes).await?;
-    file.sync_all().await?;
-    drop(file);
-    fs::rename(&temp, path).await?;
+/// The memory cache key one revision of one repository is remembered under.
+fn revision_key(repo: &RepoId, revision: &str) -> String {
+    format!("{}@{revision}", repo.qualified())
+}
+
+/// Splits a batched paths-info answer into the one document per path the cache layout
+/// spells, so a later request for any subset of those paths is a hit.
+async fn write_paths_info(
+    layout: &CacheLayout,
+    repo: &RepoId,
+    sha: &CommitSha,
+    body: &Bytes,
+) -> Result<()> {
+    let Ok(Value::Array(entries)) = serde_json::from_slice::<Value>(body) else {
+        return Ok(());
+    };
+    let mut by_path: HashMap<String, Vec<Value>> = HashMap::new();
+    for entry in entries {
+        let Some(path) = entry.get("path").and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        by_path.entry(path).or_default().push(entry);
+    }
+    let envelope = MetaEnvelope::json(CACHEABLE_STATUS);
+    for (path, entries) in by_path {
+        let document = layout.paths_info(repo, sha, &path)?;
+        let body = serde_json::to_vec(&Value::Array(entries))?;
+        write_meta_document(&document, &envelope, &body).await?;
+    }
     Ok(())
 }
 
@@ -1031,13 +1182,14 @@ mod tests {
     use jiff::Timestamp;
     use sha2::{Digest, Sha256 as Sha256Hasher};
     use tempfile::TempDir;
-    use wiremock::matchers::{method, path as path_matcher};
+    use wiremock::matchers::{body_json, method, path as path_matcher, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::access::AccessRule;
     use crate::config::{Geometry, MirrorConfig};
     use crate::upstream::client::{RetryPolicy, UpstreamClient};
+    use crate::upstream::meta::MetaKind;
 
     const SHA: &str = "9f1a2b3c4d5e6f708192a3b4c5d6e7f809a1b2c3";
     const OTHER_SHA: &str = "1111111111111111111111111111111111111111";
@@ -1781,6 +1933,296 @@ mod tests {
                 .headers
                 .iter()
                 .all(|(name, _)| !name.starts_with("x-xet-"))
+        );
+    }
+
+    fn info_body(sha: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "openai/whisper",
+            "sha": sha,
+            "lastModified": "2026-01-17T10:22:31.000Z",
+            "siblings": [{ "rfilename": "config.json" }],
+        })
+    }
+
+    fn meta_request<'a>(repo: &'a RepoId, kind: MetaKind<'a>) -> MetaRequest<'a> {
+        MetaRequest::new(repo, kind)
+    }
+
+    #[tokio::test]
+    async fn repo_info_is_proxied_once_and_cached_where_the_layout_says() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/api/models/openai/whisper"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-xet-hash", "deadbeef")
+                    .set_body_json(info_body(SHA)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let harness = harness(&server.uri(), config(false, true));
+
+        let answer = harness
+            .mirror
+            .metadata(meta_request(&repo(), MetaKind::RepoInfo { revision: None }))
+            .await
+            .expect("the repo info is proxied");
+        assert_eq!(answer.status, 200);
+        assert_eq!(
+            answer.header("x-xet-hash"),
+            Some("deadbeef"),
+            "a forwarded answer is verbatim"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&answer.body).expect("json")["sha"],
+            Value::from(SHA)
+        );
+
+        let document = harness
+            .mirror
+            .cache()
+            .layout()
+            .revision_meta(&repo(), &commit())
+            .expect("path builds");
+        assert!(document.exists(), "the envelope is written");
+        assert_eq!(
+            std::fs::read(body_path(&document)).expect("body reads"),
+            answer.body,
+            "the body sidecar is the upstream body"
+        );
+
+        let again = harness
+            .mirror
+            .metadata(meta_request(&repo(), MetaKind::RepoInfo { revision: None }))
+            .await
+            .expect("the fresh document answers");
+        assert_eq!(again.status, 200);
+        assert_eq!(again.header("x-xet-hash"), None, "hoard strips xet itself");
+    }
+
+    #[tokio::test]
+    async fn a_tree_request_carries_both_query_params_upstream() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_matcher(format!(
+                "/api/models/openai/whisper/tree/{SHA}/unet"
+            )))
+            .and(query_param("recursive", "true"))
+            .and(query_param("expand", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "type": "file", "oid": "abc", "size": 4, "path": "unet/model.bin" },
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let harness = harness(&server.uri(), config(false, true));
+
+        let kind = MetaKind::Tree {
+            revision: SHA,
+            path: "unet",
+            recursive: true,
+            expand: false,
+        };
+        let answer = harness
+            .mirror
+            .metadata(meta_request(&repo(), kind))
+            .await
+            .expect("the tree is proxied");
+        assert_eq!(answer.status, 200);
+
+        let document = harness
+            .mirror
+            .cache()
+            .layout()
+            .tree(&repo(), &commit(), "unet", true, false)
+            .expect("path builds");
+        assert!(
+            document.ends_with("tree_get_recursive_True_expand_False.json"),
+            "{}",
+            document.display()
+        );
+        assert!(document.exists());
+
+        harness
+            .mirror
+            .metadata(meta_request(&repo(), kind))
+            .await
+            .expect("the cached tree answers without a second request");
+    }
+
+    #[tokio::test]
+    async fn commits_are_proxied_once_and_cached() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_matcher(format!(
+                "/api/models/openai/whisper/commits/{SHA}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "id": SHA, "title": "init", "message": "", "authors": [], "date": "2026-01-17T10:22:31.000Z" },
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let harness = harness(&server.uri(), config(false, true));
+
+        let kind = MetaKind::Commits { revision: SHA };
+        for _ in 0..2 {
+            let answer = harness
+                .mirror
+                .metadata(meta_request(&repo(), kind))
+                .await
+                .expect("commits answer");
+            assert_eq!(answer.status, 200);
+        }
+        assert!(
+            harness
+                .mirror
+                .cache()
+                .layout()
+                .commits(&repo(), &commit())
+                .expect("path builds")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paths_info_post_reaches_the_upstream_with_its_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_matcher(format!(
+                "/api/models/openai/whisper/paths-info/{SHA}"
+            )))
+            .and(body_json(serde_json::json!({
+                "paths": ["config.json", "unet/model.bin"],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "type": "file", "oid": "a1", "size": 4, "path": "config.json" },
+                { "type": "file", "oid": "b2", "size": 8, "path": "unet/model.bin" },
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let harness = harness(&server.uri(), config(false, true));
+
+        let paths = vec!["config.json".to_owned(), "unet/model.bin".to_owned()];
+        let kind = MetaKind::PathsInfo {
+            revision: SHA,
+            paths: &paths,
+        };
+        let answer = harness
+            .mirror
+            .metadata(meta_request(&repo(), kind))
+            .await
+            .expect("paths-info is proxied");
+        assert_eq!(answer.status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&answer.body).expect("json")[1]["path"],
+            Value::from("unet/model.bin")
+        );
+
+        let layout = harness.mirror.cache().layout();
+        for path in &paths {
+            let document = layout
+                .paths_info(&repo(), &commit(), path)
+                .expect("path builds");
+            assert!(document.exists(), "{}", document.display());
+            let stored: Value =
+                serde_json::from_slice(&std::fs::read(body_path(&document)).expect("body reads"))
+                    .expect("json");
+            assert_eq!(stored[0]["path"], Value::from(path.as_str()));
+        }
+
+        let merged = harness
+            .mirror
+            .metadata(meta_request(&repo(), kind))
+            .await
+            .expect("the cached documents answer as one array");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&merged.body).expect("json"),
+            serde_json::from_slice::<Value>(&answer.body).expect("json")
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_answers_from_the_cached_document_and_asks_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/api/models/openai/whisper"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(info_body(SHA)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let online = harness(&server.uri(), config(false, true));
+        let answer = online
+            .mirror
+            .metadata(meta_request(&repo(), MetaKind::RepoInfo { revision: None }))
+            .await
+            .expect("proxied once");
+
+        let offline = Mirror::new(
+            online.mirror.store().clone(),
+            Arc::clone(online.mirror.cache()),
+            Arc::new(AccessPolicy::compile(&config(true, true)).expect("rules compile")),
+            Hub::new(
+                UpstreamClient::new(true).expect("client builds"),
+                &server.uri(),
+            )
+            .expect("hub builds"),
+        );
+        let cached = offline
+            .metadata(meta_request(&repo(), MetaKind::RepoInfo { revision: None }))
+            .await
+            .expect("the cached document answers offline");
+        assert_eq!(cached.body, answer.body);
+
+        let unknown = RepoId::new(RepoType::Models, Some("nobody".to_owned()), "nothing");
+        let error = offline
+            .metadata(meta_request(
+                &unknown,
+                MetaKind::RepoInfo { revision: None },
+            ))
+            .await
+            .expect_err("nothing is cached for it");
+        assert!(matches!(error, MirrorError::RepoNotFound(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_proxy_denial_is_a_repo_not_found_and_a_cache_denial_still_serves() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_matcher("/api/models/openai/whisper"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(info_body(SHA)))
+            .mount(&server)
+            .await;
+
+        let mut denied = config(false, true);
+        denied.proxy = vec![AccessRule::glob("other/*", true)];
+        let strict = harness(&server.uri(), denied);
+        let error = strict
+            .mirror
+            .metadata(meta_request(&repo(), MetaKind::RepoInfo { revision: None }))
+            .await
+            .expect_err("the rules deny the proxy");
+        assert!(matches!(error, MirrorError::RepoNotFound(_)), "{error}");
+
+        let uncached = harness(&server.uri(), config(false, false));
+        let answer = uncached
+            .mirror
+            .metadata(meta_request(&repo(), MetaKind::RepoInfo { revision: None }))
+            .await
+            .expect("a cache denial does not fail the request");
+        assert_eq!(answer.status, 200);
+        assert!(
+            !uncached
+                .mirror
+                .cache()
+                .layout()
+                .revision_meta(&repo(), &commit())
+                .expect("path builds")
+                .exists(),
+            "nothing is written for a repo the cache rules deny"
         );
     }
 

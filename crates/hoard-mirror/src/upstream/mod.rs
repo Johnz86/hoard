@@ -5,13 +5,15 @@
 
 pub mod client;
 pub mod hub;
+pub mod meta;
 pub mod peer;
 pub mod range;
 
 pub use client::{
-    Authorization, ProxyResponse, RetryPolicy, Retryability, UpstreamClient, UpstreamRequest,
-    classify,
+    Authorization, JSON_CONTENT_TYPE, ProxyResponse, RequestBody, RetryPolicy, Retryability,
+    UpstreamClient, UpstreamRequest, classify,
 };
 pub use hub::{BlockFetch, Hub, RemoteFile, UpstreamRevision};
+pub use meta::{DEFAULT_REVISION, MetaKind, MetaRequest};
 pub use peer::{DEFAULT_PEER_PORT, peer_base_url, peer_upstream};
 pub use range::{ByteRange, RangeOutcome, parse_ranges};

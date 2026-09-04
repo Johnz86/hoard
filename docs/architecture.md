@@ -152,8 +152,9 @@ hoard/
           hub.rs             huggingface.co metadata and files
           peer.rs            another hoard node as an upstream
           range.rs           Range header parsing and clamping, 416 decisions
+          meta.rs            metadata request kinds, their URLs and cache paths
         cache/
-          layout.rs  entry.rs  block.rs  policy.rs
+          layout.rs  entry.rs  block.rs  policy.rs  meta.rs
         git/
           smart_http.rs      info/refs and upload-pack via the git binary
           lfs_batch.rs       LFS batch API pointing at resolve

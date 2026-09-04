@@ -11,18 +11,29 @@ speak. Sources: `docs/use-case.md` (brief), `docs/design/ui-spec.md` and
 | Phase | Name | Status | Design milestone |
 | --- | --- | --- | --- |
 | 0 | Foundations | done | |
-| 1 | Core types and index store | todo | M1 Index locally |
-| 2 | Discovery and sniffing | todo | M1 |
-| 3 | Inference, triage and search | todo | M1 |
-| 4 | Index screen (web UI) | todo | M1 |
-| 5 | Hub face, local serving | todo | M2 Speak git |
-| 6 | Git face and repo detail | todo | M2 |
-| 7 | Upstream proxy and block cache | todo | M3 Cross the LAN |
+| 1 | Core types and index store | done | M1 Index locally |
+| 2 | Discovery and sniffing | done | M1 |
+| 3 | Inference, triage and search | done | M1 |
+| 4 | Index screen (web UI) | done | M1 |
+| 5 | Hub face, local serving | done | M2 Speak git |
+| 6 | Git face and repo detail | done | M2 |
+| 7 | Upstream proxy and block cache | done | M3 Cross the LAN |
 | 8 | Nodes: discovery, gossip, peer pulls | todo | M3 |
-| 9 | Shelves, loadouts, projection, usage | todo | M4 Make it usable |
-| 10 | Live index and polish | todo | M4 |
+| 9 | Shelves, loadouts, projection, usage | partial | M4 Make it usable |
+| 10 | Live index and polish | partial | M4 |
 
 Tick a phase only when its acceptance check passes and `/hoard-verify` is clean.
+
+Phases 1 to 7 were accepted against this workstation's real disks, not fixtures: 1.5 TB
+across the HuggingFace cache, a ComfyUI tree and the LM Studio models; `hf download`
+byte-identical through `HF_ENDPOINT` with an isolated `HF_HOME` so the client could not
+answer itself; `git clone` with branches, tag and history intact; and a second node in
+offline mode serving a proxied repo from the cached documents alone.
+
+Phase 9 is partial: shelves, loadouts, the usage log and `hoard link` projection all work,
+but `hoard apply` resolves and reports without pulling from a peer, which needs Phase 8.
+Phase 10 is partial: the `notify` watcher, PyTorch zip key extraction and dataset sniffing
+are in; the TREE and DISK views are not.
 
 ## Goals
 

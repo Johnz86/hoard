@@ -66,7 +66,7 @@ pub(crate) async fn xet_bridge(
 
 /// An upstream answer as this node returns it: the status, the headers and the body it
 /// gave, minus the framing of the hop it arrived over.
-fn forward(answer: ProxyResponse) -> HubResult<Response> {
+pub(crate) fn forward(answer: ProxyResponse) -> HubResult<Response> {
     let status = StatusCode::from_u16(answer.status).map_err(|_| HubError::proxy_invalid_data())?;
     let mut response = Response::new(Body::from(answer.body));
     *response.status_mut() = status;

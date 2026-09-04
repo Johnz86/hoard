@@ -5,7 +5,7 @@ use std::fmt;
 use std::time::Duration;
 
 use bytes::Bytes;
-use reqwest::header::{ACCEPT_ENCODING, AUTHORIZATION, HeaderMap, RANGE};
+use reqwest::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, HeaderMap, RANGE};
 use reqwest::{Client, Method, Response, StatusCode};
 use url::Url;
 
@@ -26,6 +26,9 @@ pub const IDENTITY_ENCODING: &str = "identity";
 /// The header family `hf_xet` keys off to fetch content straight from Xet. Hoard strips it
 /// from anything it serves itself so a client cannot be told to walk around the mirror.
 pub const XET_HEADER_PREFIX: &str = "x-xet-";
+
+/// The media type of every document the Hub API exchanges.
+pub const JSON_CONTENT_TYPE: &str = "application/json";
 
 /// A caller's `Authorization` header, forwarded upstream and never rendered.
 #[derive(Clone, PartialEq, Eq)]
@@ -103,6 +106,24 @@ impl RetryPolicy {
     }
 }
 
+/// A request body and the media type that describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestBody {
+    pub content_type: &'static str,
+    pub bytes: Bytes,
+}
+
+impl RequestBody {
+    /// The JSON body the metadata routes post, so `paths-info` reaches an upstream as the
+    /// document a Hub expects rather than as whatever spelling the client used.
+    pub fn json(bytes: impl Into<Bytes>) -> Self {
+        Self {
+            content_type: JSON_CONTENT_TYPE,
+            bytes: bytes.into(),
+        }
+    }
+}
+
 /// One upstream call: what to ask for and what to carry with it.
 #[derive(Debug, Clone)]
 pub struct UpstreamRequest<'a> {
@@ -111,6 +132,9 @@ pub struct UpstreamRequest<'a> {
     pub auth: Option<&'a Authorization>,
     pub range: Option<String>,
     pub accept_encoding: Option<&'a str>,
+    /// The query string as an upstream expects it, replacing whatever `url` carries.
+    pub query: Option<String>,
+    pub body: Option<RequestBody>,
 }
 
 impl<'a> UpstreamRequest<'a> {
@@ -121,6 +145,8 @@ impl<'a> UpstreamRequest<'a> {
             auth: None,
             range: None,
             accept_encoding: None,
+            query: None,
+            body: None,
         }
     }
 
@@ -130,6 +156,10 @@ impl<'a> UpstreamRequest<'a> {
 
     pub fn head(url: &'a Url) -> Self {
         Self::new(Method::HEAD, url)
+    }
+
+    pub fn post(url: &'a Url) -> Self {
+        Self::new(Method::POST, url)
     }
 
     pub fn with_auth(mut self, auth: Option<&'a Authorization>) -> Self {
@@ -145,6 +175,25 @@ impl<'a> UpstreamRequest<'a> {
     pub fn with_accept_encoding(mut self, encoding: &'a str) -> Self {
         self.accept_encoding = Some(encoding);
         self
+    }
+
+    pub fn with_query(mut self, query: impl Into<String>) -> Self {
+        self.query = Some(query.into());
+        self
+    }
+
+    pub fn with_body(mut self, body: RequestBody) -> Self {
+        self.body = Some(body);
+        self
+    }
+
+    /// The URL the request is actually sent to, which is `url` with its query replaced.
+    pub fn target(&self) -> Url {
+        let mut url = self.url.clone();
+        if let Some(query) = &self.query {
+            url.set_query(Some(query));
+        }
+        url
     }
 
     /// The byte range spelled the way an upstream expects it, inclusive at both ends.
@@ -256,9 +305,12 @@ impl UpstreamClient {
         &self,
         request: &UpstreamRequest<'_>,
     ) -> std::result::Result<Response, reqwest::Error> {
-        let mut builder = self
-            .http
-            .request(request.method.clone(), request.url.clone());
+        let mut builder = self.http.request(request.method.clone(), request.target());
+        if let Some(body) = &request.body {
+            builder = builder
+                .header(CONTENT_TYPE, body.content_type)
+                .body(body.bytes.clone());
+        }
         if let Some(auth) = request.auth {
             builder = builder.header(AUTHORIZATION, auth.expose());
         }

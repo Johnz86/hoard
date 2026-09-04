@@ -6,6 +6,7 @@
 pub mod block;
 pub mod entry;
 pub mod layout;
+pub mod meta;
 pub mod policy;
 
 use std::io::ErrorKind;
@@ -21,6 +22,10 @@ use tokio::sync::Mutex;
 pub use block::{BlockBitmap, BlockMeta, CACHE_VERSION, MAGIC, chunk_crc};
 pub use entry::{BlockDownloadGuard, BlockLease, BlockLocks, CacheEntry};
 pub use layout::{CacheLayout, body_path, fan_out};
+pub use meta::{
+    CACHEABLE_STATUS, CachedMeta, MetaEnvelope, fresh, read_meta_array, read_meta_document,
+    write_meta_document,
+};
 pub use policy::{EntryStat, EvictionReport, select_evictions};
 
 use crate::config::MirrorConfig;
