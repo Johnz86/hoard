@@ -243,23 +243,54 @@ fn native_secondary_indexes_update_and_abort_atomically() -> Result<()> {
         .all()?
         .next()
         .ok_or_else(|| IndexError::Catalog("missing fixture artifact".into()))??;
-    let original = artifact.identity.clone();
-    artifact.identity = "replacement".into();
+    let original = artifact.identity;
+    let replacement = 7_u128;
+    artifact.identity = replacement;
     transaction.upsert(artifact.clone())?;
     let missing: Option<ArtifactRecord> = transaction
         .get()
-        .secondary(ArtifactRecordKey::identity, original.as_str())?;
+        .secondary(ArtifactRecordKey::identity, original)?;
     assert!(missing.is_none());
     transaction.abort()?;
     let read = catalog.database.r_transaction()?;
     let restored: Option<ArtifactRecord> = read
         .get()
-        .secondary(ArtifactRecordKey::identity, original.as_str())?;
+        .secondary(ArtifactRecordKey::identity, original)?;
     assert!(restored.is_some());
     let aborted: Option<ArtifactRecord> = read
         .get()
-        .secondary(ArtifactRecordKey::identity, "replacement")?;
+        .secondary(ArtifactRecordKey::identity, replacement)?;
     assert!(aborted.is_none());
+    Ok(())
+}
+
+#[test]
+fn an_identity_is_a_hash_of_its_text_and_two_copies_share_it() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("a"))?;
+    fs::create_dir_all(input.join("b"))?;
+    fs::write(input.join("a/one.csv"), "x,y\n1,2\n")?;
+    std::os::unix::fs::symlink(input.join("a/one.csv"), input.join("b/two.csv"))?;
+    let config = IndexConfig {
+        sources: vec![SourceConfig {
+            follow_symlinks: true,
+            ..source(&input, "files")
+        }],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let read = catalog.database.r_transaction()?;
+    assert_eq!(read.len().primary::<ArtifactRecord>()?, 1);
+    let canonical = input.join("a/one.csv").canonicalize()?;
+    let expected = xxhash_rust::xxh3::xxh3_128(format!("path:{}", canonical.display()).as_bytes());
+    let found: Option<ArtifactRecord> = read
+        .get()
+        .secondary(ArtifactRecordKey::identity, expected)?;
+    assert!(
+        found.is_some(),
+        "the identity is the xxh3-128 of the canonical path text"
+    );
     Ok(())
 }
 
@@ -1157,7 +1188,7 @@ fn repository_encoding_is_frozen() -> Result<()> {
 fn artifact_record_encoding_is_frozen() -> Result<()> {
     let value = ArtifactRecord {
         id: 7,
-        identity: "sha256:0303030303030303".to_owned(),
+        identity: 0x0303_0303_0303_0303_u128,
         artifact: frozen_artifact(),
         name: "frozen.safetensors".to_owned(),
         org: Some("frozen-org".to_owned()),

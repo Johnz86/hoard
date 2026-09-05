@@ -50,7 +50,7 @@ pub(super) struct ArtifactRecord {
     #[primary_key]
     pub(super) id: i64,
     #[secondary_key(unique)]
-    pub(super) identity: String,
+    pub(super) identity: u128,
     pub(super) artifact: Artifact,
     pub(super) name: String,
     pub(super) org: Option<String>,

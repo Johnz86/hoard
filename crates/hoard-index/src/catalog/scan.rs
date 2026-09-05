@@ -609,7 +609,7 @@ struct Counters {
     repos: u64,
     artifacts: u64,
     entries: u64,
-    artifacts_by_identity: HashMap<String, i64>,
+    artifacts_by_identity: HashMap<u128, i64>,
     touched: HashSet<i64>,
 }
 
@@ -753,7 +753,7 @@ pub(super) fn creates_artifact(
 /// What one file that becomes an artifact contributes: only such a file pays for inference,
 /// a copy of the revision's card, and a content identity.
 struct ArtifactDraft {
-    identity: String,
+    identity: u128,
     inference: Inference,
     card: Option<String>,
 }
@@ -1122,21 +1122,24 @@ fn prepare_entry<'a>(
     })
 }
 
-fn identity(entry: &DiscoveredEntry, presence: &Presence) -> Result<String> {
-    match (presence.sha256, entry.git_sha1, entry.abs_path.as_deref()) {
-        (Some(sha), _, _) => Ok(format!("sha256:{sha}")),
-        (None, Some(sha), _) => Ok(format!("git:{sha}")),
-        (None, None, Some(path)) => Ok(format!(
+fn identity(entry: &DiscoveredEntry, presence: &Presence) -> Result<u128> {
+    let text = match (presence.sha256, entry.git_sha1, entry.abs_path.as_deref()) {
+        (Some(sha), _, _) => format!("sha256:{sha}"),
+        (None, Some(sha), _) => format!("git:{sha}"),
+        (None, None, Some(path)) => format!(
             "path:{}",
             path.canonicalize()
                 .unwrap_or_else(|_| path.to_path_buf())
                 .display()
-        )),
-        (None, None, None) => Err(IndexError::Catalog(format!(
-            "absent entry has no content identity: {}",
-            entry.rel_path
-        ))),
-    }
+        ),
+        (None, None, None) => {
+            return Err(IndexError::Catalog(format!(
+                "absent entry has no content identity: {}",
+                entry.rel_path
+            )));
+        }
+    };
+    Ok(xxhash_rust::xxh3::xxh3_128(text.as_bytes()))
 }
 
 struct EntryContext<'a> {
@@ -1250,7 +1253,7 @@ fn store_artifact(
     }
     let stored: Option<ArtifactRecord> = transaction
         .get()
-        .secondary(ArtifactRecordKey::identity, draft.identity.as_str())?;
+        .secondary(ArtifactRecordKey::identity, draft.identity)?;
     let id = match stored {
         Some(stored) => stored.id,
         None => next_id(&mut counters.artifacts)?,
@@ -1263,9 +1266,7 @@ fn store_artifact(
     })?;
     transaction.upsert(detail)?;
     transaction.upsert(record.clone())?;
-    counters
-        .artifacts_by_identity
-        .insert(draft.identity.clone(), id);
+    counters.artifacts_by_identity.insert(draft.identity, id);
     counters.touched.insert(id);
     Ok(record)
 }
@@ -1324,7 +1325,7 @@ fn artifact_record(
     };
     let record = ArtifactRecord {
         id,
-        identity: draft.identity.clone(),
+        identity: draft.identity,
         name: prepared.name.clone(),
         org: prepared.org.clone(),
         path_count: 1,
