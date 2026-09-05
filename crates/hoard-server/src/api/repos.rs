@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path as RoutePath, Query, State};
@@ -19,9 +20,9 @@ use hoard_index::store::usage::{PullRow, UsageDay};
 use hoard_index::store::{artifact, blob, entry, node, repo, revision, usage};
 
 use crate::api::common::{
-    Conn, DEFAULT_LIMIT, EntryView, Fact, MIDDOT, PullCommands, RowView, clamp_limit,
-    decode_row_cursor, encode_row_cursor, entry_views, facts, pull_commands, relative_time,
-    repo_id, state_label,
+    Conn, DEFAULT_LIMIT, EntryView, Fact, MIDDOT, PullCommands, RowView, blocking, clamp_limit,
+    decode_row_cursor, encode_row_cursor, facts, pull_commands, relative_time, repo_id,
+    revision_entry_views, state_label,
 };
 use crate::api::compat::{CompatView, compat_for};
 use crate::error::{ApiError, ApiResult};
@@ -273,12 +274,12 @@ pub async fn detail(
             let entries = entries_for_revision(conn, revision.id)?;
             let refs = ref_views(conn, record.id, &revision, now)?;
             let paths = match primary {
-                Some(row) => entry_views(
+                Some(row) => revision_entry_views(
                     conn,
                     &entry::entries_for_artifact(conn, row.artifact_id)?,
                     &host,
                 )?,
-                None => entry_views(conn, &entries, &host)?,
+                None => revision_entry_views(conn, &entries, &host)?,
             };
             let node_name = node::node(conn, record.node_row)?.name;
             let path = primary.and_then(|row| row.abs_path.clone());
@@ -421,18 +422,19 @@ pub async fn compat(
     let repo = repo_id(&repo_type, &org, &name)?;
     let wanted = params.wanted();
     let now = Timestamp::now();
-    let view = state
+    let row = state
         .store()
         .call(move |conn| {
             let record = repo_row(conn, &repo)?;
             let resolved = revision::resolve_revision(conn, record.id, &wanted)?;
             let rows = rows_in_revision(conn, record.id, resolved.id)?;
-            match pick_primary(&rows) {
-                Some(row) => compat_for(conn, row, DEFAULT_LIMIT, now),
-                None => Err(IndexError::not_found("artifact", record.repo.qualified())),
-            }
+            pick_primary(&rows)
+                .cloned()
+                .ok_or_else(|| IndexError::not_found("artifact", record.repo.qualified()))
         })
         .await?;
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || compat_for(&catalog, &row, DEFAULT_LIMIT, now)).await?;
     Ok(Json(view))
 }
 

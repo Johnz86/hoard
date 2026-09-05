@@ -1101,7 +1101,7 @@ async fn the_inspector_reads_facts_in_the_order_the_design_lists_them() {
 async fn an_artifact_lists_its_evidence_entries_duplicates_and_usage() {
     let world = seeded();
     let body = get(&world.state, &format!("/api/v1/artifacts/{}", world.lora)).await;
-    assert_eq!(body["entries"].as_array().expect("entries").len(), 3);
+    assert_eq!(body["entries"].as_array().expect("entries").len(), 2);
     assert_eq!(
         body["entries"][0],
         json!({
@@ -1110,8 +1110,8 @@ async fn an_artifact_lists_its_evidence_entries_duplicates_and_usage() {
             "path": "/mnt/vault/loras/film-grain-35mm.safetensors",
             "node": "workstation",
             "label": "workstation",
-            "state": "served",
-            "state_label": "SERVED \u{b7} workstation",
+            "state": "local",
+            "state_label": "LOCAL",
             "symlink": false
         })
     );
@@ -1271,14 +1271,14 @@ async fn a_blob_lists_every_path_and_node_holding_it() {
     let body = get(&world.state, &format!("/api/v1/blobs/{sha}")).await;
     assert_eq!(body["sha256"], sha);
     assert_eq!(body["size"], LORA_SIZE);
-    assert_eq!(body["path_count"], 3);
+    assert_eq!(body["path_count"], 2);
     let nodes: Vec<&str> = body["entries"]
         .as_array()
         .expect("entries")
         .iter()
         .map(|entry| entry["node"].as_str().expect("node"))
         .collect();
-    assert_eq!(nodes, ["workstation", "workstation", "laptop"]);
+    assert_eq!(nodes, ["workstation", "workstation"]);
 
     let (status, missing) = call(
         &world.state,

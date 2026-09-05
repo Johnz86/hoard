@@ -10,6 +10,7 @@ use hoard_core::{
     Role, Sha256, State, SubRole, format_size,
 };
 use hoard_index::IndexError;
+use hoard_index::catalog::EntryDetail;
 use hoard_index::search::{
     CompatTarget, CompileContext, ParsedQuery, SortKey, SortSpec, TokenKind, compile, quoted,
 };
@@ -37,6 +38,19 @@ const SECONDS_PER_HOUR: i64 = 60 * SECONDS_PER_MINUTE;
 const SECONDS_PER_DAY: i64 = 24 * SECONDS_PER_HOUR;
 const SECONDS_PER_MONTH: i64 = 30 * SECONDS_PER_DAY;
 const SECONDS_PER_YEAR: i64 = 365 * SECONDS_PER_DAY;
+
+/// Runs catalog work off the reactor. The catalog and its search index are file work, so
+/// every route that reads them hands the closure to a blocking thread.
+pub async fn blocking<T, F>(work: F) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, IndexError> + Send + 'static,
+{
+    let done = tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(done?)
+}
 
 /// Rejects a mutating request that carries no valid node token.
 pub fn authorize(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
@@ -362,9 +376,32 @@ pub struct EntryView {
     pub symlink: bool,
 }
 
+/// One path of an artifact as the catalog resolved it.
+pub fn entry_views(entries: &[EntryDetail], host: &str) -> Vec<EntryView> {
+    entries
+        .iter()
+        .map(|entry| EntryView {
+            repo: entry.repo.clone(),
+            revision: entry.revision.clone(),
+            path: entry
+                .abs_path
+                .clone()
+                .unwrap_or_else(|| entry.rel_path.clone()),
+            label: match entry.is_symlink {
+                true => format!("{} {MIDDOT} symlink", entry.node),
+                false => entry.node.clone(),
+            },
+            node: entry.node.clone(),
+            state: entry.state,
+            state_label: state_label(entry.state, None, Some(host)),
+            symlink: entry.is_symlink,
+        })
+        .collect()
+}
+
 /// Renders entries with the ref name each revision answers to, falling back to the short
 /// sha exactly as the `search_row` view does.
-pub fn entry_views(
+pub fn revision_entry_views(
     conn: &Conn,
     entries: &[EntryRow],
     host: &str,
