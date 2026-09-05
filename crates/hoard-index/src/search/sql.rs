@@ -12,7 +12,7 @@ use crate::store::SqlValue;
 
 const MATCH_EVERYTHING: &str = "1 = 1";
 const MATCH_NOTHING: &str = "1 = 0";
-const MAX_SHELF_DEPTH: usize = 4;
+pub(crate) const MAX_SHELF_DEPTH: usize = 4;
 const HOURS_PER_DAY: i64 = 24;
 
 const FREE_TEXT_SQL: &str = "(COALESCE(org, '') || ' ' || name || ' ' || base || ' ' || \
@@ -195,7 +195,7 @@ impl CompileContext {
         self
     }
 
-    fn shelf_query(&self, name: &str) -> Option<&str> {
+    pub(crate) fn shelf_query(&self, name: &str) -> Option<&str> {
         let wanted = slug(name);
         self.shelves
             .iter()

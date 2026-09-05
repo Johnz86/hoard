@@ -1,4 +1,5 @@
 mod models;
+mod query;
 mod scan;
 mod search;
 #[cfg(test)]

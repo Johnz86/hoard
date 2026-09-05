@@ -128,12 +128,14 @@ fn filtering_ranges_boolean_queries_and_pagination_are_deterministic() -> Result
     catalog.rebuild_search(|_| {})?;
     let all = search(&catalog, "")?;
     assert!(all.rows[0].size > all.rows[1].size);
-    assert_eq!(search(&catalog, "format:csv AND node:test-node")?.total, 1);
-    assert_eq!(search(&catalog, "format:csv OR format:jsonl")?.total, 2);
+    assert_eq!(search(&catalog, "format:csv node:test-node")?.total, 1);
+    assert_eq!(search(&catalog, "format:csv,jsonl")?.total, 2);
     assert_eq!(
-        search(&catalog, "size:[0 TO 20]")?.rows[0].name,
-        "tiny.jsonl"
+        search(&catalog, "size:<=20b")?.rows[0].name,
+        "tiny.jsonl",
+        "a bare size is megabytes, so the byte suffix is what selects the small file"
     );
+    assert_eq!(search(&catalog, "size:<=20b")?.total, 1);
     assert_eq!(search(&catalog, "training")?.total, 1);
     let first = catalog.search(SearchRequest {
         query: "",
@@ -177,7 +179,11 @@ fn filtering_ranges_boolean_queries_and_pagination_are_deterministic() -> Result
             })
             .is_err()
     );
-    assert!(search(&catalog, "unknown_field:csv").is_err());
+    assert_eq!(
+        search(&catalog, "unknown_field:csv")?.total,
+        0,
+        "a key the grammar does not know is free text, not an error"
+    );
     Ok(())
 }
 
@@ -229,7 +235,7 @@ fn duplicate_paths_collapse_after_correlated_entry_filtering() -> Result<()> {
         search(&catalog, "source:peer")?.rows[0].source.as_deref(),
         Some("peer")
     );
-    assert_eq!(search(&catalog, "source:peer AND state:local")?.total, 0);
+    assert_eq!(search(&catalog, "source:peer state:local")?.total, 0);
     Ok(())
 }
 
@@ -785,7 +791,7 @@ fn a_revisions_own_readme_and_config_reach_inference() -> Result<()> {
         "the rel path never leaks into the trigger"
     );
     assert_eq!(
-        search(&catalog, "\"style LoRA\"")?.total,
+        search(&catalog, "style lora")?.total,
         1,
         "the README body is searchable text"
     );

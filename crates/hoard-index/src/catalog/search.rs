@@ -6,12 +6,12 @@ use std::sync::RwLockReadGuard;
 use serde::Serialize;
 use tantivy::collector::{Collector, SegmentCollector};
 use tantivy::fastfield::Column;
-use tantivy::query::{AllQuery, Query, QueryParser};
 use tantivy::schema::{FAST, Field, INDEXED, STRING, Schema, TEXT, TantivyDocument};
 use tantivy::{DocId, Index, Score, SegmentOrdinal, SegmentReader, Term};
 
 use hoard_core::{EntryId, RepoRowId};
 
+use crate::search::{CompileContext, parse};
 use crate::store::SearchRow;
 
 use super::models::{
@@ -19,13 +19,25 @@ use super::models::{
 };
 use crate::error::{IndexError, Result};
 
+use super::query::{self, QueryFields};
 use super::{Catalog, OpenIndex};
 
 const WRITER_BUDGET: usize = 32 * 1024 * 1024;
 /// How many logged changes one Tantivy commit and one prune transaction cover.
 const REFRESH_BATCH: usize = 4096;
-const REPO_FIELD: usize = 8;
-const HASH_FIELD: usize = 11;
+pub(super) const ROLE_FIELD: usize = 0;
+pub(super) const SUB_ROLE_FIELD: usize = 1;
+pub(super) const BASE_FIELD: usize = 2;
+pub(super) const FORMAT_FIELD: usize = 3;
+pub(super) const PRECISION_FIELD: usize = 4;
+pub(super) const NODE_FIELD: usize = 5;
+pub(super) const STATE_FIELD: usize = 6;
+pub(super) const SOURCE_FIELD: usize = 7;
+pub(super) const REPO_FIELD: usize = 8;
+pub(super) const REVISION_FIELD: usize = 9;
+pub(super) const ORG_FIELD: usize = 10;
+pub(super) const HASH_FIELD: usize = 11;
+pub(super) const TRIGGER_FIELD: usize = 12;
 const KEYWORD_FIELDS: [&str; 13] = [
     "role",
     "sub_role",
@@ -42,9 +54,8 @@ const KEYWORD_FIELDS: [&str; 13] = [
     "trigger",
 ];
 
-/// Native search uses Tantivy's query syntax, with AND between bare words. Field filters,
-/// Boolean operators, phrases and numeric ranges are supported. Hoard shelves, compatibility
-/// expansion and the legacy search grammar are not yet supported by this entry point.
+/// Native search speaks Hoard's own query grammar. Shelves and `compat:` targets need a
+/// context this entry point does not carry yet, so a query naming one is refused.
 #[derive(Debug, Clone, Copy)]
 pub struct SearchRequest<'a> {
     pub query: &'a str,
@@ -331,7 +342,16 @@ impl Catalog {
             .as_ref()
             .ok_or_else(|| IndexError::Catalog("search index was closed".into()))?;
         let (_, fields) = Fields::build();
-        let query = parsed_query(&open.index, fields.text, request.query)?;
+        let context =
+            CompileContext::new(jiff::Timestamp::now()).with_local_node(manifest.node.clone());
+        let query = query::compile(
+            &parse(request.query).tokens,
+            None,
+            &QueryFields {
+                fields: &fields,
+                context: &context,
+            },
+        )?;
         let candidates = open
             .reader
             .searcher()
@@ -383,17 +403,6 @@ impl Catalog {
     }
 }
 
-fn parsed_query(index: &Index, text: Field, raw: &str) -> Result<Box<dyn Query>> {
-    if raw.trim().is_empty() {
-        return Ok(Box::new(AllQuery));
-    }
-    let mut parser = QueryParser::for_index(index, vec![text]);
-    parser.set_conjunction_by_default();
-    parser
-        .parse_query(raw)
-        .map_err(|error| IndexError::Query(error.to_string()))
-}
-
 pub(super) struct Fields {
     artifact: Field,
     entry: Field,
@@ -427,6 +436,10 @@ impl Fields {
             keywords: KEYWORD_FIELDS.map(|name| schema.add_text_field(name, STRING | FAST)),
         };
         (schema.build(), fields)
+    }
+
+    pub(super) fn keyword(&self, index: usize) -> Field {
+        self.keywords[index]
     }
 
     fn document(&self, facts: &EntryFacts<'_>, text: Option<&SearchText>) -> TantivyDocument {
@@ -751,11 +764,32 @@ impl SegmentCollector for ArtifactSegmentCollector {
 
 #[cfg(test)]
 mod tests {
-    use super::{HASH_FIELD, KEYWORD_FIELDS, REPO_FIELD};
+    use super::{
+        BASE_FIELD, FORMAT_FIELD, HASH_FIELD, KEYWORD_FIELDS, NODE_FIELD, ORG_FIELD,
+        PRECISION_FIELD, REPO_FIELD, REVISION_FIELD, ROLE_FIELD, SOURCE_FIELD, STATE_FIELD,
+        SUB_ROLE_FIELD, TRIGGER_FIELD,
+    };
 
     #[test]
     fn the_positional_keyword_fields_name_what_they_index() {
-        assert_eq!(KEYWORD_FIELDS[REPO_FIELD], "repo");
-        assert_eq!(KEYWORD_FIELDS[HASH_FIELD], "hash");
+        let positions = [
+            (ROLE_FIELD, "role"),
+            (SUB_ROLE_FIELD, "sub_role"),
+            (BASE_FIELD, "base"),
+            (FORMAT_FIELD, "format"),
+            (PRECISION_FIELD, "precision"),
+            (NODE_FIELD, "node"),
+            (STATE_FIELD, "state"),
+            (SOURCE_FIELD, "source"),
+            (REPO_FIELD, "repo"),
+            (REVISION_FIELD, "revision"),
+            (ORG_FIELD, "org"),
+            (HASH_FIELD, "hash"),
+            (TRIGGER_FIELD, "trigger"),
+        ];
+        assert_eq!(KEYWORD_FIELDS.len(), positions.len());
+        for (index, name) in positions {
+            assert_eq!(KEYWORD_FIELDS[index], name);
+        }
     }
 }
