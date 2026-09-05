@@ -144,6 +144,46 @@ The repository count still differs by two (69 native, 67 SQLite). The SQLite ind
 written hours before this scan, so the two runs did not see the same disk. Not
 investigated further.
 
+## Scale
+
+Synthetic loose source of header-only safetensors files, 1,000 per directory, one artifact
+per file, no hashing, release build, each engine measured in its own process
+(`crates/hoard-index/tests/scale.rs`, ignored tests driven by `HOARD_SCALE_ENTRIES`). Both
+engines produced exactly one artifact per file at 1,000 and at 100k.
+
+| measure | native 100k | sqlite 100k | native 1M | sqlite 1M |
+| --- | --- | --- | --- | --- |
+| scan wall | 3.654141666s | 1831.638053368s | 37.891587731s | killed after 52 min (about 1/8 done: 175 MB of database written against 136 MB for the completed 100k run) |
+| peak rss growth during scan | 958 MB | 356 MB | 8533 MB | 3.3 GB at kill |
+| rebuild wall | 408.688891ms | n/a | 3.580465533s | n/a |
+| on disk | 518 MB | 136 MB | 4138 MB | 175 MB partial |
+| search offset 0 | 7.7755ms | 214.99036ms | 123.835626ms | n/a (scan incomplete) |
+| search deep offset | 8.912689ms | 336.17858ms | 144.921021ms | n/a (scan incomplete) |
+| search filtered | 7.106394ms | 202.099611ms | 123.346183ms | n/a (scan incomplete) |
+
+Proposed thresholds at 1M entries, from the decision spec's switch conditions: native scan
+within 2x of SQLite; native peak RSS growth under 2 GB; native on disk within 3x of SQLite;
+deep-offset search under 500 ms; rebuild no slower than the scan.
+
+Verdict: native scan within 2x of SQLite is met by a factor of hundreds, 3.7 s against
+1832 s on the same 100k tree, and 37.9 s at 1M against a SQLite scan killed at 52 minutes
+roughly one eighth of the way in. Native peak RSS growth under 2 GB is missed: 958 MB at
+100k and 8533 MB at 1M. A loose source is one revision, so `prepare_revision` sniffs and
+holds every entry of the source at once, and the single per-source redb transaction buffers
+every write until commit; both grow with the source rather than with a batch. Native on
+disk within 3x of SQLite is missed: 518 MB against 136 MB at 100k, 3.8x, and 4138 MB at 1M.
+`catalog.redb` is the whole of it, 4096 MB of the 4138 MB with 42 MB of Tantivy beside it
+(2739 MB actually allocated, the redb file being sparse), which is the per-entry `SearchRow`
+copy and its tensor summary written once per path rather than once per artifact.
+Deep-offset search under 500 ms is met: 145 ms at 1M, against 336 ms for SQLite at 100k.
+Rebuild no slower than the scan is met: 3.6 s against 37.9 s. This is a conditional go: the
+engine is far faster than the SQLite scanner at every size measured, and both misses have
+identified causes inside Hoard's own code, chunked revision preparation with periodic
+commits for the memory and a narrower persisted entry record for the disk, rather than in
+redb or Tantivy, so the gate should be rerun once those two land. The SQLite scanner's own
+30 minutes for 100k header-only files is a separate finding about the legacy code, not a
+point the replacement can claim in its favor.
+
 ## Remaining replacement work
 
 - Convert the existing Store/Connection API and live server, scanner, mirror, cache
