@@ -121,7 +121,9 @@ no `dir` at all and always uses the configured root.
   "self": true }]`.
 - `GET /api/v1/peers/digest?since=<cursor>&limit=`: compact rows `{ "sha256", "size",
   "role", "base", "repo", "revision_sha", "path", "state" }` plus `next_cursor`, consumed by
-  other nodes.
+  other nodes. A digest says what a node holds and never what it dropped, so a reader also
+  re-reads the whole digest hourly and retires the rows that pass did not name; without that
+  a REMOTE row would outlive the file it points at and keep offering a pull that fails.
 - `POST /api/v1/peers { "url" }` adds a static peer.
 
 ## System

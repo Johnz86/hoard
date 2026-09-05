@@ -190,6 +190,26 @@ pub fn entry(conn: &Connection, id: EntryId) -> Result<Option<EntryRow>> {
     ))
 }
 
+/// One path of a revision, taken straight from the unique index over
+/// `(revision_id, path, node_id)` rather than by reading every path the revision holds.
+///
+/// A row the scan marked absent does not answer: the caller wants bytes that are there.
+pub fn entry_by_path(
+    conn: &Connection,
+    revision: RevisionId,
+    path: &str,
+) -> Result<Option<EntryRow>> {
+    optional_row(conn.query_row(
+        &format!(
+            "SELECT {ENTRY_COLUMNS} {ENTRY_FROM} \
+             WHERE e.revision_id = ?1 AND e.path = ?2 AND e.present = 1 \
+             ORDER BY e.node_id LIMIT 1"
+        ),
+        params![revision.get(), path],
+        |row| Ok(EntryRow::from_row(row)),
+    ))
+}
+
 pub fn entries_for_revision(conn: &Connection, revision: RevisionId) -> Result<Vec<EntryRow>> {
     entries_where(conn, "e.revision_id = ?1", revision.get())
 }
@@ -208,6 +228,17 @@ fn entries_where(conn: &Connection, clause: &str, key: i64) -> Result<Vec<EntryR
     ))?;
     let rows = statement.query_map([key], |row| Ok(EntryRow::from_row(row)))?;
     collect_rows(rows)
+}
+
+/// Returns a pull a stopped process left mid-flight to REMOTE.
+///
+/// Only the process running a pull advances it, so an entry still PULLING when this one
+/// starts will never move again: the FILES tab would show its percentage for good.
+pub fn reset_stale_pulls(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE entry SET state = ?1, pull_progress = NULL, present = 0 WHERE state = ?2",
+        params![State::Remote.as_str(), State::Pulling.as_str()],
+    )?)
 }
 
 /// Marks every path of a source the current scan did not see as absent. Rows survive so
@@ -229,6 +260,68 @@ mod tests {
     use crate::store::Store;
     use crate::store::blob::{blob, upsert_blob};
     use crate::store::fixture::{Fixture, at};
+
+    #[test]
+    fn one_path_of_a_revision_is_read_without_walking_the_others() {
+        let store = Store::open_in_memory().expect("store opens");
+        let conn = store.write().expect("writer");
+        let world = Fixture::build(&conn);
+        let rows = entries_for_revision(&conn, world.first_revision).expect("entries read");
+        let wanted = rows.first().expect("the fixture holds a path").clone();
+
+        assert_eq!(
+            entry_by_path(&conn, world.first_revision, &wanted.path).expect("the entry reads"),
+            Some(wanted)
+        );
+        assert_eq!(
+            entry_by_path(&conn, world.first_revision, "nothing/here").expect("the miss reads"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_path_the_disk_no_longer_holds_is_not_the_one_a_lookup_returns() {
+        let store = Store::open_in_memory().expect("store opens");
+        let conn = store.write().expect("writer");
+        let world = Fixture::build(&conn);
+        let gone = NewEntry {
+            present: false,
+            ..NewEntry::new(world.first_revision, "gone.safetensors", world.node_row)
+        };
+        upsert_entry(&conn, &gone, at()).expect("the absent row records");
+
+        assert_eq!(
+            entry_by_path(&conn, world.first_revision, "gone.safetensors").expect("reads"),
+            None,
+            "a row the scan marked absent must not answer a request for its path"
+        );
+    }
+
+    #[test]
+    fn a_pull_a_stopped_process_left_running_reads_remote_again() {
+        let store = Store::open_in_memory().expect("store opens");
+        let conn = store.write().expect("writer");
+        let world = Fixture::build(&conn);
+        let halfway = NewEntry {
+            state: State::Pulling,
+            pull_progress: Some(0.4),
+            ..NewEntry::new(world.first_revision, "halfway.safetensors", world.node_row)
+        };
+        let id = upsert_entry(&conn, &halfway, at()).expect("the pull records");
+
+        assert_eq!(reset_stale_pulls(&conn).expect("the sweep runs"), 1);
+        let row = entry(&conn, id)
+            .expect("the entry reads")
+            .expect("the entry is still there");
+        assert_eq!(row.state, State::Remote);
+        assert_eq!(row.pull_progress, None);
+        assert!(!row.present, "nothing local answers for it yet");
+        assert_eq!(
+            reset_stale_pulls(&conn).expect("the sweep runs"),
+            0,
+            "a second start has nothing left to settle"
+        );
+    }
 
     #[test]
     fn a_duplicate_blob_counts_both_of_its_paths() {

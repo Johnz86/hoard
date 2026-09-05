@@ -127,6 +127,14 @@ pub async fn apply(
     Ok(applied)
 }
 
+/// Drops the peer's rows a full digest pass starting at `pass_started` did not touch.
+pub async fn retract(store: &Store, peer_row: i64, pass_started: Timestamp) -> Result<u64> {
+    let dropped = store
+        .call_mut(move |conn| store_digest::retract(conn, peer_row, pass_started))
+        .await?;
+    Ok(dropped)
+}
+
 /// The cursor this node last consumed from a peer, restarting the digest if it is corrupt.
 pub async fn read_cursor(store: &Store, peer_row: i64) -> Result<Option<DigestCursor>> {
     let raw = store

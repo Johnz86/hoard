@@ -228,6 +228,7 @@ Nodes:
 ```
 mDNS _hoard._tcp -> peers table -> periodic GET /api/v1/peers/digest?since=cursor
   -> REMOTE entries in the local index -> `hoard apply` pulls via the proxy path
+  -> hourly full re-read retires the rows a peer stopped naming
 ```
 
 ## Storage

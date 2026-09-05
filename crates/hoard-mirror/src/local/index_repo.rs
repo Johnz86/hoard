@@ -12,7 +12,7 @@ use hoard_index::IndexError;
 use hoard_index::hash::git_blob_sha1_bytes;
 use hoard_index::sniff::parse_readme;
 use hoard_index::store::blob::blob;
-use hoard_index::store::entry::entries_for_revision;
+use hoard_index::store::entry::{entries_for_revision, entry_by_path};
 use hoard_index::store::node::local_node;
 use hoard_index::store::repo::{
     RepoFilter, RepoRow, list_repos as list_repo_rows, repo_by_qualified,
@@ -235,10 +235,7 @@ pub(crate) fn revision_file(
     revision: &RevisionRow,
     path: &str,
 ) -> Result<Option<RevisionFile>> {
-    let Some(row) = entries_for_revision(conn, revision.id)?
-        .into_iter()
-        .find(|row| row.present && row.path == path)
-    else {
+    let Some(row) = entry_by_path(conn, revision.id, path)? else {
         return Ok(None);
     };
     let (sha256, git_sha1) = match row.blob {

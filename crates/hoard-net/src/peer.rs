@@ -58,6 +58,13 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 /// others of a turn.
 const PAGES_PER_POLL: u32 = 20;
 
+/// How many pages one full re-read of a peer's digest may take before it gives up.
+const PAGES_PER_RESYNC: u32 = 2_000;
+
+/// How often a peer's whole digest is read again, which is what retires the rows it dropped.
+/// An incremental poll is only ever told what a peer holds, so nothing else can.
+const RESYNC_EVERY: Duration = Duration::from_secs(3600);
+
 /// How often a running pull writes its progress. Every chunk would be a write per megabyte.
 const PROGRESS_EVERY: Duration = Duration::from_millis(400);
 
@@ -978,6 +985,8 @@ struct Peer {
     /// Consecutive failed polls, which is how long the next one is put off for.
     failures: u32,
     due: Instant,
+    /// When this peer's whole digest was last read, which is what retires its dropped rows.
+    resynced: Instant,
 }
 
 impl Peer {
@@ -988,6 +997,7 @@ impl Peer {
             discovered,
             failures: 0,
             due: Instant::now(),
+            resynced: Instant::now(),
         }
     }
 
@@ -1001,6 +1011,14 @@ impl Peer {
 
     fn answered(&mut self) {
         self.failures = 0;
+    }
+
+    fn is_resync_due(&self, now: Instant) -> bool {
+        now.duration_since(self.resynced) >= RESYNC_EVERY
+    }
+
+    fn resynced(&mut self, now: Instant) {
+        self.resynced = now;
     }
 
     /// Puts the next poll off by one doubling of the interval per consecutive failure, so a
@@ -1069,8 +1087,14 @@ impl PeerSet {
         let interval = config.interval;
         futures::stream::iter(self.peers.values_mut().filter(|peer| peer.is_due(now)))
             .for_each_concurrent(POLL_CONCURRENCY, |peer| async move {
-                match poll(store, config, peer).await {
-                    Ok(()) => peer.answered(),
+                let resync = peer.is_resync_due(now);
+                match poll(store, config, peer, resync).await {
+                    Ok(()) => {
+                        peer.answered();
+                        if resync {
+                            peer.resynced(Instant::now());
+                        }
+                    }
                     Err(error) => {
                         tracing::warn!(peer = %peer.client.name(), %error, "peer poll failed");
                         peer.failed(interval, Instant::now());
@@ -1156,10 +1180,16 @@ fn answers_as_this_node(local: &NodeIdentity, peer: &NodeIdentity) -> bool {
 }
 
 /// Reads everything new from one peer and files it, then remembers how far it got.
-async fn poll(store: &Store, config: &GossipConfig, peer: &Peer) -> Result<()> {
+///
+/// `resync` reads the peer's whole digest instead, which is the only thing that retires a
+/// row: an incremental poll is told what a peer holds and never what it dropped.
+async fn poll(store: &Store, config: &GossipConfig, peer: &Peer, resync: bool) -> Result<()> {
     peer.client.health().await?;
     let indexed = peer.client.stats().await.map(|stats| stats.indexed_bytes)?;
     touch_peer(store, peer.row, indexed).await?;
+    if resync {
+        return resync_digest(store, config, peer).await;
+    }
 
     let mut cursor = digest::read_cursor(store, peer.row).await?;
     let mut rewound = false;
@@ -1194,6 +1224,58 @@ async fn poll(store: &Store, config: &GossipConfig, peer: &Peer) -> Result<()> {
         }
         cursor = Some(next);
         digest::write_cursor(store, peer.row, cursor).await?;
+    }
+    Ok(())
+}
+
+/// Reads a peer's whole digest from the start and drops what it no longer names.
+///
+/// A digest carries what a peer holds, never what it dropped, so nothing on the incremental
+/// path can retire a row: one filed once would read REMOTE for good and keep offering a pull
+/// that cannot succeed. A pass re-times every row the peer still names, and what the pass did
+/// not touch is what it deleted. Retraction is skipped when the pass did not reach the end,
+/// because a partial pass cannot tell a dropped row from an unread one.
+async fn resync_digest(store: &Store, config: &GossipConfig, peer: &Peer) -> Result<()> {
+    let started = Timestamp::now();
+    let mut cursor = None;
+    let mut reached_end = false;
+    for _ in 0..PAGES_PER_RESYNC {
+        let page = peer.client.digest(cursor, config.digest_limit).await?;
+        if page.rows.is_empty() {
+            reached_end = true;
+            break;
+        }
+        digest::apply(store, peer.client.name(), peer.row, &page).await?;
+        let Some(next) = page
+            .next_cursor
+            .as_deref()
+            .map(DigestCursor::parse)
+            .transpose()?
+        else {
+            reached_end = true;
+            break;
+        };
+        if cursor.is_some_and(|current| next <= current) {
+            tracing::warn!(peer = %peer.client.name(), "a digest cursor did not advance");
+            break;
+        }
+        cursor = Some(next);
+    }
+    if !reached_end {
+        tracing::warn!(
+            peer = %peer.client.name(),
+            "a digest did not end within one resync; nothing is retired from it"
+        );
+        return Ok(());
+    }
+    digest::write_cursor(store, peer.row, cursor).await?;
+    let dropped = digest::retract(store, peer.row, started).await?;
+    if dropped > 0 {
+        tracing::info!(
+            peer = %peer.client.name(),
+            dropped,
+            "rows a peer no longer advertises were retired"
+        );
     }
     Ok(())
 }
@@ -2023,7 +2105,7 @@ mod tests {
             .await;
 
         let (store, row) = store_with_peer(Some(DigestCursor::new(5))).await;
-        poll(&store, &gossip_config(), &peer_of(&server, row))
+        poll(&store, &gossip_config(), &peer_of(&server, row), false)
             .await
             .expect("the poll reads the peer again from the start");
 
@@ -2043,6 +2125,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_resync_drops_what_a_peer_has_stopped_advertising() {
+        let server = MockServer::start().await;
+        peer_answering_a_poll(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/peers/digest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "rows": [digest_row("loras/kept.safetensors"), digest_row("loras/gone.safetensors")],
+                "next_cursor": null,
+                "total": 2
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/peers/digest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "rows": [digest_row("loras/kept.safetensors")],
+                "next_cursor": null,
+                "total": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let (store, row) = store_with_peer(None).await;
+        let peer = peer_of(&server, row);
+        let config = gossip_config();
+        poll(&store, &config, &peer, false)
+            .await
+            .expect("the first poll files both");
+        assert_eq!(
+            filed_paths(&store).await,
+            ["loras/gone.safetensors", "loras/kept.safetensors"]
+        );
+
+        poll(&store, &config, &peer, true)
+            .await
+            .expect("the resync reads the digest again");
+        assert_eq!(
+            filed_paths(&store).await,
+            ["loras/kept.safetensors"],
+            "a row the peer stopped naming cannot stay REMOTE and offer a pull that fails"
+        );
+    }
+
+    /// Every path this node currently holds for the peer, sorted so the order is the test's.
+    async fn filed_paths(store: &Store) -> Vec<String> {
+        let mut paths: Vec<String> = store
+            .call(|conn| {
+                hoard_index::store::search_exec::query_rows(
+                    conn,
+                    "node = ?",
+                    &["laptop".into()],
+                    "",
+                    50,
+                    0,
+                )
+            })
+            .await
+            .expect("rows read")
+            .into_iter()
+            .map(|row| row.path)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[tokio::test]
     async fn a_cursor_that_does_not_advance_ends_the_poll() {
         let server = MockServer::start().await;
         peer_answering_a_poll(&server).await;
@@ -2057,7 +2206,7 @@ mod tests {
             .await;
 
         let (store, row) = store_with_peer(None).await;
-        poll(&store, &gossip_config(), &peer_of(&server, row))
+        poll(&store, &gossip_config(), &peer_of(&server, row), false)
             .await
             .expect("a repeated cursor is not an error");
 

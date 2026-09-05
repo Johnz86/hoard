@@ -13,9 +13,9 @@ use hoard_core::{Base, CommitSha, RepoId, Role, Sha256, State};
 use crate::config::SourceKind;
 use crate::error::Result;
 use crate::scan::SNIFF_VERSION;
-use crate::store::artifact::{NewArtifact, artifact_by_blob, upsert_artifact};
-use crate::store::blob::{blob_by_sha256, set_sha256, upsert_blob};
-use crate::store::convert::{optional_row, timestamp_text};
+use crate::store::artifact::{NewArtifact, artifact_by_blob, delete_orphan_fts, upsert_artifact};
+use crate::store::blob::{blob_by_sha256, delete_orphan_blobs, set_sha256, upsert_blob};
+use crate::store::convert::{optional_row, timestamp_text, to_u64};
 use crate::store::entry::{NewEntry, upsert_entry};
 use crate::store::repo::{NewRepo, repo_by_qualified, upsert_repo};
 use crate::store::revision::{NewRevision, revision_by_sha, upsert_revision};
@@ -115,6 +115,36 @@ pub fn apply(conn: &mut Connection, peer_row: i64, rows: &[RemoteEntry]) -> Resu
     }
     transaction.commit()?;
     Ok(applied)
+}
+
+/// Drops what a peer has stopped advertising, after a pass over its whole digest.
+///
+/// A digest carries what a peer holds and never what it dropped, so a row filed once would
+/// read REMOTE for good and offer a pull that cannot succeed. Entries this peer owns that
+/// the pass did not touch are the ones it stopped naming; the artifact and the blob go with
+/// them only when no other path still reaches those bytes, so what this node holds itself,
+/// or another peer still offers, survives.
+pub fn retract(conn: &mut Connection, peer_row: i64, pass_started: Timestamp) -> Result<u64> {
+    let transaction = conn.transaction()?;
+    let removed = transaction.execute(
+        "DELETE FROM entry WHERE node_id = ?1 AND state = ?2 AND last_seen < ?3",
+        (
+            peer_row,
+            State::Remote.as_str(),
+            timestamp_text(pass_started),
+        ),
+    )?;
+    if removed > 0 {
+        transaction.execute(
+            "DELETE FROM artifact WHERE NOT EXISTS \
+             (SELECT 1 FROM entry e WHERE e.artifact_id = artifact.id)",
+            [],
+        )?;
+        delete_orphan_fts(&transaction)?;
+        delete_orphan_blobs(&transaction)?;
+    }
+    transaction.commit()?;
+    Ok(to_u64(removed as i64))
 }
 
 fn apply_row(
@@ -269,6 +299,59 @@ mod tests {
             peer
         };
         (store, peer)
+    }
+
+    #[test]
+    fn a_row_a_peer_stopped_naming_is_dropped_and_the_rest_is_left_alone() {
+        let (store, peer) = seeded(1);
+        let mut conn = store.write().expect("writer");
+        let kept = remote(20, "loras/film-grain.safetensors");
+        let dropped = remote(21, "loras/film-scratch.safetensors");
+        apply(&mut conn, peer, &[kept.clone(), dropped]).expect("the first pass files both");
+
+        let pass = Timestamp::now();
+        apply(&mut conn, peer, &[kept]).expect("the peer names one of them again");
+
+        assert_eq!(
+            retract(&mut conn, peer, pass).expect("the retraction runs"),
+            1
+        );
+        let left = search_exec::query_rows(&conn, "node = ?", &["laptop".into()], "", 10, 0)
+            .expect("rows read");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].path, "loras/film-grain.safetensors");
+        assert_eq!(
+            search_exec::count_rows(&conn, "node = ?", &["workstation".into()]).expect("count"),
+            1,
+            "what this node holds itself is not a peer's to retract"
+        );
+        assert_eq!(
+            retract(&mut conn, peer, pass).expect("the retraction runs"),
+            0,
+            "a second pass has nothing left to drop"
+        );
+    }
+
+    #[test]
+    fn retracting_a_peers_row_keeps_bytes_this_node_holds_itself() {
+        let (store, peer) = seeded(1);
+        let mut conn = store.write().expect("writer");
+        let shared = RemoteEntry {
+            sha256: sha256(1),
+            ..remote(1, "loras/held-here-too.safetensors")
+        };
+        apply(&mut conn, peer, &[shared]).expect("the peer names bytes this node also holds");
+
+        let pass = Timestamp::now();
+        assert_eq!(
+            retract(&mut conn, peer, pass).expect("the retraction runs"),
+            1
+        );
+        assert_eq!(
+            search_exec::count_rows(&conn, "node = ?", &["workstation".into()]).expect("count"),
+            1,
+            "the local artifact for the same bytes survives the peer forgetting them"
+        );
     }
 
     #[test]

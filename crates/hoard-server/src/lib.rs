@@ -121,6 +121,32 @@ pub async fn sweep_stale_runs(state: &AppState) -> usize {
     }
 }
 
+/// Returns every pull a stopped process left mid-flight to REMOTE.
+///
+/// Only the process running a pull moves its percentage, so an entry still PULLING when this
+/// one starts is a transfer that died: the FILES tab would show it frozen part way for good,
+/// and nothing would offer to pull it again.
+pub async fn sweep_stale_pulls(state: &AppState) -> usize {
+    let swept = state
+        .store()
+        .call_mut(|conn| hoard_index::store::entry::reset_stale_pulls(conn))
+        .await;
+    match swept {
+        Ok(0) => 0,
+        Ok(count) => {
+            tracing::warn!(
+                count,
+                "pulls left running by a stopped process read remote again"
+            );
+            count
+        }
+        Err(error) => {
+            tracing::error!(%error, "the pulls a stopped process left could not be settled");
+            0
+        }
+    }
+}
+
 /// Serves the application until `shutdown` resolves.
 ///
 /// The peer address is carried into the request so the usage log can name which machine
@@ -133,6 +159,7 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     sweep_stale_runs(&state).await;
+    sweep_stale_pulls(&state).await;
     axum::serve(
         listener,
         app(state).into_make_service_with_connect_info::<SocketAddr>(),
@@ -145,8 +172,15 @@ where
 mod tests {
     use axum::body::Body;
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};
+    use hoard_core::{CommitSha, NodeId, RepoId, RepoType, State};
+    use hoard_index::config::SourceKind;
     use hoard_index::store::Store;
+    use hoard_index::store::entry::{NewEntry, entry, upsert_entry};
     use hoard_index::store::job::{JobState, create_job, job, list_jobs};
+    use hoard_index::store::node::{NewNode, upsert_node};
+    use hoard_index::store::repo::{NewRepo, upsert_repo};
+    use hoard_index::store::revision::{NewRevision, upsert_revision};
+    use jiff::Timestamp;
     use tower::ServiceExt;
 
     use super::*;
@@ -247,6 +281,58 @@ mod tests {
             .expect("request");
         let response = through_the_stack(request).await;
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn a_pull_left_running_by_a_stopped_process_reads_remote_at_startup() {
+        let state = state();
+        let id = state
+            .store()
+            .call_mut(|conn| {
+                let node = upsert_node(
+                    conn,
+                    &NewNode::local(
+                        NodeId::new("workstation-1").expect("a node id"),
+                        "workstation",
+                    ),
+                )?;
+                let repo = upsert_repo(
+                    conn,
+                    &NewRepo::new(
+                        RepoId::new(RepoType::Models, Some("org".to_owned()), "name"),
+                        node,
+                        SourceKind::Loose,
+                    ),
+                )?;
+                let revision = upsert_revision(
+                    conn,
+                    &NewRevision::synthetic(repo, CommitSha::from_bytes([3u8; 20])),
+                )?;
+                let halfway = NewEntry {
+                    state: State::Pulling,
+                    pull_progress: Some(0.6),
+                    ..NewEntry::new(revision, "weights.safetensors", node)
+                };
+                upsert_entry(conn, &halfway, Timestamp::now())
+            })
+            .await
+            .expect("a pull is recorded mid-flight");
+
+        assert_eq!(sweep_stale_pulls(&state).await, 1);
+        let settled = state
+            .store()
+            .call(move |conn| entry(conn, id))
+            .await
+            .expect("the entry reads back")
+            .expect("the entry survives the sweep");
+        assert_eq!(settled.state, State::Remote);
+        assert_eq!(settled.pull_progress, None);
+
+        assert_eq!(
+            sweep_stale_pulls(&state).await,
+            0,
+            "the sweep is idempotent"
+        );
     }
 
     #[tokio::test]
