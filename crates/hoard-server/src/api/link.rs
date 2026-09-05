@@ -340,7 +340,7 @@ mod tests {
         let mut config = HoardConfig::default();
         config.server.data_dir = data_dir.to_path_buf();
         config.server.projection_roots = roots;
-        let catalog = crate::testing::empty_catalog(dir.path());
+        let catalog = crate::testing::empty_catalog(dir.path(), "test");
         let state = AppState::new(config, store, catalog).expect("state builds");
         (dir, state)
     }

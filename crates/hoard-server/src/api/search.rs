@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::Json;
 use axum::extract::{Query, State};
 use jiff::Timestamp;
@@ -5,16 +7,13 @@ use serde::{Deserialize, Serialize};
 
 use hoard_core::format_size;
 use hoard_index::IndexError;
-use hoard_index::search::{
-    CompileContext, FACET_DIMENSIONS, ParsedQuery, SortSpec, compile, compile_excluding,
-    mark_active, parse,
-};
-use hoard_index::store::row::{DiskPressure, SqlValue};
-use hoard_index::store::{blob, search_exec};
+use hoard_index::catalog::{QueryPage, QueryRequest};
+use hoard_index::search::{FACET_DIMENSIONS, Facets, ParsedQuery, SortSpec, parse, quoted};
+use hoard_index::store::row::DiskPressure;
+use hoard_index::store::shelf;
 
 use crate::api::common::{
-    Conn, MIDDOT, RowView, clamp_limit, compile_context, decode_cursor, next_cursor, quoted,
-    sort_key, sort_spec,
+    MIDDOT, RowView, clamp_limit, decode_cursor, next_cursor, sort_key, sort_spec,
 };
 use crate::error::ApiResult;
 use crate::state::AppState;
@@ -98,43 +97,56 @@ pub async fn search(
     Query(params): Query<SearchParams>,
 ) -> ApiResult<Json<SearchResponse>> {
     let raw = params.q.clone().unwrap_or_default();
-    let query = parse(&raw);
     let sort = sort_spec(params.sort.as_deref(), params.dir.as_deref())?;
     let limit = clamp_limit(params.limit);
     let key = cursor_key(&raw, params.sort.as_deref(), params.dir.as_deref());
     let offset = decode_cursor(params.cursor.as_deref(), &key)?;
-    let node = state.node_name().to_owned();
-    let now = Timestamp::now();
+    let page = run_query(&state, raw, sort, limit, offset).await?;
+    if page.stale {
+        tracing::debug!("the search index is behind the catalog and is being refreshed");
+    }
+    Ok(Json(SearchResponse {
+        facets: facets(&page.facets, &page.query),
+        rows: page.rows.iter().map(RowView::from).collect(),
+        next_cursor: next_cursor(offset, limit, page.rows.len(), page.total, &key),
+        total: page.total,
+        nodes: page.nodes,
+        summary: summary(page.total, page.nodes),
+        query: page.query,
+    }))
+}
 
-    let response = state
+/// One page of the catalog, compiled against the shelves the store still holds and read on
+/// a blocking thread because the catalog and its index are file work.
+async fn run_query(
+    state: &AppState,
+    raw: String,
+    sort: SortSpec,
+    limit: u32,
+    offset: u32,
+) -> Result<QueryPage, IndexError> {
+    let shelves = state
         .store()
-        .call(move |conn| {
-            let context = compile_context(conn, &node, &query, now)?;
-            let compiled = compile(&query, sort, &context)?;
-            let rows = search_exec::query_rows(
-                conn,
-                &compiled.where_sql,
-                &compiled.params,
-                &compiled.order_sql,
-                limit,
-                offset,
-            )?;
-            let total = search_exec::count_rows(conn, &compiled.where_sql, &compiled.params)?;
-            let nodes =
-                search_exec::distinct_node_count(conn, &compiled.where_sql, &compiled.params)?;
-            let facets = facets(conn, &query, sort, &context)?;
-            Ok(SearchResponse {
-                facets,
-                rows: rows.iter().map(RowView::from).collect(),
-                next_cursor: next_cursor(offset, limit, rows.len(), total, &key),
-                total,
-                nodes,
-                summary: summary(total, nodes),
-                query,
-            })
+        .call(|conn| {
+            Ok(shelf::list_shelves(conn)?
+                .into_iter()
+                .map(|row| (row.name, row.query))
+                .collect::<Vec<_>>())
         })
         .await?;
-    Ok(Json(response))
+    let catalog = Arc::clone(state.catalog());
+    let now = Timestamp::now();
+    tokio::task::spawn_blocking(move || {
+        let context = catalog.compile_context(&raw, now, shelves)?;
+        catalog.query(QueryRequest {
+            raw: &raw,
+            sort,
+            limit,
+            offset,
+            context: &context,
+        })
+    })
+    .await?
 }
 
 /// The token strip while typing: the parse with no database work behind it.
@@ -144,43 +156,31 @@ pub async fn parse_query(Query(params): Query<SearchParams>) -> Json<ParseRespon
     })
 }
 
-fn facets(
-    conn: &Conn,
-    query: &ParsedQuery,
-    sort: SortSpec,
-    context: &CompileContext,
-) -> Result<FacetsView, IndexError> {
+/// The facet rail as the UI reads it: every bucket the catalog counted, with the token a
+/// click toggles and the whole query that selects exactly this bucket.
+fn facets(counted: &Facets, query: &ParsedQuery) -> FacetsView {
     let mut view = FacetsView {
-        disk_pressure: blob::disk_pressure(conn)?.into(),
+        disk_pressure: counted.disk_pressure.into(),
         ..FacetsView::default()
     };
-    for ((key, _), buckets) in FACET_DIMENSIONS.iter().zip(view.dimensions_mut()) {
-        let compiled = compile_excluding(query, key, sort, context)?;
-        let mut counted =
-            search_exec::facet_counts(conn, key, &compiled.where_sql, &compiled.params)?;
-        mark_active(&mut counted, query, key);
-        let dimension = Dimension {
-            key,
-            excluded_sql: &compiled.where_sql,
-            excluded_params: &compiled.params,
-            sort,
-            context,
-        };
-        let mut rendered = Vec::with_capacity(counted.len());
-        for bucket in counted {
-            let count = exact_count(conn, &dimension, &bucket.value, bucket.count)?;
-            rendered.push(FacetBucketView {
+    for (((key, _), buckets), rendered) in FACET_DIMENSIONS
+        .iter()
+        .zip(counted.dimensions())
+        .zip(view.dimensions_mut())
+    {
+        *rendered = buckets
+            .iter()
+            .map(|bucket| FacetBucketView {
+                label: bucket.label.clone().unwrap_or_else(|| bucket.value.clone()),
+                count: bucket.count,
+                active: bucket.active,
                 token: format!("{key}:{}", quoted(&bucket.value)),
                 query: select_query(query, key, &bucket.value),
-                count,
-                active: bucket.active,
-                label: bucket.label.unwrap_or_else(|| bucket.value.clone()),
-                value: bucket.value,
-            });
-        }
-        *buckets = rendered;
+                value: bucket.value.clone(),
+            })
+            .collect();
     }
-    Ok(view)
+    view
 }
 
 impl FacetsView {
@@ -208,43 +208,6 @@ pub fn select_query(query: &ParsedQuery, key: &str, value: &str) -> String {
     let addition = format!("{key}:{}", quoted(value));
     parts.push(&addition);
     parts.join(" ")
-}
-
-/// One facet dimension being counted: its key and the query with that dimension's own
-/// tokens removed, which is the query every bucket of it is measured against.
-struct Dimension<'a> {
-    key: &'a str,
-    excluded_sql: &'a str,
-    excluded_params: &'a [SqlValue],
-    sort: SortSpec,
-    context: &'a CompileContext,
-}
-
-/// The number of artifacts [`select_query`] returns.
-///
-/// The grouped count is right whenever the grammar compiles `key:value` to plain equality
-/// on the facet's own column. `base:` does not: it matches a family by prefix and lets
-/// `any` match everything, so that dimension is counted by running the query the bucket
-/// stands for rather than by grouping.
-fn exact_count(
-    conn: &Conn,
-    dimension: &Dimension<'_>,
-    value: &str,
-    grouped: u64,
-) -> Result<u64, IndexError> {
-    let key = dimension.key;
-    let token = compile(
-        &parse(&format!("{key}:{}", quoted(value))),
-        dimension.sort,
-        dimension.context,
-    )?;
-    if token.where_sql == format!("{key} = ?") && token.params == [SqlValue::text(value)] {
-        return Ok(grouped);
-    }
-    let where_sql = format!("({}) AND ({})", dimension.excluded_sql, token.where_sql);
-    let mut params = dimension.excluded_params.to_vec();
-    params.extend(token.params);
-    search_exec::count_rows(conn, &where_sql, &params)
 }
 
 /// `212 ARTIFACTS · 3 NODES`, the line the results header and the token strip both print.

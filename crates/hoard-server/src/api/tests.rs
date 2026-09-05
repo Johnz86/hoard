@@ -10,10 +10,11 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 use hoard_core::{
-    ArtifactFormat, ArtifactId, Base, Evidence, EvidenceSource, NodeId, Precision, RepoId,
-    RepoRowId, RepoType, RevisionId, Role, Sha256, State as ArtifactState, TensorSample,
-    TensorSummary,
+    Artifact, ArtifactFormat, ArtifactId, Base, BlobId, Evidence, EvidenceSource, NodeId,
+    Precision, RepoId, RepoRowId, RepoType, RevisionId, Role, Sha256, State as ArtifactState,
+    TensorSample, TensorSummary,
 };
+use hoard_index::catalog::{Catalog, SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use hoard_index::config::{SourceConfig, SourceKind};
 use hoard_index::store::Store;
 use hoard_index::store::artifact::{NewArtifact, upsert_artifact};
@@ -81,17 +82,310 @@ fn seeded() -> World {
     config.server.public_url = Some("http://hoard.lan:7099".to_owned());
     config.node.name = "workstation".to_owned();
     config.mirror.cache_root = Some(dir.path().join("repos"));
-    let catalog = crate::testing::empty_catalog(dir.path());
+    let catalog = crate::testing::empty_catalog(dir.path(), &config.node.name);
+    let native = seed_catalog(&catalog, dir.path());
+    assert_eq!(
+        native,
+        [ids.0, ids.1, ids.2, ids.3, ids.4, ids.5],
+        "the routes still on SQLite read the ids the native seed hands the search route"
+    );
     World {
         state: AppState::new(config, store, catalog).expect("state builds"),
         _dir: dir,
-        lora: ids.0,
-        ckpt: ids.1,
-        llm: ids.2,
-        vae: ids.3,
-        dataset: ids.4,
-        unknown: ids.5,
+        lora: native[0],
+        ckpt: native[1],
+        llm: native[2],
+        vae: native[3],
+        dataset: native[4],
+        unknown: native[5],
     }
+}
+
+const CKPT_IDENTITY: u128 = 0x11;
+const LORA_IDENTITY: u128 = 0x9f9f;
+const LLM_IDENTITY: u128 = 0x33;
+const VAE_IDENTITY: u128 = 0x66;
+const DS_IDENTITY: u128 = 0x44;
+const UNK_IDENTITY: u128 = 0x55;
+
+/// The same world the SQLite seed writes, as native records: the peer copy is absent
+/// because the catalog holds no peer nodes yet, so the LoRA has two paths rather than three
+/// and nothing is served. Returns the ids in the order the SQLite seed allocates them.
+fn seed_catalog(catalog: &Catalog, dir: &Path) -> [ArtifactId; 6] {
+    let ckpt = SeedArtifact {
+        org: Some("stability".to_owned()),
+        ..seed_artifact(
+            CKPT_IDENTITY,
+            "sdxl-base-1.0",
+            Artifact {
+                sha256: Some(Sha256::from_bytes([0x11; 32])),
+                base: Base::new("sdxl"),
+                base_label: Some("sdxl".to_owned()),
+                base_confidence: 0.95,
+                precision: Some(Precision::new("fp16")),
+                ..facts(CKPT_SIZE, ArtifactFormat::Safetensors, Role::Ckpt, 0.99)
+            },
+        )
+    };
+    let lora = SeedArtifact {
+        org: Some("kohya".to_owned()),
+        card: Some(CARD.to_owned()),
+        ..seed_artifact(
+            LORA_IDENTITY,
+            "film-grain-35mm",
+            Artifact {
+                sha256: Some(Sha256::from_bytes([0x9f; 32])),
+                base: Base::new("sdxl 1.0"),
+                base_label: Some("sdxl 1.0".to_owned()),
+                base_confidence: 0.9,
+                precision: Some(Precision::new("fp16")),
+                rank: Some(32),
+                alpha: Some(16.0),
+                trigger: Some("film grain, 35mm, halation".to_owned()),
+                ..facts(LORA_SIZE, ArtifactFormat::Safetensors, Role::Lora, 0.98)
+            },
+        )
+    };
+    let llm = SeedArtifact {
+        org: Some("meta".to_owned()),
+        ..seed_artifact(
+            LLM_IDENTITY,
+            "llama-3-8b",
+            Artifact {
+                base: Base::new("llama3"),
+                base_label: Some("llama 3".to_owned()),
+                base_confidence: 0.9,
+                precision: Some(Precision::new("q4_k_m")),
+                context: Some(8192),
+                ..facts(LLM_SIZE, ArtifactFormat::Gguf, Role::Llm, 0.97)
+            },
+        )
+    };
+    let vae = SeedArtifact {
+        org: Some("madebyollin".to_owned()),
+        ..seed_artifact(
+            VAE_IDENTITY,
+            "sdxl-vae",
+            Artifact {
+                base_label: Some("any".to_owned()),
+                precision: Some(Precision::new("fp32")),
+                ..facts(VAE_SIZE, ArtifactFormat::Safetensors, Role::Vae, 0.93)
+            },
+        )
+    };
+    let dataset = seed_artifact(
+        DS_IDENTITY,
+        "squad",
+        facts(DS_SIZE, ArtifactFormat::Parquet, Role::Ds, 0.99),
+    );
+    let unknown = SeedArtifact {
+        tensors: Some(mystery_tensors()),
+        evidence: mystery_evidence(),
+        ..seed_artifact(
+            UNK_IDENTITY,
+            "mystery",
+            facts(UNK_SIZE, ArtifactFormat::Bin, Role::Unk, 0.2),
+        )
+    };
+    let card = dir.join("README.md").to_string_lossy().into_owned();
+    let written = catalog
+        .seed(&[
+            seed_repo(
+                "stability/sdxl-base-1.0",
+                RepoType::Models,
+                0x11,
+                vec![
+                    seed_entry(
+                        "model.safetensors",
+                        "/data/hub/sdxl/model.safetensors",
+                        CKPT_SIZE,
+                        Some(ckpt),
+                    ),
+                    seed_entry("README.md", &card, CARD.len() as u64, None),
+                    seed_entry("config.json", "/data/hub/sdxl/config.json", 900, None),
+                ],
+            ),
+            seed_repo(
+                "kohya/film-grain-35mm",
+                RepoType::Models,
+                0x22,
+                vec![
+                    seed_entry(
+                        "film-grain-35mm.safetensors",
+                        "/mnt/vault/loras/film-grain-35mm.safetensors",
+                        LORA_SIZE,
+                        Some(lora.clone()),
+                    ),
+                    seed_entry(
+                        "loras/film-grain-35mm.safetensors",
+                        "/mnt/comfy/models/loras/film-grain-35mm.safetensors",
+                        LORA_SIZE,
+                        Some(lora),
+                    ),
+                ],
+            ),
+            seed_repo(
+                "meta/llama-3-8b",
+                RepoType::Models,
+                0x33,
+                vec![seed_entry(
+                    "model.gguf",
+                    "/data/llm/llama-3-8b.gguf",
+                    LLM_SIZE,
+                    Some(llm),
+                )],
+            ),
+            seed_repo(
+                "madebyollin/sdxl-vae",
+                RepoType::Models,
+                0x66,
+                vec![seed_entry(
+                    "vae.safetensors",
+                    "/data/vae/sdxl-vae.safetensors",
+                    VAE_SIZE,
+                    Some(vae),
+                )],
+            ),
+            seed_repo(
+                "squad",
+                RepoType::Datasets,
+                0x44,
+                vec![seed_entry(
+                    "train.parquet",
+                    "/data/ds/squad/train.parquet",
+                    DS_SIZE,
+                    Some(dataset),
+                )],
+            ),
+            seed_repo(
+                "misc/mystery",
+                RepoType::Models,
+                0x55,
+                vec![SeedEntry {
+                    state: ArtifactState::Triage,
+                    ..seed_entry(
+                        "mystery.bin",
+                        "/data/loose/mystery.bin",
+                        UNK_SIZE,
+                        Some(unknown),
+                    )
+                }],
+            ),
+        ])
+        .expect("the catalog seeds");
+    catalog.rebuild_search(|_| {}).expect("the index builds");
+    [
+        LORA_IDENTITY,
+        CKPT_IDENTITY,
+        LLM_IDENTITY,
+        VAE_IDENTITY,
+        DS_IDENTITY,
+        UNK_IDENTITY,
+    ]
+    .map(|identity| {
+        written
+            .iter()
+            .find(|(seeded, _)| *seeded == identity)
+            .map(|(_, id)| *id)
+            .expect("every seeded identity was written")
+    })
+}
+
+fn facts(size: u64, format: ArtifactFormat, role: Role, role_confidence: f32) -> Artifact {
+    Artifact {
+        id: ArtifactId::new(0),
+        blob: BlobId::new(0),
+        sha256: None,
+        size,
+        format,
+        role,
+        sub_role: None,
+        role_confidence,
+        base: Base::any(),
+        base_label: None,
+        base_confidence: 0.5,
+        precision: None,
+        quant: None,
+        rank: None,
+        alpha: None,
+        params: None,
+        context: None,
+        trigger: None,
+        sniff_version: 1,
+    }
+}
+
+fn seed_artifact(identity: u128, name: &str, artifact: Artifact) -> SeedArtifact {
+    SeedArtifact {
+        identity,
+        artifact,
+        name: name.to_owned(),
+        org: None,
+        tensors: None,
+        evidence: Vec::new(),
+        card: None,
+        group_bytes: None,
+        shard_count: None,
+    }
+}
+
+fn seed_entry(
+    rel_path: &str,
+    abs_path: &str,
+    size: u64,
+    artifact: Option<SeedArtifact>,
+) -> SeedEntry {
+    SeedEntry {
+        rel_path: rel_path.to_owned(),
+        abs_path: Some(abs_path.to_owned()),
+        size,
+        state: ArtifactState::Local,
+        is_symlink: false,
+        artifact,
+    }
+}
+
+fn seed_repo(
+    reference: &str,
+    repo_type: RepoType,
+    byte: u8,
+    entries: Vec<SeedEntry>,
+) -> SeedRepository {
+    SeedRepository {
+        repo: RepoId::parse_ref(repo_type, reference).expect("reference"),
+        source: "cache".to_owned(),
+        kind: SourceKind::HfCache,
+        root_path: std::path::PathBuf::from("/data/hub"),
+        revisions: vec![SeedRevision {
+            name: "main".to_owned(),
+            sha: Some(hoard_core::CommitSha::from_bytes([byte; 20])),
+            refs: vec!["main".to_owned()],
+            entries,
+        }],
+    }
+}
+
+fn mystery_tensors() -> TensorSummary {
+    TensorSummary {
+        tensor_count: 2,
+        params: 1_024,
+        dtypes: [("F16".to_owned(), 2u32)].into_iter().collect(),
+        key_prefixes: vec![("lora_unet".to_owned(), 2)],
+        samples: vec![TensorSample {
+            name: "lora_unet_down.weight".to_owned(),
+            dtype: "F16".to_owned(),
+            shape: vec![32, 768],
+        }],
+        metadata: Default::default(),
+    }
+}
+
+fn mystery_evidence() -> Vec<Evidence> {
+    vec![
+        Evidence::new("role", "lora", EvidenceSource::Tensor, 0.6)
+            .with_detail("lora_unet prefix on 2 tensors"),
+        Evidence::new("base", "sdxl 1.0", EvidenceSource::Tensor, 0.5),
+    ]
 }
 
 fn at() -> Timestamp {
@@ -562,9 +856,9 @@ async fn search_answers_the_documented_shape() {
     );
     assert_eq!(body["query"]["warnings"], json!([]));
     assert_eq!(body["total"], 1);
-    assert_eq!(body["nodes"], 2);
+    assert_eq!(body["nodes"], 1);
     assert_eq!(body["next_cursor"], Value::Null);
-    assert_eq!(body["summary"], "1 ARTIFACTS \u{b7} 2 NODES");
+    assert_eq!(body["summary"], "1 ARTIFACTS \u{b7} 1 NODES");
 
     let row = &body["rows"][0];
     assert_eq!(row["artifact_id"], world.lora.to_string());
@@ -584,16 +878,16 @@ async fn search_answers_the_documented_shape() {
     assert_eq!(row["quant"], Value::Null);
     assert_eq!(row["revision"], "main");
     assert_eq!(row["node"], "workstation");
-    assert_eq!(row["state"], "served");
+    assert_eq!(row["state"], "local");
     assert_eq!(row["pull_progress"], Value::Null);
     assert_eq!(row["trigger"], "film grain, 35mm, halation");
     assert_eq!(row["path"], "/mnt/vault/loras/film-grain-35mm.safetensors");
-    assert_eq!(row["path_count"], 3);
+    assert_eq!(row["path_count"], 2);
     assert_eq!(row["size_human"], "239.1 MB");
 
     let pressure = &body["facets"]["disk_pressure"];
     assert_eq!(pressure["duplicate_blobs"], 1);
-    assert_eq!(pressure["reclaimable_bytes"], LORA_SIZE * 2);
+    assert_eq!(pressure["reclaimable_bytes"], LORA_SIZE);
     for dimension in ["role", "base", "format", "precision", "node"] {
         assert!(
             body["facets"][dimension].is_array(),
@@ -1771,7 +2065,7 @@ async fn health_stats_and_settings_answer_the_shell() {
 
     let stats = get(&world.state, "/api/v1/stats").await;
     assert_eq!(stats["artifacts"], 6);
-    assert_eq!(stats["repos"], 7);
+    assert_eq!(stats["repos"], 6);
     assert_eq!(stats["triage"], 1);
     assert_eq!(stats["roles"].as_array().expect("roles").len(), 6);
     assert_eq!(stats["cache"]["bytes"], 0);

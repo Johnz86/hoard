@@ -149,7 +149,15 @@ of the shallowest README in each revision.
   again without an exclusive borrow.
 - Every command that opens the index also opens or creates the native catalog at
   `<data_dir>/native`; `hoard scan` and the scan job rescan and refresh it after the SQLite
-  scan; the server holds it as shared state. No route reads it yet.
+  scan; the server holds it as shared state.
+- `GET /api/v1/search`, `GET /api/v1/stats` and `hoard ls` read the native catalog; shelves
+  still come from SQLite until user data moves.
+- The artifact sweep keeps the totals the stats route prints in its summary record, which is
+  at model version 2; version 1 rows are migrated on open.
+- A `fixtures` feature exposes `Catalog::seed`, which writes repositories, entries,
+  artifacts, details and search text through the same allocator, change log and sweep a scan
+  uses, so a test can hold known rows without inference. It is compiled only under `cfg(test)`
+  or that feature and never reaches the binary.
 - A query answers from the published index even when a rescan has logged changes no refresh
   has applied, and says so with `stale`; only a catalog with no index at all is refused.
 - Every transaction that touches an artifact logs its id to a search change table;
@@ -358,8 +366,11 @@ than a correctness one.
 
 ## Remaining replacement work
 
-- Convert the existing Store/Connection API and live server, scanner, mirror, cache
-  eviction, gossip, watch and CLI callers to native transactions.
+- Move the routes still on SQLite to the catalog: artifact detail, compat, blob detail,
+  repos, triage, shelves, loadouts, projection, sources and jobs, nodes and peers, settings,
+  the Hub and git faces, the mirror's ingest and gossip.
+- Convert the existing Store/Connection API and live scanner, mirror, cache eviction,
+  gossip, watch and CLI callers to native transactions.
 - Path identities hash the text to_string_lossy renders; discovery currently never yields
   two distinct non-UTF-8 paths, and a byte-exact identity must land with the identity
   redesign.

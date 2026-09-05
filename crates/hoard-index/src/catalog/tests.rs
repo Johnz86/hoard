@@ -1295,6 +1295,93 @@ fn a_seeded_catalog_answers_like_a_scanned_one() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn an_any_base_answers_only_its_own_bucket() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "n", |_, _| {})?;
+    let seeded = |identity: u128, name: &str, base: Base| SeedRepository {
+        repo: RepoId::new(RepoType::Models, None, name),
+        source: "cache".into(),
+        kind: SourceKind::HfCache,
+        root_path: "/data/hub".into(),
+        revisions: vec![SeedRevision {
+            name: "main".into(),
+            sha: None,
+            refs: vec!["main".into()],
+            entries: vec![SeedEntry {
+                rel_path: format!("{name}.safetensors"),
+                abs_path: Some(format!("/data/hub/{name}.safetensors")),
+                size: 1_024,
+                state: State::Local,
+                is_symlink: false,
+                artifact: Some(SeedArtifact {
+                    identity,
+                    artifact: Artifact {
+                        base_label: Some(base.as_str().to_owned()),
+                        base,
+                        ..seeded_facts()
+                    },
+                    name: name.to_owned(),
+                    org: None,
+                    tensors: None,
+                    evidence: Vec::new(),
+                    card: None,
+                    group_bytes: None,
+                    shard_count: None,
+                }),
+            }],
+        }],
+    };
+    catalog.seed(&[
+        seeded(1, "sdxl-vae", Base::any()),
+        seeded(2, "sdxl-lora", Base::new("sdxl 1.0")),
+    ])?;
+    catalog.rebuild_search(|_| {})?;
+    let family = search(&catalog, "base:sdxl")?;
+    assert_eq!(family.total, 1);
+    assert_eq!(family.rows[0].name, "sdxl-lora", "an any base is no family");
+    let any = search(&catalog, "base:any")?;
+    assert_eq!(any.total, 1);
+    assert_eq!(any.rows[0].name, "sdxl-vae");
+    let bucket = search(&catalog, "")?
+        .facets
+        .base
+        .into_iter()
+        .find(|bucket| bucket.value == "any")
+        .ok_or_else(|| IndexError::Catalog("the rail offers an any bucket".into()))?;
+    assert_eq!(bucket.count, 1, "the bucket counts the query it opens");
+    Ok(())
+}
+
+fn seeded_facts() -> Artifact {
+    Artifact {
+        id: ArtifactId::new(0),
+        blob: BlobId::new(0),
+        sha256: None,
+        size: 1_024,
+        format: ArtifactFormat::Safetensors,
+        role: Role::Lora,
+        sub_role: None,
+        role_confidence: 0.99,
+        base: Base::any(),
+        base_label: None,
+        base_confidence: 0.9,
+        precision: None,
+        quant: None,
+        rank: None,
+        alpha: None,
+        params: None,
+        context: None,
+        trigger: None,
+        sniff_version: 1,
+    }
+}
+
 fn loose_fixture(directory: &Path) -> Result<(PathBuf, IndexConfig)> {
     let input = directory.join("models");
     fs::create_dir_all(input.join("loras"))?;

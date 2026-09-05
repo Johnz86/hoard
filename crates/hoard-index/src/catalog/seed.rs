@@ -61,22 +61,25 @@ impl Catalog {
     /// Writes records the way a scan would, for tests that need known rows without
     /// inference: ids come from the allocator, every artifact is logged for the search
     /// index, path counts and the summary are swept, and the generation increments.
-    /// Call `rebuild_search` afterwards.
-    pub fn seed(&self, repositories: &[SeedRepository]) -> Result<()> {
+    /// Call `rebuild_search` afterwards. Returns the identity of each artifact written and
+    /// the id it was given, in the order the seed first named them.
+    pub fn seed(&self, repositories: &[SeedRepository]) -> Result<Vec<(u128, ArtifactId)>> {
         let triage = IndexConfig::default().triage_confidence;
         let mut counters = Counters::load(&self.database)?;
         let transaction = self.database.rw_transaction()?;
-        {
+        let written = {
             let mut seeding = Seeding {
                 transaction: &transaction,
                 counters: &mut counters,
                 by_identity: HashMap::new(),
+                written: Vec::new(),
                 triage,
             };
             for repository in repositories {
                 seeding.repository(repository)?;
             }
-        }
+            seeding.written
+        };
         log_changes(&transaction, &mut counters)?;
         transaction.commit()?;
         self.sweep_artifacts(&mut counters, triage)?;
@@ -91,7 +94,7 @@ impl Catalog {
         manifest.counts = counts(&transaction)?;
         transaction.upsert(manifest)?;
         transaction.commit()?;
-        Ok(())
+        Ok(written)
     }
 }
 
@@ -101,6 +104,7 @@ struct Seeding<'a, 'db> {
     transaction: &'a RwTransaction<'db>,
     counters: &'a mut Counters,
     by_identity: HashMap<u128, i64>,
+    written: Vec<(u128, ArtifactId)>,
     triage: f32,
 }
 
@@ -237,6 +241,7 @@ impl Seeding<'_, '_> {
             shard_count: seed.shard_count,
         })?;
         self.by_identity.insert(seed.identity, id);
+        self.written.push((seed.identity, ArtifactId::new(id)));
         self.touch(id);
         Ok(id)
     }

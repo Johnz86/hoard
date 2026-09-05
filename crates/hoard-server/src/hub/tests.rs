@@ -75,7 +75,7 @@ fn seeded() -> World {
     config.node.name = "workstation".to_owned();
     config.mirror.cache_root = Some(root.join("repos"));
     config.mirror.offline = true;
-    let catalog = crate::testing::empty_catalog(root);
+    let catalog = crate::testing::empty_catalog(root, "test");
     World {
         state: AppState::new(config, store, catalog).expect("state builds"),
         _dir: dir,

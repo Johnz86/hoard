@@ -1,13 +1,18 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderMap;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use hoard_core::format_size;
+use hoard_index::IndexError;
+use hoard_index::catalog::{QueryPage, QueryRequest, Totals};
+use hoard_index::search::SortSpec;
 use hoard_index::store::row::FacetBucket;
-use hoard_index::store::{artifact, blob, node, repo, search_exec, setting};
+use hoard_index::store::{node, setting};
 
 use crate::api::common::authorize;
 use crate::error::{ApiError, ApiResult};
@@ -171,31 +176,44 @@ pub async fn stats(State(state): State<AppState>) -> ApiResult<Json<StatsView>> 
     })
     .await
     .unwrap_or_default();
-    let counts = state
-        .store()
-        .call(move |conn| {
-            let (local_blobs, indexed_bytes) = blob::local_totals(conn)?;
-            let repos = repo::list_repos(conn, &repo::RepoFilter::default(), None, u32::MAX)?;
-            Ok(StatsView {
-                artifacts: search_exec::count_rows(conn, "", &[])?,
-                blobs: local_blobs,
-                repos: repos.len() as u64,
-                triage: artifact::triage_count(conn)?,
-                indexed_bytes,
-                indexed_bytes_human: format_size(indexed_bytes),
-                roles: search_exec::facet_counts(conn, "role", "", &[])?,
-                formats: search_exec::facet_counts(conn, "format", "", &[])?,
-                nodes: search_exec::facet_counts(conn, "node", "", &[])?,
-                cache: CacheView {
-                    bytes,
-                    bytes_human: format_size(bytes),
-                    limit,
-                    limit_human: limit.map(format_size),
-                },
-            })
-        })
-        .await?;
-    Ok(Json(counts))
+    let (totals, page) = catalog_totals(&state).await?;
+    Ok(Json(StatsView {
+        artifacts: totals.artifacts,
+        blobs: totals.present_artifacts,
+        repos: totals.repositories,
+        triage: totals.triage_artifacts,
+        indexed_bytes: totals.indexed_bytes,
+        indexed_bytes_human: format_size(totals.indexed_bytes),
+        roles: page.facets.role,
+        formats: page.facets.format,
+        nodes: page.facets.node,
+        cache: CacheView {
+            bytes,
+            bytes_human: format_size(bytes),
+            limit,
+            limit_human: limit.map(format_size),
+        },
+    }))
+}
+
+/// The counts the sweep measured and the unnarrowed facets beside them, both read from the
+/// native catalog on a blocking thread.
+async fn catalog_totals(state: &AppState) -> Result<(Totals, QueryPage), IndexError> {
+    let catalog = Arc::clone(state.catalog());
+    let now = Timestamp::now();
+    tokio::task::spawn_blocking(move || {
+        let totals = catalog.totals()?;
+        let context = catalog.compile_context("", now, Vec::new())?;
+        let page = catalog.query(QueryRequest {
+            raw: "",
+            sort: SortSpec::default(),
+            limit: 1,
+            offset: 0,
+            context: &context,
+        })?;
+        Ok((totals, page))
+    })
+    .await?
 }
 
 pub async fn settings(State(state): State<AppState>) -> ApiResult<Json<SettingsView>> {

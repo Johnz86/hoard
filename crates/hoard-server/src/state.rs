@@ -266,7 +266,7 @@ mod tests {
     fn state() -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = Store::open_in_memory().expect("in-memory store opens");
-        let catalog = crate::testing::empty_catalog(dir.path());
+        let catalog = crate::testing::empty_catalog(dir.path(), "test");
         let state = AppState::new(HoardConfig::default(), store, catalog).expect("state builds");
         (dir, state)
     }
@@ -295,7 +295,7 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store opens");
         let mut config = HoardConfig::default();
         config.mirror.offline = true;
-        let catalog = crate::testing::empty_catalog(dir.path());
+        let catalog = crate::testing::empty_catalog(dir.path(), "test");
         let state = AppState::new(config, store, catalog).expect("state builds");
         let refused: Result<(), MirrorError> = Err(MirrorError::ProxyTimeout);
         assert!(state.note_upstream(refused).is_err());
@@ -328,7 +328,7 @@ mod tests {
         let store = Store::open_in_memory().expect("in-memory store opens");
         let mut config = HoardConfig::default();
         config.server.data_dir = std::path::PathBuf::from("/srv/hoard");
-        let catalog = crate::testing::empty_catalog(dir.path());
+        let catalog = crate::testing::empty_catalog(dir.path(), "test");
         let state = AppState::new(config, store, catalog).expect("state builds");
         assert_eq!(
             state.projection_root(),

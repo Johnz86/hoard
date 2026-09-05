@@ -9,7 +9,7 @@ pub mod grammar;
 pub mod sql;
 pub mod token;
 
-pub use facets::{FACET_DIMENSIONS, Facets, mark_active, toggle_token};
+pub use facets::{FACET_DIMENSIONS, Facets, mark_active, quoted, toggle_token};
 pub use grammar::parse;
 pub use sql::{
     CompatTarget, CompileContext, CompiledQuery, SortKey, SortSpec, compile, compile_excluding,

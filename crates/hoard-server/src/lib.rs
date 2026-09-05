@@ -189,7 +189,7 @@ mod tests {
     fn state() -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().expect("temp dir");
         let store = Store::open_in_memory().expect("in-memory store opens");
-        let catalog = crate::testing::empty_catalog(dir.path());
+        let catalog = crate::testing::empty_catalog(dir.path(), "test");
         let state = AppState::new(HoardConfig::default(), store, catalog).expect("state builds");
         (dir, state)
     }

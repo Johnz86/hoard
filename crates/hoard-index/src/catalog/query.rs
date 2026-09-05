@@ -239,15 +239,14 @@ fn base_matches(field: Field, value: &str) -> Vec<Box<dyn Query>> {
     parts
 }
 
-/// `base:` as a filter: the family asked for, or a family it prefixes either way, never
-/// `any`. `any` states that an artifact works with every architecture, which is a claim
-/// about compatibility rather than about belonging to a family.
+/// `base:` as a filter: the family asked for, or a family it prefixes either way.
+///
+/// `any` states that an artifact works with every architecture, which is a claim about
+/// compatibility rather than about belonging to a family, so an `any` artifact answers no
+/// family's query. It still answers `base:any`, which is the query the facet rail's own
+/// `any` bucket opens.
 pub(super) fn base_filter(schema: &Fields, value: &str) -> Box<dyn Query> {
-    let field = schema.keyword(BASE_FIELD);
-    Box::new(BooleanQuery::new(vec![
-        (Occur::Must, any_of(base_matches(field, value))),
-        (Occur::MustNot, term(field, ANY_BASE)),
-    ]))
+    any_of(base_matches(schema.keyword(BASE_FIELD), value))
 }
 
 /// `compat:` resolves against the same families, and here `any` does belong: an upscaler

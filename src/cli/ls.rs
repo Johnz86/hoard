@@ -2,11 +2,12 @@ use anyhow::{Context as _, Result};
 use jiff::Timestamp;
 
 use hoard_core::format_size;
-use hoard_index::search::{self, CompileContext, SortKey, SortSpec};
-use hoard_index::store::search_exec::query_rows;
+use hoard_index::IndexError;
+use hoard_index::catalog::{QueryPage, QueryRequest};
+use hoard_index::search::{self, SortKey, SortSpec};
 use hoard_index::store::shelf::list_shelves;
 
-use super::node::{Context as CliContext, local_node_name};
+use super::node::Context as CliContext;
 
 pub async fn run(
     context: CliContext,
@@ -16,17 +17,15 @@ pub async fn run(
     sort: String,
     ascending: bool,
 ) -> Result<()> {
-    let CliContext { store, .. } = context;
+    let CliContext { store, catalog, .. } = context;
     let raw = query.unwrap_or_default();
-    let parsed = search::parse(&raw);
-    for warning in &parsed.warnings {
+    for warning in &search::parse(&raw).warnings {
         tracing::warn!(%warning, "query warning");
     }
 
     let key: SortKey = sort
         .parse()
         .map_err(|_| anyhow::anyhow!("unknown sort column: {sort}"))?;
-    let node = local_node_name(&store).await.ok();
     let shelves = store
         .call(list_shelves)
         .await
@@ -35,33 +34,27 @@ pub async fn run(
         .map(|shelf| (shelf.name, shelf.query))
         .collect();
 
-    let mut compile_context = CompileContext::new(Timestamp::now()).with_shelves(shelves);
-    if let Some(node) = node {
-        compile_context = compile_context.with_local_node(node);
-    }
-    let compiled = search::compile(&parsed, SortSpec::new(key, !ascending), &compile_context)
-        .context("compiling the query")?;
-
-    let rows = store
-        .call(move |conn| {
-            query_rows(
-                conn,
-                &compiled.where_sql,
-                &compiled.params,
-                &compiled.order_sql,
-                limit,
-                0,
-            )
+    let sort = SortSpec::new(key, !ascending);
+    let page = tokio::task::spawn_blocking(move || -> Result<QueryPage, IndexError> {
+        let context = catalog.compile_context(&raw, Timestamp::now(), shelves)?;
+        catalog.query(QueryRequest {
+            raw: &raw,
+            sort,
+            limit,
+            offset: 0,
+            context: &context,
         })
-        .await
-        .context("running the query")?;
+    })
+    .await
+    .context("running the query")?
+    .context("running the query")?;
 
     if json {
-        let out = serde_json::to_string_pretty(&rows).context("rendering json")?;
+        let out = serde_json::to_string_pretty(&page.rows).context("rendering json")?;
         tracing::info!("{out}");
         return Ok(());
     }
-    render(&rows);
+    render(&page.rows);
     Ok(())
 }
 

@@ -11,7 +11,7 @@ use hoard_core::{
 };
 use hoard_index::IndexError;
 use hoard_index::search::{
-    CompatTarget, CompileContext, ParsedQuery, SortKey, SortSpec, TokenKind, compile,
+    CompatTarget, CompileContext, ParsedQuery, SortKey, SortSpec, TokenKind, compile, quoted,
 };
 use hoard_index::store::entry::EntryRow;
 use hoard_index::store::row::{SearchRow, SqlValue};
@@ -596,14 +596,6 @@ pub fn repo_id(repo_type: &str, org: &str, name: &str) -> ApiResult<RepoId> {
         org => format!("{org}/{name}"),
     };
     RepoId::parse_ref(repo_type, &reference).map_err(ApiError::from)
-}
-
-/// Quotes a grammar value that would otherwise tokenize as more than one word.
-pub fn quoted(value: &str) -> String {
-    match value.contains(char::is_whitespace) || value.contains('"') {
-        true => format!("\"{}\"", value.replace('"', "")),
-        false => value.to_owned(),
-    }
 }
 
 #[cfg(test)]

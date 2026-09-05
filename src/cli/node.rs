@@ -6,7 +6,7 @@ use anyhow::{Context as _, Result};
 use hoard_core::NodeId;
 use hoard_index::catalog::Catalog;
 use hoard_index::store::Store;
-use hoard_index::store::node::{NewNode, local_node, upsert_node};
+use hoard_index::store::node::{NewNode, upsert_node};
 use hoard_server::HoardConfig;
 
 const DEFAULT_CONFIG: &str = "hoard.toml";
@@ -94,11 +94,6 @@ pub async fn ensure_local_node(store: &Store, name: &str) -> Result<i64> {
         .await
         .context("recording this node in the index")?;
     Ok(row)
-}
-
-pub async fn local_node_name(store: &Store) -> Result<String> {
-    let row = store.call(local_node).await.context("reading this node")?;
-    Ok(row.name)
 }
 
 fn machine_identity() -> String {

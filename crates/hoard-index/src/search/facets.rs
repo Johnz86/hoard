@@ -32,6 +32,17 @@ impl Facets {
         }
     }
 
+    /// The five dimensions in the order [`FACET_DIMENSIONS`] names them.
+    pub fn dimensions(&self) -> [&[FacetBucket]; 5] {
+        [
+            &self.role,
+            &self.base,
+            &self.format,
+            &self.precision,
+            &self.node,
+        ]
+    }
+
     fn dimensions_mut(&mut self) -> [&mut Vec<FacetBucket>; 5] {
         [
             &mut self.role,
