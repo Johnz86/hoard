@@ -9,6 +9,7 @@ use hoard_index::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
 
 const FILES_PER_DIRECTORY: usize = 1000;
 const PAGE: u32 = 100;
+const TOUCHED: usize = 1000;
 const KEY_FAMILIES: [&str; 4] = [
     "model.layers.{n}.self_attn.q_proj.weight",
     "lora_unet_down_blocks_{n}_attn.lora_down.weight",
@@ -98,7 +99,7 @@ fn peak_rss_kb() -> u64 {
         .unwrap_or(0)
 }
 
-fn directory_size(path: &Path) -> u64 {
+fn directory_size(path: &Path, of: fn(&fs::Metadata) -> u64) -> u64 {
     fs::read_dir(path)
         .map(|entries| {
             entries
@@ -106,13 +107,35 @@ fn directory_size(path: &Path) -> u64 {
                 .map(|entry| {
                     let path = entry.path();
                     match path.is_dir() {
-                        true => directory_size(&path),
-                        false => entry.metadata().map(|meta| meta.len()).unwrap_or(0),
+                        true => directory_size(&path, of),
+                        false => entry.metadata().map(|meta| of(&meta)).unwrap_or(0),
                     }
                 })
                 .sum()
         })
         .unwrap_or(0)
+}
+
+fn apparent(metadata: &fs::Metadata) -> u64 {
+    metadata.len()
+}
+
+fn allocated(metadata: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.blocks() * 512
+}
+
+/// Rewrites the first `count` headers so a rescan has to read them again and log a change
+/// per artifact, without adding or removing a path.
+fn touch(tree: &Path, count: usize) {
+    for index in 0..count {
+        let directory = tree.join(format!("d{}", index / FILES_PER_DIRECTORY));
+        fs::write(
+            directory.join(format!("w{index}.safetensors")),
+            header(index + 1),
+        )
+        .expect("synthetic header is rewritable");
+    }
 }
 
 fn timed<T>(work: impl FnOnce() -> T) -> (T, Duration) {
@@ -150,7 +173,7 @@ fn native_catalog_at_scale() {
     let rss_before = peak_rss_kb();
     let (catalog, scan_time) =
         timed(|| Catalog::scan_sources(&output, "scale", &config, |_, _| {}));
-    let catalog = catalog.expect("native scan succeeds");
+    let mut catalog = catalog.expect("native scan succeeds");
     let rss_after_scan = peak_rss_kb();
     let ((), rebuild_time) = timed(|| catalog.rebuild_search(|_| {}).expect("rebuild succeeds"));
     let rss_after_rebuild = peak_rss_kb();
@@ -175,6 +198,16 @@ fn native_catalog_at_scale() {
             })
             .expect("filtered search succeeds")
     });
+    let disk_apparent = directory_size(&output, apparent);
+    let disk_allocated = directory_size(&output, allocated);
+
+    touch(&tree, TOUCHED);
+    let (rescanned, rescan_time) =
+        timed(|| catalog.rescan(&config, |_, _| {}).expect("rescan succeeds"));
+    let (applied, refresh_time) =
+        timed(|| catalog.refresh_search(|_| {}).expect("refresh succeeds"));
+    let rss_after_refresh = peak_rss_kb();
+
     report(&[
         ("engine", "native_db + tantivy".to_owned()),
         ("entries", count.to_string()),
@@ -190,11 +223,23 @@ fn native_catalog_at_scale() {
             megabytes_between(rss_after_scan, rss_after_rebuild),
         ),
         (
-            "on disk",
-            format!("{} MB", directory_size(&output) / (1024 * 1024)),
+            "on disk, apparent",
+            format!("{} MB", disk_apparent / (1024 * 1024)),
+        ),
+        (
+            "on disk, allocated",
+            format!("{} MB", disk_allocated / (1024 * 1024)),
         ),
         ("search offset 0", format!("{first_time:?}")),
         ("search deep offset", format!("{deep_time:?}")),
         ("search filtered", format!("{filtered_time:?}")),
+        ("rescan wall (1,000 changed)", format!("{rescan_time:?}")),
+        ("rescan report", format!("{rescanned:?}")),
+        ("refresh wall", format!("{refresh_time:?}")),
+        ("changes refreshed", applied.to_string()),
+        (
+            "peak rss growth during rescan and refresh",
+            megabytes_between(rss_after_rebuild, rss_after_refresh),
+        ),
     ]);
 }
