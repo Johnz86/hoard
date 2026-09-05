@@ -147,6 +147,8 @@ investigated further.
 
 - Convert the existing Store/Connection API and live server, scanner, mirror, cache
   eviction, gossip, watch and CLI callers to native transactions.
+- Path identities render through to_string_lossy; discovery currently never yields two
+  distinct non-UTF-8 paths, and a byte-exact identity must land with the identity redesign.
 - Add mutations, incremental scan/retraction and a transactional search outbox with
   replay. This slice creates complete fresh catalogs; it does not update them.
 - Implement user overrides/noise, shelves, loadouts, settings, projections, jobs,
