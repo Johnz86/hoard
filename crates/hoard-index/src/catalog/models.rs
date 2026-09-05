@@ -49,6 +49,8 @@ pub(super) struct ArtifactRecord {
     pub(super) tensors: Option<TensorSummary>,
     pub(super) evidence: Vec<Evidence>,
     pub(super) path_count: u32,
+    pub(super) group_bytes: Option<u64>,
+    pub(super) shard_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

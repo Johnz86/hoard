@@ -655,3 +655,172 @@ fn search_entry_encoding_is_frozen_until_format_version_is_bumped() -> Result<()
     insta::assert_snapshot!(hex::encode(encoded));
     Ok(())
 }
+
+fn shard_header(keys: &[&str], width: u64) -> Vec<u8> {
+    let bytes = width * width * 2;
+    let entries: Vec<String> = keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let start = index as u64 * bytes;
+            format!(
+                r#""{key}":{{"dtype":"F16","shape":[{width},{width}],"data_offsets":[{start},{}]}}"#,
+                start + bytes
+            )
+        })
+        .collect();
+    crate::sniff::tests::safetensors_fixture(&format!("{{{}}}", entries.join(",")))
+}
+
+fn llm_shards() -> Vec<Vec<u8>> {
+    vec![
+        shard_header(&["model.layers.0.self_attn.q_proj.weight"], 64),
+        shard_header(&["model.layers.1.self_attn.q_proj.weight"], 48),
+        shard_header(&["lm_head.weight"], 32),
+    ]
+}
+
+fn scan_hub(directory: &Path, hub: &Path) -> Result<Catalog> {
+    let config = IndexConfig {
+        sources: vec![SourceConfig {
+            kind: SourceKind::HfCache,
+            ..source(hub, "hub")
+        }],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(&directory.join("native"), "n", &config, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    Ok(catalog)
+}
+
+#[test]
+fn a_sharded_model_is_one_native_artifact_over_every_file() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let shards = llm_shards();
+    let total: u64 = shards.iter().map(|bytes| bytes.len() as u64).sum();
+    hf_cache_repo(
+        &hub,
+        "Qwen",
+        "Qwen3-Sharded",
+        &[
+            ("model-00001-of-00003.safetensors", shards[0].clone()),
+            ("model-00002-of-00003.safetensors", shards[1].clone()),
+            ("model-00003-of-00003.safetensors", shards[2].clone()),
+        ],
+    )?;
+    let catalog = scan_hub(directory.path(), &hub)?;
+    let rows = search(&catalog, "")?;
+    assert_eq!(rows.total, 1, "the shards are one model");
+    let row = &rows.rows[0];
+    assert_eq!(row.role, hoard_core::Role::Llm);
+    assert_eq!(row.name, "Qwen3-Sharded");
+    assert_eq!(row.org.as_deref(), Some("Qwen"));
+    assert_eq!(row.size, total, "the row weighs the whole model");
+    assert_eq!(row.shard_count, 3);
+    assert!(!row.triage);
+    assert_eq!(
+        row.path, "model-00001-of-00003.safetensors",
+        "the anchor is the lowest shard"
+    );
+    let read = catalog.database.r_transaction()?;
+    let entries: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(entries.len(), 3, "every shard is still an entry");
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.artifact_id == Some(row.artifact_id.get()))
+    );
+    assert_eq!(read.len().primary::<ArtifactRecord>()?, 1);
+    assert_eq!(
+        read.len().primary::<SearchEntry>()?,
+        1,
+        "members get no search row of their own"
+    );
+    assert!(catalog.status()?.counts.contains(&("artifacts".into(), 1)));
+    Ok(())
+}
+
+#[test]
+fn an_incomplete_shard_set_is_triage_and_counts_what_it_has() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let shards = llm_shards();
+    hf_cache_repo(
+        &hub,
+        "Qwen",
+        "Qwen3-Partial",
+        &[
+            ("model-00001-of-00003.safetensors", shards[0].clone()),
+            ("model-00002-of-00003.safetensors", shards[1].clone()),
+        ],
+    )?;
+    let catalog = scan_hub(directory.path(), &hub)?;
+    let rows = search(&catalog, "state:triage")?;
+    assert_eq!(rows.total, 1);
+    assert_eq!(rows.rows[0].shard_count, 2);
+    assert!(rows.rows[0].triage);
+    Ok(())
+}
+
+#[test]
+fn a_weight_map_groups_shards_the_naming_convention_would_miss() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let shards = llm_shards();
+    let index = br#"{"metadata":{},"weight_map":{"model.layers.0.self_attn.q_proj.weight":"part-a.safetensors","model.layers.1.self_attn.q_proj.weight":"part-b.safetensors","lm_head.weight":"part-c.safetensors"}}"#.to_vec();
+    hf_cache_repo(
+        &hub,
+        "Qwen",
+        "Qwen3-Mapped",
+        &[
+            ("model.safetensors.index.json", index),
+            ("part-a.safetensors", shards[0].clone()),
+            ("part-b.safetensors", shards[1].clone()),
+            ("part-c.safetensors", shards[2].clone()),
+        ],
+    )?;
+    let catalog = scan_hub(directory.path(), &hub)?;
+    let rows = search(&catalog, "")?;
+    assert_eq!(rows.total, 1, "the index document names the pieces");
+    assert_eq!(rows.rows[0].shard_count, 3);
+    assert_eq!(rows.rows[0].name, "Qwen3-Mapped");
+    Ok(())
+}
+
+#[test]
+fn two_shard_sets_in_one_directory_are_told_apart_by_stem() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let shards = llm_shards();
+    hf_cache_repo(
+        &hub,
+        "Qwen",
+        "Qwen3-Twins",
+        &[
+            ("model-00001-of-00002.safetensors", shards[0].clone()),
+            ("model-00002-of-00002.safetensors", shards[2].clone()),
+            ("draft-00001-of-00002.safetensors", shards[1].clone()),
+            ("draft-00002-of-00002.safetensors", shards[2].clone()),
+        ],
+    )?;
+    let catalog = scan_hub(directory.path(), &hub)?;
+    let rows = search(&catalog, "")?;
+    assert_eq!(rows.total, 2);
+    let mut names: Vec<&str> = rows.rows.iter().map(|row| row.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["draft", "model"],
+        "two sets at the root are named by stem"
+    );
+    Ok(())
+}

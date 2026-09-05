@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use native_db::Builder;
@@ -7,15 +7,20 @@ use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 
-use hoard_core::{Artifact, ArtifactFormat, ArtifactId, BlobId, EntryId, RepoRowId, Sha256, State};
+use hoard_core::{
+    Artifact, ArtifactFormat, ArtifactId, BlobId, EntryId, RepoRowId, Sha256, State, TensorSummary,
+};
 
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
 use crate::discover::{
     self, DiscoveredEntry, DiscoveredRepo, DiscoveredRevision, NoiseFilter, RevisionName,
 };
 use crate::infer::{self, InferInput, Inference};
-use crate::scan::{InferenceContext, Naming, artifact_name, inference_path};
-use crate::shard::file_name;
+use crate::scan::{
+    InferenceContext, Naming, artifact_name, disambiguate_labels, index_document, inference_path,
+    shard_label,
+};
+use crate::shard::{self, ShardCandidate, ShardSet, file_name};
 use crate::sniff::{self, SniffResult};
 use crate::store::SearchRow;
 
@@ -99,8 +104,37 @@ impl Catalog {
                         ordinal: u32::try_from(ordinal)
                             .map_err(|_| IndexError::Catalog("revision ordinal overflow".into()))?,
                     };
+                    let mut anchors: HashMap<usize, (i64, bool)> = HashMap::new();
+                    let mut members = Vec::new();
                     for prepared in prepare_revision(&context)? {
-                        store_entry(&transaction, &context, prepared, &mut counters)?;
+                        match &prepared.role {
+                            EntryRole::Member { group } => members.push((*group, prepared)),
+                            EntryRole::Anchor(facts) => {
+                                let group = facts.group;
+                                let stored = store_entry(
+                                    &transaction,
+                                    &context,
+                                    prepared,
+                                    None,
+                                    &mut counters,
+                                )?;
+                                if let Some(stored) = stored {
+                                    anchors.insert(group, stored);
+                                }
+                            }
+                            EntryRole::Standalone => {
+                                store_entry(&transaction, &context, prepared, None, &mut counters)?;
+                            }
+                        }
+                    }
+                    for (group, prepared) in members {
+                        store_entry(
+                            &transaction,
+                            &context,
+                            prepared,
+                            anchors.get(&group).copied(),
+                            &mut counters,
+                        )?;
                     }
                     progress(&source.name, counters.entries);
                 }
@@ -111,7 +145,7 @@ impl Catalog {
         let transaction = self.database.rw_transaction()?;
         transaction.insert(Manifest {
             id: 0,
-            format_version: 1,
+            format_version: 2,
             generation: 1,
             scanned_at: jiff::Timestamp::now().to_string(),
             node: node.to_owned(),
@@ -336,8 +370,129 @@ struct PreparedEntry<'a> {
     sniffed: Option<SniffResult>,
     presence: Presence,
     artifact: Option<ArtifactDraft>,
+    role: EntryRole,
     org: Option<String>,
     name: String,
+}
+
+/// One model split across files, as the revision's grouping pass settled it.
+#[derive(Clone)]
+struct GroupFacts {
+    group: usize,
+    label: String,
+    bytes: u64,
+    shard_count: u32,
+    tensors: Option<TensorSummary>,
+    incomplete: bool,
+}
+
+/// Which part one file plays: a file of its own, the shard the artifact rides on, or one
+/// more piece of a model another shard already stands for.
+enum EntryRole {
+    Standalone,
+    Anchor(GroupFacts),
+    Member { group: usize },
+}
+
+/// Everything the per entry pass of one revision reads besides the entry itself.
+struct RevisionPlan<'a> {
+    naming: Naming<'a>,
+    context: InferenceContext,
+}
+
+/// The shard sets of one revision whose anchor was read and holds an artifact, addressed by
+/// entry position. Members of any other set stay the files they are.
+fn shard_sets(entries: &[DiscoveredEntry], sniffed: &[Option<SniffResult>]) -> Vec<ShardSet> {
+    let documents: HashMap<usize, serde_json::Value> = entries
+        .iter()
+        .zip(sniffed)
+        .enumerate()
+        .filter(|(_, (entry, _))| shard::is_index_document(file_name(&entry.rel_path)))
+        .filter_map(|(position, (entry, result))| {
+            index_document(entry, result.as_ref()).map(|document| (position, document))
+        })
+        .collect();
+    let mut positions = Vec::new();
+    let mut candidates = Vec::new();
+    for (position, (entry, result)) in entries.iter().zip(sniffed).enumerate() {
+        let readable = result
+            .as_ref()
+            .is_some_and(|result| result.lfs_pointer.is_none());
+        if !readable || !shard::is_shard_file(file_name(&entry.rel_path)) {
+            continue;
+        }
+        let mut candidate = ShardCandidate::new(entry.rel_path.as_str());
+        if let Some(document) = documents.get(&position) {
+            candidate = candidate.with_index_document(document);
+        }
+        positions.push(position);
+        candidates.push(candidate);
+    }
+    shard::group_shards(&candidates)
+        .into_iter()
+        .map(|set| ShardSet {
+            members: set
+                .members
+                .iter()
+                .map(|member| positions[*member])
+                .collect(),
+            ..set
+        })
+        .filter(|set| {
+            sniffed[set.anchor()]
+                .as_ref()
+                .is_some_and(|result| result.format.is_artifact())
+        })
+        .collect()
+}
+
+/// One artifact per set, described by the union of its shard headers and weighing them all.
+fn group_facts(
+    sets: &[ShardSet],
+    sniffed: &[Option<SniffResult>],
+    presences: &[Presence],
+    naming: &Naming<'_>,
+) -> Vec<GroupFacts> {
+    let mut labels: Vec<String> = sets.iter().map(|set| shard_label(naming, set)).collect();
+    let stems: Vec<String> = sets.iter().map(|set| set.stem.clone()).collect();
+    disambiguate_labels(&mut labels, &stems);
+    sets.iter()
+        .zip(labels)
+        .enumerate()
+        .map(|(group, (set, label))| {
+            let parts: Vec<&TensorSummary> = set
+                .members
+                .iter()
+                .filter_map(|member| sniffed[*member].as_ref())
+                .filter_map(|result| result.tensors.as_ref())
+                .collect();
+            GroupFacts {
+                group,
+                label,
+                bytes: set
+                    .members
+                    .iter()
+                    .map(|member| presences[*member].size)
+                    .sum(),
+                shard_count: u32::try_from(set.members.len()).unwrap_or(u32::MAX),
+                tensors: (!parts.is_empty()).then(|| shard::merge_tensor_summaries(&parts)),
+                incomplete: set.is_incomplete(),
+            }
+        })
+        .collect()
+}
+
+fn entry_roles(count: usize, sets: &[ShardSet], facts: &[GroupFacts]) -> Vec<EntryRole> {
+    let mut roles: Vec<EntryRole> = (0..count).map(|_| EntryRole::Standalone).collect();
+    for (set, facts) in sets.iter().zip(facts) {
+        for member in &set.members {
+            roles[*member] = match *member == set.anchor() {
+                true => EntryRole::Anchor(facts.clone()),
+                false => EntryRole::Member { group: facts.group },
+            };
+        }
+    }
+    roles
 }
 
 /// Sniffs a whole revision in parallel, then prepares every file against the revision's own
@@ -346,6 +501,11 @@ struct PreparedEntry<'a> {
 fn prepare_revision<'a>(context: &EntryContext<'a>) -> Result<Vec<PreparedEntry<'a>>> {
     let entries = &context.revision.entries;
     let sniffed: Vec<Option<SniffResult>> = entries.par_iter().map(sniff_entry).collect();
+    let presences: Vec<Presence> = entries
+        .iter()
+        .zip(&sniffed)
+        .map(|(entry, result)| Presence::of(entry, result.as_ref()))
+        .collect();
     let inference_context = InferenceContext::from_results(
         entries.iter().zip(&sniffed).filter_map(|(entry, result)| {
             result
@@ -353,24 +513,40 @@ fn prepare_revision<'a>(context: &EntryContext<'a>) -> Result<Vec<PreparedEntry<
                 .map(|result| (entry.rel_path.as_str(), result))
         }),
     );
-    let artifacts = sniffed
+    let sets = shard_sets(entries, &sniffed);
+    let grouped: HashSet<usize> = sets
         .iter()
-        .filter(|result| {
-            result
-                .as_ref()
-                .is_some_and(|result| result.format.is_artifact())
+        .flat_map(|set| set.members.iter().copied())
+        .collect();
+    let standalone = sniffed
+        .iter()
+        .enumerate()
+        .filter(|(position, result)| {
+            !grouped.contains(position)
+                && result
+                    .as_ref()
+                    .is_some_and(|result| result.format.is_artifact())
         })
         .count();
-    let naming = Naming {
-        repo: &context.repo.repo,
-        root_path: &context.repo.root_path,
-        kind: context.kind,
-        single: artifacts <= 1,
+    let plan = RevisionPlan {
+        naming: Naming {
+            repo: &context.repo.repo,
+            root_path: &context.repo.root_path,
+            kind: context.kind,
+            single: standalone + sets.len() <= 1,
+        },
+        context: inference_context,
     };
+    let facts = group_facts(&sets, &sniffed, &presences, &plan.naming);
+    let roles = entry_roles(entries.len(), &sets, &facts);
     entries
         .par_iter()
         .zip(sniffed.into_par_iter())
-        .map(|(entry, sniffed)| prepare_entry(entry, sniffed, &naming, &inference_context))
+        .zip(presences.into_par_iter())
+        .zip(roles.into_par_iter())
+        .map(|(((entry, sniffed), presence), role)| {
+            prepare_entry(entry, sniffed, presence, role, &plan)
+        })
         .collect()
 }
 
@@ -388,35 +564,52 @@ fn sniff_entry(entry: &DiscoveredEntry) -> Option<SniffResult> {
 fn prepare_entry<'a>(
     entry: &'a DiscoveredEntry,
     sniffed: Option<SniffResult>,
-    naming: &Naming<'_>,
-    context: &InferenceContext,
+    presence: Presence,
+    role: EntryRole,
+    plan: &RevisionPlan<'_>,
 ) -> Result<PreparedEntry<'a>> {
-    let presence = Presence::of(entry, sniffed.as_ref());
     let format = sniffed
         .as_ref()
         .map_or(ArtifactFormat::Unknown, |result| result.format);
-    let creates_artifact = format.is_artifact() && !presence.lfs_pointer;
-    let path = inference_path(naming.root_path, &entry.rel_path, entry.abs_path.as_deref());
+    let creates_artifact =
+        format.is_artifact() && !presence.lfs_pointer && !matches!(role, EntryRole::Member { .. });
+    let path = inference_path(
+        plan.naming.root_path,
+        &entry.rel_path,
+        entry.abs_path.as_deref(),
+    );
     let file = file_name(&entry.rel_path);
+    let (size, tensors, label) = match &role {
+        EntryRole::Anchor(facts) => (
+            facts.bytes,
+            facts.tensors.as_ref(),
+            Some(facts.label.as_str()),
+        ),
+        EntryRole::Standalone | EntryRole::Member { .. } => (
+            presence.size,
+            sniffed.as_ref().and_then(|result| result.tensors.as_ref()),
+            None,
+        ),
+    };
     let artifact = creates_artifact
         .then(|| -> Result<ArtifactDraft> {
-            let mut input = InferInput::new(format, &path, file, presence.size);
+            let mut input = InferInput::new(format, &path, file, size);
+            input.tensors = tensors;
             if let Some(sniffed) = &sniffed {
-                input.tensors = sniffed.tensors.as_ref();
                 input.config = sniffed
                     .config
                     .as_ref()
-                    .or_else(|| context.config_for(&entry.rel_path));
+                    .or_else(|| plan.context.config_for(&entry.rel_path));
             }
-            input.frontmatter = context.frontmatter();
+            input.frontmatter = plan.context.frontmatter();
             Ok(ArtifactDraft {
                 identity: identity(entry, &presence)?,
                 inference: infer::infer(&input),
-                card: context.card().map(str::to_owned),
+                card: plan.context.card().map(str::to_owned),
             })
         })
         .transpose()?;
-    let (org, name) = artifact_name(naming, &entry.rel_path, None);
+    let (org, name) = artifact_name(&plan.naming, &entry.rel_path, label);
     Ok(PreparedEntry {
         discovered: entry,
         artifact,
@@ -424,6 +617,7 @@ fn prepare_entry<'a>(
         org,
         presence,
         sniffed,
+        role,
     })
 }
 
@@ -456,26 +650,37 @@ struct EntryContext<'a> {
     ordinal: u32,
 }
 
+/// Writes one file. A shard member carries no artifact of its own: it is handed the
+/// artifact and the triage verdict its anchor already established.
 fn store_entry(
     transaction: &RwTransaction<'_>,
     context: &EntryContext<'_>,
     prepared: PreparedEntry<'_>,
+    anchor: Option<(i64, bool)>,
     counters: &mut Counters,
-) -> Result<()> {
+) -> Result<Option<(i64, bool)>> {
     let entry_id = next_id(&mut counters.entries)?;
     let record = match prepared.artifact.as_ref() {
         Some(draft) => Some(store_artifact(transaction, &prepared, draft, counters)?),
         None => None,
     };
-    let state = entry_state(&prepared, record.as_ref(), context.triage);
-    let artifact_id = record.as_ref().map(|record| record.id);
+    let stored = match &record {
+        Some(record) => Some((
+            record.id,
+            artifact_triage(&prepared, record, context.triage),
+        )),
+        None => anchor,
+    };
+    let triage = stored.is_some_and(|(_, triage)| triage);
+    let state = entry_state(&prepared, triage);
+    let artifact_id = stored.map(|(id, _)| id);
     if let Some(record) = record {
         transaction.insert(SearchEntry {
             entry_id,
             artifact_id: record.id,
             repo_id: context.repo_id,
             preference: preference(state, prepared.presence.present()),
-            row: search_row(entry_id, context, &prepared, &record, state),
+            row: search_row(entry_id, context, &prepared, &record, state, triage),
             git_sha1: prepared.discovered.git_sha1,
         })?;
         transaction.upsert(record)?;
@@ -498,7 +703,16 @@ fn store_entry(
         mtime: prepared.discovered.stamp.map(|stamp| stamp.mtime),
         inode: prepared.discovered.stamp.map(|stamp| stamp.inode),
     })?;
-    Ok(())
+    Ok(stored)
+}
+
+/// A set that found fewer files than it declares cannot be served whatever its header says.
+fn artifact_triage(prepared: &PreparedEntry<'_>, record: &ArtifactRecord, confidence: f32) -> bool {
+    let incomplete = match &prepared.role {
+        EntryRole::Anchor(facts) => facts.incomplete,
+        EntryRole::Standalone | EntryRole::Member { .. } => false,
+    };
+    record.artifact.needs_triage(confidence) || incomplete
 }
 
 /// The record this entry contributes a path to, counted but not yet written: the caller
@@ -518,7 +732,7 @@ fn store_artifact(
             let record = artifact_record(next_id(&mut counters.artifacts)?, prepared, draft);
             transaction.insert(SearchText {
                 artifact_id: record.id,
-                keys: tensor_keys(prepared.sniffed.as_ref()),
+                keys: tensor_keys(record.tensors.as_ref()),
                 card: draft.card.clone().unwrap_or_default(),
             })?;
             record
@@ -531,28 +745,22 @@ fn store_artifact(
     Ok(artifact)
 }
 
-fn tensor_keys(sniffed: Option<&SniffResult>) -> String {
-    sniffed
-        .and_then(|result| result.tensors.as_ref())
-        .map_or_else(String::new, |summary| {
-            summary
-                .key_prefixes
-                .iter()
-                .map(|(key, _)| key.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
+fn tensor_keys(tensors: Option<&TensorSummary>) -> String {
+    tensors.map_or_else(String::new, |summary| {
+        summary
+            .key_prefixes
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
 }
 
-fn entry_state(
-    prepared: &PreparedEntry<'_>,
-    artifact: Option<&ArtifactRecord>,
-    triage: f32,
-) -> State {
-    match (prepared.presence.present(), artifact) {
+fn entry_state(prepared: &PreparedEntry<'_>, triage: bool) -> State {
+    match (prepared.presence.present(), triage) {
         (false, _) => State::Remote,
-        (true, Some(artifact)) if artifact.artifact.needs_triage(triage) => State::Triage,
-        (true, _) => State::Local,
+        (true, true) => State::Triage,
+        (true, false) => State::Local,
     }
 }
 
@@ -570,6 +778,21 @@ fn preference(state: State, present: bool) -> i64 {
 
 fn artifact_record(id: i64, prepared: &PreparedEntry<'_>, draft: &ArtifactDraft) -> ArtifactRecord {
     let inference = &draft.inference;
+    let (tensors, group_bytes, shard_count) = match &prepared.role {
+        EntryRole::Anchor(facts) => (
+            facts.tensors.clone(),
+            Some(facts.bytes),
+            Some(facts.shard_count),
+        ),
+        EntryRole::Standalone | EntryRole::Member { .. } => (
+            prepared
+                .sniffed
+                .as_ref()
+                .and_then(|sniffed| sniffed.tensors.clone()),
+            None,
+            None,
+        ),
+    };
     ArtifactRecord {
         id,
         identity: draft.identity.clone(),
@@ -600,11 +823,10 @@ fn artifact_record(id: i64, prepared: &PreparedEntry<'_>, draft: &ArtifactDraft)
             trigger: inference.trigger.clone(),
             sniff_version: crate::scan::SNIFF_VERSION,
         },
-        tensors: prepared
-            .sniffed
-            .as_ref()
-            .and_then(|sniffed| sniffed.tensors.clone()),
+        tensors,
         evidence: inference.evidence.clone(),
+        group_bytes,
+        shard_count,
     }
 }
 
@@ -614,6 +836,7 @@ fn search_row(
     prepared: &PreparedEntry<'_>,
     record: &ArtifactRecord,
     state: State,
+    triage: bool,
 ) -> SearchRow {
     let artifact = &record.artifact;
     let entry = prepared.discovered;
@@ -631,8 +854,8 @@ fn search_row(
         format: artifact.format,
         precision: artifact.precision.clone(),
         quant: artifact.quant.clone(),
-        size: artifact.size,
-        shard_count: 1,
+        size: record.group_bytes.unwrap_or(artifact.size),
+        shard_count: record.shard_count.unwrap_or(1),
         rank: artifact.rank,
         alpha: artifact.alpha,
         params: artifact.params,
@@ -654,7 +877,7 @@ fn search_row(
             .map(|path| path.to_string_lossy().into_owned()),
         path_count: record.path_count,
         dupe: record.path_count > 1,
-        triage: artifact.needs_triage(context.triage),
+        triage,
         last_used: None,
         repo: context.repo.repo.qualified(),
         repo_id: RepoRowId::new(context.repo_id),

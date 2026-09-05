@@ -51,7 +51,7 @@ impl Catalog {
             directory: directory.to_path_buf(),
         };
         let manifest = catalog.manifest()?;
-        if manifest.format_version != 1 {
+        if manifest.format_version != 2 {
             return Err(IndexError::Catalog(format!(
                 "unsupported format version {}",
                 manifest.format_version
