@@ -1,13 +1,24 @@
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
+
+use hoard_core::{
+    Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, EntryId, Evidence,
+    EvidenceSource, Precision, RepoId, RepoRowId, RepoType, Role, Sha256, State, SubRole,
+    TensorSample, TensorSummary,
+};
 
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
 
 use crate::error::{IndexError, Result};
+use crate::store::SearchRow;
 
-use super::models::{ArtifactRecord, ArtifactRecordKey, Entry, SearchEntry, Source};
+use super::models::{
+    ArtifactRecord, ArtifactRecordKey, Entry, Manifest, Repository, Revision, SearchEntry,
+    SearchText, Source,
+};
 use super::{Catalog, SearchRequest, models};
 
 fn running_as_root() -> bool {
@@ -757,25 +768,208 @@ fn path_counts_are_final_in_the_stored_row() -> Result<()> {
     Ok(())
 }
 
+fn frozen_encoding<T: native_model::Model>(value: &T) -> Result<String> {
+    native_model::encode(value)
+        .map(hex::encode)
+        .map_err(|error| IndexError::Catalog(error.to_string()))
+}
+
+fn frozen_source_config() -> SourceConfig {
+    SourceConfig {
+        name: "frozen".to_owned(),
+        path: PathBuf::from("/frozen/source"),
+        kind: SourceKind::HfCache,
+        include: vec!["**/*.safetensors".to_owned()],
+        exclude: vec!["**/*.tmp".to_owned()],
+        follow_symlinks: true,
+        repo_per_folder: false,
+    }
+}
+
+fn frozen_artifact() -> Artifact {
+    Artifact {
+        id: ArtifactId::new(7),
+        blob: BlobId::new(9),
+        sha256: Some(Sha256::from_bytes([3; 32])),
+        size: 4096,
+        format: ArtifactFormat::Gguf,
+        role: Role::Lora,
+        sub_role: Some(SubRole::Ipa),
+        role_confidence: 0.875,
+        base: Base::new("sdxl 1.0"),
+        base_label: Some("SDXL 1.0".to_owned()),
+        base_confidence: 0.625,
+        precision: Some(Precision::new("fp16")),
+        quant: Some("q4_k_m".to_owned()),
+        rank: Some(16),
+        alpha: Some(8.0),
+        params: Some(1_234_567),
+        context: Some(8192),
+        trigger: Some("frozen style".to_owned()),
+        sniff_version: 3,
+    }
+}
+
+fn frozen_row() -> SearchRow {
+    SearchRow {
+        artifact_id: ArtifactId::new(7),
+        blob_id: BlobId::new(9),
+        blob_sha256: Some(Sha256::from_bytes([3; 32])),
+        role: Role::Lora,
+        sub_role: Some(SubRole::Ipa),
+        role_confidence: 0.875,
+        org: Some("frozen-org".to_owned()),
+        name: "frozen.safetensors".to_owned(),
+        base: Base::new("sdxl 1.0"),
+        base_label: Some("SDXL 1.0".to_owned()),
+        format: ArtifactFormat::Gguf,
+        precision: Some(Precision::new("fp16")),
+        quant: Some("q4_k_m".to_owned()),
+        size: 4096,
+        shard_count: 3,
+        rank: Some(16),
+        alpha: Some(8.0),
+        params: Some(1_234_567),
+        context: Some(8192),
+        revision: "main".to_owned(),
+        revision_sha: Some(CommitSha::from_bytes([5; 20])),
+        node: "frozen-node".to_owned(),
+        state: State::Triage,
+        pull_progress: Some(0.5),
+        trigger: Some("frozen style".to_owned()),
+        path: "unet/frozen.safetensors".to_owned(),
+        abs_path: Some("/frozen/source/unet/frozen.safetensors".to_owned()),
+        path_count: 2,
+        dupe: true,
+        triage: true,
+        last_used: Some(
+            jiff::Timestamp::from_second(1_767_225_600).expect("frozen timestamp is in range"),
+        ),
+        repo: "datasets/frozen-org/frozen".to_owned(),
+        repo_id: RepoRowId::new(11),
+        entry_id: EntryId::new(13),
+        source: Some("frozen".to_owned()),
+        is_symlink: true,
+        lfs_pointer: true,
+    }
+}
+
 #[test]
-fn search_entry_encoding_is_frozen_until_format_version_is_bumped() -> Result<()> {
-    let (_directory, catalog) = fixture()?;
-    let read = catalog.database.r_transaction()?;
-    let mut rows: Vec<SearchEntry> = read
-        .scan()
-        .primary()?
-        .all()?
-        .collect::<native_db::db_type::Result<_>>()?;
-    rows.sort_by_key(|entry| entry.entry_id);
-    let mut first = rows
-        .into_iter()
-        .next()
-        .ok_or_else(|| IndexError::Catalog("no row".into()))?;
-    first.row.abs_path = None;
-    first.row.path = "fixed".into();
-    let encoded =
-        native_model::encode(&first).map_err(|error| IndexError::Catalog(error.to_string()))?;
-    insta::assert_snapshot!(hex::encode(encoded));
+fn source_encoding_is_frozen() -> Result<()> {
+    let value = Source {
+        name: "frozen".to_owned(),
+        config: frozen_source_config(),
+        resolved_kind: SourceKind::Git,
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn repository_encoding_is_frozen() -> Result<()> {
+    let value = Repository {
+        id: 11,
+        source: "frozen".to_owned(),
+        repo: RepoId::new(RepoType::Datasets, Some("frozen-org".to_owned()), "frozen"),
+        root_path: "/frozen/source/datasets--frozen-org--frozen".to_owned(),
+        default_ref: "main".to_owned(),
+        revisions: vec![Revision {
+            sha: Some(CommitSha::from_bytes([5; 20])),
+            refs: vec!["refs/heads/main".to_owned()],
+        }],
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn artifact_record_encoding_is_frozen() -> Result<()> {
+    let value = ArtifactRecord {
+        id: 7,
+        identity: "sha256:0303030303030303".to_owned(),
+        artifact: frozen_artifact(),
+        tensors: Some(TensorSummary {
+            tensor_count: 2,
+            params: 1_234_567,
+            dtypes: BTreeMap::from([("F16".to_owned(), 2_u32)]),
+            key_prefixes: vec![("lora_unet".to_owned(), 2_u32)],
+            samples: vec![TensorSample {
+                name: "lora_unet_down.lora_down.weight".to_owned(),
+                dtype: "F16".to_owned(),
+                shape: vec![16, 768],
+            }],
+            metadata: BTreeMap::from([("ss_network_dim".to_owned(), "16".to_owned())]),
+        }),
+        evidence: vec![
+            Evidence::new("role", "lora", EvidenceSource::Tensor, 0.95)
+                .with_detail("lora_unet_ prefix on 264 tensors"),
+        ],
+        path_count: 2,
+        group_bytes: Some(8192),
+        shard_count: Some(3),
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn entry_encoding_is_frozen() -> Result<()> {
+    let value = Entry {
+        id: 13,
+        repo_id: 11,
+        revision: 1,
+        rel_path: "unet/frozen.safetensors".to_owned(),
+        abs_path: Some("/frozen/source/unet/frozen.safetensors".to_owned()),
+        size: 4096,
+        artifact_id: Some(7),
+        state: State::Triage,
+        lfs_pointer: true,
+        is_symlink: true,
+        mtime: Some(1_767_225_600),
+        inode: Some(424_242),
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn search_entry_encoding_is_frozen() -> Result<()> {
+    let value = SearchEntry {
+        entry_id: 13,
+        artifact_id: 7,
+        repo_id: 11,
+        row: frozen_row(),
+        preference: 19,
+        git_sha1: Some(CommitSha::from_bytes([7; 20])),
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn search_text_encoding_is_frozen() -> Result<()> {
+    let value = SearchText {
+        artifact_id: 7,
+        keys: "lora_unet lora_te".to_owned(),
+        card: "# Frozen\n\nA synthetic card.\n".to_owned(),
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn manifest_encoding_is_frozen() -> Result<()> {
+    let value = Manifest {
+        id: 0,
+        format_version: 2,
+        generation: 5,
+        scanned_at: "2026-09-05T00:00:00Z".to_owned(),
+        node: "frozen-node".to_owned(),
+        counts: vec![("entries".to_owned(), 13)],
+        search_directory: Some("search-v1-1767225600000000000".to_owned()),
+        search_generation: 5,
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
     Ok(())
 }
 

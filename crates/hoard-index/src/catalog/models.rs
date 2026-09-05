@@ -23,7 +23,6 @@ pub(super) struct Source {
 pub(super) struct Repository {
     #[primary_key]
     pub(super) id: i64,
-    #[secondary_key]
     pub(super) source: String,
     pub(super) repo: RepoId,
     pub(super) root_path: String,
@@ -61,7 +60,6 @@ pub(super) struct SearchEntry {
     pub(super) entry_id: i64,
     #[secondary_key]
     pub(super) artifact_id: i64,
-    #[secondary_key]
     pub(super) repo_id: i64,
     pub(super) row: SearchRow,
     pub(super) preference: i64,

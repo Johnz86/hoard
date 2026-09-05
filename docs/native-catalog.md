@@ -97,9 +97,10 @@ O(A + K log K), where K is offset plus limit. Deep pagination and broad queries
 still require memory proportional to matching artifacts. This needs measurement
 before a large-scale adoption decision; no throughput claim is made here.
 
-Tantivy uses one writer thread with a 32 MiB indexing budget. Existing filesystem
-discovery still materializes a source's repository/entry list; the new sniffing and
-write stage does not add an unbounded whole-source batch.
+Tantivy uses one writer thread with a 32 MiB indexing budget. A source is written in one
+redb transaction, so nothing of a source is durable until it finishes and a killed scan
+removes the directory; the whole-revision sniff is bounded by a revision's file count, not
+by the source.
 
 ## Measured
 
@@ -149,6 +150,16 @@ investigated further.
   eviction, gossip, watch and CLI callers to native transactions.
 - Path identities render through to_string_lossy; discovery currently never yields two
   distinct non-UTF-8 paths, and a byte-exact identity must land with the identity redesign.
+- Bound the search collector: it materializes one candidate per matching artifact per
+  segment, so the empty query costs memory proportional to the catalog on every call;
+  replace it with a bounded heap keyed on (size, artifact id) plus an exact distinct count
+  before wiring search into serve.
+- Stop persisting SearchRow as a record: ids serialize as prefixed strings and hashes as
+  hex, artifact-wide fields are copied per entry, and name/org are per entry. Store a narrow
+  entry record and build the row at the edge.
+- Allocate ids across scans: repository, artifact and entry ids restart at 1 per scan and
+  generation is fixed at 1, so a second scan into one catalog is impossible until ids come
+  from a persisted high-water mark or from content.
 - Add mutations, incremental scan/retraction and a transactional search outbox with
   replay. This slice creates complete fresh catalogs; it does not update them.
 - Implement user overrides/noise, shelves, loadouts, settings, projections, jobs,

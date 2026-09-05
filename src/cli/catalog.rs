@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -117,8 +118,9 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
 }
 
 fn report<T: serde::Serialize>(value: &T) -> Result<()> {
-    tracing::info!("{}", serde_json::to_string_pretty(value)?);
-    Ok(())
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{}", serde_json::to_string_pretty(value)?).context("writing results")?;
+    out.flush().context("flushing results")
 }
 
 #[cfg(test)]
