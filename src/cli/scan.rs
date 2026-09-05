@@ -56,7 +56,7 @@ pub async fn run(context: Context, source: Option<String>, hash: HashPolicy) -> 
     Ok(())
 }
 
-fn progress_bar() -> Arc<ProgressBar> {
+pub(super) fn progress_bar() -> Arc<ProgressBar> {
     let bar = ProgressBar::new_spinner();
     if let Ok(style) = ProgressStyle::with_template("{spinner} {msg}") {
         bar.set_style(style);

@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use clap::Subcommand;
-use indicatif::ProgressBar;
 
 use hoard_index::catalog::{Catalog, SearchRequest};
+
+use super::scan::progress_bar;
 
 #[derive(Debug, Subcommand)]
 pub enum CatalogCommand {
@@ -52,15 +52,19 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
     match command {
         CatalogCommand::Scan { directory, source } => {
             let mut config = super::node::load_config(config_path)?;
-            if let Some(name) = source {
-                let selected = config
-                    .index
-                    .source(&name)
-                    .cloned()
-                    .with_context(|| format!("no source named {name:?}"))?;
-                config.index.sources = vec![selected];
+            if let Some(name) = source.as_deref()
+                && config.index.source(name).is_none()
+            {
+                anyhow::bail!("no source named {name} in hoard.toml");
             }
-            let progress = progress_bar("Scanning native catalog");
+            if let Some(name) = source.as_deref() {
+                config
+                    .index
+                    .sources
+                    .retain(|candidate| candidate.name == name);
+            }
+            let progress = progress_bar();
+            progress.set_message("Scanning native catalog");
             let catalog = Catalog::scan_sources(
                 &directory,
                 &config.node.name,
@@ -74,7 +78,7 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
                 progress.set_message(format!("Building Tantivy index: {count} entries"));
             })?;
             progress.finish_and_clear();
-            tracing::info!("{}", serde_json::to_string_pretty(&catalog.status()?)?);
+            report(&catalog.status()?)?;
         }
         CatalogCommand::Search {
             directory,
@@ -88,16 +92,17 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
                 limit,
                 offset,
             })?;
-            tracing::info!("{}", serde_json::to_string_pretty(&result)?);
+            report(&result)?;
         }
         CatalogCommand::Rebuild { directory } => {
             let catalog = Catalog::open(&directory)?;
-            let progress = progress_bar("Rebuilding Tantivy index");
+            let progress = progress_bar();
+            progress.set_message("Rebuilding Tantivy index");
             catalog.rebuild_search(|count| {
                 progress.set_message(format!("Rebuilding Tantivy index: {count} entries"));
             })?;
             progress.finish_and_clear();
-            tracing::info!("{}", serde_json::to_string_pretty(&catalog.status()?)?);
+            report(&catalog.status()?)?;
         }
         CatalogCommand::Status { directory } => {
             let mut catalog = Catalog::open(&directory)?;
@@ -105,17 +110,15 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
                 catalog.check_integrity()?,
                 "native database integrity check failed"
             );
-            tracing::info!("{}", serde_json::to_string_pretty(&catalog.status()?)?);
+            report(&catalog.status()?)?;
         }
     }
     Ok(())
 }
 
-fn progress_bar(message: &'static str) -> ProgressBar {
-    let progress = ProgressBar::new_spinner();
-    progress.enable_steady_tick(Duration::from_millis(100));
-    progress.set_message(message);
-    progress
+fn report<T: serde::Serialize>(value: &T) -> Result<()> {
+    tracing::info!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -143,12 +146,5 @@ mod tests {
             command: CatalogCommand::Search { query, limit: 12, offset: 3, .. }
         } if query == "role:lora"));
         Ok(())
-    }
-
-    #[test]
-    fn progress_bar_starts_empty() {
-        let progress = progress_bar("test");
-        assert_eq!(progress.position(), 0);
-        progress.finish_and_clear();
     }
 }
