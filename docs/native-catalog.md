@@ -52,7 +52,7 @@ the complete trigger string; they do not implement legacy substring matching.
 - Existing HF-cache, Git and loose-source discovery feeds the native store directly.
 - Header sniffing and inference reuse the existing Rust implementations. A revision's
   documents (README, configs, index files) are sniffed first and give every later unit its
-  inference context; each shard set and each chunk of 256 standalone files is then sniffed
+  inference context; each shard set and each chunk of 1,024 standalone files is then sniffed
   in parallel, prepared and committed as its own transaction, so memory grows with a unit,
   not with a source. Whether a repository names its single artifact is decided from file
   names before the weights are read.
@@ -167,39 +167,63 @@ on disk, searching in 215 to 336 ms; the 1M scan was killed after 52 minutes rou
 eighth of the way in. The SQLite measurement was run once to establish this baseline and
 its harness was removed; SQLite is the store being replaced, not a peer to keep measuring.
 
-| measure | native 100k | native 1M |
-| --- | --- | --- |
-| scan wall | 5.226065725s | 57.77687964s |
-| peak rss growth during scan | 198 MB | 1560 MB |
-| rebuild wall | 596.949484ms | 4.40112116s |
-| peak rss growth during rebuild | 34 MB | 0 MB |
-| on disk, apparent | 518 MB | 4138 MB |
-| on disk, allocated | 288 MB | 2983 MB |
-| search offset 0 | 10.577049ms | 189.855663ms |
-| search deep offset | 9.144823ms | 197.536743ms |
-| search filtered | 7.200678ms | 177.39202ms |
+| measure | 100k before wave 2 | native 100k | 1M before wave 2 | native 1M |
+| --- | --- | --- | --- | --- |
+| scan wall | 5.226065725s | 5.900763157s | 57.77687964s | 75.282972971s |
+| peak rss growth during scan | 198 MB | 292 MB | 1560 MB | 842 MB |
+| rebuild wall | 596.949484ms | 440.388181ms | 4.40112116s | 5.294884595s |
+| peak rss growth during rebuild | 34 MB | 54 MB | 0 MB | 0 MB |
+| on disk, apparent | 518 MB | 261 MB | 4138 MB | 4138 MB |
+| on disk, allocated | 288 MB | 243 MB | 2983 MB | 2476 MB |
+| search offset 0 | 10.577049ms | 12.251924ms | 189.855663ms | 174.943704ms |
+| search deep offset | 9.144823ms | 9.106715ms | 197.536743ms | 190.89815ms |
+| search filtered | 7.200678ms | 7.238805ms | 177.39202ms | 168.239764ms |
+
+Allocated disk is `du` over the output directory; apparent disk sums file lengths, and redb
+grows `catalog.redb` in regions, so the apparent number is quantised and the allocated one
+is what the disk actually loses.
+
+Storage by table at 100k, largest stored bytes first, as `catalog status` now reports it.
+native_db names a table `{model id}_{version}_{key}`:
+
+- `8_1_artifact_id`, the `ArtifactDetail` primary table: 100,000 rows, 52,104,170 stored
+  bytes, 37,401,770 fragmented. It holds one tensor summary and one evidence vector each.
+- `3_1_id`, the `ArtifactRecord` primary table: 100,000 rows, 30,234,460 stored,
+  20,628,632 fragmented.
+- `7_1_id`, the `Entry` primary table: 100,000 rows, 24,757,780 stored, 25,468,496
+  fragmented.
+- `5_1_artifact_id`, the `SearchText` primary table: 100,000 rows, 5,415,625 stored,
+  6,163,747 fragmented.
+- `3_1_identity`, the unique identity index on `ArtifactRecord`: 100,000 rows, 800,000
+  stored, 15,168,025 fragmented.
+
+The 1M catalog keeps that order and those ratios: 500 MB stored against 354 MB fragmented
+for `ArtifactDetail`, 294 against 253 for `ArtifactRecord`, 240 against 244 for `Entry`,
+52 against 59 for `SearchText`, and 8 against 143 for the identity index.
 
 Thresholds at 1M entries, absolute now that there is no peer left to compare against: peak
 RSS growth under 2 GB, allocated disk under 1.5 GB, deep-offset search under 500 ms,
 rebuild no slower than the scan.
 
-Verdict: peak RSS growth under 2 GB is met, 1560 MB at 1M and 198 MB at 100k, against
-8533 MB and 958 MB before the revision was split into units; the scan now holds one shard
-set or one chunk of 256 files at a time instead of a whole source, and pays 57.8 s for it
-against 37.9 s. Deep-offset search under 500 ms is met, 197 ms at 1M. Rebuild no slower
-than the scan is met, 4.4 s against 57.8 s. Allocated disk under 1.5 GB is missed, and
-missed worse than before: 2983 MB at 1M against 2739 MB for the whole-source scan, 2941 MB
-of it `catalog.redb` and the rest Tantivy. Two things ate the narrowing. The synthetic tree
-is one artifact per file with no shard set and no shared path, so the artifact-wide fields
-`SearchRow` used to copy per entry were never copied more than once here and dropping them
-saved nothing this benchmark can show; against that, splitting the tensor summary and
-evidence out of `ArtifactRecord` added a second per-artifact record, one million more keyed
-rows, and the scan now commits about 3,900 transactions per million entries instead of one,
-each writing a fresh path through every B-tree it touches. This is a go for continuing the
-replacement: memory, search latency and rebuild time all clear their thresholds and the
-disk miss is a storage-layout problem with named causes, to be settled by a per-entry
-record that stops repeating its revision, repository and absolute path and by measuring a
-tree with shared artifacts, not by anything redb or Tantivy does.
+Verdict: peak RSS growth under 2 GB is met with room to spare, 842 MB at 1M against 1560 MB
+before this wave; capping redb's page cache at 256 MB, where its default is 1 GiB, is most
+of that, and batching the artifact sweep is the rest. Deep-offset search under 500 ms is
+met, 191 ms at 1M. Rebuild no slower than the scan is met, 5.3 s against 75.3 s. The scan
+is 30 percent slower, 75.3 s against 57.8 s, and the cost is named rather than mysterious:
+every artifact a scan writes is now swept through the entry index afterwards so its path
+count is counted rather than remembered, which is what lets a rescan drop an artifact no
+path reaches any more. Allocated disk under 1.5 GB is still missed, 2476 MB at 1M, but the
+miss is measured instead of guessed. Merging the two per-file records and compacting took
+507 MB off the 1M catalog, 17 percent, and the `Entry` primary table is 240 MB of stored
+bytes at 1M, no longer where the space goes. `ArtifactDetail` is: 500 MB stored, more than
+`ArtifactRecord` and `Entry` together, for nothing but tensor samples and evidence. And
+1096 MB of the 2435 MB `catalog.redb` is not stored bytes at all but fragmentation that
+`Database::compact` does not reclaim, worst on the unique identity index, which spends
+143 MB of pages on 8 MB of keys because absolute-path identities arrive in no key order.
+The next two levers are therefore the identity string, which wants to be a fixed-width
+hash rather than a path, and `ArtifactDetail`, whose samples and evidence detail strings
+are carried in full for every artifact; neither is something redb or Tantivy is doing to
+this catalog. This remains a go for continuing the replacement.
 
 ## Remaining replacement work
 

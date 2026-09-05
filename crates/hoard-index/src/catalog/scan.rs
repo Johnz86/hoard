@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use native_db::Database;
 use native_db::transaction::RwTransaction;
-use native_db::{Builder, Database};
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
@@ -29,7 +29,7 @@ use super::models::{
 };
 use crate::error::{IndexError, Result};
 
-use super::{Catalog, models};
+use super::{Catalog, builder, models};
 
 impl Catalog {
     /// Creates a fresh native catalog directly from configured sources, without opening SQLite.
@@ -94,7 +94,7 @@ impl Catalog {
     /// Claims a fresh directory, leaving nothing behind if the database cannot be created.
     fn create(directory: PathBuf) -> Result<Self> {
         std::fs::create_dir(&directory)?;
-        match Builder::new().create(models()?, directory.join("catalog.redb")) {
+        match builder().create(models()?, directory.join("catalog.redb")) {
             Ok(database) => Ok(Self {
                 database,
                 directory,
@@ -320,51 +320,61 @@ impl Catalog {
     /// Recounts, for every artifact this walk touched, how many present paths reach it, and
     /// deletes the artifact and everything hanging off it once none does. A model split
     /// across shards is reached once per complete copy of its files, not once per file.
+    /// The sweep commits in batches, because a fresh scan touches every artifact it wrote.
     fn sweep_artifacts(&self, touched: &HashSet<i64>) -> Result<()> {
-        let transaction = self.database.rw_transaction()?;
-        for id in touched {
-            let referencing: Vec<Entry> = transaction
-                .scan()
-                .secondary::<Entry>(EntryKey::artifact_id)?
-                .start_with(Some(*id))?
-                .collect::<native_db::db_type::Result<_>>()?;
-            let Some(record) = transaction.get().primary::<ArtifactRecord>(*id)? else {
-                continue;
-            };
-            let present = referencing
-                .iter()
-                .filter(|entry| entry.state != State::Remote)
-                .count();
-            let shards = usize::try_from(record.shard_count.unwrap_or(1))
-                .unwrap_or(1)
-                .max(1);
-            match u32::try_from(present.div_ceil(shards)).unwrap_or(u32::MAX) {
-                0 => {
-                    for entry in referencing {
-                        transaction.upsert(Entry {
-                            artifact_id: None,
-                            ..entry
-                        })?;
-                    }
-                    transaction.remove(record)?;
-                    if let Some(detail) = transaction.get().primary::<ArtifactDetail>(*id)? {
-                        transaction.remove(detail)?;
-                    }
-                    if let Some(text) = transaction.get().primary::<SearchText>(*id)? {
-                        transaction.remove(text)?;
-                    }
-                }
-                paths => {
-                    transaction.upsert(ArtifactRecord {
-                        path_count: paths,
-                        ..record
-                    })?;
-                }
+        let ids: Vec<i64> = touched.iter().copied().collect();
+        for batch in ids.chunks(CHUNK) {
+            let transaction = self.database.rw_transaction()?;
+            for id in batch {
+                sweep_artifact(&transaction, *id)?;
             }
+            transaction.commit()?;
         }
-        transaction.commit()?;
         Ok(())
     }
+}
+
+fn sweep_artifact(transaction: &RwTransaction<'_>, id: i64) -> Result<()> {
+    let referencing: Vec<Entry> = transaction
+        .scan()
+        .secondary::<Entry>(EntryKey::artifact_id)?
+        .start_with(Some(id))?
+        .collect::<native_db::db_type::Result<_>>()?;
+    let Some(record) = transaction.get().primary::<ArtifactRecord>(id)? else {
+        return Ok(());
+    };
+    let present = referencing
+        .iter()
+        .filter(|entry| entry.state != State::Remote)
+        .count();
+    let shards = usize::try_from(record.shard_count.unwrap_or(1))
+        .unwrap_or(1)
+        .max(1);
+    match u32::try_from(present.div_ceil(shards)).unwrap_or(u32::MAX) {
+        0 => {
+            for entry in referencing {
+                transaction.upsert(Entry {
+                    artifact_id: None,
+                    ..entry
+                })?;
+            }
+            transaction.remove(record)?;
+            if let Some(detail) = transaction.get().primary::<ArtifactDetail>(id)? {
+                transaction.remove(detail)?;
+            }
+            if let Some(text) = transaction.get().primary::<SearchText>(id)? {
+                transaction.remove(text)?;
+            }
+        }
+        paths if paths != record.path_count => {
+            transaction.upsert(ArtifactRecord {
+                path_count: paths,
+                ..record
+            })?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn shard_count_of(
@@ -776,7 +786,7 @@ pub(super) enum EntryRole {
 }
 
 /// The largest number of standalone files one transaction covers.
-const CHUNK: usize = 256;
+const CHUNK: usize = 1024;
 
 /// Everything the per entry pass of one revision reads besides the entry itself.
 struct RevisionPlan<'a> {

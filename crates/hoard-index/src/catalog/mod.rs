@@ -73,7 +73,7 @@ impl std::fmt::Debug for Catalog {
 impl Catalog {
     /// Opens a completed scan; incomplete scans and unknown format versions are rejected.
     pub fn open(directory: &Path) -> Result<Self> {
-        let database = Builder::new().open(models()?, directory.join("catalog.redb"))?;
+        let database = builder().open(models()?, directory.join("catalog.redb"))?;
         let catalog = Self {
             database,
             directory: directory.to_path_buf(),
@@ -172,6 +172,16 @@ fn redb_error(error: impl std::fmt::Display) -> IndexError {
 fn allocated_bytes(metadata: &std::fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     metadata.blocks() * 512
+}
+
+/// redb's own default page cache is 1 GiB, which is most of what a large scan reports as
+/// resident; the catalog trades that for a quarter of it.
+const CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+pub(super) fn builder() -> Builder {
+    let mut builder = Builder::new();
+    builder.set_cache_size(CACHE_BYTES);
+    builder
 }
 
 fn models() -> Result<&'static Models> {
