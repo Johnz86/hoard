@@ -10,7 +10,7 @@ use tantivy::{DocId, Index, Score, SegmentOrdinal, SegmentReader};
 
 use crate::store::SearchRow;
 
-use super::models::{ArtifactRecord, SearchEntry, SearchText};
+use super::models::{SearchEntry, SearchText};
 use crate::error::{IndexError, Result};
 
 use super::Catalog;
@@ -130,17 +130,7 @@ impl Catalog {
                             hit.entry_id
                         ))
                     })?;
-                let artifact: ArtifactRecord =
-                    snapshot.get().primary(hit.artifact_id)?.ok_or_else(|| {
-                        IndexError::Catalog(format!(
-                            "search references missing artifact {}",
-                            hit.artifact_id
-                        ))
-                    })?;
-                let mut row = entry.row;
-                row.path_count = artifact.path_count;
-                row.dupe = artifact.path_count > 1;
-                Ok(row)
+                Ok(entry.row)
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(SearchPage { total, rows })

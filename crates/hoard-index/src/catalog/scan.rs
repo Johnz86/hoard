@@ -21,7 +21,7 @@ use crate::store::SearchRow;
 
 use super::models::{
     ArtifactRecord, ArtifactRecordKey, Entry, Manifest, Repository, Revision, SearchEntry,
-    SearchText, Source,
+    SearchEntryKey, SearchText, Source,
 };
 use crate::error::{IndexError, Result};
 
@@ -78,12 +78,9 @@ impl Catalog {
                 config: (*source).clone(),
                 resolved_kind: kind,
             })?;
-            transaction.commit()?;
             for repo in discovered.repos() {
                 let repo_id = counters.next_repo()?;
-                let transaction = self.database.rw_transaction()?;
                 transaction.insert(repository(repo_id, &source.name, repo))?;
-                transaction.commit()?;
                 for (ordinal, revision) in repo.revisions.iter().enumerate() {
                     let context = EntryContext {
                         node,
@@ -97,16 +94,15 @@ impl Catalog {
                         ordinal: u32::try_from(ordinal)
                             .map_err(|_| IndexError::Catalog("revision ordinal overflow".into()))?,
                     };
-                    let prepared = prepare_revision(&context)?;
-                    let transaction = self.database.rw_transaction()?;
-                    for prepared in prepared {
+                    for prepared in prepare_revision(&context)? {
                         store_entry(&transaction, &context, prepared, &mut counters)?;
                     }
-                    transaction.commit()?;
                     progress(&source.name, counters.entries);
                 }
             }
+            transaction.commit()?;
         }
+        self.finalize_path_counts()?;
         let transaction = self.database.rw_transaction()?;
         transaction.insert(Manifest {
             id: 0,
@@ -123,6 +119,32 @@ impl Catalog {
             search_directory: None,
             search_generation: 0,
         })?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// A row records how many paths its artifact spans, and the last path is only known once
+    /// every source has been walked, so the shared artifacts are revisited once at the end.
+    fn finalize_path_counts(&self) -> Result<()> {
+        let transaction = self.database.rw_transaction()?;
+        let shared: Vec<ArtifactRecord> = transaction
+            .scan()
+            .primary::<ArtifactRecord>()?
+            .all()?
+            .filter(|record| record.as_ref().is_ok_and(|record| record.path_count > 1))
+            .collect::<native_db::db_type::Result<_>>()?;
+        for record in shared {
+            let entries: Vec<SearchEntry> = transaction
+                .scan()
+                .secondary::<SearchEntry>(SearchEntryKey::artifact_id)?
+                .range(record.id..=record.id)?
+                .collect::<native_db::db_type::Result<_>>()?;
+            for mut entry in entries {
+                entry.row.path_count = record.path_count;
+                entry.row.dupe = true;
+                transaction.upsert(entry)?;
+            }
+        }
         transaction.commit()?;
         Ok(())
     }

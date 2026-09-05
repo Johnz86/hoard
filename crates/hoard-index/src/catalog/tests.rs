@@ -173,6 +173,9 @@ fn duplicate_paths_collapse_after_correlated_entry_filtering() -> Result<()> {
         .ok_or_else(|| IndexError::Catalog("missing fixture artifact".into()))?;
     artifact.path_count = 2;
     transaction.upsert(artifact)?;
+    entry.row.path_count = 2;
+    entry.row.dupe = true;
+    transaction.upsert(entry.clone())?;
     entry.entry_id = 900;
     entry.row.entry_id = hoard_core::EntryId::new(900);
     entry.row.node = "peer".into();
@@ -555,6 +558,36 @@ fn a_revisions_own_readme_and_config_reach_inference() -> Result<()> {
         read.len().primary::<Entry>()?,
         3,
         "every file is still an entry"
+    );
+    Ok(())
+}
+
+#[test]
+fn path_counts_are_final_in_the_stored_row() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("a"))?;
+    fs::create_dir_all(input.join("b"))?;
+    fs::write(input.join("a/same.csv"), "x,y\n1,2\n")?;
+    std::os::unix::fs::symlink(input.join("a/same.csv"), input.join("b/same.csv"))?;
+    let config = IndexConfig {
+        sources: vec![SourceConfig {
+            follow_symlinks: true,
+            ..source(&input, "files")
+        }],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let read = catalog.database.r_transaction()?;
+    let rows: Vec<SearchEntry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|entry| entry.row.path_count == 2 && entry.row.dupe)
     );
     Ok(())
 }
