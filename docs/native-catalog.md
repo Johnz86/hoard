@@ -1,5 +1,13 @@
 # Native catalog implementation status
 
+## Decision
+
+`docs/superpowers/specs/2026-09-05-native-catalog-decision.md` records why this pairing was
+chosen. native_db was preferred over raw Fjall because it already maintains typed records,
+transactions and secondary indexes on redb, so Hoard does not have to own an index
+maintenance layer. Tantivy replaces FTS5 as a disposable search index that is rebuilt from
+the native records alone.
+
 This branch implements an executable native_db/Tantivy filesystem catalog. It is an
 experimental vertical slice, not a complete replacement of Hoard's existing persistent
 layer. The regular `serve`, `scan`, `ls`, mirror and gossip paths still use SQLite.
@@ -21,6 +29,10 @@ cargo run -- catalog status --directory /existing/path/native-catalog
 cargo run -- catalog rebuild --directory /existing/path/native-catalog
 ```
 
+Only one process may open a catalog directory at a time; redb takes an exclusive lock, so
+run `search`, `status` and `rebuild` one after another. A scan that fails removes the
+directory it started; a source whose root is missing is skipped with a warning.
+
 Search uses Tantivy query syntax. Bare words are ANDed; quoted phrases, `AND`, `OR`,
 `NOT`, exact field filters and numeric byte ranges are supported. It does not yet
 compile Hoard's existing search grammar, shelves or compatibility expressions.
@@ -36,8 +48,15 @@ the complete trigger string; they do not implement legacy substring matching.
 ## What is implemented
 
 - Existing HF-cache, Git and loose-source discovery feeds the native store directly.
-- Header sniffing and inference reuse the existing Rust implementations, with up to
-  128 files prepared in a Rayon batch and one transaction per completed batch.
+- Header sniffing and inference reuse the existing Rust implementations. A revision is
+  sniffed in parallel, its shallowest README and nearest `config.json` feed inference
+  exactly as the SQLite scanner does, and the source is written in one transaction.
+- Only weight and dataset formats become artifacts; every file is still an entry record.
+- Unreadable files are recorded as absent, and git-lfs pointer files are recorded as the
+  remote weights they name.
+- Entries whose inference needs triage carry state `triage`.
+- Artifact names and orgs follow the scanner's rules: a single-artifact repository is named
+  by its repository.
 - native_db stores typed sources, repositories, revisions, artifacts, tensor
   summaries, evidence, entries and searchable text. Library types stay inside
   `hoard-index::catalog`; callers use Hoard-owned request and response types.
@@ -84,9 +103,9 @@ write stage does not add an unbounded whole-source batch.
   usage, peer cursors and the associated graph constraints/cascades.
 - Preserve complete repository Git metadata and add stable cross-scan identities.
 - Add full hash scheduling, progressive identities and content deduplication.
-- Port neighboring config/card inference, shard grouping and missing-file policies
-  from the existing scan pipeline. Current native inference uses each file's own
-  header/config/card plus path evidence. Every shard is currently a separate file.
+- Port shard grouping and missing-file policies from the existing scan pipeline. Every
+  shard is currently a separate file.
+- Add a read-only open once redb offers one, so searches can run beside a rebuild.
 - Port the complete Hoard grammar, aliases, local-node resolution, exclusions,
   facets, compatibility, shelf expansion and every sorting mode.
 - Add cleanup for superseded search directories. This slice deliberately keeps old

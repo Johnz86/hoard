@@ -34,6 +34,7 @@ Toolchain: Rust 1.95 stable, edition 2024, workspace resolver 3.
 | Logging | `tracing`, `tracing-subscriber` | 0.1, 0.3 | Structured logs, `RUST_LOG` filtering. |
 | Progress | `indicatif` | 0.18 | Scan, hash and pull progress in the CLI. |
 | Index store | `rusqlite` (bundled), `r2d2_sqlite`, `rusqlite_migration` | 0.40, 0.35, 2.6 | SQLite WAL with FTS5; one writer, pooled readers, versioned migrations. |
+| Native catalog (experimental) | `native_db`, `native_model`, `redb`, `tantivy` | 0.8.2, =0.4.20, 2.6, 0.26 | Typed records with automatic secondary indexes on a single redb file; Tantivy is a rebuildable search index. Only the `hoard catalog` commands use it. |
 | Discovery walk | `ignore`, `globset`, `notify` | 0.4, 0.4, 8.2 | Parallel walker with `.hoardignore`, include/exclude globs, live re-index. |
 | Parallel CPU work | `rayon` | 1.12 | Hashing, header sniffing, inference. |
 | Artifact formats | none (hand-written header readers) | | safetensors and GGUF headers are read directly; see "Not chosen and why". |
@@ -54,7 +55,9 @@ Not chosen and why:
 - `sqlx`: async SQLite goes through a thread pool anyway; `rusqlite` behind `spawn_blocking`
   is smaller and gives FTS5 and `user_version` migrations directly.
 - `git2`: links libgit2; `gix` is pure Rust and read paths are all the index needs.
-- `tantivy`: SQLite FTS5 plus SQL facets is enough for a few hundred thousand artifacts.
+- `tantivy` alone: it is a search index, not a store. It is used beside `native_db` in the
+  experimental catalog; see `docs/superpowers/specs/2026-09-05-native-catalog-decision.md`
+  for why that pairing was chosen over SQLite FTS5 and over Fjall.
 - `gguf-rs`: pulls `clap`, `comfy-table` and a logger into a library.
 - `memmap2`: every mapping constructor is `unsafe`, and the workspace sets
   `unsafe_code = "forbid"`. Headers are read with bounded `File` reads instead, which costs
@@ -234,6 +237,8 @@ mDNS _hoard._tcp -> peers table -> periodic GET /api/v1/peers/digest?since=curso
 ## Storage
 
 - Index: `<data-dir>/hoard.db` (SQLite WAL), recreatable from disk plus peers.
+- Native catalog: any directory given to `hoard catalog scan --directory`, holding
+  `catalog.redb` plus `search-v1-<nanos>/` Tantivy directories. Not written by `serve`.
 - Mirror cache: `<data-dir>/repos/` in the olah layout (`docs/api/hub-compat.md`).
 - Projections: symlinks written by `hoard link` and `hoard apply`, tracked in the index so
   PATHS ON DISK can show `laptop · symlink`.

@@ -21,6 +21,7 @@ speak. Sources: `docs/use-case.md` (brief), `docs/design/ui-spec.md` and
 | 8 | Nodes: discovery, gossip, peer pulls | done | M3 |
 | 9 | Shelves, loadouts, projection, usage | done | M4 Make it usable |
 | 10 | Live index and polish | partial | M4 |
+| 11 | Native catalog (native_db + Tantivy) | partial | experimental |
 
 Tick a phase only when its acceptance check passes and `/hoard-verify` is clean.
 
@@ -39,6 +40,12 @@ on many networks.
 Phase 10 is partial: the `notify` watcher, PyTorch zip key extraction and dataset sniffing
 are in; the TREE and DISK views are not. `docs/design/ui-spec.md` records them as named in
 the proposal but absent from the prototype, so there is no design to build them from.
+
+Phase 11 is an experimental vertical slice behind `hoard catalog`; see
+`docs/native-catalog.md`. It is accepted for its own commands only when a scan of this
+workstation's HuggingFace cache yields the same artifact count, names and triage set as
+`hoard scan`, and when native search answers the exact-field queries the doc lists.
+Converting `serve` and the live store is not scheduled.
 
 ## Goals
 
