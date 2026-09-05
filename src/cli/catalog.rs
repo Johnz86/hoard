@@ -11,9 +11,10 @@ use super::scan::progress_bar;
 
 #[derive(Debug, Subcommand)]
 pub enum CatalogCommand {
-    /// Scan configured sources into a fresh native_db catalog and Tantivy index.
+    /// Scan configured sources into a native catalog; an existing catalog directory is
+    /// rescanned in place.
     Scan {
-        /// A new output directory outside every scanned source.
+        /// A new output directory outside every scanned source, or one already scanned.
         #[arg(long)]
         directory: PathBuf,
         #[arg(long)]
@@ -67,22 +68,40 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
             }
             let progress = progress_bar();
             progress.set_message("Scanning native catalog");
-            let catalog = Catalog::scan_sources(
-                &directory,
-                &config.node.name,
-                &config.index,
-                |phase, count| {
-                    progress.set_message(format!("{phase}: {count} entries"));
-                },
-            )
-            .context("scanning into native catalog")?;
+            let rescanned = directory.join("catalog.redb").exists();
+            let mut catalog = match rescanned {
+                true => Catalog::open(&directory).context("opening native catalog")?,
+                false => Catalog::scan_sources(
+                    &directory,
+                    &config.node.name,
+                    &config.index,
+                    |phase, count| {
+                        progress.set_message(format!("{phase}: {count} entries"));
+                    },
+                )
+                .context("scanning into native catalog")?,
+            };
+            let rescan = match rescanned {
+                true => Some(
+                    catalog
+                        .rescan(&config.index, |phase, count| {
+                            progress.set_message(format!("{phase}: {count} entries"));
+                        })
+                        .context("rescanning native catalog")?,
+                ),
+                false => None,
+            };
             catalog.rebuild_search(|count| {
                 progress.set_message(format!("Building Tantivy index: {count} entries"));
             })?;
             progress.finish_and_clear();
             let status = catalog.status()?;
             drop(catalog);
-            report(&json!({ "status": status, "storage": Catalog::storage(&directory)? }))?;
+            report(&json!({
+                "rescan": rescan,
+                "status": status,
+                "storage": Catalog::storage(&directory)?,
+            }))?;
         }
         CatalogCommand::Search {
             directory,

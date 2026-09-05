@@ -18,7 +18,7 @@ use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Manifest, Repository,
     RepositoryKey, Revision, SearchText, Source,
 };
-use super::{Catalog, SearchRequest, models};
+use super::{Catalog, RescanReport, SearchRequest, models};
 
 fn running_as_root() -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -930,6 +930,153 @@ fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
     assert_eq!(entries, Some(2));
     let reopened = Catalog::open(&native)?;
     assert_eq!(search(&reopened, "")?.total, 2);
+    Ok(())
+}
+
+fn loose_fixture(directory: &Path) -> Result<(PathBuf, IndexConfig)> {
+    let input = directory.join("models");
+    fs::create_dir_all(input.join("loras"))?;
+    fs::write(input.join("loras/keep.safetensors"), lora_header())?;
+    fs::write(input.join("loras/gone.safetensors"), plain_header())?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    Ok((input, config))
+}
+
+#[test]
+fn an_unchanged_rescan_reads_no_headers_and_a_deleted_file_is_marked_absent() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let native = directory.path().join("native");
+    let mut catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
+    let first = catalog.status()?;
+    assert_eq!(first.generation, 1);
+
+    let unchanged = catalog.rescan(&config, |_, _| {})?;
+    assert_eq!(
+        unchanged,
+        RescanReport {
+            unchanged: 2,
+            changed: 0,
+            added: 0,
+            absent: 0
+        }
+    );
+    assert_eq!(catalog.status()?.generation, 2);
+    assert!(!catalog.status()?.search_ready, "a rescan needs a rebuild");
+
+    fs::remove_file(input.join("loras/gone.safetensors"))?;
+    let retracted = catalog.rescan(&config, |_, _| {})?;
+    assert_eq!(
+        retracted,
+        RescanReport {
+            unchanged: 1,
+            changed: 0,
+            added: 0,
+            absent: 1
+        }
+    );
+    let read = catalog.database.r_transaction()?;
+    let entries: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    let gone = entries
+        .iter()
+        .find(|entry| entry.rel_path.ends_with("gone.safetensors"))
+        .ok_or_else(|| IndexError::Catalog("the deleted path keeps its row".into()))?;
+    assert_eq!(gone.state, hoard_core::State::Remote);
+    assert!(gone.abs_path.is_some(), "the path it had is kept");
+    assert!(
+        gone.artifact_id.is_none(),
+        "its artifact had no other path and is gone"
+    );
+    assert_eq!(read.len().primary::<ArtifactRecord>()?, 1);
+    drop(read);
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "")?;
+    assert_eq!(rows.total, 1);
+    assert!(rows.rows[0].path.ends_with("keep.safetensors"));
+    Ok(())
+}
+
+#[test]
+fn a_changed_file_is_reread_and_a_new_file_continues_the_ids() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let native = directory.path().join("native");
+    let mut catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
+    let before: Vec<Entry> = {
+        let read = catalog.database.r_transaction()?;
+        read.scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?
+    };
+    let max_id = before.iter().map(|entry| entry.id).max().unwrap_or(0);
+
+    let changed_path = input.join("loras/gone.safetensors");
+    fs::write(&changed_path, lora_header())?;
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    fs::File::options()
+        .write(true)
+        .open(&changed_path)?
+        .set_modified(later)?;
+    fs::write(input.join("loras/new.safetensors"), lora_header())?;
+
+    let report = catalog.rescan(&config, |_, _| {})?;
+    assert_eq!(
+        report,
+        RescanReport {
+            unchanged: 1,
+            changed: 1,
+            added: 1,
+            absent: 0
+        }
+    );
+    let read = catalog.database.r_transaction()?;
+    let after: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(after.len(), 3);
+    let new = after
+        .iter()
+        .find(|entry| entry.rel_path.ends_with("new.safetensors"))
+        .ok_or_else(|| IndexError::Catalog("new file missing".into()))?;
+    assert!(new.id > max_id, "ids continue from the allocator");
+    let changed = after
+        .iter()
+        .find(|entry| entry.rel_path.ends_with("gone.safetensors"))
+        .ok_or_else(|| IndexError::Catalog("changed file missing".into()))?;
+    let artifact: ArtifactRecord = read
+        .get()
+        .primary(
+            changed
+                .artifact_id
+                .ok_or_else(|| IndexError::Catalog("no artifact".into()))?,
+        )?
+        .ok_or_else(|| IndexError::Catalog("artifact missing".into()))?;
+    assert_eq!(
+        artifact.artifact.role,
+        hoard_core::Role::Lora,
+        "the header was read again"
+    );
+    assert_eq!(
+        read.len().primary::<ArtifactRecord>()?,
+        3,
+        "the changed file's artifact was rewritten in place, not duplicated"
+    );
+    let repositories: Vec<Repository> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(repositories.len(), 1, "the repository keeps its id");
     Ok(())
 }
 

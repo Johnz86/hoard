@@ -118,6 +118,18 @@ pub(super) struct Entry {
     pub(super) inode: Option<u64>,
 }
 
+/// The high-water marks a later scan continues from, so ids stay stable across runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 9, version = 1)]
+#[native_db]
+pub(super) struct Allocator {
+    #[primary_key]
+    pub(super) id: u8,
+    pub(super) repos: u64,
+    pub(super) artifacts: u64,
+    pub(super) entries: u64,
+}
+
 pub(super) fn define_models() -> super::Result<Models> {
     let mut models = Models::new();
     models.define::<Source>()?;
@@ -127,5 +139,6 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<SearchText>()?;
     models.define::<Manifest>()?;
     models.define::<Entry>()?;
+    models.define::<Allocator>()?;
     Ok(models)
 }

@@ -15,6 +15,7 @@ use crate::error::{IndexError, Result};
 
 use self::models::{Manifest, define_models};
 
+pub use self::scan::RescanReport;
 pub use self::search::{SearchPage, SearchRequest};
 
 /// One redb table's share of the catalog file: the rows it holds, the bytes those rows

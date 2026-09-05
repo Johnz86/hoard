@@ -17,8 +17,10 @@ catalog by scanning sources. No existing data needs to be retained.
 
 ## Running it
 
-The parent of the output directory must already exist. The output directory must be
-new and outside every configured source.
+The parent of the output directory must already exist. A new directory is scanned fresh; an
+existing catalog directory is rescanned in place: unchanged files are not opened, changed
+files are read again, missing files keep their row as absent, and the search index is
+rebuilt afterwards.
 
 ```sh
 cargo run -- catalog scan --directory /existing/path/native-catalog
@@ -83,6 +85,10 @@ the complete trigger string; they do not implement legacy substring matching.
   pays for neither a fresh mmap directory nor a directory watcher.
 - A custom Tantivy collector produces exact distinct artifact totals and chooses the
   preferred entry after filtering. Only the result page is loaded from native_db.
+- Ids come from a persisted allocator and the generation increments per rescan; artifact
+  path counts are swept from the entry index after every scan and orphaned artifacts are
+  removed.
+- Storage is reported per redb table, and the database is compacted after every scan.
 - CLI operations run on blocking threads and report scan/index progress with indicatif.
 
 ## Search document shape
@@ -208,11 +214,8 @@ tree with shared artifacts, not by anything redb or Tantivy does.
 - Shrink the per-entry record further: revision, repository, source and absolute path are
   written out per entry, which is what the 1M catalog is mostly made of. Intern them per
   revision and reference them by id.
-- Allocate ids across scans: repository, artifact and entry ids restart at 1 per scan and
-  generation is fixed at 1, so a second scan into one catalog is impossible until ids come
-  from a persisted high-water mark or from content.
-- Add mutations, incremental scan/retraction and a transactional search outbox with
-  replay. This slice creates complete fresh catalogs; it does not update them.
+- Add a transactional search outbox with replay so a rescan updates Tantivy incrementally
+  instead of rebuilding it.
 - Implement user overrides/noise, shelves, loadouts, settings, projections, jobs,
   usage, peer cursors and the associated graph constraints/cascades.
 - Preserve complete repository Git metadata and add stable cross-scan identities.
