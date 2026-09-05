@@ -1818,3 +1818,152 @@ fn shards_group_across_chunk_boundaries() -> Result<()> {
     assert_eq!(set[0].path, "model-00001-of-00002.safetensors");
     Ok(())
 }
+
+#[test]
+fn every_sort_key_orders_the_page_and_paging_is_stable() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("loras"))?;
+    for name in ["c-style", "a-style", "b-style"] {
+        fs::write(
+            input.join(format!("loras/{name}.safetensors")),
+            lora_header(),
+        )?;
+    }
+    fs::write(input.join("data.csv"), "x,y\n1,2\n")?;
+    fs::write(input.join("tiny.jsonl"), "{\"text\":\"hello\"}\n")?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    let context = catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?;
+    let keys = [
+        SortKey::Role,
+        SortKey::Name,
+        SortKey::Base,
+        SortKey::Format,
+        SortKey::Precision,
+        SortKey::Size,
+        SortKey::Revision,
+        SortKey::Node,
+        SortKey::State,
+        SortKey::Used,
+    ];
+    for key in keys {
+        for descending in [false, true] {
+            let sort = SortSpec::new(key, descending);
+            let whole = catalog.query(QueryRequest {
+                raw: "",
+                sort,
+                limit: 10,
+                offset: 0,
+                context: &context,
+            })?;
+            assert_eq!(whole.total, 5, "{key:?}");
+            let mut walked = Vec::new();
+            for offset in [0, 2, 4] {
+                let page = catalog.query(QueryRequest {
+                    raw: "",
+                    sort,
+                    limit: 2,
+                    offset,
+                    context: &context,
+                })?;
+                walked.extend(page.rows.iter().map(|row| row.artifact_id));
+            }
+            let expected: Vec<_> = whole.rows.iter().map(|row| row.artifact_id).collect();
+            assert_eq!(
+                walked, expected,
+                "paging by 2 walks the same order as one page for {key:?} desc={descending}"
+            );
+        }
+    }
+    let by_name = catalog.query(QueryRequest {
+        raw: "",
+        sort: SortSpec::new(SortKey::Name, false),
+        limit: 10,
+        offset: 0,
+        context: &context,
+    })?;
+    let names: Vec<&str> = by_name.rows.iter().map(|row| row.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "a-style.safetensors",
+            "b-style.safetensors",
+            "c-style.safetensors",
+            "data.csv",
+            "tiny.jsonl"
+        ]
+    );
+    let by_size = catalog.query(QueryRequest {
+        raw: "",
+        sort: SortSpec::new(SortKey::Size, true),
+        limit: 10,
+        offset: 0,
+        context: &context,
+    })?;
+    let sizes: Vec<u64> = by_size.rows.iter().map(|row| row.size).collect();
+    assert!(sizes.windows(2).all(|pair| pair[0] >= pair[1]), "{sizes:?}");
+    Ok(())
+}
+
+#[test]
+fn facets_and_nodes_survive_a_multi_segment_index() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let native = directory.path().join("native");
+    let mut catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    for round in 0..3 {
+        fs::write(
+            input.join(format!("loras/extra-{round}.safetensors")),
+            lora_header(),
+        )?;
+        catalog.rescan(&config, |_, _| {})?;
+        catalog.refresh_search(|_| {})?;
+    }
+    let page = search(&catalog, "")?;
+    assert_eq!(page.total, 5);
+    assert_eq!(page.nodes, 1);
+    let names: Vec<&str> = page.rows.iter().map(|row| row.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "extra-0.safetensors",
+            "extra-1.safetensors",
+            "extra-2.safetensors",
+            "gone.safetensors",
+            "keep.safetensors"
+        ],
+        "ordinals of different segments are merged by the term they spell"
+    );
+    let context = catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?;
+    let mut walked = Vec::new();
+    for offset in [0, 2, 4] {
+        let page = catalog.query(QueryRequest {
+            raw: "",
+            sort: SortSpec::default(),
+            limit: 2,
+            offset,
+            context: &context,
+        })?;
+        walked.extend(page.rows.iter().map(|row| row.name.clone()));
+    }
+    assert_eq!(walked, names, "paging is stable across the segments");
+    let lora = page
+        .facets
+        .role
+        .iter()
+        .find(|bucket| bucket.value == "lora")
+        .map(|bucket| bucket.count);
+    assert_eq!(
+        lora,
+        Some(4),
+        "counts merge across the segments the refreshes created: {:?}",
+        page.facets.role
+    );
+    Ok(())
+}

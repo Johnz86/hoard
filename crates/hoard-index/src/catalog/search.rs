@@ -1,5 +1,5 @@
-use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::RwLockReadGuard;
 
@@ -41,6 +41,14 @@ const BASE_LABEL_COLUMN: &str = "base_label";
 /// The five facet dimensions, named as the columns a collapsed hit carries them in.
 const FACET_COLUMNS: [&str; FACET_DIMENSIONS.len()] =
     ["role", "base", "format", "precision", "node"];
+/// The base label column, kept beside the facet columns a hit carries ordinals into.
+const LABEL_COLUMN: usize = FACET_COLUMNS.len();
+/// The column the requested sort key reads, when that key is a string at all.
+const SORT_COLUMN: usize = FACET_COLUMNS.len() + 1;
+const SEGMENT_COLUMNS: usize = FACET_COLUMNS.len() + 2;
+/// The ordinal a document without a term in a column stands for. It spells the empty
+/// string, which is what a missing value sorted and counted as before ordinals were kept.
+const NO_TERM: u64 = u64::MAX;
 pub(super) const ROLE_FIELD: usize = 0;
 pub(super) const SUB_ROLE_FIELD: usize = 1;
 pub(super) const BASE_FIELD: usize = 2;
@@ -426,18 +434,14 @@ impl Catalog {
         };
         let parsed = parse(request.raw);
         let searcher = open.reader.searcher();
-        let hits = searcher.search(
+        let collected = searcher.search(
             query::compile(&parsed.tokens, None, &bound)?.as_ref(),
             &ArtifactCollector { sort: request.sort },
         )?;
-        let total = hits.len() as u64;
-        let nodes = hits
-            .values()
-            .map(|hit| hit.facets[NODE_DIMENSION].as_str())
-            .collect::<std::collections::HashSet<&str>>()
-            .len() as u64;
-        let facets = self.facets(&searcher, &parsed, &bound, &hits)?;
-        let rows = self.rows(page_of(hits, &request), &manifest.node)?;
+        let total = collected.hits.len() as u64;
+        let nodes = distinct_nodes(&collected)?;
+        let facets = self.facets(&searcher, &parsed, &bound, &collected)?;
+        let rows = self.rows(page_of(collected, &request)?, &manifest.node)?;
         Ok(QueryPage {
             query: parsed,
             rows,
@@ -454,7 +458,7 @@ impl Catalog {
         searcher: &Searcher,
         parsed: &ParsedQuery,
         bound: &QueryFields<'_>,
-        hits: &HashMap<i64, Hit>,
+        collected: &Collected,
     ) -> Result<Facets> {
         let mut dimensions: [Vec<FacetBucket>; FACET_DIMENSIONS.len()] =
             std::array::from_fn(|_| Vec::new());
@@ -465,14 +469,15 @@ impl Catalog {
                 None => None,
             };
             let labelled = index == BASE_DIMENSION;
-            let mut buckets = count_buckets(narrowed.as_ref().unwrap_or(hits), index, labelled);
+            let mut buckets =
+                count_buckets(narrowed.as_ref().unwrap_or(collected), index, labelled)?;
             if labelled {
                 for bucket in &mut buckets {
                     let scoped = BooleanQuery::intersection(vec![
                         excluded.box_clone(),
                         query::base_filter(bound.fields, &bucket.value),
                     ]);
-                    bucket.count = searcher.search(&scoped, &collector())?.len() as u64;
+                    bucket.count = searcher.search(&scoped, &collector())?.hits.len() as u64;
                 }
                 order_buckets(&mut buckets);
             }
@@ -534,26 +539,195 @@ impl Catalog {
 
 /// The requested page of the collapsed set, ordered by the sort column and then by artifact
 /// id so paging is stable however many artifacts share a value.
-fn page_of(hits: HashMap<i64, Hit>, request: &QueryRequest<'_>) -> Vec<Hit> {
-    let descending = request.sort.descending;
-    let mut hits: Vec<Hit> = hits.into_values().collect();
-    let total = hits.len() as u64;
-    let page_end = (u64::from(request.offset) + u64::from(request.limit)).min(total) as usize;
-    if page_end < hits.len() {
-        hits.select_nth_unstable_by(page_end, |left, right| precedes(left, right, descending));
-        hits.truncate(page_end);
+///
+/// A numeric key compares across the whole set, and so does a term ordinal while one segment
+/// holds every hit; either way the page is settled without spelling a single term. Ordinals
+/// of different segments do not compare, so a text key over several segments bounds each
+/// segment on its own ordinals first and spells only what survives.
+fn page_of(collected: Collected, request: &QueryRequest<'_>) -> Result<Vec<Hit>> {
+    let Collected { hits, segments } = collected;
+    let window = Window::of(request, hits.len());
+    let column = SortColumn::of(request.sort.key);
+    let order = Order {
+        rank: match column {
+            SortColumn::Size | SortColumn::Absent => size_key,
+            SortColumn::Text => ordinal_key,
+        },
+        descending: request.sort.descending,
+        reversed: window.reversed,
+    };
+    match (column, segments.len()) {
+        (SortColumn::Size | SortColumn::Absent, _) | (SortColumn::Text, 0 | 1) => {
+            Ok(ranked_window(hits.into_values().collect(), window, order))
+        }
+        (SortColumn::Text, _) => spelled_page(hits, &segments, window, order),
     }
-    hits.sort_unstable_by(|left, right| precedes(left, right, descending));
-    hits.split_off((request.offset as usize).min(hits.len()))
 }
 
-fn precedes(left: &Hit, right: &Hit, descending: bool) -> std::cmp::Ordering {
-    let ordering = left.sort.cmp(&right.sort);
-    let ordering = match descending {
-        true => ordering.reverse(),
-        false => ordering,
-    };
-    ordering.then_with(|| left.artifact_id.cmp(&right.artifact_id))
+/// What a numeric key orders by: the size the collector read straight off the fast field.
+fn size_key(hit: &Hit) -> u64 {
+    hit.sort
+}
+
+/// What a term ordinal orders by inside one segment. Ordinals are lexicographic there, and
+/// shifting them by one puts a document with no term where the empty string belongs.
+fn ordinal_key(hit: &Hit) -> u64 {
+    hit.sort.wrapping_add(1)
+}
+
+/// The total order a page is cut from, and whether it is being walked backwards.
+#[derive(Clone, Copy)]
+struct Order {
+    rank: fn(&Hit) -> u64,
+    descending: bool,
+    reversed: bool,
+}
+
+impl Order {
+    fn compare(&self, left: &Hit, right: &Hit) -> Ordering {
+        self.orient(
+            (self.rank)(left).cmp(&(self.rank)(right)),
+            left.artifact_id,
+            right.artifact_id,
+        )
+    }
+
+    fn compare_terms(&self, left: &(String, Hit), right: &(String, Hit)) -> Ordering {
+        self.orient(
+            left.0.cmp(&right.0),
+            left.1.artifact_id,
+            right.1.artifact_id,
+        )
+    }
+
+    fn orient(&self, by_value: Ordering, left: i64, right: i64) -> Ordering {
+        let ordering = match self.descending {
+            true => by_value.reverse(),
+            false => by_value,
+        }
+        .then_with(|| left.cmp(&right));
+        match self.reversed {
+            true => ordering.reverse(),
+            false => ordering,
+        }
+    }
+}
+
+/// Which slice of the ordered set the request asks for. A slice nearer the far end is cut
+/// from the reversed order and turned back around, so a deep page still selects and orders
+/// only as much as a shallow one.
+#[derive(Clone, Copy)]
+struct Window {
+    skip: usize,
+    keep: usize,
+    reversed: bool,
+}
+
+impl Window {
+    fn of(request: &QueryRequest<'_>, total: usize) -> Self {
+        let wanted = u64::from(request.offset).saturating_add(u64::from(request.limit));
+        let keep = usize::try_from(wanted).unwrap_or(usize::MAX).min(total);
+        let skip = (request.offset as usize).min(keep);
+        match total - keep < skip {
+            true => Self {
+                skip: total - keep,
+                keep: total - skip,
+                reversed: true,
+            },
+            false => Self {
+                skip,
+                keep,
+                reversed: false,
+            },
+        }
+    }
+
+    fn cut(self, mut ordered: Vec<Hit>) -> Vec<Hit> {
+        let mut page = ordered.split_off(self.skip.min(ordered.len()));
+        if self.reversed {
+            page.reverse();
+        }
+        page
+    }
+}
+
+/// Trims the hits to the `keep` that come first, leaving them in no particular order.
+fn bound(hits: &mut Vec<Hit>, keep: usize, order: Order) {
+    if keep < hits.len() {
+        hits.select_nth_unstable_by(keep, |left, right| order.compare(left, right));
+        hits.truncate(keep);
+    }
+}
+
+/// The window of an order a rank induces. Both ends are selected rather than sorted, so a
+/// page orders the rows it returns and nothing else.
+fn ranked_window(mut hits: Vec<Hit>, window: Window, order: Order) -> Vec<Hit> {
+    bound(&mut hits, window.keep, order);
+    if window.skip < hits.len() {
+        hits.select_nth_unstable_by(window.skip, |left, right| order.compare(left, right));
+    }
+    let mut page = hits.split_off(window.skip.min(hits.len()));
+    page.sort_unstable_by(|left, right| order.compare(left, right));
+    match window.reversed {
+        true => {
+            page.reverse();
+            page
+        }
+        false => page,
+    }
+}
+
+/// The page of a text key spread over several segments: each segment is bounded on its own
+/// ordinals, and only the candidates that survive that are spelled out and merged.
+fn spelled_page(
+    hits: HashMap<i64, Hit>,
+    segments: &[SegmentStrings],
+    window: Window,
+    order: Order,
+) -> Result<Vec<Hit>> {
+    let mut grouped: Vec<Vec<Hit>> = vec![Vec::new(); segments.len()];
+    for hit in hits.into_values() {
+        let group = grouped
+            .get_mut(hit.segment as usize)
+            .ok_or_else(|| unknown_segment(hit.segment))?;
+        group.push(hit);
+    }
+    let mut spelling = Spelling::new(segments);
+    let mut candidates: Vec<(String, Hit)> = Vec::new();
+    for group in &mut grouped {
+        bound(group, window.keep, order);
+        for hit in group.drain(..) {
+            let value = spelling
+                .spell(hit.segment, SORT_COLUMN, hit.sort)?
+                .to_owned();
+            candidates.push((value, hit));
+        }
+    }
+    candidates.sort_unstable_by(|left, right| order.compare_terms(left, right));
+    candidates.truncate(window.keep);
+    Ok(window.cut(candidates.into_iter().map(|(_, hit)| hit).collect()))
+}
+
+/// How many distinct nodes the collapsed set sits on, spelling one term per segment and
+/// value rather than one per hit.
+fn distinct_nodes(collected: &Collected) -> Result<u64> {
+    let ordinals: HashSet<(SegmentOrdinal, u64)> = collected
+        .hits
+        .values()
+        .map(|hit| (hit.segment, hit.facets[NODE_DIMENSION]))
+        .collect();
+    let mut spelling = Spelling::new(&collected.segments);
+    let mut names: HashSet<String> = HashSet::with_capacity(ordinals.len());
+    for (segment, ordinal) in ordinals {
+        names.insert(spelling.spell(segment, NODE_DIMENSION, ordinal)?.to_owned());
+    }
+    Ok(names.len() as u64)
+}
+
+fn unknown_segment(segment: SegmentOrdinal) -> IndexError {
+    IndexError::Catalog(format!(
+        "search hit names segment {segment}, which was not collected"
+    ))
 }
 
 fn collector() -> ArtifactCollector {
@@ -562,18 +736,18 @@ fn collector() -> ArtifactCollector {
     }
 }
 
-/// One value of one dimension while it is being counted, with the spelling every artifact in
-/// it agreed on, if they did.
+/// One value of one dimension while it is being counted by ordinal, inside one segment,
+/// with the label ordinal every artifact in it agreed on, if they did.
 #[derive(Default)]
-struct Tally<'a> {
+struct OrdinalTally {
     count: u64,
-    label: Option<&'a str>,
+    label: Option<u64>,
     seen: bool,
 }
 
-impl<'a> Tally<'a> {
-    fn observe(&mut self, label: &'a str) {
-        let offered = (!label.is_empty()).then_some(label);
+impl OrdinalTally {
+    fn observe(&mut self, label: u64) {
+        let offered = (label != NO_TERM).then_some(label);
         match self.seen {
             false => {
                 self.seen = true;
@@ -585,30 +759,74 @@ impl<'a> Tally<'a> {
     }
 }
 
-fn count_buckets(hits: &HashMap<i64, Hit>, dimension: usize, labelled: bool) -> Vec<FacetBucket> {
-    let mut tallies: HashMap<&str, Tally<'_>> = HashMap::new();
-    for hit in hits.values() {
-        let value = hit.facets[dimension].as_str();
+/// One value of one dimension once its segments have been spelled out and merged.
+#[derive(Default)]
+struct Tally {
+    count: u64,
+    label: Option<String>,
+    seen: bool,
+}
+
+impl Tally {
+    fn observe(&mut self, offered: Option<&str>) {
+        match self.seen {
+            false => {
+                self.seen = true;
+                self.label = offered.map(str::to_owned);
+            }
+            true if self.label.as_deref() != offered => self.label = None,
+            true => {}
+        }
+    }
+}
+
+/// Counts one dimension over the collapsed set by ordinal, then spells each distinct value
+/// once and merges the segments that spelled the same string.
+fn count_buckets(
+    collected: &Collected,
+    dimension: usize,
+    labelled: bool,
+) -> Result<Vec<FacetBucket>> {
+    let mut ordinals: HashMap<(SegmentOrdinal, u64), OrdinalTally> = HashMap::new();
+    for hit in collected.hits.values() {
+        let value = hit.facets[dimension];
+        if value == NO_TERM {
+            continue;
+        }
+        let tally = ordinals.entry((hit.segment, value)).or_default();
+        tally.count += 1;
+        if labelled {
+            tally.observe(hit.base_label);
+        }
+    }
+    let mut spelling = Spelling::new(&collected.segments);
+    let mut tallies: HashMap<String, Tally> = HashMap::with_capacity(ordinals.len());
+    for ((segment, ordinal), counted) in ordinals {
+        let label = match counted.label {
+            Some(label) => Some(spelling.spell(segment, LABEL_COLUMN, label)?.to_owned()),
+            None => None,
+        };
+        let value = spelling.spell(segment, dimension, ordinal)?.to_owned();
         if value.is_empty() {
             continue;
         }
         let tally = tallies.entry(value).or_default();
-        tally.count += 1;
+        tally.count += counted.count;
         if labelled {
-            tally.observe(hit.base_label.as_str());
+            tally.observe(label.as_deref().filter(|label| !label.is_empty()));
         }
     }
     let mut buckets: Vec<FacetBucket> = tallies
         .into_iter()
         .map(|(value, tally)| FacetBucket {
-            value: value.to_owned(),
-            label: tally.label.map(str::to_owned),
+            value,
+            label: tally.label,
             count: tally.count,
             active: false,
         })
         .collect();
     order_buckets(&mut buckets);
-    buckets
+    Ok(buckets)
 }
 
 fn order_buckets(buckets: &mut [FacetBucket]) {
@@ -872,24 +1090,18 @@ fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
     }
 }
 
-/// The value a hit is ordered by. Every hit of one query carries the same variant, because
-/// one query has one sort column.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum SortValue {
-    Text(String),
-    Number(u64),
-}
-
-/// One artifact's best entry, with everything ordering and the facet rail need, so a page
-/// and its counts are produced without reading the database per hit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One artifact's best entry as integers: the ordering value, the five facet ordinals and
+/// the base label ordinal, so a page and its counts are produced without spelling a term or
+/// reading the database per hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Hit {
     artifact_id: i64,
     entry_id: i64,
     preference: i64,
-    sort: SortValue,
-    facets: [String; FACET_COLUMNS.len()],
-    base_label: String,
+    segment: SegmentOrdinal,
+    sort: u64,
+    facets: [u64; FACET_COLUMNS.len()],
+    base_label: u64,
 }
 
 impl Hit {
@@ -911,54 +1123,99 @@ impl Hit {
     }
 }
 
-/// A string fast column with the ordinals this segment has already spelled out, so a value
-/// repeated across a segment is decoded once.
-#[derive(Default)]
-struct StringColumn {
-    column: Option<StrColumn>,
-    spelled: HashMap<u64, String>,
+/// The string columns of one segment, kept alive so an ordinal a hit carries can be spelled
+/// out later. The five facet columns come first, then the base label and the sort column.
+#[derive(Clone)]
+struct SegmentStrings {
+    columns: [Option<StrColumn>; SEGMENT_COLUMNS],
 }
 
-impl StringColumn {
-    fn open(segment: &SegmentReader, name: &str) -> tantivy::Result<Self> {
-        Ok(Self {
-            column: segment.fast_fields().str(name)?,
-            spelled: HashMap::new(),
-        })
+impl SegmentStrings {
+    fn open(segment: &SegmentReader, key: SortKey) -> tantivy::Result<Self> {
+        let fields = segment.fast_fields();
+        let mut columns: [Option<StrColumn>; SEGMENT_COLUMNS] = std::array::from_fn(|_| None);
+        for (column, name) in columns.iter_mut().zip(FACET_COLUMNS) {
+            *column = fields.str(name)?;
+        }
+        columns[LABEL_COLUMN] = fields.str(BASE_LABEL_COLUMN)?;
+        if matches!(SortColumn::of(key), SortColumn::Text) {
+            columns[SORT_COLUMN] = fields.str(key.column())?;
+        }
+        Ok(Self { columns })
     }
 
-    fn value(&mut self, doc: DocId) -> tantivy::Result<String> {
-        let Some(column) = &self.column else {
-            return Ok(String::new());
-        };
-        let Some(ordinal) = column.term_ords(doc).next() else {
-            return Ok(String::new());
-        };
-        if let Some(spelled) = self.spelled.get(&ordinal) {
-            return Ok(spelled.clone());
-        }
-        let mut value = String::new();
-        if !column.ord_to_str(ordinal, &mut value)? {
-            value.clear();
-        }
-        self.spelled.insert(ordinal, value.clone());
-        Ok(value)
+    fn first_ord(&self, column: usize, doc: DocId) -> u64 {
+        self.columns[column]
+            .as_ref()
+            .and_then(|column| column.term_ords(doc).next())
+            .unwrap_or(NO_TERM)
     }
+}
+
+/// Spells the ordinals of a collection out of the columns its segments kept, once per
+/// segment, column and ordinal however many hits carry that ordinal.
+struct Spelling<'a> {
+    segments: &'a [SegmentStrings],
+    spelled: HashMap<(SegmentOrdinal, usize, u64), String>,
+}
+
+impl<'a> Spelling<'a> {
+    fn new(segments: &'a [SegmentStrings]) -> Self {
+        Self {
+            segments,
+            spelled: HashMap::new(),
+        }
+    }
+
+    fn spell(&mut self, segment: SegmentOrdinal, column: usize, ordinal: u64) -> Result<&str> {
+        let key = (segment, column, ordinal);
+        if !self.spelled.contains_key(&key) {
+            let value = decode(self.segments, segment, column, ordinal)?;
+            self.spelled.insert(key, value);
+        }
+        self.spelled
+            .get(&key)
+            .map(String::as_str)
+            .ok_or_else(|| IndexError::Catalog("a spelled term went missing".into()))
+    }
+}
+
+fn decode(
+    segments: &[SegmentStrings],
+    segment: SegmentOrdinal,
+    column: usize,
+    ordinal: u64,
+) -> Result<String> {
+    if ordinal == NO_TERM {
+        return Ok(String::new());
+    }
+    let strings = segments
+        .get(segment as usize)
+        .ok_or_else(|| unknown_segment(segment))?;
+    let Some(handle) = strings.columns[column].as_ref() else {
+        return Ok(String::new());
+    };
+    let mut value = String::new();
+    if !handle.ord_to_str(ordinal, &mut value)? {
+        value.clear();
+    }
+    Ok(value)
 }
 
 /// How one segment reads the sort column: the size fast field, a string column, or nothing
 /// at all for a column the native catalog does not carry yet.
+#[derive(Clone, Copy)]
 enum SortColumn {
     Size,
     Absent,
-    Text(StringColumn),
+    Text,
 }
 
 impl SortColumn {
-    fn open(segment: &SegmentReader, key: SortKey) -> tantivy::Result<Self> {
+    fn of(key: SortKey) -> Self {
         match key {
-            SortKey::Size => Ok(SortColumn::Size),
-            SortKey::Used => Ok(SortColumn::Absent),
+            SortKey::Size => SortColumn::Size,
+            SortKey::Used => SortColumn::Absent,
             SortKey::Role
             | SortKey::Name
             | SortKey::Base
@@ -966,17 +1223,23 @@ impl SortColumn {
             | SortKey::Precision
             | SortKey::Revision
             | SortKey::Node
-            | SortKey::State => Ok(SortColumn::Text(StringColumn::open(segment, key.column())?)),
+            | SortKey::State => SortColumn::Text,
         }
     }
+}
 
-    fn value(&mut self, doc: DocId, size: u64) -> tantivy::Result<SortValue> {
-        match self {
-            SortColumn::Size => Ok(SortValue::Number(size)),
-            SortColumn::Absent => Ok(SortValue::Text(String::new())),
-            SortColumn::Text(column) => Ok(SortValue::Text(column.value(doc)?)),
-        }
-    }
+/// A whole collection: the hit retained per artifact and the segment columns their ordinals
+/// are spelled from.
+struct Collected {
+    hits: HashMap<i64, Hit>,
+    segments: Vec<SegmentStrings>,
+}
+
+/// What one segment harvests: its ordinal, its retained hits and its string columns.
+struct SegmentHits {
+    ordinal: SegmentOrdinal,
+    hits: HashMap<i64, Hit>,
+    strings: SegmentStrings,
 }
 
 struct ArtifactCollector {
@@ -984,27 +1247,23 @@ struct ArtifactCollector {
 }
 
 impl Collector for ArtifactCollector {
-    type Fruit = HashMap<i64, Hit>;
+    type Fruit = Collected;
     type Child = ArtifactSegmentCollector;
 
     fn for_segment(
         &self,
-        _: SegmentOrdinal,
+        ordinal: SegmentOrdinal,
         segment: &SegmentReader,
     ) -> tantivy::Result<Self::Child> {
         let fields = segment.fast_fields();
-        let mut facets = FACET_COLUMNS.map(|_| StringColumn::default());
-        for (column, name) in facets.iter_mut().zip(FACET_COLUMNS) {
-            *column = StringColumn::open(segment, name)?;
-        }
         Ok(ArtifactSegmentCollector {
+            ordinal,
             artifact: fields.i64("artifact_id")?,
             entry: fields.i64("entry_id")?,
             preference: fields.i64("preference")?,
             size: fields.u64("size")?,
-            sort: SortColumn::open(segment, self.sort.key)?,
-            base_label: StringColumn::open(segment, BASE_LABEL_COLUMN)?,
-            facets,
+            sort: SortColumn::of(self.sort.key),
+            strings: SegmentStrings::open(segment, self.sort.key)?,
             hits: HashMap::new(),
             invalid: false,
         })
@@ -1016,62 +1275,87 @@ impl Collector for ArtifactCollector {
 
     fn merge_fruits(
         &self,
-        fruits: Vec<tantivy::Result<HashMap<i64, Hit>>>,
+        fruits: Vec<tantivy::Result<SegmentHits>>,
     ) -> tantivy::Result<Self::Fruit> {
+        let harvested = fruits.into_iter().collect::<tantivy::Result<Vec<_>>>()?;
+        let count = harvested
+            .iter()
+            .map(|segment| segment.ordinal as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut columns: Vec<Option<SegmentStrings>> = vec![None; count];
         let mut hits = HashMap::new();
-        for fruit in fruits {
-            for hit in fruit?.into_values() {
+        for segment in harvested {
+            let slot = columns.get_mut(segment.ordinal as usize).ok_or_else(|| {
+                tantivy::TantivyError::InvalidArgument(
+                    "a segment reported an ordinal outside the searched index".into(),
+                )
+            })?;
+            *slot = Some(segment.strings);
+            for hit in segment.hits.into_values() {
                 hit.retain(&mut hits);
             }
         }
-        Ok(hits)
+        let segments = columns
+            .into_iter()
+            .map(|strings| {
+                strings.ok_or_else(|| {
+                    tantivy::TantivyError::InvalidArgument(
+                        "a searched segment produced no columns; rebuild the index".into(),
+                    )
+                })
+            })
+            .collect::<tantivy::Result<Vec<_>>>()?;
+        Ok(Collected { hits, segments })
     }
 }
 
 struct ArtifactSegmentCollector {
+    ordinal: SegmentOrdinal,
     artifact: Column<i64>,
     entry: Column<i64>,
     preference: Column<i64>,
     size: Column<u64>,
     sort: SortColumn,
-    base_label: StringColumn,
-    facets: [StringColumn; FACET_COLUMNS.len()],
+    strings: SegmentStrings,
     hits: HashMap<i64, Hit>,
     invalid: bool,
 }
 
 impl ArtifactSegmentCollector {
-    fn hit(&mut self, doc: DocId) -> tantivy::Result<Option<Hit>> {
+    fn hit(&self, doc: DocId) -> Option<Hit> {
         let (Some(artifact_id), Some(entry_id), Some(preference), Some(size)) = (
             self.artifact.first(doc),
             self.entry.first(doc),
             self.preference.first(doc),
             self.size.first(doc),
         ) else {
-            return Ok(None);
+            return None;
         };
-        let mut facets = FACET_COLUMNS.map(|_| String::new());
-        for (value, column) in facets.iter_mut().zip(self.facets.iter_mut()) {
-            *value = column.value(doc)?;
-        }
-        Ok(Some(Hit {
+        let sort = match self.sort {
+            SortColumn::Size => size,
+            SortColumn::Absent => NO_TERM,
+            SortColumn::Text => self.strings.first_ord(SORT_COLUMN, doc),
+        };
+        Some(Hit {
             artifact_id,
             entry_id,
             preference,
-            sort: self.sort.value(doc, size)?,
-            base_label: self.base_label.value(doc)?,
-            facets,
-        }))
+            segment: self.ordinal,
+            sort,
+            facets: std::array::from_fn(|dimension| self.strings.first_ord(dimension, doc)),
+            base_label: self.strings.first_ord(LABEL_COLUMN, doc),
+        })
     }
 }
 
 impl SegmentCollector for ArtifactSegmentCollector {
-    type Fruit = tantivy::Result<HashMap<i64, Hit>>;
+    type Fruit = tantivy::Result<SegmentHits>;
 
     fn collect(&mut self, doc: DocId, _: Score) {
         match self.hit(doc) {
-            Ok(Some(hit)) => hit.retain(&mut self.hits),
-            Ok(None) | Err(_) => self.invalid = true,
+            Some(hit) => hit.retain(&mut self.hits),
+            None => self.invalid = true,
         }
     }
 
@@ -1081,7 +1365,11 @@ impl SegmentCollector for ArtifactSegmentCollector {
                 "search entry is missing required fast fields; rebuild the index".into(),
             ));
         }
-        Ok(self.hits)
+        Ok(SegmentHits {
+            ordinal: self.ordinal,
+            hits: self.hits,
+            strings: self.strings,
+        })
     }
 }
 
