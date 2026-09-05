@@ -135,6 +135,11 @@ hoard/
           node.rs  source.rs  blob.rs  artifact.rs  repo.rs  revision.rs  entry.rs
           shelf.rs  loadout.rs  job.rs  usage.rs  overrides.rs  setting.rs
           projection.rs  search_exec.rs  row.rs  digest.rs
+        catalog/             experimental native_db + Tantivy catalog behind `hoard catalog`
+          mod.rs             Catalog open/status/integrity, format version
+          models.rs          native_model records: Source, Repository, ArtifactRecord, Entry, SearchEntry, SearchText, Manifest
+          scan.rs            discovery -> sniff -> infer -> one transaction per source
+          search.rs          Tantivy schema, rebuild, per-entry documents collapsed per artifact
         search/
           grammar.rs         winnow parser
           token.rs           token kinds and the parsed strip

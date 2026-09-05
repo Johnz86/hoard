@@ -52,8 +52,8 @@ the complete trigger string; they do not implement legacy substring matching.
   sniffed in parallel, its shallowest README and nearest `config.json` feed inference
   exactly as the SQLite scanner does, and the source is written in one transaction.
 - Only weight and dataset formats become artifacts; every file is still an entry record.
-- Unreadable files are recorded as absent, and git-lfs pointer files are recorded as the
-  remote weights they name.
+- Unreadable files and git-lfs pointer files are recorded as absent entries without an
+  artifact, as the SQLite scanner does.
 - Entries whose inference needs triage carry state `triage`.
 - Artifact names and orgs follow the scanner's rules: a single-artifact repository is named
   by its repository.
@@ -142,6 +142,9 @@ investigated further.
 - Add a read-only open once redb offers one, so searches can run beside a rebuild.
 - Port the complete Hoard grammar, aliases, local-node resolution, exclusions,
   facets, compatibility, shelf expansion and every sorting mode.
+- Artifact name and org are stored per entry; two entries sharing one identity in
+  different repositories can show different names depending on which entry wins the
+  preference tie. The SQLite artifact row has one name.
 - Add cleanup for superseded search directories. This slice deliberately keeps old
   generated directories; repeated rebuilds consume additional disk space.
 - Benchmark realistic catalogs and add process-kill/power-loss recovery tests.

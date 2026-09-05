@@ -2,7 +2,7 @@ use native_db::{Models, ToKey, native_db};
 use native_model::{Model, native_model};
 use serde::{Deserialize, Serialize};
 
-use hoard_core::{Artifact, CommitSha, Evidence, RepoId, State, TensorSummary};
+use hoard_core::{Artifact, CommitSha, Evidence, GitSha1, RepoId, State, TensorSummary};
 
 use crate::config::{SourceConfig, SourceKind};
 use crate::store::SearchRow;
@@ -63,7 +63,7 @@ pub(super) struct SearchEntry {
     pub(super) repo_id: i64,
     pub(super) row: SearchRow,
     pub(super) preference: i64,
-    pub(super) git_sha1: Option<String>,
+    pub(super) git_sha1: Option<GitSha1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

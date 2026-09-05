@@ -10,6 +10,11 @@ use crate::error::{IndexError, Result};
 use super::models::{ArtifactRecord, ArtifactRecordKey, Entry, Manifest, SearchEntry, Source};
 use super::{Catalog, SearchRequest, models};
 
+fn running_as_root() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata("/proc/self").is_ok_and(|metadata| metadata.uid() == 0)
+}
+
 fn source(path: &Path, name: &str) -> SourceConfig {
     SourceConfig {
         name: name.to_owned(),
@@ -356,6 +361,9 @@ fn a_failed_scan_leaves_no_directory_behind() -> Result<()> {
 #[test]
 fn an_unreadable_file_is_recorded_as_absent_instead_of_aborting() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    if running_as_root() {
+        return Ok(());
+    }
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("files");
     fs::create_dir(&input)?;
@@ -397,7 +405,7 @@ fn an_unreadable_file_is_recorded_as_absent_instead_of_aborting() -> Result<()> 
 }
 
 #[test]
-fn an_lfs_pointer_is_indexed_as_the_remote_weights_it_stands_for() -> Result<()> {
+fn an_lfs_pointer_is_an_absent_entry_without_an_artifact() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("files");
     fs::create_dir(&input)?;
@@ -417,15 +425,36 @@ fn an_lfs_pointer_is_indexed_as_the_remote_weights_it_stands_for() -> Result<()>
         |_, _| {},
     )?;
     catalog.rebuild_search(|_| {})?;
-    let rows = search(&catalog, "")?;
-    assert_eq!(rows.total, 1);
-    let row = &rows.rows[0];
-    assert!(row.lfs_pointer);
-    assert_eq!(row.size, 123_456);
-    assert_eq!(row.state, hoard_core::State::Remote);
-    assert_eq!(row.blob_sha256.map(|sha| sha.to_string()), Some(oid));
-    assert!(row.abs_path.is_none());
+    assert_eq!(
+        search(&catalog, "")?.total,
+        0,
+        "a pointer is not a model that can be served"
+    );
+    let read = catalog.database.r_transaction()?;
+    let entries: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert!(entry.lfs_pointer);
+    assert_eq!(entry.size, 123_456);
+    assert_eq!(entry.state, hoard_core::State::Remote);
+    assert!(entry.abs_path.is_none());
+    assert!(
+        entry.artifact_id.is_none(),
+        "the SQLite scanner writes no blob and no artifact for a pointer"
+    );
+    assert_eq!(read.len().primary::<ArtifactRecord>()?, 0);
     Ok(())
+}
+
+fn plain_header() -> Vec<u8> {
+    crate::sniff::tests::safetensors_fixture(concat!(
+        r#"{"model.layers.0.mlp.down_proj.weight":"#,
+        r#"{"dtype":"F16","shape":[16,64],"data_offsets":[0,2048]}}"#
+    ))
 }
 
 fn lora_header() -> Vec<u8> {
@@ -519,9 +548,9 @@ fn a_revisions_own_readme_and_config_reach_inference() -> Result<()> {
     )?;
     fs::write(
         input.join("config.json"),
-        "{\"architectures\":[\"UNet2DConditionModel\"]}",
+        "{\"architectures\":[\"LlamaForCausalLM\"]}",
     )?;
-    fs::write(input.join("unet/adapter.safetensors"), lora_header())?;
+    fs::write(input.join("unet/adapter.safetensors"), plain_header())?;
     let config = IndexConfig {
         sources: vec![source(&input, "files")],
         ..IndexConfig::default()
@@ -558,6 +587,19 @@ fn a_revisions_own_readme_and_config_reach_inference() -> Result<()> {
         read.len().primary::<Entry>()?,
         3,
         "every file is still an entry"
+    );
+    let records: Vec<ArtifactRecord> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(records.len(), 1);
+    assert!(
+        records[0].evidence.iter().any(|evidence| {
+            evidence.field == "role" && evidence.source == hoard_core::EvidenceSource::Config
+        }),
+        "the neighbouring config.json was consulted: {:?}",
+        records[0].evidence
     );
     Ok(())
 }

@@ -16,6 +16,8 @@ use crate::error::{IndexError, Result};
 use super::Catalog;
 
 const WRITER_BUDGET: usize = 32 * 1024 * 1024;
+const REPO_FIELD: usize = 8;
+const HASH_FIELD: usize = 11;
 const KEYWORD_FIELDS: [&str; 13] = [
     "role",
     "sub_role",
@@ -202,10 +204,10 @@ impl Fields {
             }
         }
         if let Some((_, qualified)) = row.repo.split_once('/') {
-            document.add_text(self.keywords[8], qualified);
+            document.add_text(self.keywords[REPO_FIELD], qualified);
         }
         if let Some(hash) = &entry.git_sha1 {
-            document.add_text(self.keywords[11], hash);
+            document.add_text(self.keywords[HASH_FIELD], hash.to_string());
         }
         for value in [
             &row.name,
@@ -327,5 +329,16 @@ impl SegmentCollector for ArtifactSegmentCollector {
             ));
         }
         Ok(self.hits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HASH_FIELD, KEYWORD_FIELDS, REPO_FIELD};
+
+    #[test]
+    fn the_positional_keyword_fields_name_what_they_index() {
+        assert_eq!(KEYWORD_FIELDS[REPO_FIELD], "repo");
+        assert_eq!(KEYWORD_FIELDS[HASH_FIELD], "hash");
     }
 }

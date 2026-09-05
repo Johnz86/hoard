@@ -38,24 +38,29 @@ impl Catalog {
         progress: impl FnMut(&str, u64),
     ) -> Result<Self> {
         let (directory, sources) = validate_output(directory, config)?;
-        std::fs::create_dir(&directory)?;
-        let catalog = Self {
-            database: Builder::new().create(models()?, directory.join("catalog.redb"))?,
-            directory,
-        };
+        let catalog = Self::create(directory)?;
         match catalog.fill(node, &sources, config.triage_confidence, progress) {
             Ok(()) => Ok(catalog),
             Err(error) => {
                 let directory = catalog.directory.clone();
                 drop(catalog);
-                if let Err(cleanup) = std::fs::remove_dir_all(&directory) {
-                    tracing::warn!(
-                        path = %directory.display(),
-                        %cleanup,
-                        "partial catalog left behind"
-                    );
-                }
+                remove_partial(&directory);
                 Err(error)
+            }
+        }
+    }
+
+    /// Claims a fresh directory, leaving nothing behind if the database cannot be created.
+    fn create(directory: PathBuf) -> Result<Self> {
+        std::fs::create_dir(&directory)?;
+        match Builder::new().create(models()?, directory.join("catalog.redb")) {
+            Ok(database) => Ok(Self {
+                database,
+                directory,
+            }),
+            Err(error) => {
+                remove_partial(&directory);
+                Err(error.into())
             }
         }
     }
@@ -131,7 +136,7 @@ impl Catalog {
             .scan()
             .primary::<ArtifactRecord>()?
             .all()?
-            .filter(|record| record.as_ref().is_ok_and(|record| record.path_count > 1))
+            .filter(|record| record.as_ref().map_or(true, |record| record.path_count > 1))
             .collect::<native_db::db_type::Result<_>>()?;
         for record in shared {
             let entries: Vec<SearchEntry> = transaction
@@ -147,6 +152,16 @@ impl Catalog {
         }
         transaction.commit()?;
         Ok(())
+    }
+}
+
+fn remove_partial(directory: &Path) {
+    if let Err(cleanup) = std::fs::remove_dir_all(directory) {
+        tracing::warn!(
+            path = %directory.display(),
+            %cleanup,
+            "partial catalog left behind"
+        );
     }
 }
 
@@ -308,16 +323,21 @@ impl Presence {
     }
 }
 
+/// What one file that becomes an artifact contributes: only such a file pays for inference,
+/// a copy of the revision's card, and a content identity.
+struct ArtifactDraft {
+    identity: String,
+    inference: Inference,
+    card: Option<String>,
+}
+
 struct PreparedEntry<'a> {
     discovered: &'a DiscoveredEntry,
-    identity: String,
     sniffed: Option<SniffResult>,
-    inference: Inference,
     presence: Presence,
-    creates_artifact: bool,
+    artifact: Option<ArtifactDraft>,
     org: Option<String>,
     name: String,
-    card: Option<String>,
 }
 
 /// Sniffs a whole revision in parallel, then prepares every file against the revision's own
@@ -375,27 +395,33 @@ fn prepare_entry<'a>(
     let format = sniffed
         .as_ref()
         .map_or(ArtifactFormat::Unknown, |result| result.format);
+    let creates_artifact = format.is_artifact() && !presence.lfs_pointer;
     let path = inference_path(naming.root_path, &entry.rel_path, entry.abs_path.as_deref());
     let file = file_name(&entry.rel_path);
-    let mut input = InferInput::new(format, &path, file, presence.size);
-    if let Some(sniffed) = &sniffed {
-        input.tensors = sniffed.tensors.as_ref();
-        input.config = sniffed
-            .config
-            .as_ref()
-            .or_else(|| context.config_for(&entry.rel_path));
-    }
-    input.frontmatter = context.frontmatter();
+    let artifact = creates_artifact
+        .then(|| -> Result<ArtifactDraft> {
+            let mut input = InferInput::new(format, &path, file, presence.size);
+            if let Some(sniffed) = &sniffed {
+                input.tensors = sniffed.tensors.as_ref();
+                input.config = sniffed
+                    .config
+                    .as_ref()
+                    .or_else(|| context.config_for(&entry.rel_path));
+            }
+            input.frontmatter = context.frontmatter();
+            Ok(ArtifactDraft {
+                identity: identity(entry, &presence)?,
+                inference: infer::infer(&input),
+                card: context.card().map(str::to_owned),
+            })
+        })
+        .transpose()?;
     let (org, name) = artifact_name(naming, &entry.rel_path, None);
-    let identity = identity(entry, &presence)?;
     Ok(PreparedEntry {
         discovered: entry,
-        identity,
-        inference: infer::infer(&input),
-        creates_artifact: format.is_artifact(),
+        artifact,
         name,
         org,
-        card: context.card().map(str::to_owned),
         presence,
         sniffed,
     })
@@ -437,20 +463,22 @@ fn store_entry(
     counters: &mut Counters,
 ) -> Result<()> {
     let entry_id = next_id(&mut counters.entries)?;
-    let artifact = match prepared.creates_artifact {
-        true => Some(store_artifact(transaction, &prepared, counters)?),
-        false => None,
+    let record = match prepared.artifact.as_ref() {
+        Some(draft) => Some(store_artifact(transaction, &prepared, draft, counters)?),
+        None => None,
     };
-    let state = entry_state(&prepared, artifact.as_ref(), context.triage);
-    if let Some(artifact) = &artifact {
+    let state = entry_state(&prepared, record.as_ref(), context.triage);
+    let artifact_id = record.as_ref().map(|record| record.id);
+    if let Some(record) = record {
         transaction.insert(SearchEntry {
             entry_id,
-            artifact_id: artifact.id,
+            artifact_id: record.id,
             repo_id: context.repo_id,
             preference: preference(state, prepared.presence.present()),
-            row: search_row(entry_id, context, &prepared, artifact, state),
-            git_sha1: prepared.discovered.git_sha1.map(|sha| sha.to_string()),
+            row: search_row(entry_id, context, &prepared, &record, state),
+            git_sha1: prepared.discovered.git_sha1,
         })?;
+        transaction.upsert(record)?;
     }
     transaction.insert(Entry {
         id: entry_id,
@@ -463,7 +491,7 @@ fn store_entry(
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
         size: prepared.presence.size,
-        artifact_id: artifact.as_ref().map(|artifact| artifact.id),
+        artifact_id,
         state,
         lfs_pointer: prepared.presence.lfs_pointer,
         is_symlink: prepared.discovered.is_symlink,
@@ -473,22 +501,25 @@ fn store_entry(
     Ok(())
 }
 
+/// The record this entry contributes a path to, counted but not yet written: the caller
+/// reads it to build the search row and then stores it by value.
 fn store_artifact(
     transaction: &RwTransaction<'_>,
     prepared: &PreparedEntry<'_>,
+    draft: &ArtifactDraft,
     counters: &mut Counters,
 ) -> Result<ArtifactRecord> {
     let existing: Option<ArtifactRecord> = transaction
         .get()
-        .secondary(ArtifactRecordKey::identity, prepared.identity.as_str())?;
+        .secondary(ArtifactRecordKey::identity, draft.identity.as_str())?;
     let mut artifact = match existing {
         Some(existing) => existing,
         None => {
-            let record = artifact_record(next_id(&mut counters.artifacts)?, prepared);
+            let record = artifact_record(next_id(&mut counters.artifacts)?, prepared, draft);
             transaction.insert(SearchText {
                 artifact_id: record.id,
                 keys: tensor_keys(prepared.sniffed.as_ref()),
-                card: prepared.card.clone().unwrap_or_default(),
+                card: draft.card.clone().unwrap_or_default(),
             })?;
             record
         }
@@ -497,7 +528,6 @@ fn store_artifact(
         .path_count
         .checked_add(1)
         .ok_or_else(|| IndexError::Catalog("artifact path count overflow".into()))?;
-    transaction.upsert(artifact.clone())?;
     Ok(artifact)
 }
 
@@ -538,11 +568,11 @@ fn preference(state: State, present: bool) -> i64 {
     (4 + weight + i64::from(present)) * 2 + 1
 }
 
-fn artifact_record(id: i64, prepared: &PreparedEntry<'_>) -> ArtifactRecord {
-    let inference = &prepared.inference;
+fn artifact_record(id: i64, prepared: &PreparedEntry<'_>, draft: &ArtifactDraft) -> ArtifactRecord {
+    let inference = &draft.inference;
     ArtifactRecord {
         id,
-        identity: prepared.identity.clone(),
+        identity: draft.identity.clone(),
         path_count: 0,
         artifact: Artifact {
             id: ArtifactId::new(id),
