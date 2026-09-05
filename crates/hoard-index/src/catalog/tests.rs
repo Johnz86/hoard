@@ -591,3 +591,25 @@ fn path_counts_are_final_in_the_stored_row() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn search_entry_encoding_is_frozen_until_format_version_is_bumped() -> Result<()> {
+    let (_directory, catalog) = fixture()?;
+    let read = catalog.database.r_transaction()?;
+    let mut rows: Vec<SearchEntry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    rows.sort_by_key(|entry| entry.entry_id);
+    let mut first = rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| IndexError::Catalog("no row".into()))?;
+    first.row.abs_path = None;
+    first.row.path = "fixed".into();
+    let encoded =
+        native_model::encode(&first).map_err(|error| IndexError::Catalog(error.to_string()))?;
+    insta::assert_snapshot!(hex::encode(encoded));
+    Ok(())
+}
