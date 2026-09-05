@@ -123,6 +123,12 @@ pub fn is_index_document(file_name: &str) -> bool {
     file_name.len() > INDEX_SUFFIX.len() && file_name.ends_with(INDEX_SUFFIX)
 }
 
+/// True for any file grouping considers: a container a model splits across, or the index
+/// document that names the pieces.
+pub fn is_shard_file(file_name: &str) -> bool {
+    is_shardable(file_name) || is_index_document(file_name)
+}
+
 /// Groups the candidates into the sets they belong to, a declared `weight_map` first and
 /// the naming convention for whatever it leaves over. Sets are ordered by their anchor.
 pub fn group_shards(candidates: &[ShardCandidate<'_>]) -> Vec<ShardSet> {
@@ -600,5 +606,14 @@ mod tests {
                 "every shard is represented in the samples"
             );
         }
+    }
+
+    #[test]
+    fn a_shard_file_is_a_container_or_the_index_that_names_them() {
+        assert!(is_shard_file("model-00001-of-00003.safetensors"));
+        assert!(is_shard_file("model.safetensors.index.json"));
+        assert!(is_shard_file("part-a.safetensors"));
+        assert!(!is_shard_file("README.md"));
+        assert!(!is_shard_file("config.json"));
     }
 }

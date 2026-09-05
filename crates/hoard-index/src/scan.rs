@@ -92,7 +92,7 @@ const HASH_BATCH: usize = 64;
 
 /// The ceiling on a `*.index.json` read for its `weight_map`. A forty shard model names a
 /// few hundred kilobytes of tensors; anything larger is not one of these documents.
-const INDEX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const INDEX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 
 /// How many repositories one page of the stamp cache query reads.
 const REPO_PAGE: u32 = 500;
@@ -1013,7 +1013,7 @@ fn is_shard_candidate(entry: &DiscoveredEntry, sniffed: &Sniffed) -> bool {
         return false;
     }
     let file = file_name(&entry.rel_path);
-    if !shard::is_shardable(file) && !shard::is_index_document(file) {
+    if !shard::is_shard_file(file) {
         return false;
     }
     match &sniffed.outcome {
@@ -1058,19 +1058,18 @@ fn index_documents(
         .enumerate()
         .filter(|(_, entry)| shard::is_index_document(file_name(&entry.rel_path)))
         .filter_map(|(position, entry)| {
-            index_document(entry, &sniffed[position]).map(|document| (position, document))
+            index_document(entry, sniffed[position].result()).map(|document| (position, document))
         })
         .collect()
 }
 
 /// A cache blob is content addressed, so the file the entry points at carries no name and
 /// no format was ever decided for it. The document is read as the JSON it is.
-fn index_document(entry: &DiscoveredEntry, sniffed: &Sniffed) -> Option<serde_json::Value> {
-    if let Some(config) = sniffed
-        .result()
-        .and_then(|result| result.config.as_ref())
-        .cloned()
-    {
+pub(crate) fn index_document(
+    entry: &DiscoveredEntry,
+    result: Option<&SniffResult>,
+) -> Option<serde_json::Value> {
+    if let Some(config) = result.and_then(|result| result.config.as_ref()).cloned() {
         return Some(config);
     }
     let abs_path = entry.abs_path.as_deref()?;
@@ -1299,29 +1298,20 @@ impl RevisionFacts<'_> {
         })
     }
 
-    /// What the row reads: the repository when it holds this model alone, the directory the
-    /// shards share when they sit in one, and the name they have in common otherwise. No
-    /// single shard's file name describes the model.
     fn label(&self, set: &ShardSet) -> String {
-        if self.naming.single {
-            return self.naming.repo.name().to_owned();
-        }
-        match file_name(&set.directory) {
-            "" => set.stem.clone(),
-            directory => directory.to_owned(),
-        }
+        shard_label(&self.naming, set)
     }
 
-    /// Two sets of one revision that would read the same are told apart by their stems.
     fn disambiguate(&mut self) {
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        for group in &self.groups {
-            *counts.entry(group.label.clone()).or_default() += 1;
-        }
-        for group in &mut self.groups {
-            if counts.get(&group.label).copied().unwrap_or_default() > 1 {
-                group.label = format!("{}/{}", group.label, group.stem);
-            }
+        let mut labels: Vec<String> = self
+            .groups
+            .iter()
+            .map(|group| group.label.clone())
+            .collect();
+        let stems: Vec<String> = self.groups.iter().map(|group| group.stem.clone()).collect();
+        disambiguate_labels(&mut labels, &stems);
+        for (group, label) in self.groups.iter_mut().zip(labels) {
+            group.label = label;
         }
     }
 
@@ -1343,6 +1333,36 @@ impl RevisionFacts<'_> {
             input = input.with_frontmatter(frontmatter);
         }
         infer(&input)
+    }
+}
+
+/// What the row reads: the repository when it holds this model alone, the directory the
+/// shards share when they sit in one, and the name they have in common otherwise. No
+/// single shard's file name describes the model.
+pub(crate) fn shard_label(naming: &Naming<'_>, set: &ShardSet) -> String {
+    if naming.single {
+        return naming.repo.name().to_owned();
+    }
+    match file_name(&set.directory) {
+        "" => set.stem.clone(),
+        directory => directory.to_owned(),
+    }
+}
+
+/// Two sets of one revision that would read the same are told apart by their stems.
+pub(crate) fn disambiguate_labels(labels: &mut [String], stems: &[String]) {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for label in labels.iter() {
+        *counts.entry(label.as_str()).or_default() += 1;
+    }
+    let shared: Vec<bool> = labels
+        .iter()
+        .map(|label| counts.get(label.as_str()).copied().unwrap_or_default() > 1)
+        .collect();
+    for ((label, stem), shared) in labels.iter_mut().zip(stems).zip(shared) {
+        if shared {
+            *label = format!("{label}/{stem}");
+        }
     }
 }
 
@@ -1452,7 +1472,11 @@ fn fresh_facts(
         config,
         ..
     } = result;
-    let (org, name) = artifact_name(&facts.naming, &plan.rel_path, group);
+    let (org, name) = artifact_name(
+        &facts.naming,
+        &plan.rel_path,
+        group.map(|group| group.label.as_str()),
+    );
     let inference = match group {
         Some(group) => Some(group.inference.clone()),
         None => creates_artifact(format).then(|| {
@@ -1505,14 +1529,14 @@ const fn creates_artifact(format: ArtifactFormat) -> bool {
 pub(crate) fn artifact_name(
     naming: &Naming<'_>,
     rel_path: &str,
-    group: Option<&ShardGroup>,
+    group_label: Option<&str>,
 ) -> (Option<String>, String) {
     let org = match naming.kind {
         SourceKind::Loose | SourceKind::Auto => None,
         SourceKind::HfCache | SourceKind::Git => naming.repo.org().map(str::to_owned),
     };
-    if let Some(group) = group {
-        return (org, group.label.clone());
+    if let Some(label) = group_label {
+        return (org, label.to_owned());
     }
     let name = match naming.kind {
         SourceKind::Loose | SourceKind::Auto => file_name(rel_path).to_owned(),
