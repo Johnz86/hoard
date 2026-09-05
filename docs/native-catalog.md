@@ -163,36 +163,37 @@ its harness was removed; SQLite is the store being replaced, not a peer to keep 
 
 | measure | native 100k | native 1M |
 | --- | --- | --- |
-| scan wall | 3.654141666s | 37.891587731s |
-| peak rss growth during scan | 958 MB | 8533 MB |
-| rebuild wall | 408.688891ms | 3.580465533s |
-| on disk | 518 MB | 4138 MB (2739 MB allocated) |
-| search offset 0 | 7.7755ms | 123.835626ms |
-| search deep offset | 8.912689ms | 144.921021ms |
-| search filtered | 7.106394ms | 123.346183ms |
+| scan wall | 5.226065725s | 57.77687964s |
+| peak rss growth during scan | 198 MB | 1560 MB |
+| rebuild wall | 596.949484ms | 4.40112116s |
+| peak rss growth during rebuild | 34 MB | 0 MB |
+| on disk, apparent | 518 MB | 4138 MB |
+| on disk, allocated | 288 MB | 2983 MB |
+| search offset 0 | 10.577049ms | 189.855663ms |
+| search deep offset | 9.144823ms | 197.536743ms |
+| search filtered | 7.200678ms | 177.39202ms |
 
 Thresholds at 1M entries, absolute now that there is no peer left to compare against: peak
 RSS growth under 2 GB, allocated disk under 1.5 GB, deep-offset search under 500 ms,
 rebuild no slower than the scan.
 
-Verdict: native scan within 2x of SQLite is met by a factor of hundreds, 3.7 s against
-1832 s on the same 100k tree, and 37.9 s at 1M against a SQLite scan killed at 52 minutes
-roughly one eighth of the way in. Native peak RSS growth under 2 GB is missed: 958 MB at
-100k and 8533 MB at 1M. A loose source is one revision, so `prepare_revision` sniffs and
-holds every entry of the source at once, and the single per-source redb transaction buffers
-every write until commit; both grow with the source rather than with a batch. Native on
-disk within 3x of SQLite is missed: 518 MB against 136 MB at 100k, 3.8x, and 4138 MB at 1M.
-`catalog.redb` is the whole of it, 4096 MB of the 4138 MB with 42 MB of Tantivy beside it
-(2739 MB actually allocated, the redb file being sparse), which is the per-entry `SearchRow`
-copy and its tensor summary written once per path rather than once per artifact.
-Deep-offset search under 500 ms is met: 145 ms at 1M, against 336 ms for SQLite at 100k.
-Rebuild no slower than the scan is met: 3.6 s against 37.9 s. This is a conditional go: the
-engine is far faster than the SQLite scanner at every size measured, and both misses have
-identified causes inside Hoard's own code, chunked revision preparation with periodic
-commits for the memory and a narrower persisted entry record for the disk, rather than in
-redb or Tantivy, so the gate should be rerun once those two land. The SQLite scanner's own
-30 minutes for 100k header-only files is a separate finding about the legacy code, not a
-point the replacement can claim in its favor.
+Verdict: peak RSS growth under 2 GB is met, 1560 MB at 1M and 198 MB at 100k, against
+8533 MB and 958 MB before the revision was split into units; the scan now holds one shard
+set or one chunk of 256 files at a time instead of a whole source, and pays 57.8 s for it
+against 37.9 s. Deep-offset search under 500 ms is met, 197 ms at 1M. Rebuild no slower
+than the scan is met, 4.4 s against 57.8 s. Allocated disk under 1.5 GB is missed, and
+missed worse than before: 2983 MB at 1M against 2739 MB for the whole-source scan, 2941 MB
+of it `catalog.redb` and the rest Tantivy. Two things ate the narrowing. The synthetic tree
+is one artifact per file with no shard set and no shared path, so the artifact-wide fields
+`SearchRow` used to copy per entry were never copied more than once here and dropping them
+saved nothing this benchmark can show; against that, splitting the tensor summary and
+evidence out of `ArtifactRecord` added a second per-artifact record, one million more keyed
+rows, and the scan now commits about 3,900 transactions per million entries instead of one,
+each writing a fresh path through every B-tree it touches. This is a go for continuing the
+replacement: memory, search latency and rebuild time all clear their thresholds and the
+disk miss is a storage-layout problem with named causes, to be settled by a per-entry
+record that stops repeating its revision, repository and absolute path and by measuring a
+tree with shared artifacts, not by anything redb or Tantivy does.
 
 ## Remaining replacement work
 
@@ -204,9 +205,9 @@ point the replacement can claim in its favor.
   segment, so the empty query costs memory proportional to the catalog on every call;
   replace it with a bounded heap keyed on (size, artifact id) plus an exact distinct count
   before wiring search into serve.
-- Stop persisting SearchRow as a record: ids serialize as prefixed strings and hashes as
-  hex, artifact-wide fields are copied per entry, and name/org are per entry. Store a narrow
-  entry record and build the row at the edge.
+- Shrink the per-entry record further: revision, repository, source and absolute path are
+  written out per entry, which is what the 1M catalog is mostly made of. Intern them per
+  revision and reference them by id.
 - Allocate ids across scans: repository, artifact and entry ids restart at 1 per scan and
   generation is fixed at 1, so a second scan into one catalog is impossible until ids come
   from a persisted high-water mark or from content.
@@ -223,9 +224,6 @@ point the replacement can claim in its favor.
 - Add a read-only open once redb offers one, so searches can run beside a rebuild.
 - Port the complete Hoard grammar, aliases, local-node resolution, exclusions,
   facets, compatibility, shelf expansion and every sorting mode.
-- Artifact name and org are stored per entry; two entries sharing one identity in
-  different repositories can show different names depending on which entry wins the
-  preference tie. The SQLite artifact row has one name.
 - Benchmark realistic catalogs and add process-kill/power-loss recovery tests.
   Current tests check transaction abort and publication boundaries, not power loss.
 
