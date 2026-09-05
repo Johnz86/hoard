@@ -1583,6 +1583,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pulled_file_never_occupies_the_slot_the_origin_hub_is_served_from() {
+        let root = TempDir::new().expect("temp dir");
+        let world = world(&root).await;
+        let bytes = safetensors("lora_unet_down_blocks.lora_down.weight");
+        let server = peer_serving(bytes.clone()).await;
+        let request = PullRequest::new(
+            identity(&server.uri()),
+            repo(),
+            commit(),
+            "loras/film-grain.safetensors",
+            sha256_of(&bytes),
+            bytes.len() as u64,
+        );
+
+        world
+            .puller
+            .pull(&request, None)
+            .await
+            .expect("the pull verifies");
+
+        assert!(
+            !cached(&world, "loras/film-grain.safetensors").await,
+            "a peer chose both the bytes and the hash it promised for them, so its copy \
+             cannot answer a client that asked for the origin Hub's"
+        );
+    }
+
+    #[tokio::test]
     async fn a_pull_whose_bytes_do_not_hash_is_refused_and_indexes_nothing() {
         let root = TempDir::new().expect("temp dir");
         let world = world(&root).await;

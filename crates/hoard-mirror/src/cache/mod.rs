@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 
 pub use block::{BlockBitmap, BlockMeta, CACHE_VERSION, MAGIC, chunk_crc};
 pub use entry::{BlockDownloadGuard, BlockLease, BlockLocks, CacheEntry};
-pub use layout::{CacheLayout, body_path, fan_out};
+pub use layout::{CacheLayout, CacheScope, body_path, fan_out};
 pub use meta::{
     CACHEABLE_STATUS, CachedMeta, MetaEnvelope, fresh, read_meta_array, read_meta_document,
     write_meta_document,
@@ -58,6 +58,17 @@ impl BlockCache {
             config,
             locks: BlockLocks::default(),
             index_writer: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// The same cache keyed for another upstream, sharing the block locks and the
+    /// object-index serialisation so two scopes writing at once still cannot interleave.
+    pub fn scoped(&self, scope: &CacheScope) -> Self {
+        Self {
+            layout: self.layout.scoped(scope),
+            config: Arc::clone(&self.config),
+            locks: self.locks.clone(),
+            index_writer: Arc::clone(&self.index_writer),
         }
     }
 

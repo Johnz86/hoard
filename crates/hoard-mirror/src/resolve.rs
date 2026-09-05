@@ -376,6 +376,7 @@ impl Mirror {
         access: Arc<AccessPolicy>,
         upstream: Hub,
     ) -> Self {
+        let cache = Arc::new(cache.scoped(&upstream.cache_scope()));
         Self {
             store,
             cache,
@@ -390,7 +391,8 @@ impl Mirror {
 
     /// The same node against a different upstream, which is how a peer pull reuses the
     /// proxy: a peer speaks the Hub API, so pulling from one is this code path with the
-    /// peer's base URL.
+    /// peer's base URL. The cache is re-keyed for that upstream, so the two never write
+    /// each other's entries.
     pub fn with_upstream(&self, upstream: Hub) -> Self {
         Self::new(
             self.store.clone(),
@@ -404,6 +406,8 @@ impl Mirror {
         &self.store
     }
 
+    /// The block cache keyed for this mirror's upstream. Its `root` is the whole tree,
+    /// which is what eviction and the size report need.
     pub fn cache(&self) -> &Arc<BlockCache> {
         &self.cache
     }
@@ -1900,7 +1904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_peer_pull_is_the_same_resolve_against_the_peer() {
+    async fn a_peer_pull_reuses_the_resolve_path_but_not_the_origin_cache_slot() {
         let peer = MockServer::start().await;
         mount_revision(&peer, SHA).await;
         let bytes: Vec<u8> = (0..70u8).collect();
@@ -1919,15 +1923,24 @@ mod tests {
             .await
             .expect("opens from the peer");
         assert_eq!(collect(&answer, None).await, bytes);
-        assert!(
-            harness
-                .mirror
+        let entry = |mirror: &Mirror| {
+            mirror
                 .cache()
                 .layout()
                 .file_entry(&repo(), &commit(), "model.safetensors")
                 .expect("path builds")
-                .exists(),
-            "a peer pull lands in the same block cache"
+        };
+        assert!(
+            entry(&mirror).exists(),
+            "a peer pull is cached, so it resumes"
+        );
+        assert!(
+            !entry(&harness.mirror).exists(),
+            "but under the peer that served it, not where the origin Hub's copy is read from"
+        );
+        assert!(
+            entry(&mirror).starts_with(harness.mirror.cache().root()),
+            "and still inside the tree eviction sweeps"
         );
     }
 

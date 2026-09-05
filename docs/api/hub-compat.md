@@ -174,7 +174,15 @@ api/{repo_type}/{org_repo}/commits/{sha}/commits_get.json[.body]
 files/{repo_type}/{org_repo}/resolve/{sha}/{file_path}/     block-cache entry
 lfs/files/{d1}/{d2}/{hash_repo}/{hash_file}/                block-cache entry
 lfs/object_index/{h[:2]}/{sha256}.json                      content hash -> repos
+peers/{sha256-of-peer-base-url}/...                         the same tree, per peer
 ```
+
+Those keys hold what the origin Hub served. A peer is another hoard node speaking the same
+API, and it chooses both the bytes it returns and the hash it promises for them, so its copy
+of a revision is keyed under `peers/{key}/` instead: a peer can never place bytes where a
+client asking for `huggingface.co`'s copy would read them, nor in another peer's slot. The
+key is the sha256 of the peer's base URL. Eviction sweeps from `repos/`, so every scope is
+still subject to `cache_size_limit`.
 
 A block-cache entry is a directory with `meta.bin` (magic `OLAH`, version 10, block size
 64 MiB, chunk size 1 MiB, file size, etag), `chunks.crc` (little-endian u32 CRC32 per 1 MiB
@@ -196,6 +204,9 @@ Hoard keeps this layout so an existing olah cache directory can be pointed at di
   characters in the final segment.
 - Completed cache entries are ingested into the index, so a fully cached upstream file
   becomes a local artifact with a role and appears in search.
+- Cache keys carry the upstream that served them: olah has one upstream, hoard also pulls
+  from LAN peers, which are not the audience of the caller's token and are not trusted to
+  supply the origin's bytes.
 - ETag quoting is consistent: always quoted on resolve, LFS and xet responses.
 - Routes hoard adds beyond olah: `GET /api/models`, `/api/datasets`, `/api/spaces` list
   endpoints (with `search`, `author`, `limit` query params) backed by the index,

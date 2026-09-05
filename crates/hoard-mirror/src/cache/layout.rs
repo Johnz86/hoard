@@ -1,8 +1,42 @@
 use std::path::{Path, PathBuf};
 
 use hoard_core::{CommitSha, RepoId, Sha256, clean_repo_path};
+use sha2::{Digest, Sha256 as Sha256Hasher};
+use url::Url;
 
 use crate::error::{MirrorError, Result};
+
+/// The subtree holding what upstreams other than the origin Hub have served.
+const PEERS_DIR: &str = "peers";
+
+/// Which upstream's copy of a file an entry holds.
+///
+/// A peer chooses both the bytes it serves and the hash it promises for them, so its copy of
+/// a revision must not occupy the slot a client asking for the origin Hub's copy is answered
+/// from. `Origin` keys entries exactly as olah does, so an existing `repos/` tree is still
+/// read unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CacheScope {
+    #[default]
+    Origin,
+    Peer(String),
+}
+
+impl CacheScope {
+    /// The scope for bytes served by the upstream at `base`, keyed on the whole base URL so
+    /// two peers never share an entry.
+    pub fn peer(base: &Url) -> Self {
+        let digest = Sha256Hasher::digest(base.as_str().as_bytes());
+        Self::Peer(hex::encode(digest))
+    }
+
+    fn base(&self, root: &Path) -> PathBuf {
+        match self {
+            Self::Origin => root.to_path_buf(),
+            Self::Peer(key) => root.join(PEERS_DIR).join(key),
+        }
+    }
+}
 
 /// Path construction for the olah `repos/` tree.
 ///
@@ -12,13 +46,28 @@ use crate::error::{MirrorError, Result};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheLayout {
     root: PathBuf,
+    base: PathBuf,
 }
 
 impl CacheLayout {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root = root.into();
+        Self {
+            base: root.clone(),
+            root,
+        }
     }
 
+    /// The same tree keyed for another upstream. Scopes do not nest: the key is always
+    /// derived from the sweep root, so scoping a scoped layout replaces the scope.
+    pub fn scoped(&self, scope: &CacheScope) -> Self {
+        Self {
+            base: scope.base(&self.root),
+            root: self.root.clone(),
+        }
+    }
+
+    /// The whole cache tree, every scope included, which is what eviction sweeps.
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -65,7 +114,7 @@ impl CacheLayout {
             return Err(MirrorError::EntryNotFound(file_path.to_owned()));
         }
         let base = self
-            .root
+            .base
             .join("files")
             .join(repo.repo_type().as_str())
             .join(repo_reference(repo)?)
@@ -84,7 +133,7 @@ impl CacheLayout {
         hash_file: &str,
     ) -> Result<PathBuf> {
         Ok(self
-            .root
+            .base
             .join("lfs")
             .join("files")
             .join(hex_component(dir1)?)
@@ -103,7 +152,7 @@ impl CacheLayout {
     /// `lfs/object_index/{h[:2]}/{sha256}.json`, the content hash to repo registry.
     pub fn lfs_object_index(&self, content_hash: &Sha256) -> PathBuf {
         let hex = content_hash.to_hex();
-        self.root
+        self.base
             .join("lfs")
             .join("object_index")
             .join(&hex[..2])
@@ -112,7 +161,7 @@ impl CacheLayout {
 
     fn api_dir(&self, repo: &RepoId, kind: &str, sha: &CommitSha) -> Result<PathBuf> {
         Ok(self
-            .root
+            .base
             .join("api")
             .join(repo.repo_type().as_str())
             .join(repo_reference(repo)?)
@@ -191,6 +240,10 @@ mod tests {
         CommitSha::from_str(SHA).expect("valid commit sha")
     }
 
+    fn peer_base(url: &str) -> Url {
+        Url::parse(url).expect("valid peer base")
+    }
+
     fn rendered(path: Result<PathBuf>) -> String {
         path.expect("path builds").display().to_string()
     }
@@ -242,6 +295,56 @@ mod tests {
                 .display()
                 .to_string(),
             format!("/data/repos/lfs/object_index/01/{OID}.json")
+        );
+    }
+
+    #[test]
+    fn a_peer_scope_moves_every_key_out_of_the_slots_the_origin_hub_uses() {
+        let origin = layout();
+        let peer = origin.scoped(&CacheScope::peer(&peer_base("http://laptop:7099")));
+        let repo = repo();
+        let sha = commit();
+        let oid = Sha256::from_str(OID).expect("valid oid");
+
+        let origin_keys = [
+            rendered(origin.revision_meta(&repo, &sha)),
+            rendered(origin.tree(&repo, &sha, "", true, false)),
+            rendered(origin.paths_info(&repo, &sha, "model.safetensors")),
+            rendered(origin.commits(&repo, &sha)),
+            rendered(origin.file_entry(&repo, &sha, "model.safetensors")),
+            rendered(origin.lfs_entry_by_hash(OID, OID)),
+            origin.lfs_object_index(&oid).display().to_string(),
+        ];
+        let peer_keys = [
+            rendered(peer.revision_meta(&repo, &sha)),
+            rendered(peer.tree(&repo, &sha, "", true, false)),
+            rendered(peer.paths_info(&repo, &sha, "model.safetensors")),
+            rendered(peer.commits(&repo, &sha)),
+            rendered(peer.file_entry(&repo, &sha, "model.safetensors")),
+            rendered(peer.lfs_entry_by_hash(OID, OID)),
+            peer.lfs_object_index(&oid).display().to_string(),
+        ];
+
+        for (origin_key, peer_key) in origin_keys.iter().zip(peer_keys.iter()) {
+            assert_ne!(origin_key, peer_key);
+            assert!(peer_key.starts_with("/data/repos/peers/"), "{peer_key}");
+        }
+        assert_eq!(peer.root(), origin.root(), "eviction sweeps both scopes");
+    }
+
+    #[test]
+    fn each_peer_gets_a_key_of_its_own_and_scopes_do_not_nest() {
+        let origin = layout();
+        let one = CacheScope::peer(&peer_base("http://laptop:7099"));
+        let again = CacheScope::peer(&peer_base("http://laptop:7099"));
+        let other = CacheScope::peer(&peer_base("http://desktop:7099"));
+
+        assert_eq!(one, again, "one peer keeps one slot across pulls");
+        assert_ne!(one, other, "and cannot reach into another peer's");
+        assert_eq!(
+            origin.scoped(&one).scoped(&CacheScope::Origin),
+            origin,
+            "scoping is keyed from the sweep root, so it never nests"
         );
     }
 

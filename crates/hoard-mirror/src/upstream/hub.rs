@@ -17,7 +17,7 @@ use reqwest::header::{
 use serde::Deserialize;
 use url::Url;
 
-use crate::cache::{BlockLease, CacheEntry};
+use crate::cache::{BlockLease, CacheEntry, CacheScope};
 use crate::error::{MirrorError, Result};
 use crate::model::HubTimestamp;
 use crate::upstream::client::{
@@ -139,6 +139,15 @@ impl Hub {
 
     pub const fn kind(&self) -> UpstreamKind {
         self.kind
+    }
+
+    /// The cache subtree bytes from this upstream belong in. A peer's copy of a file is not
+    /// interchangeable with the origin Hub's, so the two are never keyed alike.
+    pub fn cache_scope(&self) -> CacheScope {
+        match self.kind {
+            UpstreamKind::Origin => CacheScope::Origin,
+            UpstreamKind::Peer => CacheScope::peer(&self.base),
+        }
     }
 
     /// The credentials this upstream may be given. A caller's `Authorization` is addressed
@@ -526,6 +535,20 @@ mod tests {
     use crate::upstream::client::RetryPolicy;
 
     const SHA: &str = "9f1a2b3c4d5e6f708192a3b4c5d6e7f809a1b2c3";
+
+    #[test]
+    fn only_the_origin_hub_writes_into_the_unscoped_cache() {
+        let client = UpstreamClient::new(false).expect("client builds");
+        let origin = Hub::new(client.clone(), "https://huggingface.co").expect("hub builds");
+        let peer = Hub::peer(client, "http://laptop:7099").expect("hub builds");
+
+        assert_eq!(origin.cache_scope(), CacheScope::Origin);
+        assert_eq!(
+            peer.cache_scope(),
+            CacheScope::peer(peer.base()),
+            "a peer is keyed on the address it was reached at"
+        );
+    }
 
     fn hub(base: &str) -> Hub {
         let client = UpstreamClient::new(false)
