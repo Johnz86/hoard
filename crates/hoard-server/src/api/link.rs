@@ -332,12 +332,17 @@ mod tests {
     use super::*;
     use crate::config::HoardConfig;
 
-    fn state_at(data_dir: &Path, roots: Vec<PathBuf>) -> AppState {
+    /// The projection rules are about paths the node never has to hold, so `data_dir` here
+    /// names a directory that does not exist; the catalog beside the state gets a real one.
+    fn state_at(data_dir: &Path, roots: Vec<PathBuf>) -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().expect("temp dir");
         let store = Store::open_in_memory().expect("store opens");
         let mut config = HoardConfig::default();
         config.server.data_dir = data_dir.to_path_buf();
         config.server.projection_roots = roots;
-        AppState::new(config, store).expect("state builds")
+        let catalog = crate::testing::empty_catalog(dir.path());
+        let state = AppState::new(config, store, catalog).expect("state builds");
+        (dir, state)
     }
 
     #[test]
@@ -375,7 +380,7 @@ mod tests {
 
     #[test]
     fn a_projection_never_escapes_the_directories_this_node_offers() {
-        let state = state_at(Path::new("/srv/hoard"), Vec::new());
+        let (_dir, state) = state_at(Path::new("/srv/hoard"), Vec::new());
         assert_eq!(
             projection_dir(&state, Profile::ComfyUi, None).expect("the default is the root"),
             PathBuf::from("/srv/hoard/profiles/comfyui")
@@ -401,7 +406,7 @@ mod tests {
 
     #[test]
     fn a_configured_root_is_the_only_way_out_of_the_data_directory() {
-        let state = state_at(
+        let (_dir, state) = state_at(
             Path::new("/srv/hoard"),
             vec![PathBuf::from("/home/hoarder/ComfyUI/models")],
         );

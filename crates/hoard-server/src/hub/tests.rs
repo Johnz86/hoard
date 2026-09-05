@@ -75,8 +75,9 @@ fn seeded() -> World {
     config.node.name = "workstation".to_owned();
     config.mirror.cache_root = Some(root.join("repos"));
     config.mirror.offline = true;
+    let catalog = crate::testing::empty_catalog(root);
     World {
-        state: AppState::new(config, store).expect("state builds"),
+        state: AppState::new(config, store, catalog).expect("state builds"),
         _dir: dir,
     }
 }
@@ -91,7 +92,8 @@ fn mirrored(upstream: &str) -> World {
     config.mirror.proxy = vec![AccessRule::glob("*", true), AccessRule::glob("*/*", true)];
     config.mirror.cache = vec![AccessRule::glob("*", true), AccessRule::glob("*/*", true)];
     let store = world.state.store().clone();
-    world.state = AppState::new(config, store).expect("state builds");
+    let catalog = std::sync::Arc::clone(world.state.catalog());
+    world.state = AppState::new(config, store, catalog).expect("state builds");
     world
 }
 

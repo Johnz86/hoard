@@ -179,7 +179,7 @@ hoard/
         error.rs             NetError
     hoard-server/            axum wiring only
       src/
-        state.rs  error.rs  layers.rs  assets.rs
+        state.rs  error.rs  layers.rs  assets.rs  testing.rs (test-only fixtures)
         hub/                 Hub-compatible routes
           mod.rs  meta.rs  files.rs  proxy.rs
         git/                 git smart HTTP and LFS routes (mod.rs)
@@ -242,8 +242,11 @@ mDNS _hoard._tcp -> peers table -> periodic GET /api/v1/peers/digest?since=curso
 ## Storage
 
 - Index: `<data-dir>/hoard.db` (SQLite WAL), recreatable from disk plus peers.
-- Native catalog: any directory given to `hoard catalog scan --directory`, holding
-  `catalog.redb` plus `search-v1-<nanos>/` Tantivy directories. Not written by `serve`.
+- Native catalog: `<data-dir>/native/`, holding `catalog.redb` plus `search-v1-<nanos>/`
+  Tantivy directories. Every command that opens the index opens or creates it there, and
+  `hoard scan` and the `/api/v1/scan` job rescan and refresh it after the SQLite scan; the
+  server holds it as shared state. No route reads it yet. `hoard catalog` still takes any
+  directory with `--directory`.
 - Mirror cache: `<data-dir>/repos/` in the olah layout (`docs/api/hub-compat.md`).
 - Projections: symlinks written by `hoard link` and `hoard apply`, tracked in the index so
   PATHS ON DISK can show `laptop · symlink`.

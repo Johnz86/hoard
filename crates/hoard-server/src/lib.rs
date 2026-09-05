@@ -8,6 +8,8 @@ pub mod git;
 pub mod hub;
 pub mod layers;
 pub mod state;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod ui;
 
 use std::future::Future;
@@ -184,13 +186,17 @@ mod tests {
 
     use super::*;
 
-    fn state() -> AppState {
+    fn state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().expect("temp dir");
         let store = Store::open_in_memory().expect("in-memory store opens");
-        AppState::new(HoardConfig::default(), store).expect("state builds")
+        let catalog = crate::testing::empty_catalog(dir.path());
+        let state = AppState::new(HoardConfig::default(), store, catalog).expect("state builds");
+        (dir, state)
     }
 
     async fn through_the_stack(request: Request<Body>) -> axum::response::Response {
-        app(state())
+        let (_dir, state) = state();
+        app(state)
             .oneshot(request)
             .await
             .expect("the assembled application answers")
@@ -284,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_pull_left_running_by_a_stopped_process_reads_remote_at_startup() {
-        let state = state();
+        let (_dir, state) = state();
         let id = state
             .store()
             .call_mut(|conn| {
@@ -336,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_left_running_by_a_stopped_process_is_failed_at_startup() {
-        let state = state();
+        let (_dir, state) = state();
         let id = state
             .store()
             .call_mut(|conn| create_job(conn, "scan", Some("cache")))

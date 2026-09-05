@@ -81,8 +81,9 @@ fn seeded() -> World {
     config.server.public_url = Some("http://hoard.lan:7099".to_owned());
     config.node.name = "workstation".to_owned();
     config.mirror.cache_root = Some(dir.path().join("repos"));
+    let catalog = crate::testing::empty_catalog(dir.path());
     World {
-        state: AppState::new(config, store).expect("state builds"),
+        state: AppState::new(config, store, catalog).expect("state builds"),
         _dir: dir,
         lora: ids.0,
         ckpt: ids.1,
@@ -2054,4 +2055,27 @@ async fn usage_rows_stay_readable_after_a_pull_is_logged() {
         .await
         .expect("clients count");
     assert_eq!(counted, 3);
+}
+
+#[tokio::test]
+async fn a_scan_job_keeps_the_native_catalog_current() {
+    let world = seeded();
+    let started = post(&world.state, "/api/v1/scan", json!({})).await;
+    let job = started["job_id"].as_str().expect("job id").to_owned();
+    settle(&world.state, &job).await;
+    for attempt in 0..20 {
+        let catalog = std::sync::Arc::clone(world.state.catalog());
+        let status = tokio::task::spawn_blocking(move || catalog.status())
+            .await
+            .expect("join")
+            .expect("status");
+        if status.generation >= 2 && status.search_ready {
+            return;
+        }
+        assert!(
+            attempt < 19,
+            "the job never rescanned the catalog: {status:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use hoard_core::{JobId, SourceId, format_size};
 use hoard_index::IndexError;
+use hoard_index::catalog::RescanReport;
 use hoard_index::config::HashPolicy;
 use hoard_index::scan::ScanOptions;
 use hoard_index::store::job::{JobRow, JobState};
@@ -134,7 +135,30 @@ pub async fn scan(
 async fn hand_off_to_scanner(state: &AppState, options: ScanOptions) -> Result<(), IndexError> {
     let config = state.config().index.clone();
     hoard_index::scan::scan(state.store(), &config, options, &|_| {}).await?;
+    let report = refresh_catalog(state, config).await?;
+    tracing::info!(
+        unchanged = report.unchanged,
+        changed = report.changed,
+        added = report.added,
+        absent = report.absent,
+        "native catalog rescanned"
+    );
     Ok(())
+}
+
+/// Walks the sources again into the native catalog and applies what changed to its search
+/// index, on a blocking thread because both are file and database work.
+async fn refresh_catalog(
+    state: &AppState,
+    config: hoard_index::config::IndexConfig,
+) -> Result<RescanReport, IndexError> {
+    let catalog = std::sync::Arc::clone(state.catalog());
+    tokio::task::spawn_blocking(move || -> Result<RescanReport, IndexError> {
+        let report = catalog.rescan(&config, |_, _| {})?;
+        catalog.refresh_search(|_| {})?;
+        Ok(report)
+    })
+    .await?
 }
 
 async fn newest_scan_job(state: &AppState) -> Result<Option<JobId>, IndexError> {

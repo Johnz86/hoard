@@ -80,8 +80,9 @@ fn seeded() -> World {
     config.server.public_url = Some(PUBLIC_URL.to_owned());
     config.mirror.cache_root = Some(dir.path().join("repos"));
     config.mirror.offline = true;
+    let catalog = crate::testing::empty_catalog(dir.path());
     World {
-        state: AppState::new(config, store).expect("state builds"),
+        state: AppState::new(config, store, catalog).expect("state builds"),
         head,
         _dir: dir,
     }

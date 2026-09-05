@@ -33,7 +33,7 @@ impl Check {
 }
 
 pub async fn run(context: Context) -> Result<()> {
-    let Context { config, store } = context;
+    let Context { config, store, .. } = context;
     let mut checks = Vec::new();
 
     checks.push(git_binary());

@@ -136,7 +136,14 @@ of the shallowest README in each revision.
 - Ids come from a persisted allocator and the generation increments per rescan; artifact
   path counts are swept from the entry index after every scan and orphaned artifacts are
   removed.
-- Storage is reported per redb table, and the database is compacted after every scan.
+- Storage is reported per redb table, and `hoard catalog scan` compacts the database after
+  every scan. A rescan itself does not, so a catalog shared by the server can be walked
+  again without an exclusive borrow.
+- Every command that opens the index also opens or creates the native catalog at
+  `<data_dir>/native`; `hoard scan` and the scan job rescan and refresh it after the SQLite
+  scan; the server holds it as shared state. No route reads it yet.
+- A query answers from the published index even when a rescan has logged changes no refresh
+  has applied, and says so with `stale`; only a catalog with no index at all is refused.
 - Every transaction that touches an artifact logs its id to a search change table;
   refresh_search replays the log after a durable cursor, one Tantivy commit per batch,
   deleting the artifact's documents by term and re-adding its entries, and prunes what it

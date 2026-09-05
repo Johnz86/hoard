@@ -1,22 +1,27 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 
 use hoard_core::NodeId;
+use hoard_index::catalog::Catalog;
 use hoard_index::store::Store;
 use hoard_index::store::node::{NewNode, local_node, upsert_node};
 use hoard_server::HoardConfig;
 
 const DEFAULT_CONFIG: &str = "hoard.toml";
 
-/// The configuration and the open index, which every subcommand needs.
+/// The configuration, the open index and the native catalog beside it, which every
+/// subcommand needs.
 pub struct Context {
     pub config: HoardConfig,
     pub store: Store,
+    pub catalog: Arc<Catalog>,
 }
 
-/// Loads `hoard.toml`, opens the index and makes sure this node exists in it under the
-/// name the configuration chose.
+/// Loads `hoard.toml`, opens the index and the native catalog beside it, and makes sure this
+/// node exists in the index under the name the configuration chose. A data directory without
+/// a native catalog gets one scanned into it, which is why this reports its progress.
 pub async fn open(config_path: Option<&Path>) -> Result<Context> {
     let config = load_config(config_path)?;
     let database = config.index.database_path();
@@ -27,7 +32,31 @@ pub async fn open(config_path: Option<&Path>) -> Result<Context> {
     let store = Store::open(&database)
         .with_context(|| format!("opening the index at {}", database.display()))?;
     ensure_local_node(&store, &config.node.name).await?;
-    Ok(Context { config, store })
+    let catalog = open_catalog(&config).await?;
+    Ok(Context {
+        config,
+        store,
+        catalog,
+    })
+}
+
+async fn open_catalog(config: &HoardConfig) -> Result<Arc<Catalog>> {
+    let index = config.index.clone();
+    let node = config.node.name.clone();
+    tokio::task::spawn_blocking(move || {
+        Catalog::open_or_scan(&index, &node, |phase, count| {
+            tracing::info!(phase, count, "building the native catalog");
+        })
+    })
+    .await
+    .context("opening the native catalog")?
+    .map(Arc::new)
+    .with_context(|| {
+        format!(
+            "opening the native catalog at {}",
+            config.index.native_path().display()
+        )
+    })
 }
 
 pub fn load_config(config_path: Option<&Path>) -> Result<HoardConfig> {
