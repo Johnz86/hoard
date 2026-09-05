@@ -1,4 +1,5 @@
 pub mod apply;
+pub mod catalog;
 pub mod doctor;
 pub mod link;
 pub mod loadout;
@@ -26,6 +27,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Build and query the experimental native_db/Tantivy catalog.
+    Catalog {
+        #[command(subcommand)]
+        command: catalog::CatalogCommand,
+    },
     /// Serve the Hub API, the git face and the web UI on this node.
     Serve {
         /// Override `[server] bind`.

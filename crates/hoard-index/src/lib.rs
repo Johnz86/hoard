@@ -4,6 +4,7 @@
 //! This crate owns every fact hoard knows about a file. It never serves HTTP and never
 //! depends on axum: `hoard-mirror` and `hoard-server` read from it.
 
+pub mod catalog;
 pub mod config;
 pub mod discover;
 pub mod error;

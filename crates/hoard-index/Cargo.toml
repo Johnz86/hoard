@@ -36,6 +36,9 @@ strum.workspace = true
 toml.workspace = true
 regex.workspace = true
 tokio.workspace = true
+native_db = { version = "0.8.2", default-features = false }
+native_model = "=0.4.20"
+tantivy = { version = "0.26.1", default-features = false, features = ["mmap", "lz4-compression"] }
 
 [dev-dependencies]
 tempfile.workspace = true
