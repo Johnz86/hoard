@@ -213,6 +213,8 @@ fn native_catalog_at_scale() {
     let (loras, lora_time) = timed(|| run("role:lora", 0));
     let (_, filtered_time) = timed(|| run("fmt:safetensors size:>0", 0));
     let rss_after_queries = peak_rss_kb();
+    let (_, collapse_time) = timed(|| run("node:self", 0));
+    let rss_after_collapse = peak_rss_kb();
     let disk_apparent = directory_size(&output, apparent);
     let disk_allocated = directory_size(&output, allocated);
 
@@ -249,11 +251,16 @@ fn native_catalog_at_scale() {
         ("query deep offset", format!("{deep_time:?}")),
         ("query role:lora with facets", format!("{lora_time:?}")),
         ("query filtered", format!("{filtered_time:?}")),
+        ("query node:self with facets", format!("{collapse_time:?}")),
         ("role:lora artifacts", loras.total.to_string()),
         ("facet dimensions counted", facet_summary(&loras.facets)),
         (
             "peak rss growth during queries",
             megabytes_between(rss_after_rebuild, rss_after_queries),
+        ),
+        (
+            "peak rss growth during the collapse query",
+            megabytes_between(rss_after_queries, rss_after_collapse),
         ),
         ("rescan wall (1,000 changed)", format!("{rescan_time:?}")),
         ("rescan report", format!("{rescanned:?}")),
@@ -261,7 +268,7 @@ fn native_catalog_at_scale() {
         ("changes refreshed", applied.to_string()),
         (
             "peak rss growth during rescan and refresh",
-            megabytes_between(rss_after_queries, rss_after_refresh),
+            megabytes_between(rss_after_collapse, rss_after_refresh),
         ),
     ]);
 }
