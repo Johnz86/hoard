@@ -24,7 +24,6 @@ const REINFORCEMENT: f32 = 0.5;
 /// a folder layout alone never labels a file.
 const ROLE_FLOOR: f32 = 0.5;
 
-/// Everything inference is allowed to read about one file.
 #[derive(Debug, Clone)]
 pub struct InferInput<'a> {
     pub format: ArtifactFormat,

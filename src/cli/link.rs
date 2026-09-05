@@ -1,5 +1,3 @@
-//! `hoard link`: project a query or shelf into a tool's layout as symlinks.
-
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
@@ -33,9 +31,7 @@ pub async fn run(
     Ok(())
 }
 
-/// Posts to a running node. Projection and apply are node operations by definition: the
-/// node holding the bytes writes the links, so the CLI asks it rather than reaching into
-/// another machine's filesystem.
+/// POSTs JSON to a node's `/api/v1` route, authenticating with `HOARD_NODE_TOKEN` when set.
 pub async fn post(base: &str, route: &str, body: &Value) -> Result<Value> {
     let url = format!("{}{route}", base.trim_end_matches('/'));
     let mut request = reqwest::Client::new().post(&url).json(body);

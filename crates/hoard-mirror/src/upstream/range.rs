@@ -7,7 +7,6 @@ use std::fmt::Write as _;
 
 use http_range_header::{EndPosition, StartPosition, parse_range_header};
 
-/// The multipart part header, boundary aside, that separates two ranges of a 206.
 const PART_CONTENT_TYPE: &str = "application/octet-stream";
 
 /// The most ranges one `Range` header may name. Each range costs an upstream request on the

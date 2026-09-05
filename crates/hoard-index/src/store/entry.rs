@@ -124,8 +124,8 @@ impl NewEntry {
 /// Inserts or refreshes a path, then recounts the paths reaching its bytes.
 ///
 /// When the bytes at a path changed, the blob it used to point at loses a path and is
-/// recounted too; leaving that count behind is what made `dupe:` flag files that are not
-/// duplicates and DISK PRESSURE report bytes nothing holds any more.
+/// recounted too, so `dupe:` and DISK PRESSURE never count a path against bytes it no
+/// longer reaches.
 pub fn upsert_entry(conn: &Connection, input: &NewEntry, seen: Timestamp) -> Result<EntryId> {
     let previous = previous_blob(conn, input)?;
     let id: i64 = conn.query_row(

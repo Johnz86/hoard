@@ -44,7 +44,6 @@ impl RevisionRow {
     }
 }
 
-/// A revision as discovery found it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewRevision {
     pub repo: RepoRowId,
@@ -112,7 +111,6 @@ impl FromStr for RefKind {
     }
 }
 
-/// A named pointer into a repository's history.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RefRow {
     pub id: i64,

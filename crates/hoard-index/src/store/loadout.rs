@@ -33,7 +33,6 @@ impl LoadoutRow {
         })
     }
 
-    /// Parses the stored document into the domain loadout.
     pub fn parse(&self) -> Result<Loadout> {
         Ok(Loadout::parse(&self.document)?)
     }

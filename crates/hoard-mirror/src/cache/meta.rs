@@ -145,7 +145,6 @@ pub fn fresh(cached: Option<CachedMeta>, max_age: Option<Duration>) -> Option<Ca
         .filter(|cached| max_age.is_none_or(|limit| cached.age < limit))
 }
 
-/// Replaces a file in one step, so a reader never sees a half-written document.
 async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let temp = temp_path(path);
     let mut file = fs::File::create(&temp).await?;

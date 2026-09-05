@@ -9,8 +9,6 @@ use hoard_index::store::search_exec;
 
 use crate::api::common::{Conn, MIDDOT, state_label};
 
-/// The `compat:` query, written once so the endpoints and the search grammar resolve the
-/// same way.
 const COMPAT_QUERY: &str = "compat:subject";
 
 /// How many candidates the domain rule is asked about.

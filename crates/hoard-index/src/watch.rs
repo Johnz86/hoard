@@ -101,7 +101,6 @@ fn watch_error(error: notify::Error) -> IndexError {
     IndexError::Config(format!("filesystem watch failed: {error}"))
 }
 
-/// Passes on the paths of events that can change what the index holds.
 fn forward(sender: &Sender<PathBuf>, event: notify::Result<notify::Event>) {
     let event = match event {
         Ok(event) => event,

@@ -5,7 +5,6 @@ use rusqlite::Connection;
 use crate::error::Result;
 use crate::store::convert::{collect_rows, optional_row};
 
-/// Reads one stored setting.
 pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
     optional_row(
         conn.query_row("SELECT value FROM setting WHERE key = ?1", [key], |row| {
@@ -28,7 +27,6 @@ pub fn remove_setting(conn: &Connection, key: &str) -> Result<bool> {
     Ok(conn.execute("DELETE FROM setting WHERE key = ?1", [key])? > 0)
 }
 
-/// Every setting, which is what the settings endpoint returns in one call.
 pub fn all_settings(conn: &Connection) -> Result<BTreeMap<String, String>> {
     let mut statement = conn.prepare("SELECT key, value FROM setting ORDER BY key")?;
     let rows = statement.query_map([], |row| {

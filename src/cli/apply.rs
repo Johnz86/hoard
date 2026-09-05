@@ -1,5 +1,3 @@
-//! `hoard apply`: resolve a loadout on a node, pulling what is missing and writing links.
-
 use anyhow::{Context as _, Result};
 use serde_json::json;
 

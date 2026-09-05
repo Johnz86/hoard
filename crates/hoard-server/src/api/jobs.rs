@@ -15,9 +15,7 @@ use crate::api::common::authorize;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
-/// The job kind a scan runs under, which is what the JOBS tab groups by.
 const SCAN_KIND: &str = hoard_index::scan::SCAN_JOB;
-/// How long the handler waits for the scanner to open its job row before giving up.
 const JOB_ATTEMPTS: u32 = 200;
 const JOB_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
@@ -133,18 +131,12 @@ pub async fn scan(
     Ok(Json(ScanStarted { job_id }))
 }
 
-/// The single call into `hoard_index::scan`, which owns the job row it reports through.
 async fn hand_off_to_scanner(state: &AppState, options: ScanOptions) -> Result<(), IndexError> {
     let config = state.config().index.clone();
     hoard_index::scan::scan(state.store(), &config, options, &|_| {}).await?;
     Ok(())
 }
 
-/// The scanner records its own job as its first act, so the handler answers with that row
-/// rather than opening a second one beside it.
-///
-/// Whatever state it reached: a scan of one small source settles before this handler next
-/// looks, and the row it settled as is still the row the request started.
 async fn newest_scan_job(state: &AppState) -> Result<Option<JobId>, IndexError> {
     state
         .store()

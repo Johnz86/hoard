@@ -1,5 +1,3 @@
-//! Loading the configuration, opening the index, and this machine's node identity.
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -74,8 +72,6 @@ pub async fn local_node_name(store: &Store) -> Result<String> {
     Ok(row.name)
 }
 
-/// A stable per-machine identity. `/etc/machine-id` survives a rename and a reinstall of
-/// hoard; the hostname is only a fallback for systems without one.
 fn machine_identity() -> String {
     let raw = std::fs::read_to_string("/var/lib/dbus/machine-id")
         .or_else(|_| std::fs::read_to_string("/etc/machine-id"))
@@ -110,7 +106,6 @@ fn fold(name: &str) -> String {
     }
 }
 
-/// `hoard nodes`: this node and the peers it knows.
 pub async fn list(context: Context) -> Result<()> {
     let Context { store, .. } = context;
     let nodes = store

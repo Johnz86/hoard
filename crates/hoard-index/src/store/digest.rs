@@ -41,7 +41,6 @@ pub struct DigestEntry {
     pub state: State,
 }
 
-/// One page of this node's digest.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DigestPage {
     pub rows: Vec<DigestEntry>,
@@ -65,7 +64,6 @@ pub struct RemoteEntry {
     pub name: String,
 }
 
-/// What filing one digest page changed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DigestApplied {
     pub entries: u64,

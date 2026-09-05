@@ -128,7 +128,7 @@ hoard/
         triage.rs            queue, confirm, reject, noise list
         hash/                fingerprint, sha256, git blob sha1
         store/
-          schema.sql  migrations.rs  pool.rs
+          schema.sql  migrations.rs  pool.rs  convert.rs  fixture.rs
           node.rs  source.rs  blob.rs  artifact.rs  repo.rs  revision.rs  entry.rs
           shelf.rs  loadout.rs  job.rs  usage.rs  overrides.rs  setting.rs
           projection.rs  search_exec.rs  row.rs  digest.rs
@@ -175,8 +175,8 @@ hoard/
         hub/                 Hub-compatible routes
           mod.rs  meta.rs  files.rs  proxy.rs
         git/                 git smart HTTP and LFS routes (mod.rs)
-        api/                 /api/v1: search, artifacts, repos, readme, shelves, loadouts,
-                             triage, sources, jobs, nodes, usage, link, apply, stats
+        api/                 /api/v1: search, compat, artifacts, repos, readme, shelves,
+                             loadouts, triage, sources, jobs, nodes, usage, link, apply, stats
         ui/                  embedded web/ and index.html fallback
   web/
     index.html

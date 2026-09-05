@@ -26,7 +26,6 @@ pub struct Facets {
 }
 
 impl Facets {
-    /// Flags the buckets the query already selects, dimension by dimension.
     pub fn mark_query(&mut self, query: &ParsedQuery) {
         for (buckets, (key, _)) in self.dimensions_mut().into_iter().zip(FACET_DIMENSIONS) {
             mark_active(buckets, query, key);
@@ -44,8 +43,6 @@ impl Facets {
     }
 }
 
-/// Marks the buckets of one dimension that the query selects, so the rail can show which
-/// click produced the current result set.
 pub fn mark_active(buckets: &mut [FacetBucket], query: &ParsedQuery, key: &str) {
     for bucket in buckets {
         bucket.active = query
@@ -55,8 +52,7 @@ pub fn mark_active(buckets: &mut [FacetBucket], query: &ParsedQuery, key: &str) 
     }
 }
 
-/// Adds `key:value` to a query, or removes it when the query already selects it. This is what
-/// a facet click does, and the reason a click is reversible by clicking again.
+/// Adds `key:value` to a query, or removes it when the query already selects it.
 pub fn toggle_token(raw_query: &str, key: &str, value: &str) -> String {
     let found = scan(raw_query)
         .into_iter()

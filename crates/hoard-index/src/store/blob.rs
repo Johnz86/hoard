@@ -177,11 +177,6 @@ pub fn refresh_all_path_counts(conn: &Connection) -> Result<usize> {
     Ok(changed)
 }
 
-/// What deduplicating the index would give back: every extra copy of a duplicated blob.
-/// How many blobs are still waiting for a sha256.
-///
-/// Counted in SQL rather than by listing rows: a cold disk can leave hundreds of thousands
-/// of blobs unhashed, and the SCANS tab only needs the number.
 /// How many blobs this node actually holds, and how many bytes they occupy.
 ///
 /// Counted from the entries present on the local node rather than from scan totals, so
@@ -198,6 +193,10 @@ pub fn local_totals(conn: &Connection) -> Result<(u64, u64)> {
     Ok((to_u64(blobs), to_u64(bytes)))
 }
 
+/// How many blobs are still waiting for a sha256.
+///
+/// Counted in SQL rather than by listing rows: a cold disk can leave hundreds of thousands
+/// of blobs unhashed, and the SCANS tab only needs the number.
 pub fn pending_hash_count(conn: &Connection) -> Result<u64> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM blob WHERE sha256 IS NULL",
@@ -207,6 +206,7 @@ pub fn pending_hash_count(conn: &Connection) -> Result<u64> {
     Ok(to_u64(count))
 }
 
+/// What deduplicating the index would give back: every extra copy of a duplicated blob.
 pub fn disk_pressure(conn: &Connection) -> Result<DiskPressure> {
     let (reclaimable_bytes, duplicate_blobs) = conn.query_row(
         "SELECT COALESCE(SUM(size * (path_count - 1)), 0), COUNT(*) FROM blob WHERE path_count > 1",

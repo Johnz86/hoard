@@ -24,7 +24,6 @@ use crate::api::link::{self, Profile};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
-/// The job kind an apply runs under.
 const APPLY_KIND: &str = "apply";
 /// The slot an upscaler occupies, which is the one that reads a factor rather than a weight.
 const FACTOR_SLOT: LoadoutSlot = LoadoutSlot::Upscaler;
@@ -369,7 +368,6 @@ async fn report_only(
     Ok(())
 }
 
-/// Pulls what only a peer has, then writes the profile's links for every line that landed.
 async fn run_apply(
     state: &AppState,
     id: LoadoutId,
@@ -459,7 +457,6 @@ async fn run_apply(
     Ok(())
 }
 
-/// The puller an apply pulls with, aimed at this node's own data directory.
 fn puller(state: &AppState) -> ApiResult<Puller> {
     Puller::new(
         state.store().clone(),
@@ -475,20 +472,15 @@ fn puller(state: &AppState) -> ApiResult<Puller> {
     .map_err(|error| ApiError::internal(error.to_string()))
 }
 
-/// Where one line's bytes are coming from.
 #[derive(Debug, Clone)]
 enum LineSource {
-    /// Already on this node, at this path.
     Held(String),
-    /// Only a peer has it; this is the pull that would fetch it.
     Peer(Box<PullRequest>),
     Nowhere,
 }
 
 #[derive(Debug, Clone)]
 struct PlannedLine {
-    /// `None` when nothing on this LAN answers the pin, which is a line with no artifact
-    /// rather than a line pinned to artifact zero.
     artifact: Option<ArtifactId>,
     role: Role,
     name: String,
@@ -503,7 +495,6 @@ struct ReadyLine {
     target: String,
 }
 
-/// Resolves every pinned line against the index and the peers the index knows.
 async fn plan_of(state: &AppState, id: LoadoutId) -> ApiResult<Vec<PlannedLine>> {
     let plan = state
         .store()
@@ -549,7 +540,6 @@ fn plan_line(conn: &Conn, pin: &LoadoutPin, local: &str) -> Result<PlannedLine, 
     })
 }
 
-/// The pull that would fetch one row from the node holding it.
 fn pull_request(conn: &Conn, row: &SearchRow) -> Result<Option<PullRequest>, IndexError> {
     let Some(sha256) = row.blob_sha256 else {
         return Ok(None);
@@ -665,7 +655,6 @@ pub async fn export(
     }))
 }
 
-/// The drawer's whole state for one loadout, resolved against the named node.
 fn view_of(conn: &Conn, id: LoadoutId, node_name: &str) -> Result<LoadoutView, IndexError> {
     let record = loadout::loadout(conn, id)?;
     let document = record.parse()?;

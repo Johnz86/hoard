@@ -40,7 +40,6 @@ impl ToolLayout {
     }
 }
 
-/// Category folders of a ComfyUI `models/` directory.
 const COMFYUI_DIRS: [&str; 12] = [
     "loras",
     "checkpoints",
@@ -56,16 +55,12 @@ const COMFYUI_DIRS: [&str; 12] = [
     "style_models",
 ];
 
-/// Category folders of an Automatic1111 `models/` directory.
 const A1111_DIRS: [&str; 5] = ["stable-diffusion", "lora", "esrgan", "vae", "embeddings"];
 
-/// Working folders of a kohya training directory.
 const KOHYA_DIRS: [&str; 4] = ["img", "model", "log", "reg"];
 
-/// How many category folders have to agree before a layout counts as recognized.
 const LAYOUT_QUORUM: usize = 2;
 
-/// Names the tool layout a directory looks like, or `None` for a plain folder.
 pub fn layout(root: &Path) -> Option<ToolLayout> {
     let Ok(children) = std::fs::read_dir(root) else {
         return None;

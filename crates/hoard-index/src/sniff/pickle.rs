@@ -67,7 +67,6 @@ pub fn summarize(path: &Path, size: u64) -> Result<TensorSummary> {
     Ok(evidence.into_summary(keys))
 }
 
-/// What the first bytes say the file is, before any of it is scanned.
 enum Container {
     Zip,
     Pickle,

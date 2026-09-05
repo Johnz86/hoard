@@ -47,7 +47,6 @@ pub struct DiscoveredFile {
     pub symlink_target: Option<PathBuf>,
 }
 
-/// The include and exclude globs, symlink policy and thread count of one walk.
 #[derive(Debug, Clone)]
 pub struct WalkOptions {
     include: Option<GlobSet>,

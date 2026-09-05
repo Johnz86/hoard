@@ -263,11 +263,8 @@ impl PeerClient {
 /// Everything the STATE column depends on for one entry on one node.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StateFacts {
-    /// This node holds the bytes.
     pub held: bool,
-    /// This node offers them on the LAN.
     pub served: bool,
-    /// A transfer is running for them right now.
     pub pulling: bool,
     /// The bytes are here but hoard could not say what they are.
     pub triage: bool,
@@ -309,7 +306,6 @@ pub fn pin_is_stale(pinned: Option<CommitSha>, origin: Option<CommitSha>) -> boo
     matches!((pinned, origin), (Some(pinned), Some(origin)) if pinned != origin)
 }
 
-/// One file to fetch from one peer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PullRequest {
     pub peer: NodeIdentity,
@@ -340,7 +336,6 @@ impl PullRequest {
         }
     }
 
-    /// The file name the pulled bytes land under.
     pub fn file_name(&self) -> &str {
         let trimmed = self.path.trim_end_matches('/');
         trimmed.rsplit('/').next().unwrap_or(trimmed)
@@ -580,7 +575,6 @@ impl Puller {
         self.mark(transfer, State::Pulling, Some(fraction)).await
     }
 
-    /// The local repository and revision the pulled path belongs to, created on first pull.
     async fn local_revision(&self, request: &PullRequest) -> Result<hoard_core::RevisionId> {
         let repo = request.repo.clone();
         let revision = request.revision;
@@ -602,7 +596,6 @@ impl Puller {
         Ok(rows)
     }
 
-    /// Writes the entry this node shows for the file, with the state a reader should see.
     async fn mark(
         &self,
         transfer: Transfer<'_>,
@@ -629,7 +622,6 @@ impl Puller {
         Ok(())
     }
 
-    /// Interprets the verified bytes and records them as an artifact of this node.
     async fn file(&self, transfer: Transfer<'_>, sha256: Sha256) -> Result<PullOutcome> {
         let path = transfer.destination.to_path_buf();
         let facts = tokio::task::spawn_blocking(move || read_facts(&path))
@@ -695,7 +687,6 @@ impl Puller {
     }
 }
 
-/// One running transfer: what is being fetched, where it lands, and what reports it.
 #[derive(Debug, Clone, Copy)]
 struct Transfer<'a> {
     request: &'a PullRequest,
@@ -704,7 +695,6 @@ struct Transfer<'a> {
     job: JobId,
 }
 
-/// How much of a transfer has moved.
 #[derive(Debug, Clone, Copy)]
 struct Moved {
     written: u64,
@@ -720,7 +710,6 @@ impl Moved {
     }
 }
 
-/// What one pulled file proves about itself, read once on a blocking thread.
 #[derive(Debug, Clone)]
 struct PulledFacts {
     size: u64,
@@ -799,15 +788,13 @@ fn write_artifact(
     Ok(id)
 }
 
-/// The content hash a peer names in its headers, when it names one.
-///
-/// A disagreement here is caught before a byte moves; a peer whose headers and bytes
-/// disagree is caught by the hash taken over the stream itself.
-/// The content hash the answer states, if it states one.
+/// The content hash a peer's headers advertise, if they advertise one.
 ///
 /// A peer names it outright for a file of any size; the LFS etag carries it only for large
-/// ones, and a plain etag is a git blob name below the LFS threshold. Without one there is
-/// nothing to verify the bytes against, so the pull is refused rather than trusted.
+/// ones, and a plain etag is a git blob name below the LFS threshold. A disagreement here is
+/// caught before a byte moves; a peer whose headers and bytes disagree is caught by the hash
+/// taken over the stream itself. Without one there is nothing to verify the bytes against, so
+/// the pull is refused rather than trusted.
 fn advertised_sha256(answer: &hoard_mirror::resolve::FileAnswer) -> Option<Sha256> {
     answer.content_sha256.or_else(|| {
         answer
@@ -824,7 +811,6 @@ fn is_plain(segment: &&str) -> bool {
     !segment.is_empty() && *segment != "." && *segment != ".."
 }
 
-/// The file a transfer writes into until its bytes verify.
 fn partial_path(destination: &Path) -> PathBuf {
     let mut partial = destination.as_os_str().to_owned();
     partial.push(".");
@@ -846,7 +832,6 @@ fn mismatch(request: &PullRequest, actual: Sha256) -> NetError {
     }
 }
 
-/// How the background gossip task is configured.
 #[derive(Debug, Clone)]
 pub struct GossipConfig {
     pub identity: NodeIdentity,
@@ -975,7 +960,6 @@ async fn unless_stopped<F: Future<Output = ()>>(
     }
 }
 
-/// One peer as the loop tracks it.
 #[derive(Debug)]
 struct Peer {
     client: PeerClient,
@@ -1080,8 +1064,6 @@ impl PeerSet {
         gone
     }
 
-    /// Polls every peer that is due, several at a time, so one unreachable peer costs the
-    /// others nothing but a slot.
     async fn poll_all(&mut self, store: &Store, config: &GossipConfig) {
         let now = Instant::now();
         let interval = config.interval;
@@ -1303,7 +1285,6 @@ async fn rewind(
     Ok(true)
 }
 
-/// How many artifacts this node has filed for one peer.
 async fn filed_for(store: &Store, row: i64) -> Result<u64> {
     let filed = store
         .call(move |conn| {
@@ -1347,7 +1328,6 @@ mod tests {
         RepoId::new(RepoType::Models, Some("kohya".to_owned()), "film-grain")
     }
 
-    /// A minimal safetensors file: an eight byte header length, then the JSON header.
     fn safetensors(tensor: &str) -> Vec<u8> {
         let header = format!(
             "{{\"{tensor}\":{{\"dtype\":\"F16\",\"shape\":[4,4],\"data_offsets\":[0,32]}}}}"
@@ -1417,7 +1397,6 @@ mod tests {
         }
     }
 
-    /// The entry this node shows for one pulled path, whatever state it is in.
     async fn pulled_entry(store: &Store, path: &str) -> Option<EntryRow> {
         let wanted = path.to_owned();
         store
@@ -1437,7 +1416,6 @@ mod tests {
             .expect("entries read")
     }
 
-    /// Whether the bytes a peer really served are in the index under their own hash.
     async fn indexed(store: &Store, bytes: &[u8]) -> bool {
         let sha256 = sha256_of(bytes);
         store
@@ -1446,8 +1424,6 @@ mod tests {
             .expect("blob lookup")
     }
 
-    /// Whether the shared block cache holds every block of a file, which is what the Hub
-    /// face serves to this node's own clients and re-gossips onward.
     async fn cached(world: &World, path: &str) -> bool {
         let dir = world
             .cache
@@ -1460,7 +1436,6 @@ mod tests {
         }
     }
 
-    /// A peer answering the metadata routes a pull uses, under the etag it chooses.
     async fn peer_answering(server: &MockServer, bytes: &[u8], etag: &str) {
         Mock::given(method("GET"))
             .and(path("/api/models/kohya/film-grain"))
@@ -1491,7 +1466,6 @@ mod tests {
             .await;
     }
 
-    /// A peer serving one file over the Hub routes a pull uses.
     async fn peer_serving(bytes: Vec<u8>) -> MockServer {
         let server = MockServer::start().await;
         let etag = format!("\"{}\"", sha256_of(&bytes).to_hex());
@@ -1935,7 +1909,6 @@ mod tests {
         assert!(matches!(error, NetError::BadDigest { peer, .. } if peer == "laptop"));
     }
 
-    /// A peer answering health and stats, which every poll begins with.
     async fn peer_answering_a_poll(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path("/healthz"))
@@ -1967,7 +1940,6 @@ mod tests {
         })
     }
 
-    /// A store holding this node and one peer row, with the cursor it last read that peer to.
     async fn store_with_peer(cursor: Option<DigestCursor>) -> (Store, i64) {
         let store = Store::open_in_memory().expect("store opens");
         let row = store
@@ -2169,7 +2141,6 @@ mod tests {
         );
     }
 
-    /// Every path this node currently holds for the peer, sorted so the order is the test's.
     async fn filed_paths(store: &Store) -> Vec<String> {
         let mut paths: Vec<String> = store
             .call(|conn| {

@@ -17,7 +17,6 @@ use crate::api::compat::{CompatRowView, CompatView, compat_for};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
-/// How many pulls the artifact usage summary counts as one LAN activity line.
 const PULLS_LABEL: &str = "pulls on lan";
 
 #[derive(Debug, Clone, Default, Deserialize)]

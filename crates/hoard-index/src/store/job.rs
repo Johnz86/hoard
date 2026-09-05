@@ -16,7 +16,6 @@ use crate::store::convert::{
 const JOB_COLUMNS: &str = "id, kind, state, phase, subject, progress, bytes, total, rate_bps, \
      error, started, finished";
 
-/// Where a background job stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobState {

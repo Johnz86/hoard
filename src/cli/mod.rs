@@ -1,6 +1,3 @@
-//! The `hoard` command line: one binary that serves a node, indexes its disks and answers
-//! the same query grammar the web UI and the JSON API use.
-
 pub mod apply;
 pub mod doctor;
 pub mod link;
@@ -99,7 +96,6 @@ pub enum Command {
     Doctor,
 }
 
-/// The `--hash` spelling from `docs/feature-plan.md`, mapped onto the index's policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum HashWhen {
     /// Hash during the scan, before it reports done.

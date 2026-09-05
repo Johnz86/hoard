@@ -1,5 +1,3 @@
-//! `hoard ls`: the same grammar the search bar and the JSON API use, on the terminal.
-
 use anyhow::{Context as _, Result};
 use jiff::Timestamp;
 
@@ -67,7 +65,6 @@ pub async fn run(
     Ok(())
 }
 
-/// The nine columns of the design's table, in the same order, sized for a terminal.
 fn render(rows: &[hoard_index::store::SearchRow]) {
     let mut out = String::new();
     out.push_str(&format!(

@@ -49,9 +49,9 @@ type MediaPredicate = fn(StatusCode, Version, &HeaderMap, &Extensions) -> bool;
 /// exclusions.
 ///
 /// Weights, packfiles and cached blocks are already incompressible, so compressing them
-/// spends CPU on every LAN pull for nothing. It is not only wasteful: gzip applied to the
-/// streamed `git upload-pack` result truncated the body, which broke `git clone` outright.
-/// An allowlist cannot regress that way when a new binary content type appears.
+/// spends CPU on every LAN pull for nothing. An allowlist keeps every binary content type
+/// out of the compressor by construction, where an exclusion list would only cover the
+/// content types already known about.
 pub fn compression() -> CompressionLayer<impl Predicate + Send + Sync + 'static> {
     let predicate = SizeAbove::new(MIN_COMPRESS_BYTES).and(is_text_response as MediaPredicate);
     CompressionLayer::new()

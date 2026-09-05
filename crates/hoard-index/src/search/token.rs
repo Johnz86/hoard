@@ -101,7 +101,6 @@ impl TokenKind {
         }
     }
 
-    /// Resolves every accepted spelling of a key, or `None` when the grammar has no such key.
     pub fn from_key(key: &str) -> Option<Self> {
         match key.trim().to_ascii_lowercase().as_str() {
             "role" => Some(TokenKind::Role),
@@ -125,7 +124,6 @@ impl TokenKind {
         }
     }
 
-    /// True for the keys whose value may open with a comparison operator.
     pub const fn takes_operator(self) -> bool {
         matches!(self, TokenKind::Size | TokenKind::Used)
     }

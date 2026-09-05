@@ -6,7 +6,6 @@ use url::Url;
 
 use crate::error::{MirrorError, Result};
 
-/// The subtree holding what upstreams other than the origin Hub have served.
 const PEERS_DIR: &str = "peers";
 
 /// Which upstream's copy of a file an entry holds.

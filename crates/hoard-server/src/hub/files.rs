@@ -85,7 +85,6 @@ async fn refine(state: &AppState, repo: &RepoId, revision: &str, error: MirrorEr
     }
 }
 
-/// Whether the index holds this repository at this revision.
 async fn holds(state: &AppState, repo: &RepoId, revision: &str) -> bool {
     let qualified = repo.qualified();
     let wanted = revision.to_owned();
@@ -325,7 +324,6 @@ impl Drop for Meter {
     }
 }
 
-/// One finished response, recorded away from the request path.
 struct Record {
     store: Store,
     repo: RepoId,

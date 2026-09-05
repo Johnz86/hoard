@@ -1,5 +1,3 @@
-//! `hoard serve`: the Hub API, the git face, the JSON API and the web UI on one port.
-
 use std::net::SocketAddr;
 
 use anyhow::{Context as _, Result};
@@ -40,8 +38,6 @@ pub async fn run(context: Context, bind: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// Waits for Ctrl-C or SIGTERM. Graceful shutdown matters here because a block download
-/// interrupted mid-write would leave a partial block behind.
 async fn shutdown() {
     let interrupt = async {
         let _ = signal::ctrl_c().await;

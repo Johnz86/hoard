@@ -1,5 +1,3 @@
-//! `hoard loadout`: read, validate and export the portable pinned document.
-
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
@@ -84,8 +82,6 @@ async fn resolve(store: &Store, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// A pin resolves by content hash first and by repo plus commit plus path second, which is
-/// what lets the same document resolve on a node that stores the bytes somewhere else.
 async fn locate(store: &Store, pin: &LoadoutPin) -> Result<&'static str> {
     let Some(sha) = pin.sha256 else {
         return Ok("missing");

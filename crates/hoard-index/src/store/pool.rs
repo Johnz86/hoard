@@ -112,7 +112,6 @@ impl Store {
         Ok(store)
     }
 
-    /// Borrows a connection for reading.
     pub fn read(&self) -> Result<Reader> {
         Ok(self.pool.get()?)
     }

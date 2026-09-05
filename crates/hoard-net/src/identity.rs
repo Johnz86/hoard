@@ -30,7 +30,6 @@ pub const PROTOCOL_VERSION: &str = "1";
 /// tab and a value of the `node:` facet.
 pub const MAX_NAME: usize = 64;
 
-/// The identity one node advertises to the LAN.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeIdentity {
     id: NodeId,
@@ -195,7 +194,6 @@ pub fn normalize_address(address: &str) -> Result<Url> {
     Ok(url)
 }
 
-/// The same URL with a host a peer can dial, which an unspecified bind address is not.
 fn routable(mut url: Url) -> Result<Url> {
     if !is_unspecified(&url) {
         return Ok(url);
@@ -206,7 +204,6 @@ fn routable(mut url: Url) -> Result<Url> {
     Ok(url)
 }
 
-/// Whether an advertised URL points back at whoever reads it rather than at its author.
 fn reaches_the_reader(url: &Url) -> bool {
     is_unspecified(url)
         || matches!(
@@ -226,7 +223,6 @@ fn is_unspecified(url: &Url) -> bool {
     }
 }
 
-/// What this machine calls itself, for the node that binds every interface.
 fn local_host_name() -> String {
     std::fs::read_to_string("/etc/hostname")
         .ok()
@@ -256,7 +252,6 @@ pub fn address_identity(url: &Url) -> Result<NodeId> {
         .map_err(|error| NetError::Config(error.to_string()))
 }
 
-/// Folds text to the alphabet a node id and a DNS label share.
 fn fold_label(raw: &str) -> String {
     let folded: String = raw
         .chars()

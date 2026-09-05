@@ -20,7 +20,6 @@ use tokio::task::JoinHandle;
 use crate::error::{NetError, Result};
 use crate::identity::{NodeIdentity, SERVICE_TYPE};
 
-/// Where a node looks for its peers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DiscoveryMode {
     /// Advertise and browse `_hoard._tcp`, alongside any statically configured peers.
@@ -53,7 +52,6 @@ impl DiscoveryMode {
 /// gossip loop is bounded like every other input from the network.
 pub const ARRIVALS: usize = 256;
 
-/// How many spellings of one name are tried before a peer is named after its node id.
 const NAME_ATTEMPTS: u32 = 16;
 
 /// A peer appearing or disappearing, whatever found it.
@@ -124,7 +122,6 @@ impl Discovery {
         self.daemon.is_some()
     }
 
-    /// Withdraws the advertisement and stops browsing.
     pub fn stop(&mut self) {
         if let Some(browser) = self.browser.take() {
             browser.abort();
@@ -146,7 +143,6 @@ impl Drop for Discovery {
     }
 }
 
-/// Sends every statically configured peer as an arrival.
 fn announce_statics(sender: &Sender<PeerEvent>, local: &NodeIdentity, statics: &[String]) {
     for address in statics {
         match NodeIdentity::from_address(address) {
@@ -236,7 +232,6 @@ fn start_mdns(
     Ok((daemon, registered, browser))
 }
 
-/// The TXT record in the shape `mdns-sd` registers.
 fn txt_properties(identity: &NodeIdentity) -> HashMap<String, String> {
     identity.txt_records().into_iter().collect()
 }
@@ -480,8 +475,6 @@ mod tests {
             .expect("an unknown peer is ignored");
     }
 
-    /// Multicast is not available in every environment this suite runs in, so the mDNS path
-    /// is exercised on request rather than on every build.
     #[tokio::test]
     #[ignore = "needs a multicast route"]
     async fn mdns_advertises_and_browses_the_hoard_service() {

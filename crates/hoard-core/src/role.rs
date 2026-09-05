@@ -180,7 +180,6 @@ impl SubRole {
         }
     }
 
-    /// The role a sub-role always belongs to.
     pub const fn role(self) -> Role {
         match self {
             SubRole::Ipa => Role::Lora,

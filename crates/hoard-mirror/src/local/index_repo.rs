@@ -596,7 +596,6 @@ fn last_commit(revision: &RevisionRow) -> LastCommit {
     }
 }
 
-/// Splits a path into the part under `prefix`, or `None` when it is not under it.
 fn under<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
     if prefix.is_empty() {
         return Some(path);
@@ -720,7 +719,6 @@ mod tests {
         "2026-01-17T10:22:31Z".parse().expect("timestamp parses")
     }
 
-    /// A repository with one revision, one LFS-sized weight file and two small files.
     pub(crate) fn seed(store: &Store) -> RepoId {
         let conn = store.write().expect("writer");
         let node = upsert_node(
@@ -934,7 +932,6 @@ mod tests {
     /// against `git hash-object`. The Hub reports this as a tree entry's `oid`, because the
     /// blob git tracks for an LFS file is the pointer, never the media.
     const WEIGHTS_POINTER_OID: &str = "e5ac5c26df05b49b81220fd5128d05097e959822";
-    /// The byte length of that pointer file.
     const LFS_POINTER_SIZE: u64 = 135;
 
     static STATEMENTS: AtomicUsize = AtomicUsize::new(0);

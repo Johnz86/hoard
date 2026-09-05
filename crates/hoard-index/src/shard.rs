@@ -18,7 +18,6 @@ use crate::sniff::{MAX_PREFIXES, MAX_SAMPLES};
 /// its name spells.
 const SHARD_EXTENSIONS: [&str; 5] = ["safetensors", "bin", "pth", "gguf", "parquet"];
 
-/// The tail of the document that names the pieces of a model.
 const INDEX_SUFFIX: &str = ".index.json";
 
 /// What separates a shard's own number from the size of the set it belongs to.
@@ -179,8 +178,6 @@ fn declared_set(
     })
 }
 
-/// What makes two files members of one set: a directory, a name, a container and a total
-/// they all agree on.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SetKey<'a> {
     directory: &'a str,
@@ -340,7 +337,6 @@ fn spread_samples(parts: &[&TensorSummary]) -> Vec<TensorSample> {
     samples
 }
 
-/// The last segment of a path inside a revision.
 pub(crate) fn file_name(rel_path: &str) -> &str {
     rel_path.rsplit('/').next().unwrap_or(rel_path)
 }

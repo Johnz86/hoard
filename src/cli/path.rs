@@ -1,5 +1,3 @@
-//! `hoard path`: print where a repo or artifact actually is, for shell interpolation.
-
 use anyhow::{Context as _, Result};
 
 use hoard_core::{RepoId, Sha256};
@@ -11,8 +9,7 @@ use hoard_index::store::repo::repo_by_qualified;
 
 use super::node::Context;
 
-/// Resolves `org/name`, `type/org/name`, an artifact id or a sha256 to a path on this disk.
-/// This is what makes `llama-server -m $(hoard path org/model)` work.
+/// Prints only the path, so the command composes as `llama-server -m $(hoard path org/model)`.
 pub async fn run(context: Context, target: String) -> Result<()> {
     let Context { store, .. } = context;
     let path = resolve(&store, &target)

@@ -26,7 +26,6 @@ const SNAPSHOTS_DIR: &str = "snapshots";
 /// directory symlink pointing at an ancestor would otherwise loop until the stack is gone.
 const REFS_DEPTH: usize = 4;
 
-/// The repository a cache directory name encodes, or `None` when the name is not one.
 pub fn repo_dir_name(path: &Path) -> Option<RepoId> {
     let name = path.file_name()?.to_str()?;
     parse_dir_name(name)
@@ -199,7 +198,6 @@ fn read_snapshot(
     Ok(files.into_iter().map(cache_entry).collect())
 }
 
-/// Points the entry at the blob the snapshot links to and reads the hash out of its name.
 fn cache_entry(file: walker::DiscoveredFile) -> DiscoveredEntry {
     let mut entry = DiscoveredEntry::from_file(file);
     if !entry.is_symlink {

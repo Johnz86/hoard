@@ -112,7 +112,6 @@ pub fn source(conn: &Connection, id: SourceId) -> Result<SourceRow> {
     )
 }
 
-/// Records what a completed scan of the source found.
 pub fn record_scan_stats(conn: &Connection, id: SourceId, stats: &ScanStats) -> Result<()> {
     conn.execute(
         "UPDATE source SET file_count = ?2, blob_count = ?3, byte_count = ?4, last_scan = ?5 \

@@ -217,7 +217,6 @@ impl AppState {
         outcome
     }
 
-    /// What the last upstream call showed.
     pub fn upstream_health(&self) -> UpstreamHealth {
         match self.offline() {
             true => UpstreamHealth::Offline,

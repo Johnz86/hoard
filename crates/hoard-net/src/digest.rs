@@ -260,7 +260,6 @@ mod tests {
         }
     }
 
-    /// A store holding `count` hashed local artifacts, plus an empty peer node row.
     async fn seeded(count: u8) -> (Store, i64) {
         let store = Store::open_in_memory().expect("store opens");
         let peer = store

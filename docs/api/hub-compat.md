@@ -129,6 +129,44 @@ returns a synthetic anonymous identity so `hf auth whoami` does not hang.
 are proxied as in olah. Hoard strips `x-xet-hash` from resolve responses it serves itself so
 `hf_xet` never bypasses the mirror. Xet pass-through for very large files is a config flag.
 
+### Git smart HTTP face
+
+`GET /{org}/{repo}[.git]/info/refs?service=git-upload-pack`,
+`POST /{org}/{repo}[.git]/git-upload-pack` and
+`POST /{org}/{repo}[.git]/info/lfs/objects/batch` serve `git clone` and `git-lfs` over the
+same port as the Hub face, for models only: the clone URL carries no repo type, so datasets
+and spaces stay on the Hub face. Both the `org/repo` and orgless `repo` spellings work, with
+or without a trailing `.git`. Only a repository this node holds as a git clone answers here;
+an HF cache snapshot or a loose folder is 404 on this face while staying reachable on the
+Hub face.
+
+`info/refs` accepts `service=git-upload-pack` only. Any other service, `git-receive-pack`
+included, is 403 with the plain-text body
+`this mirror is read-only: git-receive-pack is not implemented`; a missing or unrecognized
+`service` is 404. The advertisement is `application/x-git-upload-pack-advertisement`;
+`git-upload-pack` streams the negotiated pack as `application/x-git-upload-pack-result`.
+Both carry `cache-control: no-cache`.
+
+`POST /{org}/{repo}[.git]/git-receive-pack` is always refused: 403 with the same read-only
+body when no node token is configured or a valid one is presented, 401
+`{"error":{"code":"Unauthorized","message":"a node write token is required"}}` when a token
+is configured and the request presents none or the wrong one.
+
+`POST /{org}/{repo}[.git]/info/lfs/objects/batch` answers
+`application/vnd.git-lfs+json`, 200, and resolves every named object independently rather
+than failing the whole batch:
+
+| Case | Object result |
+| --- | --- |
+| `download`, object held | `actions.download.href` at this node's own `/{ref}/resolve/{sha}/{path}`, `authenticated: true` |
+| `download`, object not held | `{"error":{"code":404,"message":"Object does not exist"}}` |
+| `upload` (any object) | `{"error":{"code":403,"message":"this mirror is read-only: upload is not supported"}}` |
+| object past position 256 of the request | `{"error":{"code":413,"message":"too many objects in one batch"}}`, resolved no further |
+
+A request naming more than 1000 objects in total is refused outright: 422
+`{"error":"too many objects in one batch"}`. A body that is not valid JSON is 422
+`{"error":"invalid batch body"}`.
+
 ## Error contract
 
 All error headers are lower-case. Bodies are JSON when shown.
@@ -139,6 +177,8 @@ All error headers are lower-case. Bodies are JSON when shown.
 | Bad `repo_type` or unknown route | 404 | `RepoNotFound` | `{"error":"Sorry, we can't find the page you are looking for."}` |
 | Path not in revision | 404 | `EntryNotFound` | empty |
 | Bad revision | 404 | `RevisionNotFound` | `{"error":"Invalid rev id: <rev>"}` |
+| Malformed request (paths-info missing `paths`, LFS batch over 1000 objects or invalid JSON) | 422 | `BadRequest` | `{"error":"<message>"}` |
+| Unsatisfiable range | 416 | `RangeNotSatisfiable` | empty, `content-range: bytes */<size>` |
 | Upstream unreachable or rate limited (408, 425, 429, 5xx) | 504 | `ProxyTimeout` | empty |
 | Upstream returned garbage | 504 | `ProxyInvalidData` | empty |
 
@@ -190,8 +230,10 @@ chunk of the logical file) and `blocks/block_{n:08}.bin`. A block is present iff
 exists with non-zero size; the presence bitmap is rebuilt from one directory scan on open
 and never persisted. Missing blocks are fetched with a `Range` request by exactly one
 downloader (advisory lock on `block_{n:08}.bin.dl.lock`), CRCs are written before the block
-is renamed into place, and a CRC mismatch on read invalidates that block. Eviction runs
-hourly when `cache_size_limit` is set, removing whole entries by LRU, FIFO or LARGE_FIRST.
+is renamed into place, and a CRC mismatch on read invalidates that block. One eviction pass
+removes whole entries by LRU, FIFO or LARGE_FIRST until the cache is back under
+`cache_size_limit`; nothing schedules a pass automatically yet, so it runs only when
+something calls it.
 
 Hoard keeps this layout so an existing olah cache directory can be pointed at directly.
 

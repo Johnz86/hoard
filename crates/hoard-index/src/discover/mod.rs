@@ -40,7 +40,6 @@ pub struct DiscoveredEntry {
 }
 
 impl DiscoveredEntry {
-    /// A loose file, whose bytes are exactly where the walk found them.
     pub fn from_file(file: DiscoveredFile) -> Self {
         Self {
             rel_path: file.rel_path,
@@ -68,7 +67,6 @@ pub enum RevisionName {
     Synthetic,
 }
 
-/// One revision of a repository with the paths it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredRevision {
     pub name: RevisionName,
@@ -98,7 +96,6 @@ pub struct DiscoveredRef {
     pub revision: usize,
 }
 
-/// A repository as one layout presents it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredRepo {
     pub repo: RepoId,
@@ -162,7 +159,6 @@ impl Discovered {
         }
     }
 
-    /// Every path this source claims, across every repository and revision.
     pub fn file_count(&self) -> usize {
         self.repos().iter().map(DiscoveredRepo::file_count).sum()
     }

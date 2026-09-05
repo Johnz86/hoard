@@ -21,13 +21,10 @@ use crate::error::{IndexError, Result};
 
 pub use readme::{ReadmeDoc, parse_readme};
 
-/// How many leading bytes the magic tests may look at.
 const PROBE_BYTES: u64 = 4096;
 /// Ceiling for the whole-document reads (README, config JSON).
 const DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
-/// How many key prefixes a summary keeps.
 pub(crate) const MAX_PREFIXES: usize = 32;
-/// How many tensor samples a summary keeps.
 pub(crate) const MAX_SAMPLES: usize = 64;
 /// Key fragments that always earn a sample slot because inference reads them.
 const SAMPLE_KEYWORDS: [&str; 21] = [
@@ -78,7 +75,6 @@ pub struct LfsPointer {
     pub size: u64,
 }
 
-/// Everything one file yielded to header sniffing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SniffResult {
     pub format: ArtifactFormat,
@@ -252,7 +248,7 @@ fn extension(path: &Path) -> Option<String> {
     Some(path.extension()?.to_str()?.to_ascii_lowercase())
 }
 
-/// Parses a git LFS pointer, which is the only text file hoard treats as a blob stand-in.
+/// The only text file hoard treats as a stand-in for a blob that is not on this disk.
 pub fn parse_lfs_pointer(head: &[u8]) -> Option<LfsPointer> {
     let text = std::str::from_utf8(head).ok()?;
     if !text.starts_with(LFS_SPEC_V1) {
@@ -603,8 +599,6 @@ pub(crate) mod tests {
         assert_eq!(config["model_type"], serde_json::json!("clip"));
     }
 
-    /// Walks the real caches on this workstation and prints what each file was taken for.
-    /// Ignored by default: it depends on paths that exist only on the author's machine.
     #[test]
     #[ignore = "reads the local model caches"]
     #[allow(clippy::print_stdout)]

@@ -362,8 +362,9 @@ fn tree_entry(
     entry
 }
 
-/// `<git dir>/lfs/objects/<a>/<b>/<oid>`, the layout `git lfs` writes. An object name too
-/// short to fan out lands directly in `objects`, which is where it would not be found.
+/// `<git dir>/lfs/objects/<a>/<b>/<oid>`, the layout `git lfs` writes. An object name with
+/// fewer than 4 hex characters cannot fan out into `<a>/<b>` and is placed directly under
+/// `objects` instead.
 pub fn lfs_object_path(git_dir: &Path, oid_hex: &str) -> PathBuf {
     let objects = git_dir.join("lfs").join("objects");
     match (oid_hex.get(0..2), oid_hex.get(2..4)) {

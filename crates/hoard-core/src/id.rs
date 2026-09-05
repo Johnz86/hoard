@@ -342,7 +342,7 @@ row_id!(JobId, "job_");
 pub struct NodeId(String);
 
 impl NodeId {
-    /// Accepts any non-empty identity; callers derive it from the machine id and node name.
+    /// Accepts a non-empty identity of ASCII alphanumeric characters and hyphens only.
     pub fn new(raw: impl Into<String>) -> Result<Self, HoardError> {
         let raw = raw.into();
         if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {

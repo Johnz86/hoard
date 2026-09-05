@@ -494,7 +494,6 @@ async fn call(
     call_as(state, method, uri, body, None).await
 }
 
-/// One request, optionally presenting an `authorization` header verbatim.
 async fn call_as(
     state: &AppState,
     method: Method,
@@ -1552,7 +1551,6 @@ async fn a_projection_writes_one_symlink_per_row() {
     assert!(!Path::new("/tmp/hoard-escape").exists());
 }
 
-/// A projection replaces a link it made before, and never removes a file it did not make.
 #[tokio::test]
 async fn a_projection_replaces_its_own_link_and_leaves_a_file_alone() {
     let world = seeded();

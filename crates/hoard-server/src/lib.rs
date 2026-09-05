@@ -86,7 +86,6 @@ pub fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// The reason a job row left running by a previous process is failed with.
 const KILLED: &str = "the process running this job was stopped";
 
 /// Settles what a stopped process left behind.

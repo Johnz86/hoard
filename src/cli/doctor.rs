@@ -1,5 +1,3 @@
-//! `hoard doctor`: check that this installation can do everything it claims.
-
 use std::path::Path;
 
 use anyhow::Result;
@@ -10,8 +8,6 @@ use hoard_index::store::source::list_sources;
 
 use super::node::Context;
 
-/// One check and what it found. A failed check names the consequence, not just the fault,
-/// because the point of the command is to explain which capability is unavailable.
 struct Check {
     name: &'static str,
     ok: bool,
@@ -109,8 +105,6 @@ pub async fn run(context: Context) -> Result<()> {
     Ok(())
 }
 
-/// The git face spawns `git upload-pack`, so a node without the binary can still serve the
-/// Hub API but cannot be cloned from. That is worth saying out loud.
 fn git_binary() -> Check {
     match std::process::Command::new("git").arg("--version").output() {
         Ok(output) if output.status.success() => Check::pass(

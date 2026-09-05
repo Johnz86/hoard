@@ -50,7 +50,6 @@ pub const REVISION_CACHE_CAPACITY: u64 = 4_096;
 /// nothing cached is served at all.
 pub const METADATA_TTL: Duration = REVISION_TTL;
 
-/// The read size of a file served straight off the filesystem.
 const LOCAL_READ: u64 = 1024 * 1024;
 
 /// The read size of a proxied file that may not be cached, so nothing has to buffer a whole
@@ -156,7 +155,6 @@ pub struct UpstreamSource {
     ingest: Option<IngestTrigger>,
 }
 
-/// The upstream bytes of one file: which upstream, which URL, whose credentials.
 #[derive(Debug, Clone)]
 struct RemoteBytes {
     hub: Hub,
@@ -988,7 +986,6 @@ fn guess_content_type(path: &str) -> String {
         .map_or_else(|| OCTET_STREAM.to_owned(), |mime| mime.to_string())
 }
 
-/// The memory cache key one revision of one repository is remembered under.
 fn revision_key(repo: &RepoId, revision: &str) -> String {
     format!("{}@{revision}", repo.qualified())
 }
@@ -1322,8 +1319,6 @@ mod tests {
         }
     }
 
-    /// A mirror over an existing cache tree and index, for the tests that change the rules
-    /// and ask the same node again.
     fn mirror_at(root: &Path, upstream: &str, config: MirrorConfig, store: Store) -> Mirror {
         let offline = config.offline;
         let access = AccessPolicy::compile(&config).expect("rules compile");

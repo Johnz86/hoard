@@ -55,7 +55,6 @@ pub struct CompiledQuery {
     pub fts_match: Option<String>,
 }
 
-/// The column a sort names, one per sortable table header plus last use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortKey {
     Role,
@@ -117,7 +116,7 @@ impl FromStr for SortKey {
     }
 }
 
-/// A column and a direction. The compiler always appends `artifact_id` so paging is stable.
+/// The compiler always appends `artifact_id ASC` so paging is stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SortSpec {
     pub key: SortKey,
@@ -163,7 +162,6 @@ impl CompatTarget {
     }
 }
 
-/// Everything compilation needs that the query text does not carry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompileContext {
     pub now: Timestamp,
@@ -206,7 +204,6 @@ impl CompileContext {
     }
 }
 
-/// Compiles a parsed query into a predicate over `search_row`.
 pub fn compile(
     query: &ParsedQuery,
     sort: SortSpec,

@@ -27,11 +27,8 @@ use crate::api::compat::{CompatView, compat_for};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
-/// How many days the USAGE chart covers.
 const USAGE_DAYS: u32 = 7;
-/// How many lines RECENT PULLS shows.
 const RECENT_PULLS: u32 = 20;
-/// How many artifacts of a repository are read to pick the one the header describes.
 const REPO_ARTIFACTS: u32 = 64;
 const README_PATH: &str = "README.md";
 const README_LIMIT: u64 = 4 * 1024 * 1024;

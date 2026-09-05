@@ -28,8 +28,6 @@ pub const DEFAULT_LOCK_STALE_AFTER: Duration = Duration::from_secs(300);
 
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// Distinguishes the temporary block files of two writers that both believed a stale lock
-/// was theirs to take, so neither can see the other's half-written bytes.
 static WRITER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The in-process half of the per-block single flight.
@@ -495,8 +493,6 @@ async fn resize_crc_file(dir: &Path, meta: &BlockMeta) -> Result<()> {
     Ok(())
 }
 
-/// Removes the header, the CRCs and every block, keeping the lock sidecars other tasks may
-/// be holding.
 async fn wipe(dir: &Path) -> Result<()> {
     for name in [META_FILE, CRC_FILE] {
         match fs::remove_file(dir.join(name)).await {
@@ -562,11 +558,6 @@ async fn ensure_file(path: &Path) -> Result<()> {
     }
 }
 
-/// Whether a `create_new` on the lock sidecar made this caller the one downloader.
-///
-/// A caller that removes a stale lock re-attempts the claim exactly once and waits if it
-/// lost, so two processes that both saw the same lock go stale still download the block
-/// once between them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LockClaim {
     Won,

@@ -145,7 +145,6 @@ pub async fn upload_pack(
     Ok(pack_stream(Pack { child, stdout }))
 }
 
-/// The running `upload-pack` and the pipe its packfile arrives on.
 #[derive(Debug)]
 struct Pack {
     child: Child,

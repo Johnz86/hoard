@@ -247,7 +247,6 @@ impl TensorSummary {
             .map(Precision::from_dtype)
     }
 
-    /// True when any tensor key starts with the given prefix.
     pub fn has_prefix(&self, prefix: &str) -> bool {
         self.key_prefixes
             .iter()
@@ -258,7 +257,6 @@ impl TensorSummary {
                 .any(|sample| sample.name.starts_with(prefix))
     }
 
-    /// True when any tensor key contains the given fragment.
     pub fn has_fragment(&self, fragment: &str) -> bool {
         self.key_prefixes
             .iter()
@@ -281,7 +279,6 @@ impl TensorSummary {
     }
 }
 
-/// The width of a float dtype, and `None` for every other spelling.
 fn float_bits(dtype: &str) -> Option<u32> {
     match Precision::from_dtype(dtype).as_str() {
         "fp8" => Some(8),

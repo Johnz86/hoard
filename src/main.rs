@@ -1,5 +1,3 @@
-//! The `hoard` binary.
-
 mod cli;
 
 use anyhow::Result;
@@ -69,8 +67,6 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Output goes through `tracing` rather than `println!`, so `RUST_LOG` controls it and the
-/// same lines are structured when the server writes them.
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new("hoard=info,hoard_server=info,hoard_index=info,hoard_mirror=info")

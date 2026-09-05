@@ -1,5 +1,3 @@
-//! `hoard scan`: walk the nominated sources and index what they hold.
-
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -66,8 +64,6 @@ fn progress_bar() -> Arc<ProgressBar> {
     Arc::new(bar)
 }
 
-/// The message is contextually sensitive: it names the phase, the counts and the file the
-/// scan is actually on, so a long scan of a cold disk is legible rather than a spinner.
 fn tick(bar: &ProgressBar, progress: &ScanProgress) {
     let current = progress.current.as_deref().unwrap_or_default();
     let message = match progress.total {

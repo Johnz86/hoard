@@ -9,7 +9,6 @@ use serde_json::{Value, json};
 use crate::error::Result;
 use crate::sniff::{read_bounded, read_tail};
 
-/// How much of a text dataset the line and key sniffing may read.
 const TEXT_PREFIX_BYTES: u64 = 256 * 1024;
 const PARQUET_FOOTER_BYTES: u64 = 8;
 const DELIMITERS: [char; 4] = [',', '\t', ';', '|'];

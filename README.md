@@ -1,9 +1,12 @@
 # Hoard
 
 Local HuggingFace-compatible mirror and artifact index. Hoard discovers model, dataset and
-repository files across local disks, identifies them from their tensor headers, indexes
-them in SQLite, and serves them through the HuggingFace Hub API and a dense web UI. Repos
-not held locally are proxied from `huggingface.co` and block-cached.
+repository files across local disks, identifies them from their tensor headers, and indexes
+them in SQLite. It serves that index through the HuggingFace Hub API, git over HTTP, and a
+dense web UI, proxying and block-caching `huggingface.co` for repos it doesn't hold
+locally. Nodes find each other on the LAN, gossip their index and pull artifacts peer to
+peer; loadouts pin a checkpoint plus its adapters and auxiliaries as a portable text file,
+applied to a node as symlinks.
 
 - `docs/use-case.md`: designer's brief
 - `docs/feature-plan.md`: scope, phases, acceptance criteria
@@ -23,8 +26,8 @@ for `crates/` and `web/`, the `/hoard-verify` and `/hoard-next-phase` skills, an
 ## Build
 
 ```sh
-cargo build --release
-cargo test
+cargo build --workspace
+cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```

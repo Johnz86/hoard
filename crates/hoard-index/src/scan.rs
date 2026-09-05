@@ -58,7 +58,6 @@ use crate::store::setting::{get_setting, put_setting};
 use crate::store::source::{ScanStats, record_scan_stats, upsert_source};
 use crate::triage::needs_triage;
 
-/// The walk that decides what exists.
 pub const PHASE_DISCOVER: &str = "discover";
 /// Header sniffing, fingerprinting and inference.
 pub const PHASE_SNIFF: &str = "sniff";
@@ -67,10 +66,8 @@ pub const PHASE_SNIFF: &str = "sniff";
 pub const PHASE_READ: &str = "read";
 /// Whole-file sha256, inline or from the background queue.
 pub const PHASE_HASH: &str = "hash";
-/// Writing rows into the index.
 pub const PHASE_STORE: &str = "store";
 
-/// The `job.kind` a scan records.
 /// The version of the sniffing and inference rules an artifact was produced by.
 ///
 /// Bump this whenever those rules change. A scan whose recorded version differs ignores the
@@ -81,6 +78,7 @@ pub const SNIFF_VERSION: u32 = 3;
 /// Where the last scan's [`SNIFF_VERSION`] is recorded.
 const SNIFF_VERSION_KEY: &str = "sniff_version";
 
+/// The `job.kind` a scan records.
 pub const SCAN_JOB: &str = "scan";
 /// The `job.kind` a background hashing run records.
 pub const HASH_JOB: &str = "hash";
@@ -1136,9 +1134,8 @@ impl InferenceContext {
     }
 
     /// The config that describes a file is the nearest one at or above its own directory,
-    /// never simply the shallowest in the revision. A text encoder's `config.json` sitting
-    /// beside it must not speak for unrelated weights in a sibling directory, which is how
-    /// one gemma-3 encoder came to label every other model in a ComfyUI tree.
+    /// never simply the shallowest in the revision: a `config.json` beside one file must
+    /// not describe unrelated weights in a sibling directory.
     fn config_for(&self, rel_path: &str) -> Option<&serde_json::Value> {
         let directory = directory_of(rel_path);
         self.configs
@@ -2089,7 +2086,6 @@ mod tests {
         }
     }
 
-    /// A safetensors file whose header names the keys a caller asks for.
     fn safetensors(keys: &[(&str, &[u64], &str)], metadata: &[(&str, &str)]) -> Vec<u8> {
         let mut header = serde_json::Map::new();
         if !metadata.is_empty() {

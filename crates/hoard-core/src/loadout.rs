@@ -256,7 +256,6 @@ impl Loadout {
     }
 }
 
-/// One compatibility problem found by validation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoadoutViolation {
     pub path: String,

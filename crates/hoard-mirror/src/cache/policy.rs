@@ -6,8 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::config::CleanStrategy;
 use crate::error::Result;
 
-/// The header of a block-cache entry. An entry that lost it to a crash mid-rewrite is still
-/// an entry, so eviction recognises the `blocks/` directory as well.
 const META_FILE: &str = "meta.bin";
 const BLOCKS_DIR: &str = "blocks";
 const META_LOCK_FILE: &str = "meta.lock";
@@ -75,7 +73,7 @@ pub fn select_evictions(
 }
 
 /// Scans `root`, evicts whole units until the tree fits under `limit` and reports what it
-/// did. The hourly timer that calls this belongs to the server.
+/// did.
 pub async fn run_once(root: &Path, limit: u64, strategy: CleanStrategy) -> Result<EvictionReport> {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {

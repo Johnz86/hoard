@@ -122,8 +122,6 @@ pub async fn ingest_cached_file(
     .await
 }
 
-/// Drops every block of an entry whose bytes were not what was promised, so no later
-/// request is served them from the cache under the upstream's etag.
 async fn discard(entry: &mut CacheEntry) {
     for index in 0..entry.meta().block_count() {
         if let Err(error) = entry.invalidate_block(index).await {
@@ -137,8 +135,6 @@ async fn discard(entry: &mut CacheEntry) {
     }
 }
 
-/// The content hashes of a cached file: the sha256 every node dedupes on, plus the git
-/// object name small files are served with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct EntryHashes {
     sha256: Sha256,

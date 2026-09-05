@@ -112,7 +112,6 @@ pub struct RepoInfo {
     pub created_at: HubTimestamp,
 }
 
-/// Whether a tree entry is a file or a directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TreeEntryKind {

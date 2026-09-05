@@ -110,14 +110,14 @@ pub struct SearchRow {
     pub lfs_pointer: bool,
 }
 
-/// The column list every search query selects, in the order `SearchRow::from_row` reads.
+/// The column list every search query selects. `SearchRow::from_row` reads columns by
+/// name, so this list's order need not match its field order.
 pub const SEARCH_COLUMNS: &str = "artifact_id, blob_id, blob_sha256, role, sub_role, \
      role_confidence, org, name, base, base_label, format, precision, quant, size, shard_count, \
      rank, alpha, params, context, revision, revision_sha, node, state, pull_progress, \
      trigger_words, path, abs_path, path_count, dupe, triage, last_used, repo, repo_id, \
      entry_id, source, is_symlink, lfs_pointer";
 
-/// What [`SearchRow::shard_count`] holds for a model nothing split.
 fn single_shard() -> u32 {
     1
 }

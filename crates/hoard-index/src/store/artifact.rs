@@ -284,8 +284,7 @@ pub fn delete_orphan_fts(conn: &Connection) -> Result<u64> {
 /// Removes artifacts for formats that describe their neighbours rather than standing alone.
 ///
 /// A `config.json` or a README is context for the weights beside it, never a row of its own.
-/// The scan has always applied that rule, but the upstream ingest once did not, so an index
-/// can hold such rows from before; the entries stay, because the files are still servable.
+/// The entries stay, since the files are still servable.
 pub fn delete_describing(conn: &Connection) -> Result<u64> {
     let standalone: Vec<&'static str> = ArtifactFormat::iter()
         .filter(|format| format.is_artifact())
