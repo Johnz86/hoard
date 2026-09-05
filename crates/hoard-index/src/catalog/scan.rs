@@ -7,9 +7,7 @@ use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 
-use hoard_core::{
-    Artifact, ArtifactFormat, ArtifactId, BlobId, EntryId, RepoRowId, Sha256, State, TensorSummary,
-};
+use hoard_core::{Artifact, ArtifactFormat, ArtifactId, BlobId, Sha256, State, TensorSummary};
 
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
 use crate::discover::{
@@ -22,10 +20,9 @@ use crate::scan::{
 };
 use crate::shard::{self, ShardCandidate, ShardSet, file_name};
 use crate::sniff::{self, SniffResult};
-use crate::store::SearchRow;
 
 use super::models::{
-    ArtifactRecord, Entry, Manifest, Repository, Revision, SearchEntry, SearchEntryKey, SearchText,
+    ArtifactDetail, ArtifactRecord, Entry, Manifest, Repository, Revision, SearchEntry, SearchText,
     Source,
 };
 use crate::error::{IndexError, Result};
@@ -146,7 +143,7 @@ impl Catalog {
         let transaction = self.database.rw_transaction()?;
         transaction.insert(Manifest {
             id: 0,
-            format_version: 2,
+            format_version: 3,
             generation: 1,
             scanned_at: jiff::Timestamp::now().to_string(),
             node: node.to_owned(),
@@ -163,7 +160,7 @@ impl Catalog {
         Ok(())
     }
 
-    /// A row records how many paths its artifact spans, and the last path is only known once
+    /// An artifact records how many paths reach it, and the last path is only known once
     /// every source has been walked, so the shared artifacts are revisited once at the end.
     fn finalize_path_counts(&self, counters: &Counters) -> Result<()> {
         let transaction = self.database.rw_transaction()?;
@@ -178,16 +175,6 @@ impl Catalog {
                 })?;
             record.path_count = seen.path_count;
             transaction.upsert(record)?;
-            let entries: Vec<SearchEntry> = transaction
-                .scan()
-                .secondary::<SearchEntry>(SearchEntryKey::artifact_id)?
-                .range(seen.id..=seen.id)?
-                .collect::<native_db::db_type::Result<_>>()?;
-            for mut entry in entries {
-                entry.row.path_count = seen.path_count;
-                entry.row.dupe = true;
-                transaction.upsert(entry)?;
-            }
         }
         transaction.commit()?;
         Ok(())
@@ -705,7 +692,24 @@ fn store_entry(
             artifact_id: record.id,
             repo_id: context.repo_id,
             preference: preference(state, prepared.presence.present()),
-            row: search_row(entry_id, context, &prepared, &record, state, triage),
+            revision: context.revision_name.clone(),
+            revision_sha: match context.revision.name {
+                RevisionName::Commit(sha) => Some(sha),
+                RevisionName::Synthetic => None,
+            },
+            node: context.node.to_owned(),
+            state,
+            triage,
+            path: prepared.discovered.rel_path.clone(),
+            abs_path: prepared
+                .presence
+                .abs_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            repo: context.repo.repo.qualified(),
+            source: context.source.to_owned(),
+            is_symlink: prepared.discovered.is_symlink,
+            lfs_pointer: prepared.presence.lfs_pointer,
             git_sha1: prepared.discovered.git_sha1,
         })?;
     }
@@ -757,12 +761,13 @@ fn store_artifact(
             .primary(seen.id)?
             .ok_or_else(|| IndexError::Catalog(format!("artifact {} vanished mid-scan", seen.id)));
     }
-    let record = artifact_record(next_id(&mut counters.artifacts)?, prepared, draft);
+    let (record, detail) = artifact_record(next_id(&mut counters.artifacts)?, prepared, draft);
     transaction.insert(SearchText {
         artifact_id: record.id,
-        keys: tensor_keys(record.tensors.as_ref()),
+        keys: tensor_keys(detail.tensors.as_ref()),
         card: draft.card.clone().unwrap_or_default(),
     })?;
+    transaction.insert(detail)?;
     transaction.insert(record.clone())?;
     counters.artifacts_by_identity.insert(
         draft.identity.clone(),
@@ -805,7 +810,11 @@ fn preference(state: State, present: bool) -> i64 {
     (4 + weight + i64::from(present)) * 2 + 1
 }
 
-fn artifact_record(id: i64, prepared: &PreparedEntry<'_>, draft: &ArtifactDraft) -> ArtifactRecord {
+fn artifact_record(
+    id: i64,
+    prepared: &PreparedEntry<'_>,
+    draft: &ArtifactDraft,
+) -> (ArtifactRecord, ArtifactDetail) {
     let inference = &draft.inference;
     let (tensors, group_bytes, shard_count) = match &prepared.role {
         EntryRole::Anchor(facts) => (
@@ -822,9 +831,11 @@ fn artifact_record(id: i64, prepared: &PreparedEntry<'_>, draft: &ArtifactDraft)
             None,
         ),
     };
-    ArtifactRecord {
+    let record = ArtifactRecord {
         id,
         identity: draft.identity.clone(),
+        name: prepared.name.clone(),
+        org: prepared.org.clone(),
         path_count: 1,
         artifact: Artifact {
             id: ArtifactId::new(id),
@@ -834,9 +845,7 @@ fn artifact_record(id: i64, prepared: &PreparedEntry<'_>, draft: &ArtifactDraft)
             format: prepared
                 .sniffed
                 .as_ref()
-                .map_or(hoard_core::ArtifactFormat::Unknown, |sniffed| {
-                    sniffed.format
-                }),
+                .map_or(ArtifactFormat::Unknown, |sniffed| sniffed.format),
             role: inference.role,
             sub_role: inference.sub_role,
             role_confidence: inference.role_confidence,
@@ -852,67 +861,13 @@ fn artifact_record(id: i64, prepared: &PreparedEntry<'_>, draft: &ArtifactDraft)
             trigger: inference.trigger.clone(),
             sniff_version: crate::scan::SNIFF_VERSION,
         },
-        tensors,
-        evidence: inference.evidence.clone(),
         group_bytes,
         shard_count,
-    }
-}
-
-fn search_row(
-    entry_id: i64,
-    context: &EntryContext<'_>,
-    prepared: &PreparedEntry<'_>,
-    record: &ArtifactRecord,
-    state: State,
-    triage: bool,
-) -> SearchRow {
-    let artifact = &record.artifact;
-    let entry = prepared.discovered;
-    SearchRow {
-        artifact_id: artifact.id,
-        blob_id: artifact.blob,
-        blob_sha256: artifact.sha256,
-        role: artifact.role,
-        sub_role: artifact.sub_role,
-        role_confidence: artifact.role_confidence,
-        org: prepared.org.clone(),
-        name: prepared.name.clone(),
-        base: artifact.base.clone(),
-        base_label: artifact.base_label.clone(),
-        format: artifact.format,
-        precision: artifact.precision.clone(),
-        quant: artifact.quant.clone(),
-        size: record.group_bytes.unwrap_or(artifact.size),
-        shard_count: record.shard_count.unwrap_or(1),
-        rank: artifact.rank,
-        alpha: artifact.alpha,
-        params: artifact.params,
-        context: artifact.context,
-        revision: context.revision_name.clone(),
-        revision_sha: match context.revision.name {
-            RevisionName::Commit(sha) => Some(sha),
-            RevisionName::Synthetic => None,
-        },
-        node: context.node.to_owned(),
-        state,
-        pull_progress: None,
-        trigger: artifact.trigger.clone(),
-        path: entry.rel_path.clone(),
-        abs_path: prepared
-            .presence
-            .abs_path
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned()),
-        path_count: record.path_count,
-        dupe: record.path_count > 1,
-        triage,
-        last_used: None,
-        repo: context.repo.repo.qualified(),
-        repo_id: RepoRowId::new(context.repo_id),
-        entry_id: EntryId::new(entry_id),
-        source: Some(context.source.to_owned()),
-        is_symlink: entry.is_symlink,
-        lfs_pointer: prepared.presence.lfs_pointer,
-    }
+    };
+    let detail = ArtifactDetail {
+        artifact_id: id,
+        tensors,
+        evidence: inference.evidence.clone(),
+    };
+    (record, detail)
 }

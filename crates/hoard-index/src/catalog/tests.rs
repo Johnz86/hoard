@@ -5,19 +5,17 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 use hoard_core::{
-    Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, EntryId, Evidence,
-    EvidenceSource, Precision, RepoId, RepoRowId, RepoType, Role, Sha256, State, SubRole,
-    TensorSample, TensorSummary,
+    Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, Evidence, EvidenceSource,
+    Precision, RepoId, RepoType, Role, Sha256, State, SubRole, TensorSample, TensorSummary,
 };
 
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
 
 use crate::error::{IndexError, Result};
-use crate::store::SearchRow;
 
 use super::models::{
-    ArtifactRecord, ArtifactRecordKey, Entry, Manifest, Repository, Revision, SearchEntry,
-    SearchText, Source,
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, Manifest, Repository, Revision,
+    SearchEntry, SearchText, Source,
 };
 use super::{Catalog, SearchRequest, models};
 
@@ -181,7 +179,7 @@ fn duplicate_paths_collapse_after_correlated_entry_filtering() -> Result<()> {
         .all()?
         .next()
         .ok_or_else(|| IndexError::Catalog("missing fixture entry".into()))??;
-    let original_node = entry.row.node.clone();
+    let original_node = entry.node.clone();
     let artifact_id = entry.artifact_id;
     let mut artifact: ArtifactRecord = transaction
         .get()
@@ -189,13 +187,10 @@ fn duplicate_paths_collapse_after_correlated_entry_filtering() -> Result<()> {
         .ok_or_else(|| IndexError::Catalog("missing fixture artifact".into()))?;
     artifact.path_count = 2;
     transaction.upsert(artifact)?;
-    entry.row.path_count = 2;
-    entry.row.dupe = true;
     transaction.upsert(entry.clone())?;
     entry.entry_id = 900;
-    entry.row.entry_id = hoard_core::EntryId::new(900);
-    entry.row.node = "peer".into();
-    entry.row.state = hoard_core::State::Remote;
+    entry.node = "peer".into();
+    entry.state = hoard_core::State::Remote;
     entry.preference = 1;
     transaction.insert(entry)?;
     transaction.commit()?;
@@ -715,18 +710,22 @@ fn a_revisions_own_readme_and_config_reach_inference() -> Result<()> {
         .all()?
         .collect::<native_db::db_type::Result<_>>()?;
     assert_eq!(records.len(), 1);
+    let detail: ArtifactDetail = read
+        .get()
+        .primary(records[0].id)?
+        .ok_or_else(|| IndexError::Catalog("detail missing".into()))?;
     assert!(
-        records[0].evidence.iter().any(|evidence| {
+        detail.evidence.iter().any(|evidence| {
             evidence.field == "role" && evidence.source == hoard_core::EvidenceSource::Config
         }),
         "the neighbouring config.json was consulted: {:?}",
-        records[0].evidence
+        detail.evidence
     );
     Ok(())
 }
 
 #[test]
-fn path_counts_are_final_in_the_stored_row() -> Result<()> {
+fn path_counts_are_final_on_the_artifact() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("files");
     fs::create_dir_all(input.join("a"))?;
@@ -741,30 +740,88 @@ fn path_counts_are_final_in_the_stored_row() -> Result<()> {
         ..IndexConfig::default()
     };
     let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
-    let read = catalog.database.r_transaction()?;
-    let rows: Vec<SearchEntry> = read
-        .scan()
-        .primary()?
-        .all()?
-        .collect::<native_db::db_type::Result<_>>()?;
-    assert_eq!(rows.len(), 2);
+    {
+        let read = catalog.database.r_transaction()?;
+        let entries: Vec<SearchEntry> = read
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
+        assert_eq!(entries.len(), 2);
+        let first: SearchEntry = read
+            .get()
+            .primary(1_i64)?
+            .ok_or_else(|| IndexError::Catalog("first entry missing".into()))?;
+        let record: ArtifactRecord = read
+            .get()
+            .primary(first.artifact_id)?
+            .ok_or_else(|| IndexError::Catalog("artifact missing".into()))?;
+        assert_eq!(
+            record.path_count, 2,
+            "only the final sweep can have set the count"
+        );
+    }
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "")?;
     assert!(
-        rows.iter()
-            .all(|entry| entry.row.path_count == 2 && entry.row.dupe)
+        rows.rows.iter().all(|row| row.path_count == 2 && row.dupe),
+        "every assembled row reads the final count"
     );
-    let first: SearchEntry = read
+    Ok(())
+}
+
+#[test]
+fn a_row_is_assembled_from_its_entry_and_artifact() -> Result<()> {
+    let (_directory, catalog) = fixture()?;
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "format:csv")?;
+    assert_eq!(rows.total, 1);
+    let row = &rows.rows[0];
+    let read = catalog.database.r_transaction()?;
+    let entry: SearchEntry = read
         .get()
-        .primary(1_i64)?
-        .ok_or_else(|| IndexError::Catalog("first row missing".into()))?;
-    assert_eq!(
-        first.row.path_count, 2,
-        "only the final sweep can have set the first row"
-    );
-    let record: ArtifactRecord = read
+        .primary(row.entry_id.get())?
+        .ok_or_else(|| IndexError::Catalog("entry missing".into()))?;
+    let artifact: ArtifactRecord = read
         .get()
-        .primary(first.artifact_id)?
+        .primary(row.artifact_id.get())?
         .ok_or_else(|| IndexError::Catalog("artifact missing".into()))?;
-    assert_eq!(record.path_count, 2);
+    assert_eq!(row.name, artifact.name);
+    assert_eq!(row.path, entry.path);
+    assert_eq!(row.size, artifact.artifact.size);
+    assert_eq!(row.state, entry.state);
+    assert!(
+        read.get().primary::<ArtifactDetail>(artifact.id)?.is_some(),
+        "the detail record exists"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_second_path_does_not_rename_the_artifact() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("a"))?;
+    fs::create_dir_all(input.join("b"))?;
+    fs::write(input.join("a/first.csv"), "x,y\n1,2\n")?;
+    std::os::unix::fs::symlink(input.join("a/first.csv"), input.join("b/second.csv"))?;
+    let config = IndexConfig {
+        sources: vec![SourceConfig {
+            follow_symlinks: true,
+            ..source(&input, "files")
+        }],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "")?;
+    assert_eq!(rows.total, 1);
+    assert_eq!(
+        rows.rows[0].name, "first.csv",
+        "the first path names the artifact"
+    );
+    assert_eq!(rows.rows[0].path_count, 2);
+    assert!(rows.rows[0].dupe);
     Ok(())
 }
 
@@ -810,50 +867,6 @@ fn frozen_artifact() -> Artifact {
     }
 }
 
-fn frozen_row() -> SearchRow {
-    SearchRow {
-        artifact_id: ArtifactId::new(7),
-        blob_id: BlobId::new(9),
-        blob_sha256: Some(Sha256::from_bytes([3; 32])),
-        role: Role::Lora,
-        sub_role: Some(SubRole::Ipa),
-        role_confidence: 0.875,
-        org: Some("frozen-org".to_owned()),
-        name: "frozen.safetensors".to_owned(),
-        base: Base::new("sdxl 1.0"),
-        base_label: Some("SDXL 1.0".to_owned()),
-        format: ArtifactFormat::Gguf,
-        precision: Some(Precision::new("fp16")),
-        quant: Some("q4_k_m".to_owned()),
-        size: 4096,
-        shard_count: 3,
-        rank: Some(16),
-        alpha: Some(8.0),
-        params: Some(1_234_567),
-        context: Some(8192),
-        revision: "main".to_owned(),
-        revision_sha: Some(CommitSha::from_bytes([5; 20])),
-        node: "frozen-node".to_owned(),
-        state: State::Triage,
-        pull_progress: Some(0.5),
-        trigger: Some("frozen style".to_owned()),
-        path: "unet/frozen.safetensors".to_owned(),
-        abs_path: Some("/frozen/source/unet/frozen.safetensors".to_owned()),
-        path_count: 2,
-        dupe: true,
-        triage: true,
-        last_used: Some(
-            jiff::Timestamp::from_second(1_767_225_600).expect("frozen timestamp is in range"),
-        ),
-        repo: "datasets/frozen-org/frozen".to_owned(),
-        repo_id: RepoRowId::new(11),
-        entry_id: EntryId::new(13),
-        source: Some("frozen".to_owned()),
-        is_symlink: true,
-        lfs_pointer: true,
-    }
-}
-
 #[test]
 fn source_encoding_is_frozen() -> Result<()> {
     let value = Source {
@@ -888,6 +901,20 @@ fn artifact_record_encoding_is_frozen() -> Result<()> {
         id: 7,
         identity: "sha256:0303030303030303".to_owned(),
         artifact: frozen_artifact(),
+        name: "frozen.safetensors".to_owned(),
+        org: Some("frozen-org".to_owned()),
+        path_count: 2,
+        group_bytes: Some(8192),
+        shard_count: Some(3),
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn artifact_detail_encoding_is_frozen() -> Result<()> {
+    let value = ArtifactDetail {
+        artifact_id: 7,
         tensors: Some(TensorSummary {
             tensor_count: 2,
             params: 1_234_567,
@@ -904,9 +931,6 @@ fn artifact_record_encoding_is_frozen() -> Result<()> {
             Evidence::new("role", "lora", EvidenceSource::Tensor, 0.95)
                 .with_detail("lora_unet_ prefix on 264 tensors"),
         ],
-        path_count: 2,
-        group_bytes: Some(8192),
-        shard_count: Some(3),
     };
     insta::assert_snapshot!(frozen_encoding(&value)?);
     Ok(())
@@ -938,8 +962,18 @@ fn search_entry_encoding_is_frozen() -> Result<()> {
         entry_id: 13,
         artifact_id: 7,
         repo_id: 11,
-        row: frozen_row(),
         preference: 19,
+        revision: "main".to_owned(),
+        revision_sha: Some(CommitSha::from_bytes([5; 20])),
+        node: "frozen-node".to_owned(),
+        state: State::Triage,
+        triage: true,
+        path: "unet/frozen.safetensors".to_owned(),
+        abs_path: Some("/frozen/source/unet/frozen.safetensors".to_owned()),
+        repo: "datasets/frozen-org/frozen".to_owned(),
+        source: "frozen".to_owned(),
+        is_symlink: true,
+        lfs_pointer: true,
         git_sha1: Some(CommitSha::from_bytes([7; 20])),
     };
     insta::assert_snapshot!(frozen_encoding(&value)?);

@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use hoard_core::{Artifact, CommitSha, Evidence, GitSha1, RepoId, State, TensorSummary};
 
 use crate::config::{SourceConfig, SourceKind};
-use crate::store::SearchRow;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 1, version = 1)]
@@ -45,11 +44,21 @@ pub(super) struct ArtifactRecord {
     #[secondary_key(unique)]
     pub(super) identity: String,
     pub(super) artifact: Artifact,
-    pub(super) tensors: Option<TensorSummary>,
-    pub(super) evidence: Vec<Evidence>,
+    pub(super) name: String,
+    pub(super) org: Option<String>,
     pub(super) path_count: u32,
     pub(super) group_bytes: Option<u64>,
     pub(super) shard_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 8, version = 1)]
+#[native_db]
+pub(super) struct ArtifactDetail {
+    #[primary_key]
+    pub(super) artifact_id: i64,
+    pub(super) tensors: Option<TensorSummary>,
+    pub(super) evidence: Vec<Evidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -61,8 +70,18 @@ pub(super) struct SearchEntry {
     #[secondary_key]
     pub(super) artifact_id: i64,
     pub(super) repo_id: i64,
-    pub(super) row: SearchRow,
     pub(super) preference: i64,
+    pub(super) revision: String,
+    pub(super) revision_sha: Option<CommitSha>,
+    pub(super) node: String,
+    pub(super) state: State,
+    pub(super) triage: bool,
+    pub(super) path: String,
+    pub(super) abs_path: Option<String>,
+    pub(super) repo: String,
+    pub(super) source: String,
+    pub(super) is_symlink: bool,
+    pub(super) lfs_pointer: bool,
     pub(super) git_sha1: Option<GitSha1>,
 }
 
@@ -116,6 +135,7 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<Source>()?;
     models.define::<Repository>()?;
     models.define::<ArtifactRecord>()?;
+    models.define::<ArtifactDetail>()?;
     models.define::<SearchEntry>()?;
     models.define::<SearchText>()?;
     models.define::<Manifest>()?;

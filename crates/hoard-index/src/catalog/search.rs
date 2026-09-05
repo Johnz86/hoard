@@ -10,9 +10,11 @@ use tantivy::query::{AllQuery, Query, QueryParser};
 use tantivy::schema::{FAST, Field, INDEXED, STRING, Schema, TEXT, TantivyDocument};
 use tantivy::{DocId, Index, Score, SegmentOrdinal, SegmentReader};
 
+use hoard_core::{EntryId, RepoRowId};
+
 use crate::store::SearchRow;
 
-use super::models::{Manifest, SearchEntry, SearchText};
+use super::models::{ArtifactRecord, Manifest, SearchEntry, SearchText};
 use crate::error::{IndexError, Result};
 
 use super::{Catalog, OpenIndex};
@@ -76,10 +78,27 @@ impl Catalog {
         let mut writer = index.writer_with_num_threads(1, WRITER_BUDGET)?;
         let snapshot = self.database.r_transaction()?;
         progress(0);
+        let mut cached: Option<(i64, ArtifactRecord)> = None;
         for (ordinal, entry) in snapshot.scan().primary::<SearchEntry>()?.all()?.enumerate() {
             let entry = entry?;
+            if cached
+                .as_ref()
+                .is_none_or(|(id, _)| *id != entry.artifact_id)
+            {
+                let artifact: ArtifactRecord =
+                    snapshot.get().primary(entry.artifact_id)?.ok_or_else(|| {
+                        IndexError::Catalog(format!(
+                            "entry {} references missing artifact {}",
+                            entry.entry_id, entry.artifact_id
+                        ))
+                    })?;
+                cached = Some((entry.artifact_id, artifact));
+            }
+            let Some((_, artifact)) = &cached else {
+                return Err(IndexError::Catalog("artifact cache went empty".into()));
+            };
             let text: Option<SearchText> = snapshot.get().primary(entry.artifact_id)?;
-            writer.add_document(fields.document(&entry, text.as_ref()))?;
+            writer.add_document(fields.document(&entry, artifact, text.as_ref()))?;
             if ordinal.is_multiple_of(512) {
                 progress(ordinal as u64 + 1);
             }
@@ -212,7 +231,14 @@ impl Catalog {
                             hit.entry_id
                         ))
                     })?;
-                Ok(entry.row)
+                let artifact: ArtifactRecord =
+                    snapshot.get().primary(entry.artifact_id)?.ok_or_else(|| {
+                        IndexError::Catalog(format!(
+                            "search references missing artifact {}",
+                            entry.artifact_id
+                        ))
+                    })?;
+                Ok(assemble_row(&entry, &artifact))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(SearchPage { total, rows })
@@ -253,47 +279,53 @@ impl Fields {
         (schema.build(), fields)
     }
 
-    fn document(&self, entry: &SearchEntry, text: Option<&SearchText>) -> TantivyDocument {
-        let row = &entry.row;
+    fn document(
+        &self,
+        entry: &SearchEntry,
+        artifact: &ArtifactRecord,
+        text: Option<&SearchText>,
+    ) -> TantivyDocument {
+        let facts = &artifact.artifact;
         let mut document = TantivyDocument::new();
         document.add_i64(self.artifact, entry.artifact_id);
         document.add_i64(self.entry, entry.entry_id);
         document.add_i64(self.preference, entry.preference);
-        document.add_u64(self.size, row.size);
-        let hash = row.blob_sha256.map(|value| value.to_string());
+        document.add_u64(self.size, artifact.group_bytes.unwrap_or(facts.size));
+        let hash = facts.sha256.map(|value| value.to_string());
         let values = [
-            row.role.as_str(),
-            row.sub_role.as_ref().map_or("", |role| role.as_str()),
-            row.base.as_str(),
-            row.format.as_str(),
-            row.precision
+            facts.role.as_str(),
+            facts.sub_role.as_ref().map_or("", |role| role.as_str()),
+            facts.base.as_str(),
+            facts.format.as_str(),
+            facts
+                .precision
                 .as_ref()
                 .map_or("", |precision| precision.as_str()),
-            &row.node,
-            row.state.as_str(),
-            row.source.as_deref().unwrap_or_default(),
-            &row.repo,
-            &row.revision,
-            row.org.as_deref().unwrap_or_default(),
+            &entry.node,
+            entry.state.as_str(),
+            &entry.source,
+            &entry.repo,
+            &entry.revision,
+            artifact.org.as_deref().unwrap_or_default(),
             hash.as_deref().unwrap_or_default(),
-            row.trigger.as_deref().unwrap_or_default(),
+            facts.trigger.as_deref().unwrap_or_default(),
         ];
         for (field, value) in self.keywords.iter().zip(values) {
             if !value.is_empty() {
                 document.add_text(*field, value);
             }
         }
-        if let Some((_, qualified)) = row.repo.split_once('/') {
+        if let Some((_, qualified)) = entry.repo.split_once('/') {
             document.add_text(self.keywords[REPO_FIELD], qualified);
         }
         if let Some(hash) = &entry.git_sha1 {
             document.add_text(self.keywords[HASH_FIELD], hash.to_string());
         }
         for value in [
-            &row.name,
-            row.org.as_deref().unwrap_or_default(),
-            row.base.as_str(),
-            row.trigger.as_deref().unwrap_or_default(),
+            artifact.name.as_str(),
+            artifact.org.as_deref().unwrap_or_default(),
+            facts.base.as_str(),
+            facts.trigger.as_deref().unwrap_or_default(),
         ] {
             document.add_text(self.text, value);
         }
@@ -302,6 +334,51 @@ impl Fields {
             document.add_text(self.text, &text.card);
         }
         document
+    }
+}
+
+/// The UI row an artifact and one of its entries make together. Artifact-wide facts are
+/// stored once per artifact and per-entry facts once per entry; nothing is copied per path.
+pub(super) fn assemble_row(entry: &SearchEntry, artifact: &ArtifactRecord) -> SearchRow {
+    let facts = &artifact.artifact;
+    SearchRow {
+        artifact_id: facts.id,
+        blob_id: facts.blob,
+        blob_sha256: facts.sha256,
+        role: facts.role,
+        sub_role: facts.sub_role,
+        role_confidence: facts.role_confidence,
+        org: artifact.org.clone(),
+        name: artifact.name.clone(),
+        base: facts.base.clone(),
+        base_label: facts.base_label.clone(),
+        format: facts.format,
+        precision: facts.precision.clone(),
+        quant: facts.quant.clone(),
+        size: artifact.group_bytes.unwrap_or(facts.size),
+        shard_count: artifact.shard_count.unwrap_or(1),
+        rank: facts.rank,
+        alpha: facts.alpha,
+        params: facts.params,
+        context: facts.context,
+        revision: entry.revision.clone(),
+        revision_sha: entry.revision_sha,
+        node: entry.node.clone(),
+        state: entry.state,
+        pull_progress: None,
+        trigger: facts.trigger.clone(),
+        path: entry.path.clone(),
+        abs_path: entry.abs_path.clone(),
+        path_count: artifact.path_count,
+        dupe: artifact.path_count > 1,
+        triage: entry.triage,
+        last_used: None,
+        repo: entry.repo.clone(),
+        repo_id: RepoRowId::new(entry.repo_id),
+        entry_id: EntryId::new(entry.entry_id),
+        source: Some(entry.source.clone()),
+        is_symlink: entry.is_symlink,
+        lfs_pointer: entry.lfs_pointer,
     }
 }
 
