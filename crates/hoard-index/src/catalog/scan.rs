@@ -60,9 +60,10 @@ impl Catalog {
     /// Walks the configured sources again. An unchanged file (same inode, mtime and size)
     /// is never opened; a changed or new file is prepared as in a fresh scan; a file that
     /// is gone keeps its row with state `Remote`. Ids continue from the allocator, the
-    /// generation increments, and the search index must be rebuilt afterwards.
+    /// generation increments, and the search index must be refreshed afterwards. The file is
+    /// not compacted, so a shared catalog can rescan without an exclusive borrow.
     pub fn rescan(
-        &mut self,
+        &self,
         config: &IndexConfig,
         progress: impl FnMut(&str, u64),
     ) -> Result<RescanReport> {
@@ -87,7 +88,6 @@ impl Catalog {
         manifest.counts = counts(&transaction)?;
         transaction.upsert(manifest)?;
         transaction.commit()?;
-        self.compact()?;
         Ok(walk.report)
     }
 
@@ -488,11 +488,11 @@ fn validate_output<'a>(
 
 /// The configured sources this node can actually walk, in configuration order. A root that
 /// is not mounted is skipped with a warning; two sources of one name are a configuration
-/// error, because a repository's identity is its source and its name.
+/// error, because a repository's identity is its source and its name. A configuration that
+/// names no walkable source yields an empty catalog rather than an error, so opening one
+/// beside the index never fails on an unmounted disk; a command that means to scan refuses
+/// an empty list itself.
 fn available_sources(config: &IndexConfig) -> Result<Vec<&SourceConfig>> {
-    if config.sources.is_empty() {
-        return Err(IndexError::Catalog("no sources are configured".into()));
-    }
     let mut names = HashSet::with_capacity(config.sources.len());
     let mut selected = Vec::with_capacity(config.sources.len());
     for source in &config.sources {
@@ -512,11 +512,6 @@ fn available_sources(config: &IndexConfig) -> Result<Vec<&SourceConfig>> {
             continue;
         }
         selected.push(source);
-    }
-    if selected.is_empty() {
-        return Err(IndexError::Catalog(
-            "no configured source is available".into(),
-        ));
     }
     Ok(selected)
 }

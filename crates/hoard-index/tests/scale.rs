@@ -191,7 +191,7 @@ fn native_catalog_at_scale() {
     let rss_before = peak_rss_kb();
     let (catalog, scan_time) =
         timed(|| Catalog::scan_sources(&output, "scale", &config, |_, _| {}));
-    let mut catalog = catalog.expect("native scan succeeds");
+    let catalog = catalog.expect("native scan succeeds");
     let rss_after_scan = peak_rss_kb();
     let ((), rebuild_time) = timed(|| catalog.rebuild_search(|_| {}).expect("rebuild succeeds"));
     let rss_after_rebuild = peak_rss_kb();

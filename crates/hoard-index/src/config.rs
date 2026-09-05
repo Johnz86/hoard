@@ -114,6 +114,11 @@ impl IndexConfig {
         self.data_dir.join("hoard.db")
     }
 
+    /// The native catalog directory, `<data-dir>/native`.
+    pub fn native_path(&self) -> PathBuf {
+        self.data_dir.join("native")
+    }
+
     /// Expands `~` in every configured path and rejects duplicate source names.
     pub fn normalize(&mut self, home: Option<&Path>) -> Result<(), IndexError> {
         self.data_dir = expand_tilde(&self.data_dir, home);

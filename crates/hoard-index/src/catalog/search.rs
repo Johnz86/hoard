@@ -92,7 +92,8 @@ pub struct QueryRequest<'a> {
 
 /// A page of artifacts with the counts the index screen prints beside it. Entry selection
 /// happens after filtering, choosing the highest availability preference and then the
-/// lowest entry id; `nodes` counts the nodes those preferred entries sit on.
+/// lowest entry id; `nodes` counts the nodes those preferred entries sit on. `stale` says
+/// the answer predates changes a rescan has already logged.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct QueryPage {
     pub query: ParsedQuery,
@@ -100,6 +101,7 @@ pub struct QueryPage {
     pub total: u64,
     pub nodes: u64,
     pub facets: Facets,
+    pub stale: bool,
 }
 
 impl Catalog {
@@ -403,7 +405,8 @@ impl Catalog {
 
     /// Runs one query of Hoard's grammar: the page of rows in the requested order, the
     /// distinct artifact and node totals, and every facet dimension counted with its own
-    /// key excluded. Refuses a stale or unbuilt index.
+    /// key excluded. Changes a rescan logged but no refresh has applied leave the published
+    /// index answering with `stale` set; only a catalog with no index at all is refused.
     pub fn query(&self, request: QueryRequest<'_>) -> Result<QueryPage> {
         if request.limit > PAGE_LIMIT {
             return Err(IndexError::Query(format!(
@@ -415,9 +418,7 @@ impl Catalog {
             .search_directory
             .as_deref()
             .ok_or_else(|| IndexError::Catalog("search index needs rebuilding".into()))?;
-        if self.pending_after(manifest.search_seq)? > 0 {
-            return Err(IndexError::Catalog("search index needs refreshing".into()));
-        }
+        let stale = self.pending_after(manifest.search_seq)? > 0;
         if !directory.starts_with("search-v1-") || directory.contains(['/', '\\']) {
             return Err(IndexError::Catalog(
                 "invalid search directory in manifest".into(),
@@ -448,6 +449,7 @@ impl Catalog {
             total,
             nodes,
             facets,
+            stale,
         })
     }
 

@@ -73,6 +73,9 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
                     .sources
                     .retain(|candidate| candidate.name == name);
             }
+            if config.index.sources.is_empty() {
+                anyhow::bail!("no sources are configured; add [[index.sources]] to hoard.toml");
+            }
             let progress = progress_bar();
             progress.set_message("Scanning native catalog");
             let rescanned = directory.join("catalog.redb").exists();
@@ -110,6 +113,7 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
                     })?;
                 }
             }
+            catalog.compact()?;
             progress.finish_and_clear();
             let status = catalog.status()?;
             drop(catalog);

@@ -364,14 +364,16 @@ fn invalid_output_and_sources_do_not_overwrite_existing_data() -> Result<()> {
         catalog.status()?.counts.last(),
         Some(&("entries".into(), 2))
     );
-    assert!(
-        Catalog::scan_sources(
-            &directory.path().join("empty"),
-            "node",
-            &IndexConfig::default(),
-            |_, _| {}
-        )
-        .is_err()
+    let empty = Catalog::scan_sources(
+        &directory.path().join("empty"),
+        "node",
+        &IndexConfig::default(),
+        |_, _| {},
+    )?;
+    assert_eq!(
+        empty.status()?.counts.last(),
+        Some(&("entries".into(), 0)),
+        "a configuration naming no source scans to an empty catalog of its own"
     );
     Ok(())
 }
@@ -1123,8 +1125,7 @@ fn disk_pressure_is_summarised_after_every_sweep() -> Result<()> {
         }],
         ..IndexConfig::default()
     };
-    let mut catalog =
-        Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
     let pressure = catalog.disk_pressure()?;
     assert_eq!(pressure.duplicate_blobs, 1);
     assert_eq!(
@@ -1156,7 +1157,7 @@ fn an_unchanged_rescan_reads_no_headers_and_a_deleted_file_is_marked_absent() ->
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
     let native = directory.path().join("native");
-    let mut catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
     let first = catalog.status()?;
     assert_eq!(first.generation, 1);
 
@@ -1214,7 +1215,7 @@ fn a_changed_file_is_reread_and_a_new_file_continues_the_ids() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
     let native = directory.path().join("native");
-    let mut catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
     let before: Vec<Entry> = {
         let read = catalog.database.r_transaction()?;
         read.scan()
@@ -1520,7 +1521,7 @@ fn a_rescan_refreshes_the_index_without_a_rebuild() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
     let native = directory.path().join("native");
-    let mut catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
     catalog.rebuild_search(|_| {})?;
     assert_eq!(catalog.pending_changes()?, 0);
     assert!(catalog.status()?.search_ready);
@@ -1566,7 +1567,7 @@ fn a_refresh_is_idempotent_and_resumes_from_the_cursor() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
     let native = directory.path().join("native");
-    let mut catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
     catalog.rebuild_search(|_| {})?;
     fs::write(input.join("loras/new.safetensors"), lora_header())?;
     catalog.rescan(&config, |_, _| {})?;
@@ -1915,7 +1916,7 @@ fn facets_and_nodes_survive_a_multi_segment_index() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
     let native = directory.path().join("native");
-    let mut catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
     catalog.rebuild_search(|_| {})?;
     for round in 0..3 {
         fs::write(
@@ -1965,5 +1966,54 @@ fn facets_and_nodes_survive_a_multi_segment_index() -> Result<()> {
         "counts merge across the segments the refreshes created: {:?}",
         page.facets.role
     );
+    Ok(())
+}
+
+#[test]
+fn a_catalog_can_be_shared_across_threads() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Catalog>();
+}
+
+#[test]
+fn a_query_serves_the_published_index_while_changes_are_pending() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    fs::write(input.join("loras/new.safetensors"), lora_header())?;
+    catalog.rescan(&config, |_, _| {})?;
+    let page = search(&catalog, "")?;
+    assert!(page.stale, "the index has not seen the rescan yet");
+    assert_eq!(page.total, 2, "the published index still answers");
+    catalog.refresh_search(|_| {})?;
+    let fresh = search(&catalog, "")?;
+    assert!(!fresh.stale);
+    assert_eq!(fresh.total, 3);
+    Ok(())
+}
+
+#[test]
+fn open_or_scan_creates_then_reopens_and_tolerates_no_sources() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (_input, config) = loose_fixture(directory.path())?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        ..config
+    };
+    let first = Catalog::open_or_scan(&config, "n", |_, _| {})?;
+    assert!(first.status()?.search_ready);
+    assert_eq!(search(&first, "")?.total, 2);
+    drop(first);
+    let second = Catalog::open_or_scan(&config, "n", |_, _| {})?;
+    assert_eq!(second.status()?.generation, 1, "reopening does not rescan");
+    drop(second);
+    let empty = IndexConfig {
+        data_dir: directory.path().join("empty"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let none = Catalog::open_or_scan(&empty, "n", |_, _| {})?;
+    assert_eq!(search(&none, "")?.total, 0);
     Ok(())
 }

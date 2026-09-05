@@ -12,6 +12,7 @@ use native_db::{Builder, Database, Models};
 use redb::{MultimapTableHandle, ReadableTableMetadata, TableHandle};
 use serde::Serialize;
 
+use crate::config::IndexConfig;
 use crate::error::{IndexError, Result};
 use crate::store::DiskPressure;
 
@@ -92,6 +93,34 @@ impl Catalog {
                 "unsupported format version {}",
                 manifest.format_version
             )));
+        }
+        Ok(catalog)
+    }
+
+    /// Opens the catalog at `config.native_path()`, scanning the configured sources into a
+    /// new one when there is none, and always returns one a query can use: an index is built
+    /// when there is none and refreshed when a rescan left changes behind. A configuration
+    /// naming no walkable source yields an empty catalog rather than an error.
+    pub fn open_or_scan(
+        config: &IndexConfig,
+        node: &str,
+        mut progress: impl FnMut(&str, u64),
+    ) -> Result<Self> {
+        let directory = config.native_path();
+        let catalog = match directory.join("catalog.redb").exists() {
+            true => Self::open(&directory)?,
+            false => {
+                if let Some(parent) = directory.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                Self::scan_sources(&directory, node, config, &mut progress)?
+            }
+        };
+        let status = catalog.status()?;
+        if !status.search_built {
+            catalog.rebuild_search(|count| progress("building the search index", count))?;
+        } else if status.pending_changes > 0 {
+            catalog.refresh_search(|count| progress("refreshing the search index", count))?;
         }
         Ok(catalog)
     }
