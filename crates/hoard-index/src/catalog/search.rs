@@ -214,9 +214,6 @@ impl Fields {
         if let Some((_, qualified)) = row.repo.split_once('/') {
             document.add_text(self.keywords[8], qualified);
         }
-        if let Some(org) = &entry.repo_org {
-            document.add_text(self.keywords[10], org);
-        }
         if let Some(hash) = &entry.git_sha1 {
             document.add_text(self.keywords[11], hash);
         }

@@ -1095,7 +1095,7 @@ fn artifact_units(sniffed: &[Sniffed], sets: &[ShardSet]) -> usize {
 
 /// The documents of a revision that describe the weights beside them.
 #[derive(Debug, Default)]
-struct InferenceContext {
+pub(crate) struct InferenceContext {
     configs: Vec<(String, serde_json::Value)>,
     frontmatter: Option<Vec<(String, String)>>,
     card: Option<String>,
@@ -1103,20 +1103,29 @@ struct InferenceContext {
 
 impl InferenceContext {
     fn collect(entries: &[DiscoveredEntry], sniffed: &[Sniffed]) -> Self {
+        Self::from_results(entries.iter().zip(sniffed).filter_map(|(entry, found)| {
+            found
+                .result()
+                .map(|result| (entry.rel_path.as_str(), result))
+        }))
+    }
+
+    /// The shallowest README and every model config of a revision, keyed by the directory
+    /// each config governs.
+    pub(crate) fn from_results<'a>(
+        results: impl Iterator<Item = (&'a str, &'a SniffResult)>,
+    ) -> Self {
         let mut context = InferenceContext::default();
         let mut card_depth = usize::MAX;
-        for (entry, found) in entries.iter().zip(sniffed) {
-            let Some(result) = found.result() else {
-                continue;
-            };
-            let depth = entry.rel_path.matches('/').count();
-            let name = file_name(&entry.rel_path).to_ascii_lowercase();
+        for (rel_path, result) in results {
+            let depth = rel_path.matches('/').count();
+            let name = file_name(rel_path).to_ascii_lowercase();
             if let Some(config) = &result.config
                 && is_model_config(&name)
             {
                 context
                     .configs
-                    .push((directory_of(&entry.rel_path).to_owned(), config.clone()));
+                    .push((directory_of(rel_path).to_owned(), config.clone()));
             }
             if let Some(readme) = &result.readme
                 && name == "readme.md"
@@ -1133,10 +1142,18 @@ impl InferenceContext {
         context
     }
 
+    pub(crate) fn frontmatter(&self) -> Option<&[(String, String)]> {
+        self.frontmatter.as_deref()
+    }
+
+    pub(crate) fn card(&self) -> Option<&str> {
+        self.card.as_deref()
+    }
+
     /// The config that describes a file is the nearest one at or above its own directory,
     /// never simply the shallowest in the revision: a `config.json` beside one file must
     /// not describe unrelated weights in a sibling directory.
-    fn config_for(&self, rel_path: &str) -> Option<&serde_json::Value> {
+    pub(crate) fn config_for(&self, rel_path: &str) -> Option<&serde_json::Value> {
         let directory = directory_of(rel_path);
         self.configs
             .iter()
@@ -1158,11 +1175,11 @@ fn is_model_config(name: &str) -> bool {
     matches!(name, "config.json" | "model_index.json")
 }
 
-struct Naming<'a> {
-    repo: &'a RepoId,
-    root_path: &'a Path,
-    kind: SourceKind,
-    single: bool,
+pub(crate) struct Naming<'a> {
+    pub(crate) repo: &'a RepoId,
+    pub(crate) root_path: &'a Path,
+    pub(crate) kind: SourceKind,
+    pub(crate) single: bool,
 }
 
 /// Which part one entry plays in a shard set, by the position of the set it belongs to.
@@ -1175,7 +1192,7 @@ enum GroupRole {
 /// One model split across files, as the scan will write it: the artifact rides on the
 /// anchor shard's blob, and it describes the union of every member's header.
 #[derive(Debug)]
-struct ShardGroup {
+pub(crate) struct ShardGroup {
     anchor: usize,
     members: Vec<usize>,
     label: String,
@@ -1485,7 +1502,7 @@ const fn creates_artifact(format: ArtifactFormat) -> bool {
 
 /// A repository names its artifact; a loose file is named by its own file name; a shard set
 /// carries the label the set was given, because no one shard's name describes the model.
-fn artifact_name(
+pub(crate) fn artifact_name(
     naming: &Naming<'_>,
     rel_path: &str,
     group: Option<&ShardGroup>,
@@ -1509,7 +1526,7 @@ fn artifact_name(
 
 /// The path inference reads folder hints from. A cache blob is content addressed, so its
 /// place in the snapshot tree is what carries the hint, not the file it links to.
-fn inference_path(root_path: &Path, rel_path: &str, abs_path: Option<&Path>) -> PathBuf {
+pub(crate) fn inference_path(root_path: &Path, rel_path: &str, abs_path: Option<&Path>) -> PathBuf {
     let natural = abs_path.filter(|path| {
         path.file_name()
             .and_then(|name| name.to_str())

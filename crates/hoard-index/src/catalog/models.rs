@@ -2,7 +2,7 @@ use native_db::{Models, ToKey, native_db};
 use native_model::{Model, native_model};
 use serde::{Deserialize, Serialize};
 
-use hoard_core::{Artifact, CommitSha, Evidence, RepoId, TensorSummary};
+use hoard_core::{Artifact, CommitSha, Evidence, RepoId, State, TensorSummary};
 
 use crate::config::{SourceConfig, SourceKind};
 use crate::store::SearchRow;
@@ -64,9 +64,6 @@ pub(super) struct SearchEntry {
     pub(super) row: SearchRow,
     pub(super) preference: i64,
     pub(super) git_sha1: Option<String>,
-    pub(super) repo_org: Option<String>,
-    pub(super) mtime: Option<i64>,
-    pub(super) inode: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,6 +91,26 @@ pub(super) struct Manifest {
     pub(super) search_generation: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 7, version = 1)]
+#[native_db]
+pub(super) struct Entry {
+    #[primary_key]
+    pub(super) id: i64,
+    #[secondary_key]
+    pub(super) repo_id: i64,
+    pub(super) revision: u32,
+    pub(super) rel_path: String,
+    pub(super) abs_path: Option<String>,
+    pub(super) size: u64,
+    pub(super) artifact_id: Option<i64>,
+    pub(super) state: State,
+    pub(super) lfs_pointer: bool,
+    pub(super) is_symlink: bool,
+    pub(super) mtime: Option<i64>,
+    pub(super) inode: Option<u64>,
+}
+
 pub(super) fn define_models() -> super::Result<Models> {
     let mut models = Models::new();
     models.define::<Source>()?;
@@ -102,5 +119,6 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<SearchEntry>()?;
     models.define::<SearchText>()?;
     models.define::<Manifest>()?;
+    models.define::<Entry>()?;
     Ok(models)
 }

@@ -30,7 +30,7 @@ Keywords use exact spelling. Results use descending size and ascending artifact 
 Exact fields: `role`, `sub_role`, `base`, `format`, `precision`, `node`, `state`,
 `source`, `repo`, `revision`, `org`, `hash`, `trigger`. `size` is a numeric byte count.
 Free text indexes names, organizations, bases, triggers, tensor key prefixes and
-the body of individual README artifacts. Trigger field filters currently match
+the body of the shallowest README in each revision. Trigger field filters currently match
 the complete trigger string; they do not implement legacy substring matching.
 
 ## What is implemented

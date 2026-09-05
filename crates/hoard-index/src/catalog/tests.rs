@@ -7,7 +7,7 @@ use crate::config::{IndexConfig, SourceConfig, SourceKind};
 
 use crate::error::{IndexError, Result};
 
-use super::models::{ArtifactRecord, ArtifactRecordKey, Manifest, SearchEntry, Source};
+use super::models::{ArtifactRecord, ArtifactRecordKey, Entry, Manifest, SearchEntry, Source};
 use super::{Catalog, SearchRequest, models};
 
 fn source(path: &Path, name: &str) -> SourceConfig {
@@ -371,10 +371,24 @@ fn an_unreadable_file_is_recorded_as_absent_instead_of_aborting() -> Result<()> 
         |_, _| {},
     )?;
     catalog.rebuild_search(|_| {})?;
-    let rows = search(&catalog, "state:remote")?;
-    assert_eq!(rows.total, 1);
-    assert_eq!(rows.rows[0].name, "locked.csv");
-    assert!(rows.rows[0].abs_path.is_none());
+    let rows = search(&catalog, "")?;
+    assert_eq!(rows.total, 1, "the unreadable file proves no artifact");
+    assert_eq!(rows.rows[0].name, "readable.csv");
+    let read = catalog.database.r_transaction()?;
+    let entries: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    let absent = entries
+        .iter()
+        .find(|entry| entry.rel_path == "locked.csv")
+        .ok_or_else(|| IndexError::Catalog("missing unreadable entry".into()))?;
+    assert_eq!(entries.len(), 2, "the unreadable file is still an entry");
+    assert_eq!(absent.state, hoard_core::State::Remote);
+    assert!(absent.abs_path.is_none());
+    assert!(absent.artifact_id.is_none());
+    drop(read);
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
@@ -408,5 +422,139 @@ fn an_lfs_pointer_is_indexed_as_the_remote_weights_it_stands_for() -> Result<()>
     assert_eq!(row.state, hoard_core::State::Remote);
     assert_eq!(row.blob_sha256.map(|sha| sha.to_string()), Some(oid));
     assert!(row.abs_path.is_none());
+    Ok(())
+}
+
+fn lora_header() -> Vec<u8> {
+    crate::sniff::tests::safetensors_fixture(concat!(
+        r#"{"__metadata__":{"ss_network_dim":"16","ss_network_alpha":"8"},"#,
+        r#""lora_unet_down_blocks_0_attn.lora_down.weight":"#,
+        r#"{"dtype":"F16","shape":[16,768],"data_offsets":[0,24576]},"#,
+        r#""lora_unet_down_blocks_0_attn.lora_up.weight":"#,
+        r#"{"dtype":"F16","shape":[768,16],"data_offsets":[24576,49152]}}"#
+    ))
+}
+
+fn hf_cache_repo(root: &Path, org: &str, name: &str, files: &[(&str, Vec<u8>)]) -> Result<()> {
+    let repo = root.join(format!("models--{org}--{name}"));
+    let commit = "b".repeat(40);
+    let snapshot = repo.join("snapshots").join(&commit);
+    fs::create_dir_all(&snapshot)?;
+    fs::create_dir_all(repo.join("blobs"))?;
+    fs::create_dir_all(repo.join("refs"))?;
+    fs::write(repo.join("refs/main"), &commit)?;
+    for (index, (rel_path, content)) in files.iter().enumerate() {
+        let blob = repo.join("blobs").join(format!("{index:064x}"));
+        fs::write(&blob, content)?;
+        let link = snapshot.join(rel_path);
+        if let Some(parent) = link.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        std::os::unix::fs::symlink(&blob, &link)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn hf_cache_rows_match_the_legacy_shape() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    hf_cache_repo(
+        &hub,
+        "acme",
+        "styler",
+        &[
+            (
+                "README.md",
+                b"---\ninstance_prompt: acme style\n---\nA style LoRA.\n".to_vec(),
+            ),
+            (
+                "config.json",
+                b"{\"architectures\":[\"UNet2DConditionModel\"]}".to_vec(),
+            ),
+            ("unet/adapter.safetensors", lora_header()),
+        ],
+    )?;
+    let config = IndexConfig {
+        sources: vec![SourceConfig {
+            kind: SourceKind::HfCache,
+            ..source(&hub, "hub")
+        }],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "")?;
+    assert_eq!(
+        rows.total, 1,
+        "only the weights become an artifact, not README or config"
+    );
+    let row = &rows.rows[0];
+    assert_eq!(row.org.as_deref(), Some("acme"));
+    assert_eq!(
+        row.name, "styler",
+        "a single-artifact repo is named by its repo"
+    );
+    let read = catalog.database.r_transaction()?;
+    assert_eq!(
+        read.len().primary::<Entry>()?,
+        3,
+        "every file is still an entry"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_revisions_own_readme_and_config_reach_inference() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("unet"))?;
+    fs::write(
+        input.join("README.md"),
+        "---\ninstance_prompt: acme style\n---\nA style LoRA.\n",
+    )?;
+    fs::write(
+        input.join("config.json"),
+        "{\"architectures\":[\"UNet2DConditionModel\"]}",
+    )?;
+    fs::write(input.join("unet/adapter.safetensors"), lora_header())?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "")?;
+    assert_eq!(
+        rows.total, 1,
+        "only the weights become an artifact, not README or config"
+    );
+    let row = &rows.rows[0];
+    assert_eq!(
+        row.name, "adapter.safetensors",
+        "a loose file is named by its own file name"
+    );
+    assert_eq!(
+        row.trigger.as_deref(),
+        Some("acme style"),
+        "the README frontmatter reached inference"
+    );
+    assert_ne!(
+        row.trigger.as_deref(),
+        Some("unet/adapter"),
+        "the rel path never leaks into the trigger"
+    );
+    assert_eq!(
+        search(&catalog, "\"style LoRA\"")?.total,
+        1,
+        "the README body is searchable text"
+    );
+    let read = catalog.database.r_transaction()?;
+    assert_eq!(
+        read.len().primary::<Entry>()?,
+        3,
+        "every file is still an entry"
+    );
     Ok(())
 }
