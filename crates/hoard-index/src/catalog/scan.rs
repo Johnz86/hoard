@@ -22,8 +22,8 @@ use crate::shard::{self, ShardCandidate, ShardSet, file_name};
 use crate::sniff::{self, SniffResult};
 
 use super::models::{
-    ArtifactDetail, ArtifactRecord, Entry, Manifest, Repository, Revision, SearchEntry, SearchText,
-    Source,
+    ArtifactDetail, ArtifactRecord, Entry, Manifest, Repository, Revision, SearchText, Source,
+    repository_key,
 };
 use crate::error::{IndexError, Result};
 
@@ -87,12 +87,9 @@ impl Catalog {
             for (repo, repo_id) in discovered.repos().iter().zip(repo_ids) {
                 for (ordinal, revision) in repo.revisions.iter().enumerate() {
                     let context = EntryContext {
-                        node,
-                        source: &source.name,
                         repo,
                         repo_id,
                         revision,
-                        revision_name: revision_name(repo, ordinal),
                         triage,
                         kind,
                         ordinal: u32::try_from(ordinal)
@@ -117,7 +114,7 @@ impl Catalog {
         let transaction = self.database.rw_transaction()?;
         transaction.insert(Manifest {
             id: 0,
-            format_version: 3,
+            format_version: 4,
             generation: 1,
             scanned_at: jiff::Timestamp::now().to_string(),
             node: node.to_owned(),
@@ -279,6 +276,7 @@ fn next_id(counter: &mut u64) -> Result<i64> {
 fn repository(id: i64, source: &str, repo: &DiscoveredRepo) -> Repository {
     Repository {
         id,
+        key: repository_key(source, &repo.repo),
         source: source.to_owned(),
         repo: repo.repo.clone(),
         root_path: repo.root_path.to_string_lossy().into_owned(),
@@ -288,6 +286,7 @@ fn repository(id: i64, source: &str, repo: &DiscoveredRepo) -> Repository {
             .iter()
             .enumerate()
             .map(|(ordinal, revision)| Revision {
+                name: revision_name(repo, ordinal),
                 sha: match revision.name {
                     RevisionName::Commit(sha) => Some(sha),
                     RevisionName::Synthetic => None,
@@ -759,12 +758,9 @@ fn identity(entry: &DiscoveredEntry, presence: &Presence) -> Result<String> {
 }
 
 struct EntryContext<'a> {
-    node: &'a str,
-    source: &'a str,
     repo: &'a DiscoveredRepo,
     repo_id: i64,
     revision: &'a DiscoveredRevision,
-    revision_name: String,
     triage: f32,
     kind: SourceKind,
     ordinal: u32,
@@ -821,36 +817,10 @@ fn store_entry(
     let triage = stored.is_some_and(|(_, triage)| triage);
     let state = entry_state(&prepared, triage);
     let artifact_id = stored.map(|(id, _)| id);
-    if let Some(record) = record {
-        transaction.insert(SearchEntry {
-            entry_id,
-            artifact_id: record.id,
-            repo_id: context.repo_id,
-            preference: preference(state, prepared.presence.present()),
-            revision: context.revision_name.clone(),
-            revision_sha: match context.revision.name {
-                RevisionName::Commit(sha) => Some(sha),
-                RevisionName::Synthetic => None,
-            },
-            node: context.node.to_owned(),
-            state,
-            triage,
-            path: prepared.discovered.rel_path.clone(),
-            abs_path: prepared
-                .presence
-                .abs_path
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
-            repo: context.repo.repo.qualified(),
-            source: context.source.to_owned(),
-            is_symlink: prepared.discovered.is_symlink,
-            lfs_pointer: prepared.presence.lfs_pointer,
-            git_sha1: prepared.discovered.git_sha1,
-        })?;
-    }
     transaction.insert(Entry {
         id: entry_id,
         repo_id: context.repo_id,
+        artifact_id,
         revision: context.ordinal,
         rel_path: prepared.discovered.rel_path.clone(),
         abs_path: prepared
@@ -859,10 +829,12 @@ fn store_entry(
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
         size: prepared.presence.size,
-        artifact_id,
         state,
+        triage,
+        preference: preference(state, prepared.presence.present()),
         lfs_pointer: prepared.presence.lfs_pointer,
         is_symlink: prepared.discovered.is_symlink,
+        git_sha1: prepared.discovered.git_sha1,
         mtime: prepared.discovered.stamp.map(|stamp| stamp.mtime),
         inode: prepared.discovered.stamp.map(|stamp| stamp.inode),
     })?;

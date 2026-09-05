@@ -79,7 +79,7 @@ impl Catalog {
             search_cache: RwLock::new(None),
         };
         let manifest = catalog.manifest()?;
-        if manifest.format_version != 3 {
+        if manifest.format_version != 4 {
             return Err(IndexError::Catalog(format!(
                 "unsupported format version {}",
                 manifest.format_version

@@ -14,7 +14,7 @@ use hoard_core::{EntryId, RepoRowId};
 
 use crate::store::SearchRow;
 
-use super::models::{ArtifactRecord, Manifest, SearchEntry, SearchText};
+use super::models::{ArtifactRecord, Entry, Manifest, Repository, Revision, SearchText};
 use crate::error::{IndexError, Result};
 
 use super::{Catalog, OpenIndex};
@@ -76,36 +76,60 @@ impl Catalog {
         let (schema, fields) = Fields::build();
         let index = Index::create_in_dir(directory, schema)?;
         let mut writer = index.writer_with_num_threads(1, WRITER_BUDGET)?;
+        let node = self.manifest()?.node;
         let snapshot = self.database.r_transaction()?;
         progress(0);
-        let mut cached: Option<(i64, ArtifactRecord)> = None;
-        for (ordinal, entry) in snapshot.scan().primary::<SearchEntry>()?.all()?.enumerate() {
+        let mut repositories: Option<(i64, Repository)> = None;
+        let mut artifacts: Option<(i64, ArtifactRecord)> = None;
+        let mut indexed = 0_u64;
+        for entry in snapshot.scan().primary::<Entry>()?.all()? {
             let entry = entry?;
-            if cached
+            let Some(artifact_id) = entry.artifact_id else {
+                continue;
+            };
+            if repositories
                 .as_ref()
-                .is_none_or(|(id, _)| *id != entry.artifact_id)
+                .is_none_or(|(id, _)| *id != entry.repo_id)
             {
-                let artifact: ArtifactRecord =
-                    snapshot.get().primary(entry.artifact_id)?.ok_or_else(|| {
+                let repository: Repository =
+                    snapshot.get().primary(entry.repo_id)?.ok_or_else(|| {
                         IndexError::Catalog(format!(
-                            "entry {} references missing artifact {}",
-                            entry.entry_id, entry.artifact_id
+                            "entry {} references missing repository {}",
+                            entry.id, entry.repo_id
                         ))
                     })?;
-                cached = Some((entry.artifact_id, artifact));
+                repositories = Some((entry.repo_id, repository));
             }
-            let Some((_, artifact)) = &cached else {
-                return Err(IndexError::Catalog("artifact cache went empty".into()));
+            if artifacts.as_ref().is_none_or(|(id, _)| *id != artifact_id) {
+                let artifact: ArtifactRecord =
+                    snapshot.get().primary(artifact_id)?.ok_or_else(|| {
+                        IndexError::Catalog(format!(
+                            "entry {} references missing artifact {artifact_id}",
+                            entry.id
+                        ))
+                    })?;
+                artifacts = Some((artifact_id, artifact));
+            }
+            let (Some((_, repository)), Some((_, artifact))) = (&repositories, &artifacts) else {
+                return Err(IndexError::Catalog("resolution cache went empty".into()));
             };
-            let text: Option<SearchText> = snapshot.get().primary(entry.artifact_id)?;
-            writer.add_document(fields.document(&entry, artifact, text.as_ref()))?;
-            if ordinal.is_multiple_of(512) {
-                progress(ordinal as u64 + 1);
+            let text: Option<SearchText> = snapshot.get().primary(artifact_id)?;
+            let facts = EntryFacts {
+                revision: revision_of(repository, &entry)?,
+                entry: &entry,
+                repository,
+                artifact,
+                node: &node,
+            };
+            writer.add_document(fields.document(&facts, text.as_ref()))?;
+            indexed += 1;
+            if indexed.is_multiple_of(512) {
+                progress(indexed);
             }
         }
         writer.commit()?;
         writer.wait_merging_threads()?;
-        progress(snapshot.len().primary::<SearchEntry>()?);
+        progress(indexed);
         Ok(())
     }
 
@@ -220,27 +244,40 @@ impl Catalog {
         }
         hits.sort_unstable_by_key(Hit::sort_key);
         let snapshot = self.database.r_transaction()?;
-        let rows = hits
-            .into_iter()
-            .skip(request.offset as usize)
-            .map(|hit| {
-                let entry: SearchEntry =
-                    snapshot.get().primary(hit.entry_id)?.ok_or_else(|| {
-                        IndexError::Catalog(format!(
-                            "search references missing entry {}",
-                            hit.entry_id
-                        ))
-                    })?;
-                let artifact: ArtifactRecord =
-                    snapshot.get().primary(entry.artifact_id)?.ok_or_else(|| {
-                        IndexError::Catalog(format!(
-                            "search references missing artifact {}",
-                            entry.artifact_id
-                        ))
-                    })?;
-                Ok(assemble_row(&entry, &artifact))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut repositories: HashMap<i64, Repository> = HashMap::new();
+        let mut rows = Vec::with_capacity(hits.len().saturating_sub(request.offset as usize));
+        for hit in hits.into_iter().skip(request.offset as usize) {
+            let entry: Entry = snapshot.get().primary(hit.entry_id)?.ok_or_else(|| {
+                IndexError::Catalog(format!("search references missing entry {}", hit.entry_id))
+            })?;
+            let artifact_id = entry.artifact_id.ok_or_else(|| {
+                IndexError::Catalog(format!("entry {} lost its artifact", entry.id))
+            })?;
+            let artifact: ArtifactRecord =
+                snapshot.get().primary(artifact_id)?.ok_or_else(|| {
+                    IndexError::Catalog(format!("search references missing artifact {artifact_id}"))
+                })?;
+            let repository = match repositories.entry(entry.repo_id) {
+                std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let repository: Repository =
+                        snapshot.get().primary(entry.repo_id)?.ok_or_else(|| {
+                            IndexError::Catalog(format!(
+                                "search references missing repository {}",
+                                entry.repo_id
+                            ))
+                        })?;
+                    slot.insert(repository)
+                }
+            };
+            rows.push(assemble_row(&EntryFacts {
+                revision: revision_of(repository, &entry)?,
+                entry: &entry,
+                repository,
+                artifact: &artifact,
+                node: &manifest.node,
+            }));
+        }
         Ok(SearchPage { total, rows })
     }
 }
@@ -279,43 +316,46 @@ impl Fields {
         (schema.build(), fields)
     }
 
-    fn document(
-        &self,
-        entry: &SearchEntry,
-        artifact: &ArtifactRecord,
-        text: Option<&SearchText>,
-    ) -> TantivyDocument {
-        let facts = &artifact.artifact;
+    fn document(&self, facts: &EntryFacts<'_>, text: Option<&SearchText>) -> TantivyDocument {
+        let EntryFacts {
+            entry,
+            repository,
+            revision,
+            artifact,
+            node,
+        } = facts;
+        let inferred = &artifact.artifact;
+        let repo = repository.repo.qualified();
         let mut document = TantivyDocument::new();
-        document.add_i64(self.artifact, entry.artifact_id);
-        document.add_i64(self.entry, entry.entry_id);
+        document.add_i64(self.artifact, artifact.id);
+        document.add_i64(self.entry, entry.id);
         document.add_i64(self.preference, entry.preference);
-        document.add_u64(self.size, artifact.group_bytes.unwrap_or(facts.size));
-        let hash = facts.sha256.map(|value| value.to_string());
+        document.add_u64(self.size, artifact.group_bytes.unwrap_or(inferred.size));
+        let hash = inferred.sha256.map(|value| value.to_string());
         let values = [
-            facts.role.as_str(),
-            facts.sub_role.as_ref().map_or("", |role| role.as_str()),
-            facts.base.as_str(),
-            facts.format.as_str(),
-            facts
+            inferred.role.as_str(),
+            inferred.sub_role.as_ref().map_or("", |role| role.as_str()),
+            inferred.base.as_str(),
+            inferred.format.as_str(),
+            inferred
                 .precision
                 .as_ref()
                 .map_or("", |precision| precision.as_str()),
-            &entry.node,
+            node,
             entry.state.as_str(),
-            &entry.source,
-            &entry.repo,
-            &entry.revision,
+            &repository.source,
+            &repo,
+            &revision.name,
             artifact.org.as_deref().unwrap_or_default(),
             hash.as_deref().unwrap_or_default(),
-            facts.trigger.as_deref().unwrap_or_default(),
+            inferred.trigger.as_deref().unwrap_or_default(),
         ];
         for (field, value) in self.keywords.iter().zip(values) {
             if !value.is_empty() {
                 document.add_text(*field, value);
             }
         }
-        if let Some((_, qualified)) = entry.repo.split_once('/') {
+        if let Some((_, qualified)) = repo.split_once('/') {
             document.add_text(self.keywords[REPO_FIELD], qualified);
         }
         if let Some(hash) = &entry.git_sha1 {
@@ -324,8 +364,8 @@ impl Fields {
         for value in [
             artifact.name.as_str(),
             artifact.org.as_deref().unwrap_or_default(),
-            facts.base.as_str(),
-            facts.trigger.as_deref().unwrap_or_default(),
+            inferred.base.as_str(),
+            inferred.trigger.as_deref().unwrap_or_default(),
         ] {
             document.add_text(self.text, value);
         }
@@ -337,46 +377,76 @@ impl Fields {
     }
 }
 
+/// Everything one indexed or returned row needs, with the records an `Entry` only points at
+/// already resolved: nothing below this line reads the database.
+struct EntryFacts<'a> {
+    entry: &'a Entry,
+    repository: &'a Repository,
+    revision: &'a Revision,
+    artifact: &'a ArtifactRecord,
+    node: &'a str,
+}
+
+fn revision_of<'a>(repository: &'a Repository, entry: &Entry) -> Result<&'a Revision> {
+    repository
+        .revisions
+        .get(entry.revision as usize)
+        .ok_or_else(|| {
+            IndexError::Catalog(format!(
+                "entry {} names revision {} of repository {}",
+                entry.id, entry.revision, repository.id
+            ))
+        })
+}
+
 /// The UI row an artifact and one of its entries make together. Artifact-wide facts are
-/// stored once per artifact and per-entry facts once per entry; nothing is copied per path.
-pub(super) fn assemble_row(entry: &SearchEntry, artifact: &ArtifactRecord) -> SearchRow {
-    let facts = &artifact.artifact;
+/// stored once per artifact and per-entry facts once per entry; the repository, revision and
+/// node a row shows are resolved here rather than copied onto every path.
+fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
+    let EntryFacts {
+        entry,
+        repository,
+        revision,
+        artifact,
+        node,
+    } = facts;
+    let inferred = &artifact.artifact;
     SearchRow {
-        artifact_id: facts.id,
-        blob_id: facts.blob,
-        blob_sha256: facts.sha256,
-        role: facts.role,
-        sub_role: facts.sub_role,
-        role_confidence: facts.role_confidence,
+        artifact_id: inferred.id,
+        blob_id: inferred.blob,
+        blob_sha256: inferred.sha256,
+        role: inferred.role,
+        sub_role: inferred.sub_role,
+        role_confidence: inferred.role_confidence,
         org: artifact.org.clone(),
         name: artifact.name.clone(),
-        base: facts.base.clone(),
-        base_label: facts.base_label.clone(),
-        format: facts.format,
-        precision: facts.precision.clone(),
-        quant: facts.quant.clone(),
-        size: artifact.group_bytes.unwrap_or(facts.size),
+        base: inferred.base.clone(),
+        base_label: inferred.base_label.clone(),
+        format: inferred.format,
+        precision: inferred.precision.clone(),
+        quant: inferred.quant.clone(),
+        size: artifact.group_bytes.unwrap_or(inferred.size),
         shard_count: artifact.shard_count.unwrap_or(1),
-        rank: facts.rank,
-        alpha: facts.alpha,
-        params: facts.params,
-        context: facts.context,
-        revision: entry.revision.clone(),
-        revision_sha: entry.revision_sha,
-        node: entry.node.clone(),
+        rank: inferred.rank,
+        alpha: inferred.alpha,
+        params: inferred.params,
+        context: inferred.context,
+        revision: revision.name.clone(),
+        revision_sha: revision.sha,
+        node: (*node).to_owned(),
         state: entry.state,
         pull_progress: None,
-        trigger: facts.trigger.clone(),
-        path: entry.path.clone(),
+        trigger: inferred.trigger.clone(),
+        path: entry.rel_path.clone(),
         abs_path: entry.abs_path.clone(),
         path_count: artifact.path_count,
         dupe: artifact.path_count > 1,
         triage: entry.triage,
         last_used: None,
-        repo: entry.repo.clone(),
+        repo: repository.repo.qualified(),
         repo_id: RepoRowId::new(entry.repo_id),
-        entry_id: EntryId::new(entry.entry_id),
-        source: Some(entry.source.clone()),
+        entry_id: EntryId::new(entry.id),
+        source: Some(repository.source.clone()),
         is_symlink: entry.is_symlink,
         lfs_pointer: entry.lfs_pointer,
     }

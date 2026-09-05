@@ -22,6 +22,8 @@ pub(super) struct Source {
 pub(super) struct Repository {
     #[primary_key]
     pub(super) id: i64,
+    #[secondary_key(unique)]
+    pub(super) key: String,
     pub(super) source: String,
     pub(super) repo: RepoId,
     pub(super) root_path: String,
@@ -31,8 +33,14 @@ pub(super) struct Repository {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct Revision {
+    pub(super) name: String,
     pub(super) sha: Option<CommitSha>,
     pub(super) refs: Vec<String>,
+}
+
+/// The identity a repository keeps across scans: its source and its qualified name.
+pub(super) fn repository_key(source: &str, repo: &RepoId) -> String {
+    format!("{source}\0{}", repo.qualified())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,30 +67,6 @@ pub(super) struct ArtifactDetail {
     pub(super) artifact_id: i64,
     pub(super) tensors: Option<TensorSummary>,
     pub(super) evidence: Vec<Evidence>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 4, version = 1)]
-#[native_db]
-pub(super) struct SearchEntry {
-    #[primary_key]
-    pub(super) entry_id: i64,
-    #[secondary_key]
-    pub(super) artifact_id: i64,
-    pub(super) repo_id: i64,
-    pub(super) preference: i64,
-    pub(super) revision: String,
-    pub(super) revision_sha: Option<CommitSha>,
-    pub(super) node: String,
-    pub(super) state: State,
-    pub(super) triage: bool,
-    pub(super) path: String,
-    pub(super) abs_path: Option<String>,
-    pub(super) repo: String,
-    pub(super) source: String,
-    pub(super) is_symlink: bool,
-    pub(super) lfs_pointer: bool,
-    pub(super) git_sha1: Option<GitSha1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,14 +102,18 @@ pub(super) struct Entry {
     pub(super) id: i64,
     #[secondary_key]
     pub(super) repo_id: i64,
+    #[secondary_key(optional)]
+    pub(super) artifact_id: Option<i64>,
     pub(super) revision: u32,
     pub(super) rel_path: String,
     pub(super) abs_path: Option<String>,
     pub(super) size: u64,
-    pub(super) artifact_id: Option<i64>,
     pub(super) state: State,
+    pub(super) triage: bool,
+    pub(super) preference: i64,
     pub(super) lfs_pointer: bool,
     pub(super) is_symlink: bool,
+    pub(super) git_sha1: Option<GitSha1>,
     pub(super) mtime: Option<i64>,
     pub(super) inode: Option<u64>,
 }
@@ -136,7 +124,6 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<Repository>()?;
     models.define::<ArtifactRecord>()?;
     models.define::<ArtifactDetail>()?;
-    models.define::<SearchEntry>()?;
     models.define::<SearchText>()?;
     models.define::<Manifest>()?;
     models.define::<Entry>()?;

@@ -15,8 +15,8 @@ use crate::error::{IndexError, Result};
 use crate::store::SearchRow;
 
 use super::models::{
-    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, Manifest, Repository, Revision,
-    SearchEntry, SearchText, Source,
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Manifest, Repository,
+    RepositoryKey, Revision, SearchText, Source,
 };
 use super::{Catalog, SearchRequest, models};
 
@@ -82,7 +82,18 @@ fn sources_scan_into_typed_native_records_and_reopen_without_sqlite() -> Result<
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].resolved_kind, SourceKind::Loose);
         assert_eq!(read.len().primary::<ArtifactRecord>()?, 2);
-        assert_eq!(read.len().primary::<SearchEntry>()?, 2);
+        let entries: Vec<Entry> = read
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.artifact_id.is_some())
+                .count(),
+            2
+        );
     }
     catalog.rebuild_search(|_| {})?;
     let found = search(&catalog, "format:csv")?;
@@ -176,21 +187,29 @@ fn duplicate_paths_collapse_after_correlated_entry_filtering() -> Result<()> {
     let transaction = catalog.database.rw_transaction()?;
     let mut entry = transaction
         .scan()
-        .primary::<SearchEntry>()?
+        .primary::<Entry>()?
         .all()?
         .next()
         .ok_or_else(|| IndexError::Catalog("missing fixture entry".into()))??;
-    let original_node = entry.node.clone();
-    let artifact_id = entry.artifact_id;
+    let artifact_id = entry
+        .artifact_id
+        .ok_or_else(|| IndexError::Catalog("fixture entry has no artifact".into()))?;
     let mut artifact: ArtifactRecord = transaction
         .get()
         .primary(artifact_id)?
         .ok_or_else(|| IndexError::Catalog("missing fixture artifact".into()))?;
     artifact.path_count = 2;
     transaction.upsert(artifact)?;
-    transaction.upsert(entry.clone())?;
-    entry.entry_id = 900;
-    entry.node = "peer".into();
+    let mut repository: Repository = transaction
+        .get()
+        .primary(entry.repo_id)?
+        .ok_or_else(|| IndexError::Catalog("missing fixture repository".into()))?;
+    repository.id = 900;
+    repository.key = models::repository_key("peer", &repository.repo);
+    repository.source = "peer".to_owned();
+    transaction.insert(repository)?;
+    entry.id = 900;
+    entry.repo_id = 900;
     entry.state = hoard_core::State::Remote;
     entry.preference = 1;
     transaction.insert(entry)?;
@@ -203,11 +222,14 @@ fn duplicate_paths_collapse_after_correlated_entry_filtering() -> Result<()> {
         .iter()
         .find(|row| row.artifact_id.get() == artifact_id)
         .ok_or_else(|| IndexError::Catalog("missing shared result".into()))?;
-    assert_eq!(shared.node, original_node);
+    assert_eq!(shared.source.as_deref(), Some("datasets"));
     assert!(shared.dupe);
     assert_eq!(shared.path_count, 2);
-    assert_eq!(search(&catalog, "node:peer")?.rows[0].node, "peer");
-    assert_eq!(search(&catalog, "node:peer AND state:local")?.total, 0);
+    assert_eq!(
+        search(&catalog, "source:peer")?.rows[0].source.as_deref(),
+        Some("peer")
+    );
+    assert_eq!(search(&catalog, "source:peer AND state:local")?.total, 0);
     Ok(())
 }
 
@@ -743,19 +765,23 @@ fn path_counts_are_final_on_the_artifact() -> Result<()> {
     let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
     {
         let read = catalog.database.r_transaction()?;
-        let entries: Vec<SearchEntry> = read
+        let entries: Vec<Entry> = read
             .scan()
             .primary()?
             .all()?
             .collect::<native_db::db_type::Result<_>>()?;
         assert_eq!(entries.len(), 2);
-        let first: SearchEntry = read
+        let first: Entry = read
             .get()
             .primary(1_i64)?
             .ok_or_else(|| IndexError::Catalog("first entry missing".into()))?;
         let record: ArtifactRecord = read
             .get()
-            .primary(first.artifact_id)?
+            .primary(
+                first
+                    .artifact_id
+                    .ok_or_else(|| IndexError::Catalog("first entry has no artifact".into()))?,
+            )?
             .ok_or_else(|| IndexError::Catalog("artifact missing".into()))?;
         assert_eq!(
             record.path_count, 2,
@@ -779,7 +805,7 @@ fn a_row_is_assembled_from_its_entry_and_artifact() -> Result<()> {
     assert_eq!(rows.total, 1);
     let row = &rows.rows[0];
     let read = catalog.database.r_transaction()?;
-    let entry: SearchEntry = read
+    let entry: Entry = read
         .get()
         .primary(row.entry_id.get())?
         .ok_or_else(|| IndexError::Catalog("entry missing".into()))?;
@@ -788,12 +814,58 @@ fn a_row_is_assembled_from_its_entry_and_artifact() -> Result<()> {
         .primary(row.artifact_id.get())?
         .ok_or_else(|| IndexError::Catalog("artifact missing".into()))?;
     assert_eq!(row.name, artifact.name);
-    assert_eq!(row.path, entry.path);
+    assert_eq!(row.path, entry.rel_path);
     assert_eq!(row.size, artifact.artifact.size);
     assert_eq!(row.state, entry.state);
     assert!(
         read.get().primary::<ArtifactDetail>(artifact.id)?.is_some(),
         "the detail record exists"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_entry_is_the_only_per_file_record() -> Result<()> {
+    let (_directory, catalog) = fixture()?;
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "format:csv")?;
+    assert_eq!(rows.total, 1);
+    let row = &rows.rows[0];
+    let read = catalog.database.r_transaction()?;
+    let entry: Entry = read
+        .get()
+        .primary(row.entry_id.get())?
+        .ok_or_else(|| IndexError::Catalog("entry missing".into()))?;
+    let repository: Repository = read
+        .get()
+        .primary(entry.repo_id)?
+        .ok_or_else(|| IndexError::Catalog("repository missing".into()))?;
+    assert_eq!(
+        row.revision,
+        repository.revisions[entry.revision as usize].name
+    );
+    assert_eq!(row.repo, repository.repo.qualified());
+    assert_eq!(row.source.as_deref(), Some(repository.source.as_str()));
+    assert_eq!(row.node, "test-node");
+    assert_eq!(row.path, entry.rel_path);
+    assert_eq!(entry.artifact_id, Some(row.artifact_id.get()));
+    let by_artifact: Vec<Entry> = read
+        .scan()
+        .secondary::<Entry>(EntryKey::artifact_id)?
+        .start_with(Some(row.artifact_id.get()))?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(
+        by_artifact.len(),
+        1,
+        "the optional secondary key finds the entry"
+    );
+    let found: Option<Repository> = read.get().secondary(
+        RepositoryKey::key,
+        super::models::repository_key("datasets", &repository.repo).as_str(),
+    )?;
+    assert!(
+        found.is_some(),
+        "a repository is found by source and qualified name"
     );
     Ok(())
 }
@@ -916,13 +988,16 @@ fn source_encoding_is_frozen() -> Result<()> {
 
 #[test]
 fn repository_encoding_is_frozen() -> Result<()> {
+    let repo = RepoId::new(RepoType::Datasets, Some("frozen-org".to_owned()), "frozen");
     let value = Repository {
         id: 11,
+        key: models::repository_key("frozen", &repo),
         source: "frozen".to_owned(),
-        repo: RepoId::new(RepoType::Datasets, Some("frozen-org".to_owned()), "frozen"),
+        repo,
         root_path: "/frozen/source/datasets--frozen-org--frozen".to_owned(),
         default_ref: "main".to_owned(),
         revisions: vec![Revision {
+            name: "main".to_owned(),
             sha: Some(CommitSha::from_bytes([5; 20])),
             refs: vec!["refs/heads/main".to_owned()],
         }],
@@ -977,40 +1052,19 @@ fn entry_encoding_is_frozen() -> Result<()> {
     let value = Entry {
         id: 13,
         repo_id: 11,
+        artifact_id: Some(7),
         revision: 1,
         rel_path: "unet/frozen.safetensors".to_owned(),
         abs_path: Some("/frozen/source/unet/frozen.safetensors".to_owned()),
         size: 4096,
-        artifact_id: Some(7),
-        state: State::Triage,
-        lfs_pointer: true,
-        is_symlink: true,
-        mtime: Some(1_767_225_600),
-        inode: Some(424_242),
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn search_entry_encoding_is_frozen() -> Result<()> {
-    let value = SearchEntry {
-        entry_id: 13,
-        artifact_id: 7,
-        repo_id: 11,
-        preference: 19,
-        revision: "main".to_owned(),
-        revision_sha: Some(CommitSha::from_bytes([5; 20])),
-        node: "frozen-node".to_owned(),
         state: State::Triage,
         triage: true,
-        path: "unet/frozen.safetensors".to_owned(),
-        abs_path: Some("/frozen/source/unet/frozen.safetensors".to_owned()),
-        repo: "datasets/frozen-org/frozen".to_owned(),
-        source: "frozen".to_owned(),
-        is_symlink: true,
+        preference: 19,
         lfs_pointer: true,
+        is_symlink: true,
         git_sha1: Some(CommitSha::from_bytes([7; 20])),
+        mtime: Some(1_767_225_600),
+        inode: Some(424_242),
     };
     insta::assert_snapshot!(frozen_encoding(&value)?);
     Ok(())
@@ -1124,11 +1178,6 @@ fn a_sharded_model_is_one_native_artifact_over_every_file() -> Result<()> {
             .all(|entry| entry.artifact_id == Some(row.artifact_id.get()))
     );
     assert_eq!(read.len().primary::<ArtifactRecord>()?, 1);
-    assert_eq!(
-        read.len().primary::<SearchEntry>()?,
-        1,
-        "members get no search row of their own"
-    );
     assert!(catalog.status()?.counts.contains(&("artifacts".into(), 1)));
     Ok(())
 }
