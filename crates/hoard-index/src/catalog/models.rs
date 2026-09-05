@@ -82,6 +82,21 @@ pub(super) struct SearchText {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 6, version = 1)]
 #[native_db]
+pub(super) struct ManifestV1 {
+    #[primary_key]
+    pub(super) id: u8,
+    pub(super) format_version: u32,
+    pub(super) generation: u64,
+    pub(super) scanned_at: String,
+    pub(super) node: String,
+    pub(super) counts: Vec<(String, u64)>,
+    pub(super) search_directory: Option<String>,
+    pub(super) search_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 6, version = 2, from = ManifestV1)]
+#[native_db]
 pub(super) struct Manifest {
     #[primary_key]
     pub(super) id: u8,
@@ -92,6 +107,38 @@ pub(super) struct Manifest {
     pub(super) counts: Vec<(String, u64)>,
     pub(super) search_directory: Option<String>,
     pub(super) search_generation: u64,
+    pub(super) search_seq: u64,
+}
+
+impl From<Manifest> for ManifestV1 {
+    fn from(manifest: Manifest) -> Self {
+        Self {
+            id: manifest.id,
+            format_version: manifest.format_version,
+            generation: manifest.generation,
+            scanned_at: manifest.scanned_at,
+            node: manifest.node,
+            counts: manifest.counts,
+            search_directory: manifest.search_directory,
+            search_generation: manifest.search_generation,
+        }
+    }
+}
+
+impl From<ManifestV1> for Manifest {
+    fn from(manifest: ManifestV1) -> Self {
+        Self {
+            id: manifest.id,
+            format_version: manifest.format_version,
+            generation: manifest.generation,
+            scanned_at: manifest.scanned_at,
+            node: manifest.node,
+            counts: manifest.counts,
+            search_directory: manifest.search_directory,
+            search_generation: manifest.search_generation,
+            search_seq: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,6 +184,7 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<ArtifactRecord>()?;
     models.define::<ArtifactDetail>()?;
     models.define::<SearchText>()?;
+    models.define::<ManifestV1>()?;
     models.define::<Manifest>()?;
     models.define::<Entry>()?;
     models.define::<Allocator>()?;

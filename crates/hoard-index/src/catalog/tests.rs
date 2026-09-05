@@ -15,8 +15,8 @@ use crate::error::{IndexError, Result};
 use crate::store::SearchRow;
 
 use super::models::{
-    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Manifest, Repository,
-    RepositoryKey, Revision, SearchText, Source,
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Manifest, ManifestV1,
+    Repository, RepositoryKey, Revision, SearchText, Source,
 };
 use super::{Catalog, RescanReport, SearchRequest, models};
 
@@ -291,6 +291,43 @@ fn an_identity_is_a_hash_of_its_text_and_two_copies_share_it() -> Result<()> {
         found.is_some(),
         "the identity is the xxh3-128 of the canonical path text"
     );
+    Ok(())
+}
+
+#[test]
+fn a_version_one_manifest_is_migrated_on_open() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("catalog.redb");
+    {
+        let database = native_db::Builder::new().create(models()?, &path)?;
+        let transaction = database.rw_transaction()?;
+        transaction.insert(ManifestV1 {
+            id: 0,
+            format_version: 5,
+            generation: 3,
+            scanned_at: "then".to_owned(),
+            node: "old".to_owned(),
+            counts: vec![("entries".to_owned(), 1)],
+            search_directory: None,
+            search_generation: 0,
+        })?;
+        transaction.commit()?;
+        let read = database.r_transaction()?;
+        let invisible: Option<Manifest> = read.get().primary(0_u8)?;
+        assert!(
+            invisible.is_none(),
+            "a v1 row is not visible to the v2 type until migrated"
+        );
+    }
+    let catalog = Catalog::open(directory.path())?;
+    let status = catalog.status()?;
+    assert_eq!(status.generation, 3);
+    assert_eq!(status.node, "old");
+    let read = catalog.database.r_transaction()?;
+    let migrated: Option<Manifest> = read.get().primary(0_u8)?;
+    assert_eq!(migrated.map(|manifest| manifest.search_seq), Some(0));
+    let old: Option<ManifestV1> = read.get().primary(0_u8)?;
+    assert!(old.is_none(), "the v1 table is drained");
     Ok(())
 }
 
@@ -1262,6 +1299,23 @@ fn search_text_encoding_is_frozen() -> Result<()> {
 #[test]
 fn manifest_encoding_is_frozen() -> Result<()> {
     let value = Manifest {
+        id: 0,
+        format_version: 2,
+        generation: 5,
+        scanned_at: "2026-09-05T00:00:00Z".to_owned(),
+        node: "frozen-node".to_owned(),
+        counts: vec![("entries".to_owned(), 13)],
+        search_directory: Some("search-v1-1767225600000000000".to_owned()),
+        search_generation: 5,
+        search_seq: 9,
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn manifest_v1_encoding_is_frozen() -> Result<()> {
+    let value = ManifestV1 {
         id: 0,
         format_version: 2,
         generation: 5,

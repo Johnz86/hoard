@@ -127,13 +127,14 @@ impl Catalog {
         counters.save(&transaction)?;
         transaction.insert(Manifest {
             id: 0,
-            format_version: 4,
+            format_version: 5,
             generation: 1,
             scanned_at: jiff::Timestamp::now().to_string(),
             node: node.to_owned(),
             counts: counts(&transaction)?,
             search_directory: None,
             search_generation: 0,
+            search_seq: 0,
         })?;
         transaction.commit()?;
         Ok(())

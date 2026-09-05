@@ -74,13 +74,16 @@ impl Catalog {
     /// Opens a completed scan; incomplete scans and unknown format versions are rejected.
     pub fn open(directory: &Path) -> Result<Self> {
         let database = builder().open(models()?, directory.join("catalog.redb"))?;
+        let transaction = database.rw_transaction()?;
+        transaction.migrate::<Manifest>()?;
+        transaction.commit()?;
         let catalog = Self {
             database,
             directory: directory.to_path_buf(),
             search_cache: RwLock::new(None),
         };
         let manifest = catalog.manifest()?;
-        if manifest.format_version != 4 {
+        if manifest.format_version != 5 {
             return Err(IndexError::Catalog(format!(
                 "unsupported format version {}",
                 manifest.format_version
