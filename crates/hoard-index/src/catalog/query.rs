@@ -9,7 +9,7 @@ use tantivy::schema::{Field, IndexRecordOption};
 
 use crate::error::{IndexError, Result};
 use crate::search::sql::MAX_SHELF_DEPTH;
-use crate::search::{CompareOp, CompileContext, Token, TokenKind, parse};
+use crate::search::{CompareOp, CompileContext, SortKey, Token, TokenKind, parse};
 
 use super::search::{
     BASE_FIELD, FORMAT_FIELD, Fields, HASH_FIELD, NODE_FIELD, ORG_FIELD, PRECISION_FIELD,
@@ -25,6 +25,84 @@ const LOCAL_NODE_ALIASES: [&str; 4] = ["self", "me", "local", "here"];
 pub(super) struct QueryFields<'a> {
     pub(super) fields: &'a Fields,
     pub(super) context: &'a CompileContext,
+}
+
+/// Whether answering this query needs one document per entry collapsed to its artifact, or
+/// whether primary documents alone carry every field it filters and orders on. Only `node`,
+/// `state`, `source`, `repo`, `rev` and `hash` vary between the entries of one artifact.
+pub(super) fn needs_collapse(
+    tokens: &[Token],
+    context: &CompileContext,
+    sort: SortKey,
+) -> Result<bool> {
+    if sorts_on_an_entry(sort) {
+        return Ok(true);
+    }
+    filters_on_an_entry(tokens, context, 0)
+}
+
+fn sorts_on_an_entry(sort: SortKey) -> bool {
+    match sort {
+        SortKey::Revision | SortKey::Node | SortKey::State => true,
+        SortKey::Role
+        | SortKey::Name
+        | SortKey::Base
+        | SortKey::Format
+        | SortKey::Precision
+        | SortKey::Size
+        | SortKey::Used => false,
+    }
+}
+
+fn filters_on_an_entry(tokens: &[Token], context: &CompileContext, depth: usize) -> Result<bool> {
+    for token in tokens {
+        let entry_level = match token.kind {
+            TokenKind::Node
+            | TokenKind::State
+            | TokenKind::Source
+            | TokenKind::Repo
+            | TokenKind::Revision
+            | TokenKind::Hash => true,
+            TokenKind::Shelf => shelf_filters_on_an_entry(token, context, depth)?,
+            TokenKind::Role
+            | TokenKind::Base
+            | TokenKind::Format
+            | TokenKind::Precision
+            | TokenKind::Dupe
+            | TokenKind::Compat
+            | TokenKind::Size
+            | TokenKind::Used
+            | TokenKind::Trigger
+            | TokenKind::Org
+            | TokenKind::Text => false,
+        };
+        if entry_level {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn shelf_filters_on_an_entry(
+    token: &Token,
+    context: &CompileContext,
+    depth: usize,
+) -> Result<bool> {
+    if depth >= MAX_SHELF_DEPTH {
+        return Err(IndexError::Query(format!(
+            "shelf {:?} expands into itself more than {MAX_SHELF_DEPTH} times",
+            token.value
+        )));
+    }
+    for value in &token.values {
+        let stored = context
+            .shelf_query(value)
+            .ok_or_else(|| IndexError::Query(format!("there is no shelf named {value:?}")))?;
+        if filters_on_an_entry(&parse(stored).tokens, context, depth + 1)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Compiles the tokens of a parsed query into one Tantivy query, or every token except

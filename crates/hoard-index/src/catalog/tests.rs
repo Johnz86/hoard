@@ -12,14 +12,15 @@ use hoard_core::{
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
 
 use crate::error::{IndexError, Result};
-use crate::search::{SortKey, SortSpec};
+use crate::search::{CompileContext, SortKey, SortSpec, parse};
 use crate::store::SearchRow;
 
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Manifest, ManifestV1,
     Repository, RepositoryKey, Revision, SearchChange, SearchText, Source, Summary,
 };
-use super::{Catalog, QueryPage, QueryRequest, RescanReport, models};
+use super::search::QueryPath;
+use super::{Catalog, QueryPage, QueryRequest, RescanReport, models, query};
 
 fn running_as_root() -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -2012,6 +2013,149 @@ fn facets_and_nodes_survive_a_multi_segment_index() -> Result<()> {
         "counts merge across the segments the refreshes created: {:?}",
         page.facets.role
     );
+    Ok(())
+}
+
+#[test]
+fn the_primary_path_answers_exactly_what_the_collapse_path_answers() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let shards = llm_shards();
+    hf_cache_repo(
+        &hub,
+        "Qwen",
+        "Qwen3-Sharded",
+        &[
+            ("model-00001-of-00002.safetensors", shards[0].clone()),
+            ("model-00002-of-00002.safetensors", shards[2].clone()),
+        ],
+    )?;
+    hf_cache_repo(
+        &hub,
+        "acme",
+        "styler",
+        &[("unet/adapter.safetensors", lora_header())],
+    )?;
+    hf_cache_repo(
+        &hub,
+        "acme",
+        "styler-copy",
+        &[("unet/adapter.safetensors", lora_header())],
+    )?;
+    hf_cache_repo(
+        &hub,
+        "data",
+        "rows",
+        &[("train.csv", b"x,y\n1,2\n".to_vec())],
+    )?;
+    let catalog = scan_hub(directory.path(), &hub)?;
+    let context = catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?;
+    let queries = [
+        "",
+        "role:lora",
+        "fmt:csv,safetensors",
+        "base:qwen",
+        "dupe:true",
+        "size:>100b",
+        "-role:ds",
+        "adapter",
+    ];
+    let keys = [
+        SortKey::Name,
+        SortKey::Size,
+        SortKey::Role,
+        SortKey::Base,
+        SortKey::Format,
+        SortKey::Precision,
+        SortKey::Used,
+    ];
+    for raw in queries {
+        for key in keys {
+            for descending in [false, true] {
+                for (limit, offset) in [(10, 0), (2, 0), (2, 2), (1, 3)] {
+                    let request = QueryRequest {
+                        raw,
+                        sort: SortSpec::new(key, descending),
+                        limit,
+                        offset,
+                        context: &context,
+                    };
+                    let fast = catalog.query_via(request.clone(), QueryPath::Primary)?;
+                    let slow = catalog.query_via(request, QueryPath::Collapse)?;
+                    assert_eq!(fast.total, slow.total, "{raw} {key:?} desc={descending}");
+                    assert_eq!(fast.nodes, slow.nodes, "{raw}");
+                    assert_eq!(fast.facets, slow.facets, "{raw} {key:?}");
+                    let fast_ids: Vec<_> = fast
+                        .rows
+                        .iter()
+                        .map(|row| (row.artifact_id, row.entry_id))
+                        .collect();
+                    let slow_ids: Vec<_> = slow
+                        .rows
+                        .iter()
+                        .map(|row| (row.artifact_id, row.entry_id))
+                        .collect();
+                    assert_eq!(
+                        fast_ids, slow_ids,
+                        "{raw} {key:?} desc={descending} limit={limit} offset={offset}"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn entry_level_tokens_and_sorts_take_the_collapse_path() -> Result<()> {
+    let context = CompileContext::new(jiff::Timestamp::now()).with_shelves(vec![
+        ("here".into(), "node:self".into()),
+        ("loras".into(), "role:lora".into()),
+    ]);
+    let collapse = [
+        "node:self",
+        "state:local",
+        "source:hub",
+        "repo:acme/styler",
+        "rev:main",
+        "hash:abcd",
+        "shelf:here",
+        "role:lora node:self",
+    ];
+    let primary = [
+        "",
+        "role:lora",
+        "base:sdxl",
+        "fmt:gguf",
+        "prec:fp16",
+        "dupe:true",
+        "size:<1gb",
+        "used:>30d",
+        "trigger:grain",
+        "org:acme",
+        "film grain",
+        "shelf:loras",
+        "-role:ds",
+    ];
+    for raw in collapse {
+        assert!(
+            query::needs_collapse(&parse(raw).tokens, &context, SortKey::Name)?,
+            "{raw}"
+        );
+    }
+    for raw in primary {
+        assert!(
+            !query::needs_collapse(&parse(raw).tokens, &context, SortKey::Name)?,
+            "{raw}"
+        );
+    }
+    for key in [SortKey::Revision, SortKey::Node, SortKey::State] {
+        assert!(
+            query::needs_collapse(&parse("").tokens, &context, key)?,
+            "{key:?}"
+        );
+    }
     Ok(())
 }
 

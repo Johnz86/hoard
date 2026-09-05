@@ -1,14 +1,16 @@
 use std::cmp::{Ordering, Reverse};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::RwLockReadGuard;
 
 use serde::Serialize;
-use tantivy::collector::{Collector, SegmentCollector};
+use tantivy::collector::{Collector, Count, SegmentCollector};
 use tantivy::columnar::StrColumn;
 use tantivy::fastfield::Column;
-use tantivy::query::{BooleanQuery, QueryClone};
-use tantivy::schema::{FAST, Field, INDEXED, STRING, Schema, TEXT, TantivyDocument};
+use tantivy::query::{BooleanQuery, Query, QueryClone, TermQuery};
+use tantivy::schema::{
+    FAST, Field, INDEXED, IndexRecordOption, STRING, Schema, TEXT, TantivyDocument,
+};
 use tantivy::{DocId, Index, Score, Searcher, SegmentOrdinal, SegmentReader, Term};
 
 use hoard_core::{EntryId, RepoRowId};
@@ -408,6 +410,32 @@ impl Catalog {
     /// key excluded. Changes a rescan logged but no refresh has applied leave the published
     /// index answering with `stale` set; only a catalog with no index at all is refused.
     pub fn query(&self, request: QueryRequest<'_>) -> Result<QueryPage> {
+        let parsed = parse(request.raw);
+        let path = match query::needs_collapse(&parsed.tokens, request.context, request.sort.key)? {
+            true => QueryPath::Collapse,
+            false => QueryPath::Primary,
+        };
+        self.answer(request, parsed, path)
+    }
+
+    /// The same answer forced onto one path, so the two can be compared on a query either
+    /// could take.
+    #[cfg(test)]
+    pub(super) fn query_via(
+        &self,
+        request: QueryRequest<'_>,
+        path: QueryPath,
+    ) -> Result<QueryPage> {
+        let parsed = parse(request.raw);
+        self.answer(request, parsed, path)
+    }
+
+    fn answer(
+        &self,
+        request: QueryRequest<'_>,
+        parsed: ParsedQuery,
+        path: QueryPath,
+    ) -> Result<QueryPage> {
         if request.limit > PAGE_LIMIT {
             return Err(IndexError::Query(format!(
                 "page limit must be at most {PAGE_LIMIT}"
@@ -433,16 +461,36 @@ impl Catalog {
             fields: &fields,
             context: request.context,
         };
-        let parsed = parse(request.raw);
         let searcher = open.reader.searcher();
-        let collected = searcher.search(
-            query::compile(&parsed.tokens, None, &bound)?.as_ref(),
-            &ArtifactCollector { sort: request.sort },
-        )?;
-        let total = collected.hits.len() as u64;
-        let nodes = distinct_nodes(&collected)?;
-        let facets = self.facets(&searcher, &parsed, &bound, &collected)?;
-        let rows = self.rows(page_of(collected, &request)?, &manifest.node)?;
+        let compiled = query::compile(&parsed.tokens, None, &bound)?;
+        let summary = match path {
+            QueryPath::Primary => {
+                let restricted = only_primary(&fields, compiled);
+                let counted = searcher.search(&restricted, &Count)?;
+                let window = Window::of(&request, counted);
+                searcher.search(
+                    &restricted,
+                    &PrimaryCollector {
+                        sort: request.sort,
+                        keep: window.keep,
+                        reversed: window.reversed,
+                    },
+                )?
+            }
+            QueryPath::Collapse => searcher
+                .search(compiled.as_ref(), &ArtifactCollector { sort: request.sort })?
+                .summary(),
+        };
+        let total = summary.total;
+        let nodes = distinct_nodes(&summary)?;
+        let facets = self.facets(&FacetPass {
+            searcher: &searcher,
+            parsed: &parsed,
+            bound: &bound,
+            summary: &summary,
+            path,
+        })?;
+        let rows = self.rows(page_of(summary, &request)?, &manifest.node)?;
         Ok(QueryPage {
             query: parsed,
             rows,
@@ -453,33 +501,27 @@ impl Catalog {
         })
     }
 
-    /// Each dimension counted over the collapsed set its own key does not narrow, which is
-    /// what keeps a facet click from reducing the rail it was clicked in to one bucket.
-    fn facets(
-        &self,
-        searcher: &Searcher,
-        parsed: &ParsedQuery,
-        bound: &QueryFields<'_>,
-        collected: &Collected,
-    ) -> Result<Facets> {
+    /// Each dimension counted over the set its own key does not narrow, which is what keeps
+    /// a facet click from reducing the rail it was clicked in to one bucket.
+    fn facets(&self, pass: &FacetPass<'_>) -> Result<Facets> {
         let mut dimensions: [Vec<FacetBucket>; FACET_DIMENSIONS.len()] =
             std::array::from_fn(|_| Vec::new());
         for (index, (key, _)) in FACET_DIMENSIONS.iter().enumerate() {
-            let excluded = query::compile(&parsed.tokens, Some(key), bound)?;
-            let narrowed = match parsed.tokens_with_key(key).next() {
-                Some(_) => Some(searcher.search(excluded.as_ref(), &collector())?),
+            let excluded = query::compile(&pass.parsed.tokens, Some(key), pass.bound)?;
+            let narrowed = match pass.parsed.tokens_with_key(key).next() {
+                Some(_) => Some(pass.narrowed(excluded.box_clone())?),
                 None => None,
             };
             let labelled = index == BASE_DIMENSION;
             let mut buckets =
-                count_buckets(narrowed.as_ref().unwrap_or(collected), index, labelled)?;
+                count_buckets(narrowed.as_ref().unwrap_or(pass.summary), index, labelled)?;
             if labelled {
                 for bucket in &mut buckets {
                     let scoped = BooleanQuery::intersection(vec![
                         excluded.box_clone(),
-                        query::base_filter(bound.fields, &bucket.value),
+                        query::base_filter(pass.bound.fields, &bucket.value),
                     ]);
-                    bucket.count = searcher.search(&scoped, &collector())?.hits.len() as u64;
+                    bucket.count = pass.count(scoped)?;
                 }
                 order_buckets(&mut buckets);
             }
@@ -494,7 +536,7 @@ impl Catalog {
             node,
             disk_pressure: self.disk_pressure()?,
         };
-        facets.mark_query(parsed);
+        facets.mark_query(pass.parsed);
         Ok(facets)
     }
 
@@ -551,14 +593,8 @@ impl Catalog {
             .as_ref()
             .ok_or_else(|| IndexError::Catalog("search index was closed".into()))?;
         let field = open.index.schema().get_field(field)?;
-        let query = tantivy::query::TermQuery::new(
-            Term::from_field_u64(field, value),
-            tantivy::schema::IndexRecordOption::Basic,
-        );
-        let counted = open
-            .reader
-            .searcher()
-            .search(&query, &tantivy::collector::Count)?;
+        let query = TermQuery::new(Term::from_field_u64(field, value), IndexRecordOption::Basic);
+        let counted = open.reader.searcher().search(&query, &Count)?;
         Ok(counted as u64)
     }
 }
@@ -570,23 +606,33 @@ impl Catalog {
 /// holds every hit; either way the page is settled without spelling a single term. Ordinals
 /// of different segments do not compare, so a text key over several segments bounds each
 /// segment on its own ordinals first and spells only what survives.
-fn page_of(collected: Collected, request: &QueryRequest<'_>) -> Result<Vec<Hit>> {
-    let Collected { hits, segments } = collected;
-    let window = Window::of(request, hits.len());
-    let column = SortColumn::of(request.sort.key);
-    let order = Order {
-        rank: match column {
+fn page_of(summary: Summary, request: &QueryRequest<'_>) -> Result<Vec<Hit>> {
+    let Summary {
+        total,
+        candidates,
+        segments,
+        ..
+    } = summary;
+    let window = Window::of(request, usize::try_from(total).unwrap_or(usize::MAX));
+    let order = order_of(request.sort, window.reversed);
+    match (SortColumn::of(request.sort.key), segments.len()) {
+        (SortColumn::Size | SortColumn::Absent, _) | (SortColumn::Text, 0 | 1) => {
+            Ok(ranked_window(candidates, window, order))
+        }
+        (SortColumn::Text, _) => spelled_page(candidates, &segments, window, order),
+    }
+}
+
+/// The order a sort and a window induce, which a segment bounds its candidates by and the
+/// page is then cut from, so both agree on which end comes first.
+fn order_of(sort: SortSpec, reversed: bool) -> Order {
+    Order {
+        rank: match SortColumn::of(sort.key) {
             SortColumn::Size | SortColumn::Absent => size_key,
             SortColumn::Text => ordinal_key,
         },
-        descending: request.sort.descending,
-        reversed: window.reversed,
-    };
-    match (column, segments.len()) {
-        (SortColumn::Size | SortColumn::Absent, _) | (SortColumn::Text, 0 | 1) => {
-            Ok(ranked_window(hits.into_values().collect(), window, order))
-        }
-        (SortColumn::Text, _) => spelled_page(hits, &segments, window, order),
+        descending: sort.descending,
+        reversed,
     }
 }
 
@@ -706,13 +752,13 @@ fn ranked_window(mut hits: Vec<Hit>, window: Window, order: Order) -> Vec<Hit> {
 /// The page of a text key spread over several segments: each segment is bounded on its own
 /// ordinals, and only the candidates that survive that are spelled out and merged.
 fn spelled_page(
-    hits: HashMap<i64, Hit>,
+    hits: Vec<Hit>,
     segments: &[SegmentStrings],
     window: Window,
     order: Order,
 ) -> Result<Vec<Hit>> {
     let mut grouped: Vec<Vec<Hit>> = vec![Vec::new(); segments.len()];
-    for hit in hits.into_values() {
+    for hit in hits {
         let group = grouped
             .get_mut(hit.segment as usize)
             .ok_or_else(|| unknown_segment(hit.segment))?;
@@ -734,18 +780,17 @@ fn spelled_page(
     Ok(window.cut(candidates.into_iter().map(|(_, hit)| hit).collect()))
 }
 
-/// How many distinct nodes the collapsed set sits on, spelling one term per segment and
+/// How many distinct nodes the answered set sits on, spelling one term per segment and
 /// value rather than one per hit.
-fn distinct_nodes(collected: &Collected) -> Result<u64> {
-    let ordinals: HashSet<(SegmentOrdinal, u64)> = collected
-        .hits
-        .values()
-        .map(|hit| (hit.segment, hit.facets[NODE_DIMENSION]))
-        .collect();
-    let mut spelling = Spelling::new(&collected.segments);
-    let mut names: HashSet<String> = HashSet::with_capacity(ordinals.len());
-    for (segment, ordinal) in ordinals {
-        names.insert(spelling.spell(segment, NODE_DIMENSION, ordinal)?.to_owned());
+fn distinct_nodes(summary: &Summary) -> Result<u64> {
+    let mut spelling = Spelling::new(&summary.segments);
+    let mut names: HashSet<String> = HashSet::with_capacity(summary.nodes.len());
+    for (segment, ordinal) in &summary.nodes {
+        names.insert(
+            spelling
+                .spell(*segment, NODE_DIMENSION, *ordinal)?
+                .to_owned(),
+        );
     }
     Ok(names.len() as u64)
 }
@@ -756,10 +801,24 @@ fn unknown_segment(segment: SegmentOrdinal) -> IndexError {
     ))
 }
 
+/// The order a facet recount collects in. It never pages, so any total order will do.
+fn facet_sort() -> SortSpec {
+    SortSpec::new(SortKey::Size, true)
+}
+
 fn collector() -> ArtifactCollector {
-    ArtifactCollector {
-        sort: SortSpec::new(SortKey::Size, true),
-    }
+    ArtifactCollector { sort: facet_sort() }
+}
+
+/// The query restricted to the one document per artifact the build marked primary.
+fn only_primary(fields: &Fields, query: Box<dyn Query>) -> BooleanQuery {
+    BooleanQuery::intersection(vec![
+        query,
+        Box::new(TermQuery::new(
+            Term::from_field_u64(fields.primary, 1),
+            IndexRecordOption::Basic,
+        )),
+    ])
 }
 
 /// One value of one dimension while it is being counted by ordinal, inside one segment,
@@ -806,33 +865,37 @@ impl Tally {
     }
 }
 
-/// Counts one dimension over the collapsed set by ordinal, then spells each distinct value
-/// once and merges the segments that spelled the same string.
-fn count_buckets(
-    collected: &Collected,
-    dimension: usize,
-    labelled: bool,
-) -> Result<Vec<FacetBucket>> {
-    let mut ordinals: HashMap<(SegmentOrdinal, u64), OrdinalTally> = HashMap::new();
-    for hit in collected.hits.values() {
-        let value = hit.facets[dimension];
-        if value == NO_TERM {
+/// Adds one hit to the ordinal tallies of all five dimensions, observing the base label
+/// wherever a bucket may carry one.
+fn tally(tallies: &mut HashMap<(SegmentOrdinal, usize, u64), OrdinalTally>, hit: &Hit) {
+    for (dimension, ordinal) in hit.facets.iter().enumerate() {
+        if *ordinal == NO_TERM {
             continue;
         }
-        let tally = ordinals.entry((hit.segment, value)).or_default();
-        tally.count += 1;
-        if labelled {
-            tally.observe(hit.base_label);
+        let counted = tallies
+            .entry((hit.segment, dimension, *ordinal))
+            .or_default();
+        counted.count += 1;
+        if dimension == BASE_DIMENSION {
+            counted.observe(hit.base_label);
         }
     }
-    let mut spelling = Spelling::new(&collected.segments);
-    let mut tallies: HashMap<String, Tally> = HashMap::with_capacity(ordinals.len());
-    for ((segment, ordinal), counted) in ordinals {
+}
+
+/// Spells one dimension's ordinal tallies out and merges the segments that spelled the same
+/// string. The counting itself happened once, while the set was collected.
+fn count_buckets(summary: &Summary, dimension: usize, labelled: bool) -> Result<Vec<FacetBucket>> {
+    let mut spelling = Spelling::new(&summary.segments);
+    let mut tallies: HashMap<String, Tally> = HashMap::new();
+    for ((segment, counted_dimension, ordinal), counted) in &summary.tallies {
+        if *counted_dimension != dimension {
+            continue;
+        }
         let label = match counted.label {
-            Some(label) => Some(spelling.spell(segment, LABEL_COLUMN, label)?.to_owned()),
+            Some(label) => Some(spelling.spell(*segment, LABEL_COLUMN, label)?.to_owned()),
             None => None,
         };
-        let value = spelling.spell(segment, dimension, ordinal)?.to_owned();
+        let value = spelling.spell(*segment, dimension, *ordinal)?.to_owned();
         if value.is_empty() {
             continue;
         }
@@ -1274,89 +1337,99 @@ impl SortColumn {
     }
 }
 
-/// A whole collection: the hit retained per artifact and the segment columns their ordinals
-/// are spelled from.
+/// Which of the two collections answers a query: primary documents alone, or one document
+/// per entry collapsed to its artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueryPath {
+    Primary,
+    Collapse,
+}
+
+/// What both collections hand to the facet, node and paging code, so each of those is
+/// written once: the total, the candidates that can reach the requested window, every
+/// dimension's ordinal tallies, the node ordinals, and the columns to spell them from.
+struct Summary {
+    total: u64,
+    candidates: Vec<Hit>,
+    tallies: HashMap<(SegmentOrdinal, usize, u64), OrdinalTally>,
+    nodes: HashSet<(SegmentOrdinal, u64)>,
+    segments: Vec<SegmentStrings>,
+}
+
+/// A whole collapsed collection: the hit retained per artifact and the segment columns their
+/// ordinals are spelled from.
 struct Collected {
     hits: HashMap<i64, Hit>,
     segments: Vec<SegmentStrings>,
 }
 
-/// What one segment harvests: its ordinal, its retained hits and its string columns.
-struct SegmentHits {
-    ordinal: SegmentOrdinal,
-    hits: HashMap<i64, Hit>,
-    strings: SegmentStrings,
+impl Collected {
+    /// Tallies the collapsed hits the way a primary collection tallies them as it goes, so
+    /// both paths are counted and paged by the same code.
+    fn summary(self) -> Summary {
+        let Collected { hits, segments } = self;
+        let mut tallies = HashMap::new();
+        let mut nodes = HashSet::new();
+        let mut candidates = Vec::with_capacity(hits.len());
+        for hit in hits.into_values() {
+            tally(&mut tallies, &hit);
+            nodes.insert((hit.segment, hit.facets[NODE_DIMENSION]));
+            candidates.push(hit);
+        }
+        Summary {
+            total: candidates.len() as u64,
+            candidates,
+            tallies,
+            nodes,
+            segments,
+        }
+    }
 }
 
-struct ArtifactCollector {
-    sort: SortSpec,
+/// Everything the facet rail needs to count a dimension the same way the page was answered.
+struct FacetPass<'a> {
+    searcher: &'a Searcher,
+    parsed: &'a ParsedQuery,
+    bound: &'a QueryFields<'a>,
+    summary: &'a Summary,
+    path: QueryPath,
 }
 
-impl Collector for ArtifactCollector {
-    type Fruit = Collected;
-    type Child = ArtifactSegmentCollector;
-
-    fn for_segment(
-        &self,
-        ordinal: SegmentOrdinal,
-        segment: &SegmentReader,
-    ) -> tantivy::Result<Self::Child> {
-        let fields = segment.fast_fields();
-        Ok(ArtifactSegmentCollector {
-            ordinal,
-            artifact: fields.i64("artifact_id")?,
-            entry: fields.i64("entry_id")?,
-            preference: fields.i64("preference")?,
-            size: fields.u64("size")?,
-            sort: SortColumn::of(self.sort.key),
-            strings: SegmentStrings::open(segment, self.sort.key)?,
-            hits: HashMap::new(),
-            invalid: false,
+impl FacetPass<'_> {
+    /// The same collection over the query with one dimension's own key excluded. It keeps no
+    /// candidates, because only the tallies are read from it.
+    fn narrowed(&self, excluded: Box<dyn Query>) -> Result<Summary> {
+        Ok(match self.path {
+            QueryPath::Primary => self.searcher.search(
+                &only_primary(self.bound.fields, excluded),
+                &PrimaryCollector {
+                    sort: facet_sort(),
+                    keep: 0,
+                    reversed: false,
+                },
+            )?,
+            QueryPath::Collapse => self
+                .searcher
+                .search(excluded.as_ref(), &collector())?
+                .summary(),
         })
     }
 
-    fn requires_scoring(&self) -> bool {
-        false
-    }
-
-    fn merge_fruits(
-        &self,
-        fruits: Vec<tantivy::Result<SegmentHits>>,
-    ) -> tantivy::Result<Self::Fruit> {
-        let harvested = fruits.into_iter().collect::<tantivy::Result<Vec<_>>>()?;
-        let count = harvested
-            .iter()
-            .map(|segment| segment.ordinal as usize + 1)
-            .max()
-            .unwrap_or(0);
-        let mut columns: Vec<Option<SegmentStrings>> = vec![None; count];
-        let mut hits = HashMap::new();
-        for segment in harvested {
-            let slot = columns.get_mut(segment.ordinal as usize).ok_or_else(|| {
-                tantivy::TantivyError::InvalidArgument(
-                    "a segment reported an ordinal outside the searched index".into(),
-                )
-            })?;
-            *slot = Some(segment.strings);
-            for hit in segment.hits.into_values() {
-                hit.retain(&mut hits);
-            }
-        }
-        let segments = columns
-            .into_iter()
-            .map(|strings| {
-                strings.ok_or_else(|| {
-                    tantivy::TantivyError::InvalidArgument(
-                        "a searched segment produced no columns; rebuild the index".into(),
-                    )
-                })
-            })
-            .collect::<tantivy::Result<Vec<_>>>()?;
-        Ok(Collected { hits, segments })
+    /// How many artifacts one base bucket holds, which the prefix rule can settle only by
+    /// running that bucket's own query.
+    fn count(&self, scoped: BooleanQuery) -> Result<u64> {
+        Ok(match self.path {
+            QueryPath::Primary => self
+                .searcher
+                .search(&only_primary(self.bound.fields, Box::new(scoped)), &Count)?
+                as u64,
+            QueryPath::Collapse => self.searcher.search(&scoped, &collector())?.hits.len() as u64,
+        })
     }
 }
 
-struct ArtifactSegmentCollector {
+/// The fast fields one segment reads a hit out of, opened once per segment.
+struct HitColumns {
     ordinal: SegmentOrdinal,
     artifact: Column<i64>,
     entry: Column<i64>,
@@ -1364,11 +1437,26 @@ struct ArtifactSegmentCollector {
     size: Column<u64>,
     sort: SortColumn,
     strings: SegmentStrings,
-    hits: HashMap<i64, Hit>,
-    invalid: bool,
 }
 
-impl ArtifactSegmentCollector {
+impl HitColumns {
+    fn open(
+        ordinal: SegmentOrdinal,
+        segment: &SegmentReader,
+        key: SortKey,
+    ) -> tantivy::Result<Self> {
+        let fields = segment.fast_fields();
+        Ok(Self {
+            ordinal,
+            artifact: fields.i64("artifact_id")?,
+            entry: fields.i64("entry_id")?,
+            preference: fields.i64("preference")?,
+            size: fields.u64("size")?,
+            sort: SortColumn::of(key),
+            strings: SegmentStrings::open(segment, key)?,
+        })
+    }
+
     fn hit(&self, doc: DocId) -> Option<Hit> {
         let (Some(artifact_id), Some(entry_id), Some(preference), Some(size)) = (
             self.artifact.first(doc),
@@ -1395,11 +1483,112 @@ impl ArtifactSegmentCollector {
     }
 }
 
+/// The columns each searched segment kept, slotted by its ordinal so a hit naming a segment
+/// finds them.
+fn segment_columns(
+    harvested: Vec<(SegmentOrdinal, SegmentStrings)>,
+    count: usize,
+) -> tantivy::Result<Vec<SegmentStrings>> {
+    let mut columns: Vec<Option<SegmentStrings>> = vec![None; count];
+    for (ordinal, strings) in harvested {
+        let slot = columns.get_mut(ordinal as usize).ok_or_else(|| {
+            tantivy::TantivyError::InvalidArgument(
+                "a segment reported an ordinal outside the searched index".into(),
+            )
+        })?;
+        *slot = Some(strings);
+    }
+    columns
+        .into_iter()
+        .map(|strings| {
+            strings.ok_or_else(|| {
+                tantivy::TantivyError::InvalidArgument(
+                    "a searched segment produced no columns; rebuild the index".into(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn missing_fast_fields() -> tantivy::TantivyError {
+    tantivy::TantivyError::InvalidArgument(
+        "search entry is missing required fast fields; rebuild the index".into(),
+    )
+}
+
+/// What one segment harvests while collapsing: its ordinal, its retained hits and its string
+/// columns.
+struct SegmentHits {
+    ordinal: SegmentOrdinal,
+    hits: HashMap<i64, Hit>,
+    strings: SegmentStrings,
+}
+
+struct ArtifactCollector {
+    sort: SortSpec,
+}
+
+impl Collector for ArtifactCollector {
+    type Fruit = Collected;
+    type Child = ArtifactSegmentCollector;
+
+    fn for_segment(
+        &self,
+        ordinal: SegmentOrdinal,
+        segment: &SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        Ok(ArtifactSegmentCollector {
+            columns: HitColumns::open(ordinal, segment, self.sort.key)?,
+            hits: HashMap::new(),
+            invalid: false,
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn merge_fruits(
+        &self,
+        fruits: Vec<tantivy::Result<SegmentHits>>,
+    ) -> tantivy::Result<Self::Fruit> {
+        let harvested = fruits.into_iter().collect::<tantivy::Result<Vec<_>>>()?;
+        let count = harvested
+            .iter()
+            .map(|segment| segment.ordinal as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut hits = HashMap::new();
+        let mut columns = Vec::with_capacity(harvested.len());
+        for segment in harvested {
+            let SegmentHits {
+                ordinal,
+                hits: retained,
+                strings,
+            } = segment;
+            for hit in retained.into_values() {
+                hit.retain(&mut hits);
+            }
+            columns.push((ordinal, strings));
+        }
+        Ok(Collected {
+            hits,
+            segments: segment_columns(columns, count)?,
+        })
+    }
+}
+
+struct ArtifactSegmentCollector {
+    columns: HitColumns,
+    hits: HashMap<i64, Hit>,
+    invalid: bool,
+}
+
 impl SegmentCollector for ArtifactSegmentCollector {
     type Fruit = tantivy::Result<SegmentHits>;
 
     fn collect(&mut self, doc: DocId, _: Score) {
-        match self.hit(doc) {
+        match self.columns.hit(doc) {
             Some(hit) => hit.retain(&mut self.hits),
             None => self.invalid = true,
         }
@@ -1407,14 +1596,193 @@ impl SegmentCollector for ArtifactSegmentCollector {
 
     fn harvest(self) -> Self::Fruit {
         if self.invalid {
-            return Err(tantivy::TantivyError::InvalidArgument(
-                "search entry is missing required fast fields; rebuild the index".into(),
-            ));
+            return Err(missing_fast_fields());
         }
+        let HitColumns {
+            ordinal, strings, ..
+        } = self.columns;
         Ok(SegmentHits {
-            ordinal: self.ordinal,
+            ordinal,
             hits: self.hits,
-            strings: self.strings,
+            strings,
+        })
+    }
+}
+
+/// One candidate while a segment keeps only the `keep` that come first. It orders by the
+/// page's own order, so the heap's greatest is the one that leaves next.
+struct Candidate {
+    hit: Hit,
+    order: Order,
+}
+
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.order.compare(&self.hit, &other.hit)
+    }
+}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Candidate {}
+
+/// The bounded collection over primary documents: a count, the candidates that can reach the
+/// requested window, the facet tallies and the node ordinals, none of which grows with the
+/// number of documents matched.
+struct PrimaryCollector {
+    sort: SortSpec,
+    keep: usize,
+    reversed: bool,
+}
+
+/// What one segment harvests while answering from primary documents.
+struct PrimarySummary {
+    ordinal: SegmentOrdinal,
+    count: u64,
+    candidates: BinaryHeap<Candidate>,
+    tallies: HashMap<(SegmentOrdinal, usize, u64), OrdinalTally>,
+    nodes: HashSet<(SegmentOrdinal, u64)>,
+    strings: SegmentStrings,
+}
+
+impl Collector for PrimaryCollector {
+    type Fruit = Summary;
+    type Child = PrimarySegmentCollector;
+
+    fn for_segment(
+        &self,
+        ordinal: SegmentOrdinal,
+        segment: &SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        Ok(PrimarySegmentCollector {
+            columns: HitColumns::open(ordinal, segment, self.sort.key)?,
+            order: order_of(self.sort, self.reversed),
+            keep: self.keep,
+            count: 0,
+            candidates: BinaryHeap::new(),
+            tallies: HashMap::new(),
+            nodes: HashSet::new(),
+            invalid: false,
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn merge_fruits(
+        &self,
+        fruits: Vec<tantivy::Result<PrimarySummary>>,
+    ) -> tantivy::Result<Self::Fruit> {
+        let harvested = fruits.into_iter().collect::<tantivy::Result<Vec<_>>>()?;
+        let count = harvested
+            .iter()
+            .map(|segment| segment.ordinal as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut total = 0;
+        let mut candidates = Vec::new();
+        let mut tallies = HashMap::new();
+        let mut nodes = HashSet::new();
+        let mut columns = Vec::with_capacity(harvested.len());
+        for segment in harvested {
+            let PrimarySummary {
+                ordinal,
+                count: matched,
+                candidates: kept,
+                tallies: counted,
+                nodes: seen,
+                strings,
+            } = segment;
+            total += matched;
+            candidates.extend(kept.into_iter().map(|candidate| candidate.hit));
+            tallies.extend(counted);
+            nodes.extend(seen);
+            columns.push((ordinal, strings));
+        }
+        Ok(Summary {
+            total,
+            candidates,
+            tallies,
+            nodes,
+            segments: segment_columns(columns, count)?,
+        })
+    }
+}
+
+struct PrimarySegmentCollector {
+    columns: HitColumns,
+    order: Order,
+    keep: usize,
+    count: u64,
+    candidates: BinaryHeap<Candidate>,
+    tallies: HashMap<(SegmentOrdinal, usize, u64), OrdinalTally>,
+    nodes: HashSet<(SegmentOrdinal, u64)>,
+    invalid: bool,
+}
+
+impl PrimarySegmentCollector {
+    fn offer(&mut self, hit: Hit) {
+        if self.keep == 0 {
+            return;
+        }
+        let candidate = Candidate {
+            hit,
+            order: self.order,
+        };
+        if self.candidates.len() < self.keep {
+            self.candidates.push(candidate);
+            return;
+        }
+        if self
+            .candidates
+            .peek()
+            .is_some_and(|leaving| candidate < *leaving)
+        {
+            self.candidates.pop();
+            self.candidates.push(candidate);
+        }
+    }
+}
+
+impl SegmentCollector for PrimarySegmentCollector {
+    type Fruit = tantivy::Result<PrimarySummary>;
+
+    fn collect(&mut self, doc: DocId, _: Score) {
+        let Some(hit) = self.columns.hit(doc) else {
+            self.invalid = true;
+            return;
+        };
+        self.count += 1;
+        tally(&mut self.tallies, &hit);
+        self.nodes.insert((hit.segment, hit.facets[NODE_DIMENSION]));
+        self.offer(hit);
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        if self.invalid {
+            return Err(missing_fast_fields());
+        }
+        let HitColumns {
+            ordinal, strings, ..
+        } = self.columns;
+        Ok(PrimarySummary {
+            ordinal,
+            count: self.count,
+            candidates: self.candidates,
+            tallies: self.tallies,
+            nodes: self.nodes,
+            strings,
         })
     }
 }
