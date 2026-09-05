@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use hoard_index::catalog::{Catalog, QueryRequest};
 use hoard_index::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
-use hoard_index::search::{CompileContext, SortKey, SortSpec};
+use hoard_index::search::{CompileContext, Facets, SortKey, SortSpec};
 
 const FILES_PER_DIRECTORY: usize = 1000;
 const PAGE: u32 = 100;
@@ -149,6 +149,23 @@ fn megabytes_between(before: u64, after: u64) -> String {
     format!("{} MB", after.saturating_sub(before) / 1024)
 }
 
+/// How many buckets each of the five dimensions came back with, in the rail's order, so a
+/// zero anywhere is visible beside the time the query took.
+fn facet_summary(facets: &Facets) -> String {
+    let counts = [
+        facets.role.len(),
+        facets.base.len(),
+        facets.format.len(),
+        facets.precision.len(),
+        facets.node.len(),
+    ];
+    counts
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<String>>()
+        .join(" / ")
+}
+
 fn report(rows: &[(&str, String)]) {
     eprintln!();
     eprintln!("| measure | value |");
@@ -193,7 +210,9 @@ fn native_catalog_at_scale() {
     let (first, first_time) = timed(|| run("", 0));
     let deep_offset = u32::try_from(first.total.saturating_sub(u64::from(PAGE))).unwrap_or(0);
     let (_, deep_time) = timed(|| run("", deep_offset));
+    let (loras, lora_time) = timed(|| run("role:lora", 0));
     let (_, filtered_time) = timed(|| run("fmt:safetensors size:>0", 0));
+    let rss_after_queries = peak_rss_kb();
     let disk_apparent = directory_size(&output, apparent);
     let disk_allocated = directory_size(&output, allocated);
 
@@ -226,16 +245,23 @@ fn native_catalog_at_scale() {
             "on disk, allocated",
             format!("{} MB", disk_allocated / (1024 * 1024)),
         ),
-        ("search offset 0", format!("{first_time:?}")),
-        ("search deep offset", format!("{deep_time:?}")),
-        ("search filtered", format!("{filtered_time:?}")),
+        ("query empty by name", format!("{first_time:?}")),
+        ("query deep offset", format!("{deep_time:?}")),
+        ("query role:lora with facets", format!("{lora_time:?}")),
+        ("query filtered", format!("{filtered_time:?}")),
+        ("role:lora artifacts", loras.total.to_string()),
+        ("facet dimensions counted", facet_summary(&loras.facets)),
+        (
+            "peak rss growth during queries",
+            megabytes_between(rss_after_rebuild, rss_after_queries),
+        ),
         ("rescan wall (1,000 changed)", format!("{rescan_time:?}")),
         ("rescan report", format!("{rescanned:?}")),
         ("refresh wall", format!("{refresh_time:?}")),
         ("changes refreshed", applied.to_string()),
         (
             "peak rss growth during rescan and refresh",
-            megabytes_between(rss_after_rebuild, rss_after_refresh),
+            megabytes_between(rss_after_queries, rss_after_refresh),
         ),
     ]);
 }
