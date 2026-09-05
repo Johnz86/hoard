@@ -56,8 +56,9 @@ the complete trigger string; they do not implement legacy substring matching.
   become one artifact anchored on the lowest shard. Members are entries that point at that
   artifact and have no search row; the anchor's row carries the whole model's size and
   shard count, and an incomplete set is triage.
-- Unreadable files and git-lfs pointer files are recorded as absent entries without an
-  artifact, as the SQLite scanner does.
+- An unreadable file keeps its path and is recorded as an absent entry without an artifact;
+  a git-lfs pointer stub is recorded as absent with the pointer's size and hash; a fetched
+  LFS weight is an ordinary artifact. This is what the SQLite scanner does.
 - Entries whose inference needs triage carry state `triage`.
 - Artifact names and orgs follow the scanner's rules: a single-artifact repository is named
   by its repository.

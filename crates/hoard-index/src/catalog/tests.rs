@@ -397,7 +397,10 @@ fn an_unreadable_file_is_recorded_as_absent_instead_of_aborting() -> Result<()> 
         .ok_or_else(|| IndexError::Catalog("missing unreadable entry".into()))?;
     assert_eq!(entries.len(), 2, "the unreadable file is still an entry");
     assert_eq!(absent.state, hoard_core::State::Remote);
-    assert!(absent.abs_path.is_none());
+    assert!(
+        absent.abs_path.is_some(),
+        "the file is on this disk even though it could not be read"
+    );
     assert!(absent.artifact_id.is_none());
     drop(read);
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o600))?;
@@ -447,6 +450,65 @@ fn an_lfs_pointer_is_an_absent_entry_without_an_artifact() -> Result<()> {
         "the SQLite scanner writes no blob and no artifact for a pointer"
     );
     assert_eq!(read.len().primary::<ArtifactRecord>()?, 0);
+    Ok(())
+}
+
+fn discovered(
+    rel_path: &str,
+    abs_path: Option<&Path>,
+    lfs_pointer: bool,
+) -> crate::discover::DiscoveredEntry {
+    crate::discover::DiscoveredEntry {
+        rel_path: rel_path.to_owned(),
+        abs_path: abs_path.map(Path::to_path_buf),
+        size: 0,
+        stamp: None,
+        is_symlink: false,
+        sha256: None,
+        git_sha1: None,
+        lfs_pointer,
+    }
+}
+
+#[test]
+fn a_fetched_lfs_weight_is_an_artifact_and_an_unfetched_pointer_is_not() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let weights = directory.path().join("model.safetensors");
+    fs::write(&weights, lora_header())?;
+    let fetched = discovered("model.safetensors", Some(&weights), true);
+    let sniffed = crate::sniff::sniff_path(&weights)?;
+    let presence = super::scan::Presence::of(&fetched, Some(&sniffed));
+    assert!(presence.readable);
+    assert!(
+        presence.lfs_pointer,
+        "discovery's flag is kept for the entry row"
+    );
+    assert!(
+        !presence.pointer_bytes,
+        "the bytes on disk are weights, not a pointer"
+    );
+    assert!(super::scan::creates_artifact(
+        sniffed.format,
+        &presence,
+        &super::scan::EntryRole::Standalone
+    ));
+
+    let pointer = directory.path().join("pointer.safetensors");
+    let oid = "a".repeat(64);
+    fs::write(
+        &pointer,
+        format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize 5\n"),
+    )?;
+    let unfetched = discovered("pointer.safetensors", Some(&pointer), false);
+    let sniffed = crate::sniff::sniff_path(&pointer)?;
+    let presence = super::scan::Presence::of(&unfetched, Some(&sniffed));
+    assert!(presence.pointer_bytes);
+    assert!(!presence.readable);
+    assert!(!super::scan::creates_artifact(
+        sniffed.format,
+        &presence,
+        &super::scan::EntryRole::Standalone
+    ));
     Ok(())
 }
 

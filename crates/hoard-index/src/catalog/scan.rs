@@ -322,39 +322,53 @@ fn revision_name(repo: &DiscoveredRepo, ordinal: usize) -> String {
         })
 }
 
-/// What this disk actually holds for one discovered path, after sniffing has run: an
-/// unreadable file and a git-lfs pointer both stand for bytes that are not here.
-struct Presence {
-    abs_path: Option<PathBuf>,
-    size: u64,
-    sha256: Option<Sha256>,
-    lfs_pointer: bool,
+/// What this disk holds for one discovered path once sniffing has run. A file can be on
+/// disk yet unreadable, and an LFS-tracked file can be a fetched weight or a pointer stub.
+pub(super) struct Presence {
+    pub(super) abs_path: Option<PathBuf>,
+    pub(super) readable: bool,
+    pub(super) size: u64,
+    pub(super) sha256: Option<Sha256>,
+    pub(super) lfs_pointer: bool,
+    pub(super) pointer_bytes: bool,
 }
 
 impl Presence {
-    fn of(entry: &DiscoveredEntry, sniffed: Option<&SniffResult>) -> Self {
+    pub(super) fn of(entry: &DiscoveredEntry, sniffed: Option<&SniffResult>) -> Self {
         let pointer = sniffed
             .and_then(|result| result.lfs_pointer.as_ref())
             .filter(|_| entry.sha256.is_none());
         match pointer {
             Some(pointer) => Self {
                 abs_path: None,
+                readable: false,
                 size: pointer.size,
                 sha256: Some(pointer.sha256),
                 lfs_pointer: true,
+                pointer_bytes: true,
             },
             None => Self {
-                abs_path: entry.abs_path.clone().filter(|_| sniffed.is_some()),
+                abs_path: entry.abs_path.clone(),
+                readable: sniffed.is_some(),
                 size: entry.size,
                 sha256: entry.sha256,
                 lfs_pointer: entry.lfs_pointer,
+                pointer_bytes: false,
             },
         }
     }
 
     fn present(&self) -> bool {
-        self.abs_path.is_some()
+        self.readable
     }
+}
+
+pub(super) fn creates_artifact(
+    format: ArtifactFormat,
+    presence: &Presence,
+    role: &EntryRole,
+) -> bool {
+    format.is_artifact() && !presence.pointer_bytes && !matches!(role, EntryRole::Member { .. })
 }
 
 /// What one file that becomes an artifact contributes: only such a file pays for inference,
@@ -377,7 +391,7 @@ struct PreparedEntry<'a> {
 
 /// One model split across files, as the revision's grouping pass settled it.
 #[derive(Clone)]
-struct GroupFacts {
+pub(super) struct GroupFacts {
     group: usize,
     label: String,
     bytes: u64,
@@ -388,7 +402,7 @@ struct GroupFacts {
 
 /// Which part one file plays: a file of its own, the shard the artifact rides on, or one
 /// more piece of a model another shard already stands for.
-enum EntryRole {
+pub(super) enum EntryRole {
     Standalone,
     Anchor(GroupFacts),
     Member { group: usize },
@@ -571,8 +585,7 @@ fn prepare_entry<'a>(
     let format = sniffed
         .as_ref()
         .map_or(ArtifactFormat::Unknown, |result| result.format);
-    let creates_artifact =
-        format.is_artifact() && !presence.lfs_pointer && !matches!(role, EntryRole::Member { .. });
+    let creates_artifact = creates_artifact(format, &presence, &role);
     let path = inference_path(
         plan.naming.root_path,
         &entry.rel_path,
