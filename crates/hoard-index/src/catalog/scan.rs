@@ -7,7 +7,7 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use hoard_core::{Artifact, ArtifactId, BlobId, EntryId, RepoRowId, State};
 
-use crate::config::IndexConfig;
+use crate::config::{IndexConfig, SourceConfig};
 use crate::discover::{
     self, DiscoveredEntry, DiscoveredRepo, DiscoveredRevision, NoiseFilter, RevisionName,
 };
@@ -33,28 +33,52 @@ impl Catalog {
         directory: &Path,
         node: &str,
         config: &IndexConfig,
-        mut progress: impl FnMut(&str, u64),
+        progress: impl FnMut(&str, u64),
     ) -> Result<Self> {
-        let directory = validate_output(directory, config)?;
+        let (directory, sources) = validate_output(directory, config)?;
         std::fs::create_dir(&directory)?;
         let catalog = Self {
             database: Builder::new().create(models()?, directory.join("catalog.redb"))?,
             directory,
         };
+        match catalog.fill(node, &sources, config.triage_confidence, progress) {
+            Ok(()) => Ok(catalog),
+            Err(error) => {
+                let directory = catalog.directory.clone();
+                drop(catalog);
+                if let Err(cleanup) = std::fs::remove_dir_all(&directory) {
+                    tracing::warn!(
+                        path = %directory.display(),
+                        %cleanup,
+                        "partial catalog left behind"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn fill(
+        &self,
+        node: &str,
+        sources: &[&SourceConfig],
+        triage: f32,
+        mut progress: impl FnMut(&str, u64),
+    ) -> Result<()> {
         let mut counters = Counters::default();
-        for source in &config.sources {
+        for source in sources {
             progress(&format!("discovering {}", source.name), counters.entries);
             let discovered = discover::discover(source, &NoiseFilter::default())?;
-            let transaction = catalog.database.rw_transaction()?;
+            let transaction = self.database.rw_transaction()?;
             transaction.insert(Source {
                 name: source.name.clone(),
-                config: source.clone(),
+                config: (*source).clone(),
                 resolved_kind: discovered.kind(),
             })?;
             transaction.commit()?;
             for repo in discovered.repos() {
                 let repo_id = counters.next_repo()?;
-                let transaction = catalog.database.rw_transaction()?;
+                let transaction = self.database.rw_transaction()?;
                 transaction.insert(repository(repo_id, &source.name, repo))?;
                 transaction.commit()?;
                 for (ordinal, revision) in repo.revisions.iter().enumerate() {
@@ -65,14 +89,14 @@ impl Catalog {
                         repo_id,
                         revision,
                         revision_name: revision_name(repo, ordinal),
-                        triage: config.triage_confidence,
+                        triage,
                     };
                     for chunk in revision.entries.chunks(BATCH_SIZE) {
                         let prepared = chunk
                             .par_iter()
                             .map(prepare_entry)
                             .collect::<Result<Vec<_>>>()?;
-                        let transaction = catalog.database.rw_transaction()?;
+                        let transaction = self.database.rw_transaction()?;
                         for prepared in prepared {
                             store_entry(&transaction, &context, prepared, &mut counters)?;
                         }
@@ -82,7 +106,7 @@ impl Catalog {
                 }
             }
         }
-        let transaction = catalog.database.rw_transaction()?;
+        let transaction = self.database.rw_transaction()?;
         transaction.insert(Manifest {
             id: 0,
             format_version: 1,
@@ -90,7 +114,7 @@ impl Catalog {
             scanned_at: jiff::Timestamp::now().to_string(),
             node: node.to_owned(),
             counts: vec![
-                ("sources".into(), config.sources.len() as u64),
+                ("sources".into(), sources.len() as u64),
                 ("repositories".into(), counters.repos),
                 ("artifacts".into(), counters.artifacts),
                 ("entries".into(), counters.entries),
@@ -99,11 +123,14 @@ impl Catalog {
             search_generation: 0,
         })?;
         transaction.commit()?;
-        Ok(catalog)
+        Ok(())
     }
 }
 
-fn validate_output(directory: &Path, config: &IndexConfig) -> Result<PathBuf> {
+fn validate_output<'a>(
+    directory: &Path,
+    config: &'a IndexConfig,
+) -> Result<(PathBuf, Vec<&'a SourceConfig>)> {
     if config.sources.is_empty() {
         return Err(IndexError::Catalog("no sources are configured".into()));
     }
@@ -121,6 +148,7 @@ fn validate_output(directory: &Path, config: &IndexConfig) -> Result<PathBuf> {
         .ok_or_else(|| IndexError::Catalog("output needs a directory name".into()))?;
     let output = parent.canonicalize()?.join(name);
     let mut names = HashSet::with_capacity(config.sources.len());
+    let mut selected = Vec::with_capacity(config.sources.len());
     for source in &config.sources {
         if !names.insert(&source.name) {
             return Err(IndexError::Catalog(format!(
@@ -128,14 +156,32 @@ fn validate_output(directory: &Path, config: &IndexConfig) -> Result<PathBuf> {
                 source.name
             )));
         }
-        if output.starts_with(source.path.canonicalize()?) {
+        let root = match source.path.canonicalize() {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::warn!(
+                    source = %source.name,
+                    path = %source.path.display(),
+                    %error,
+                    "source root is unavailable; skipping"
+                );
+                continue;
+            }
+        };
+        if output.starts_with(&root) {
             return Err(IndexError::Catalog(format!(
                 "catalog output is inside scanned source {:?}",
                 source.name
             )));
         }
+        selected.push(source);
     }
-    Ok(output)
+    if selected.is_empty() {
+        return Err(IndexError::Catalog(
+            "no configured source is available".into(),
+        ));
+    }
+    Ok((output, selected))
 }
 
 #[derive(Default)]

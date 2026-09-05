@@ -308,3 +308,44 @@ fn a_catalog_open_elsewhere_reports_the_lock_plainly() -> Result<()> {
     drop(catalog);
     Ok(())
 }
+
+#[test]
+fn a_missing_source_root_is_skipped_not_fatal() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir(&input)?;
+    fs::write(input.join("tiny.jsonl"), "{\"text\":\"hello\"}\n")?;
+    let config = IndexConfig {
+        sources: vec![
+            source(&input, "present"),
+            source(&directory.path().join("unmounted"), "absent"),
+        ],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "test-node",
+        &config,
+        |_, _| {},
+    )?;
+    let status = catalog.status()?;
+    assert!(status.counts.contains(&("sources".into(), 1)));
+    assert!(status.counts.contains(&("entries".into(), 1)));
+    Ok(())
+}
+
+#[test]
+fn a_failed_scan_leaves_no_directory_behind() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let not_a_directory = directory.path().join("file-as-root");
+    fs::write(&not_a_directory, "x")?;
+    let config = IndexConfig {
+        sources: vec![source(&not_a_directory, "broken")],
+        ..IndexConfig::default()
+    };
+    let output = directory.path().join("native");
+    let result = Catalog::scan_sources(&output, "test-node", &config, |_, _| {});
+    assert!(result.is_err());
+    assert!(!output.exists());
+    Ok(())
+}
