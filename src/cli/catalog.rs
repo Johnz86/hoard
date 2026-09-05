@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use clap::Subcommand;
+use serde_json::json;
 
 use hoard_index::catalog::{Catalog, SearchRequest};
 
@@ -79,7 +80,9 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
                 progress.set_message(format!("Building Tantivy index: {count} entries"));
             })?;
             progress.finish_and_clear();
-            report(&catalog.status()?)?;
+            let status = catalog.status()?;
+            drop(catalog);
+            report(&json!({ "status": status, "storage": Catalog::storage(&directory)? }))?;
         }
         CatalogCommand::Search {
             directory,
@@ -111,7 +114,9 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
                 catalog.check_integrity()?,
                 "native database integrity check failed"
             );
-            report(&catalog.status()?)?;
+            let status = catalog.status()?;
+            drop(catalog);
+            report(&json!({ "status": status, "storage": Catalog::storage(&directory)? }))?;
         }
     }
     Ok(())

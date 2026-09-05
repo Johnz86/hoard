@@ -40,8 +40,11 @@ impl Catalog {
         progress: impl FnMut(&str, u64),
     ) -> Result<Self> {
         let (directory, sources) = validate_output(directory, config)?;
-        let catalog = Self::create(directory)?;
-        match catalog.fill(node, &sources, config.triage_confidence, progress) {
+        let mut catalog = Self::create(directory)?;
+        match catalog
+            .fill(node, &sources, config.triage_confidence, progress)
+            .and_then(|()| catalog.compact())
+        {
             Ok(()) => Ok(catalog),
             Err(error) => {
                 let directory = catalog.directory.clone();

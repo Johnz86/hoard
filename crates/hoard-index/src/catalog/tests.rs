@@ -826,6 +826,41 @@ fn a_second_path_does_not_rename_the_artifact() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
+    let (directory, mut catalog) = fixture()?;
+    catalog.rebuild_search(|_| {})?;
+    catalog.compact()?;
+    assert_eq!(search(&catalog, "")?.total, 2, "compaction loses nothing");
+    let native = directory.path().join("native");
+    drop(catalog);
+    let report = Catalog::storage(&native)?;
+    assert!(report.file_bytes > 0);
+    assert!(report.allocated_bytes > 0);
+    let names: Vec<&str> = report
+        .tables
+        .iter()
+        .map(|table| table.name.as_str())
+        .collect();
+    assert!(
+        names.iter().any(|name| name.starts_with("7_1_")),
+        "the Entry table is listed: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name.starts_with("3_1_")),
+        "the ArtifactRecord table is listed: {names:?}"
+    );
+    let entries = report
+        .tables
+        .iter()
+        .find(|table| table.name.starts_with("7_1_id"))
+        .map(|table| table.entries);
+    assert_eq!(entries, Some(2));
+    let reopened = Catalog::open(&native)?;
+    assert_eq!(search(&reopened, "")?.total, 2);
+    Ok(())
+}
+
 fn frozen_encoding<T: native_model::Model>(value: &T) -> Result<String> {
     native_model::encode(value)
         .map(hex::encode)
