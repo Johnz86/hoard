@@ -7,7 +7,7 @@ use crate::config::{IndexConfig, SourceConfig, SourceKind};
 
 use crate::error::{IndexError, Result};
 
-use super::models::{ArtifactRecord, ArtifactRecordKey, Entry, Manifest, SearchEntry, Source};
+use super::models::{ArtifactRecord, ArtifactRecordKey, Entry, SearchEntry, Source};
 use super::{Catalog, SearchRequest, models};
 
 fn running_as_root() -> bool {
@@ -288,19 +288,67 @@ fn invalid_output_and_sources_do_not_overwrite_existing_data() -> Result<()> {
 }
 
 #[test]
-fn unpublished_rebuilds_do_not_change_the_previous_search_manifest() -> Result<()> {
+fn an_unpublished_build_leaves_the_previous_index_serving() -> Result<()> {
     let (_directory, catalog) = fixture()?;
     catalog.rebuild_search(|_| {})?;
-    let original = catalog.manifest()?;
-    fs::create_dir(catalog.directory.join("search-v1-interrupted"))?;
-    let reopened_manifest: Manifest = catalog
-        .database
-        .r_transaction()?
-        .get()
-        .primary(0_u8)?
-        .ok_or_else(|| IndexError::Catalog("missing fixture manifest".into()))?;
-    assert_eq!(reopened_manifest, original);
+    let before = catalog.manifest()?;
+    let staged = catalog.directory.join("search-v1-staged");
+    fs::create_dir(&staged)?;
+    catalog.build_index(&staged, |_| {})?;
+    assert_eq!(catalog.manifest()?, before, "building publishes nothing");
+    assert_eq!(
+        search(&catalog, "")?.total,
+        2,
+        "the previous index still answers"
+    );
+    catalog.publish("search-v1-staged".to_owned())?;
+    assert_eq!(
+        catalog.manifest()?.search_directory.as_deref(),
+        Some("search-v1-staged")
+    );
+    assert_eq!(
+        search(&catalog, "")?.total,
+        2,
+        "the new index answers after publish"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_rebuild_prunes_the_index_directories_it_supersedes() -> Result<()> {
+    let (_directory, catalog) = fixture()?;
+    catalog.rebuild_search(|_| {})?;
+    let first = catalog
+        .manifest()?
+        .search_directory
+        .ok_or_else(|| IndexError::Catalog("no index".into()))?;
+    catalog.rebuild_search(|_| {})?;
+    let second = catalog
+        .manifest()?
+        .search_directory
+        .ok_or_else(|| IndexError::Catalog("no index".into()))?;
+    assert_ne!(first, second);
+    assert!(
+        !catalog.directory.join(&first).exists(),
+        "the superseded directory is gone"
+    );
+    assert!(catalog.directory.join(&second).exists());
     assert_eq!(search(&catalog, "")?.total, 2);
+    Ok(())
+}
+
+#[test]
+fn a_rebuild_keeps_manifest_fields_it_does_not_own() -> Result<()> {
+    let (_directory, catalog) = fixture()?;
+    {
+        let transaction = catalog.database.rw_transaction()?;
+        let mut manifest = catalog.manifest()?;
+        manifest.node = "renamed".to_owned();
+        transaction.upsert(manifest)?;
+        transaction.commit()?;
+    }
+    catalog.rebuild_search(|_| {})?;
+    assert_eq!(catalog.manifest()?.node, "renamed");
     Ok(())
 }
 

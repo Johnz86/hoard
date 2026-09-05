@@ -5,7 +5,7 @@ mod search;
 mod tests;
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use native_db::{Builder, Database, Models};
 use serde::Serialize;
@@ -31,6 +31,15 @@ pub struct CatalogStatus {
 pub struct Catalog {
     database: Database<'static>,
     directory: PathBuf,
+    search_cache: RwLock<Option<OpenIndex>>,
+}
+
+/// The Tantivy index a catalog is currently serving, kept open so a query does not pay for
+/// a fresh mmap directory and a directory watcher.
+struct OpenIndex {
+    directory: String,
+    index: tantivy::Index,
+    reader: tantivy::IndexReader,
 }
 
 impl std::fmt::Debug for Catalog {
@@ -49,6 +58,7 @@ impl Catalog {
         let catalog = Self {
             database,
             directory: directory.to_path_buf(),
+            search_cache: RwLock::new(None),
         };
         let manifest = catalog.manifest()?;
         if manifest.format_version != 2 {

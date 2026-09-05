@@ -62,6 +62,7 @@ impl Catalog {
             Ok(database) => Ok(Self {
                 database,
                 directory,
+                search_cache: std::sync::RwLock::new(None),
             }),
             Err(error) => {
                 remove_partial(&directory);

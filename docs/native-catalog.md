@@ -74,7 +74,10 @@ the complete trigger string; they do not implement legacy substring matching.
 - A completion manifest is published after all scan batches commit. An interrupted
   scan remains unusable instead of exposing a partially built catalog.
 - A search rebuild uses a fresh directory and publishes its name in a redb
-  transaction only after Tantivy commits. The previous directory remains available.
+  transaction only after Tantivy commits. An unpublished build leaves the previous
+  directory serving; publishing then removes every superseded directory.
+- A catalog keeps the published Tantivy index and a manual-reload reader open, so a query
+  pays for neither a fresh mmap directory nor a directory watcher.
 - A custom Tantivy collector produces exact distinct artifact totals and chooses the
   preferred entry after filtering. Only the result page is loaded from native_db.
 - CLI operations run on blocking threads and report scan/index progress with indicatif.
@@ -160,8 +163,6 @@ investigated further.
 - Artifact name and org are stored per entry; two entries sharing one identity in
   different repositories can show different names depending on which entry wins the
   preference tie. The SQLite artifact row has one name.
-- Add cleanup for superseded search directories. This slice deliberately keeps old
-  generated directories; repeated rebuilds consume additional disk space.
 - Benchmark realistic catalogs and add process-kill/power-loss recovery tests.
   Current tests check transaction abort and publication boundaries, not power loss.
 

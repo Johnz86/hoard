@@ -1,5 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::RwLockReadGuard;
 
 use serde::Serialize;
 use tantivy::collector::{Collector, SegmentCollector};
@@ -10,10 +12,10 @@ use tantivy::{DocId, Index, Score, SegmentOrdinal, SegmentReader};
 
 use crate::store::SearchRow;
 
-use super::models::{SearchEntry, SearchText};
+use super::models::{Manifest, SearchEntry, SearchText};
 use crate::error::{IndexError, Result};
 
-use super::Catalog;
+use super::{Catalog, OpenIndex};
 
 const WRITER_BUDGET: usize = 32 * 1024 * 1024;
 const REPO_FIELD: usize = 8;
@@ -54,15 +56,23 @@ pub struct SearchPage {
 
 impl Catalog {
     /// Builds a fresh index using only native records and publishes it after a durable commit.
-    /// Previous search directories are retained, so an interrupted rebuild cannot destroy the
-    /// last usable index. The callback receives the number of entries indexed.
-    pub fn rebuild_search(&self, mut progress: impl FnMut(u64)) -> Result<()> {
-        let mut manifest = self.manifest()?;
+    /// An interrupted rebuild publishes nothing, so the last usable index keeps answering.
+    /// The callback receives the number of entries indexed.
+    pub fn rebuild_search(&self, progress: impl FnMut(u64)) -> Result<()> {
         let directory_name = format!("search-v1-{}", jiff::Timestamp::now().as_nanosecond());
         let directory = self.directory.join(&directory_name);
         std::fs::create_dir(&directory)?;
+        self.build_index(&directory, progress)?;
+        self.publish(directory_name)
+    }
+
+    pub(super) fn build_index(
+        &self,
+        directory: &Path,
+        mut progress: impl FnMut(u64),
+    ) -> Result<()> {
         let (schema, fields) = Fields::build();
-        let index = Index::create_in_dir(&directory, schema)?;
+        let index = Index::create_in_dir(directory, schema)?;
         let mut writer = index.writer_with_num_threads(1, WRITER_BUDGET)?;
         let snapshot = self.database.r_transaction()?;
         progress(0);
@@ -77,12 +87,84 @@ impl Catalog {
         writer.commit()?;
         writer.wait_merging_threads()?;
         progress(snapshot.len().primary::<SearchEntry>()?);
-        manifest.search_directory = Some(directory_name);
-        manifest.search_generation = manifest.generation;
+        Ok(())
+    }
+
+    /// Switches the manifest to `directory_name` in one transaction, touching only the two
+    /// search fields, then removes every other `search-v1-*` directory.
+    pub(super) fn publish(&self, directory_name: String) -> Result<()> {
         let transaction = self.database.rw_transaction()?;
+        let mut manifest: Manifest = transaction.get().primary(0_u8)?.ok_or_else(|| {
+            IndexError::Catalog("scan is incomplete; scan again into a new directory".into())
+        })?;
+        manifest.search_directory = Some(directory_name.clone());
+        manifest.search_generation = manifest.generation;
         transaction.upsert(manifest)?;
         transaction.commit()?;
+        self.prune_search_directories(&directory_name);
         Ok(())
+    }
+
+    fn prune_search_directories(&self, keep: &str) {
+        let Ok(entries) = std::fs::read_dir(&self.directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !name.starts_with("search-v1-") || name == keep {
+                continue;
+            }
+            if let Err(error) = std::fs::remove_dir_all(entry.path()) {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    %error,
+                    "superseded search directory not removed"
+                );
+            }
+        }
+    }
+
+    fn open_index(&self, directory: &str) -> Result<RwLockReadGuard<'_, Option<OpenIndex>>> {
+        {
+            let cached = self.read_cache()?;
+            if cached
+                .as_ref()
+                .is_some_and(|open| open.directory == directory)
+            {
+                return Ok(cached);
+            }
+        }
+        let index = Index::open_in_dir(self.directory.join(directory))?;
+        let (schema, _) = Fields::build();
+        if index.schema() != schema {
+            return Err(IndexError::Catalog(
+                "search schema differs; rebuild the index".into(),
+            ));
+        }
+        let reader = index
+            .reader_builder()
+            .reload_policy(tantivy::ReloadPolicy::Manual)
+            .try_into()?;
+        let mut cache = self
+            .search_cache
+            .write()
+            .map_err(|_| IndexError::Catalog("search cache poisoned".into()))?;
+        *cache = Some(OpenIndex {
+            directory: directory.to_owned(),
+            index,
+            reader,
+        });
+        drop(cache);
+        self.read_cache()
+    }
+
+    fn read_cache(&self) -> Result<RwLockReadGuard<'_, Option<OpenIndex>>> {
+        self.search_cache
+            .read()
+            .map_err(|_| IndexError::Catalog("search cache poisoned".into()))
     }
 
     pub fn search(&self, request: SearchRequest<'_>) -> Result<SearchPage> {
@@ -100,16 +182,14 @@ impl Catalog {
                 "invalid search directory in manifest".into(),
             ));
         }
-        let index = Index::open_in_dir(self.directory.join(directory))?;
-        let (schema, fields) = Fields::build();
-        if index.schema() != schema {
-            return Err(IndexError::Catalog(
-                "search schema differs; rebuild the index".into(),
-            ));
-        }
-        let query = parsed_query(&index, fields.text, request.query)?;
-        let reader = index.reader()?;
-        let candidates = reader
+        let guard = self.open_index(directory)?;
+        let open = guard
+            .as_ref()
+            .ok_or_else(|| IndexError::Catalog("search index was closed".into()))?;
+        let (_, fields) = Fields::build();
+        let query = parsed_query(&open.index, fields.text, request.query)?;
+        let candidates = open
+            .reader
             .searcher()
             .search(query.as_ref(), &ArtifactCollector)?;
         let total = candidates.len() as u64;
