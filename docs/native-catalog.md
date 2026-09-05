@@ -93,6 +93,37 @@ Tantivy uses one writer thread with a 32 MiB indexing budget. Existing filesyste
 discovery still materializes a source's repository/entry list; the new sniffing and
 write stage does not add an unbounded whole-source batch.
 
+## Measured
+
+Against this workstation's real HuggingFace cache (314 GB, source `hf-cache`), release
+build, output on the same NVMe:
+
+```
+hoard --config hoard.toml catalog scan --source hf-cache --directory <out>
+```
+
+- Wall time: 0.2 s on a warm page cache, under 1 s cold. Only headers are read, and cache
+  blob names already carry the content hash, so no file is hashed.
+- Catalog size: 3.0 MB (`catalog.redb` plus one Tantivy directory).
+- Manifest counts: 1 source, 69 repositories, 134 artifacts, 477 entries.
+- Native `state:triage` returns 80 artifacts.
+
+The same source in the SQLite index (`data/hoard.db`) holds 477 entries, 67 repositories,
+28 artifacts and 10 triage artifacts. Entries agree exactly; artifacts do not.
+
+The whole artifact difference is shard grouping. 83 of the 134 native artifacts are named
+`model-<n>-of-<m>.safetensors`; the SQLite scanner collapses each of those sets into one
+artifact named by its repository. The first three names present only in the native catalog
+are `model-00000-of-00014.safetensors`, `model-00001-of-00002.safetensors` and
+`model-00001-of-00003.safetensors`; the first three present only in the SQLite index are
+`Agents-A1`, `NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` and `Qwen3-8B-NVFP4`, which are exactly
+those repository-named shard sets. The triage difference has the same cause: one shard
+header alone rarely carries enough evidence to place a role confidently.
+
+The repository count differs by two (69 native, 67 SQLite). The SQLite index was last
+written hours before this scan, so the two runs did not see the same disk. Not
+investigated further.
+
 ## Remaining replacement work
 
 - Convert the existing Store/Connection API and live server, scanner, mirror, cache
@@ -104,7 +135,10 @@ write stage does not add an unbounded whole-source batch.
 - Preserve complete repository Git metadata and add stable cross-scan identities.
 - Add full hash scheduling, progressive identities and content deduplication.
 - Port shard grouping and missing-file policies from the existing scan pipeline. Every
-  shard is currently a separate file.
+  shard is currently a separate file, which is the only measured divergence from the
+  SQLite scanner: 83 of 134 artifacts on this workstation's cache are shards that the
+  SQLite scanner collapses into 5 repository-named artifacts, and the ungrouped shard
+  headers also inflate the triage set from 10 to 80.
 - Add a read-only open once redb offers one, so searches can run beside a rebuild.
 - Port the complete Hoard grammar, aliases, local-node resolution, exclusions,
   facets, compatibility, shelf expansion and every sorting mode.
