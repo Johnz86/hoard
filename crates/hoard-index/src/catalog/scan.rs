@@ -25,7 +25,7 @@ use crate::sniff::{self, SniffResult};
 
 use super::models::{
     Allocator, ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Manifest,
-    Repository, RepositoryKey, Revision, SearchChange, SearchText, Source, repository_key,
+    Repository, RepositoryKey, Revision, SearchChange, SearchText, Source, Summary, repository_key,
 };
 use crate::error::{IndexError, Result};
 
@@ -337,6 +337,34 @@ impl Catalog {
             log_changes(&transaction, counters)?;
             transaction.commit()?;
         }
+        self.summarise_disk_pressure()
+    }
+
+    /// Recounts what duplicated paths cost, which the facet rail reads as DISK PRESSURE.
+    /// An artifact reached by more than one path wastes every copy but the first.
+    fn summarise_disk_pressure(&self) -> Result<()> {
+        let read = self.database.r_transaction()?;
+        let mut summary = Summary {
+            id: 0,
+            reclaimable_bytes: 0,
+            duplicate_artifacts: 0,
+        };
+        for record in read.scan().primary::<ArtifactRecord>()?.all()? {
+            let record = record?;
+            let copies = u64::from(record.path_count.saturating_sub(1));
+            if copies == 0 {
+                continue;
+            }
+            let bytes = record.group_bytes.unwrap_or(record.artifact.size);
+            summary.reclaimable_bytes = summary
+                .reclaimable_bytes
+                .saturating_add(bytes.saturating_mul(copies));
+            summary.duplicate_artifacts += 1;
+        }
+        drop(read);
+        let transaction = self.database.rw_transaction()?;
+        transaction.upsert(summary)?;
+        transaction.commit()?;
         Ok(())
     }
 }

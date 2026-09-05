@@ -394,17 +394,23 @@ fn parsed_query(index: &Index, text: Field, raw: &str) -> Result<Box<dyn Query>>
         .map_err(|error| IndexError::Query(error.to_string()))
 }
 
-struct Fields {
+pub(super) struct Fields {
     artifact: Field,
     entry: Field,
     preference: Field,
-    size: Field,
-    text: Field,
+    pub(super) size: Field,
+    pub(super) text: Field,
+    pub(super) name: Field,
+    pub(super) base_label: Field,
+    pub(super) revision_sha: Field,
+    pub(super) repo_org: Field,
+    pub(super) dupe: Field,
+    pub(super) trigger_text: Field,
     keywords: [Field; KEYWORD_FIELDS.len()],
 }
 
 impl Fields {
-    fn build() -> (Schema, Self) {
+    pub(super) fn build() -> (Schema, Self) {
         let mut schema = Schema::builder();
         let fields = Self {
             artifact: schema.add_i64_field("artifact_id", FAST | INDEXED),
@@ -412,7 +418,13 @@ impl Fields {
             preference: schema.add_i64_field("preference", FAST),
             size: schema.add_u64_field("size", FAST | INDEXED),
             text: schema.add_text_field("text", TEXT),
-            keywords: KEYWORD_FIELDS.map(|name| schema.add_text_field(name, STRING)),
+            name: schema.add_text_field("name", STRING | FAST),
+            base_label: schema.add_text_field("base_label", STRING | FAST),
+            revision_sha: schema.add_text_field("revision_sha", STRING),
+            repo_org: schema.add_text_field("repo_org", STRING),
+            dupe: schema.add_u64_field("dupe", INDEXED | FAST),
+            trigger_text: schema.add_text_field("trigger_text", TEXT),
+            keywords: KEYWORD_FIELDS.map(|name| schema.add_text_field(name, STRING | FAST)),
         };
         (schema.build(), fields)
     }
@@ -456,11 +468,28 @@ impl Fields {
                 document.add_text(*field, value);
             }
         }
-        if let Some((_, qualified)) = repo.split_once('/') {
-            document.add_text(self.keywords[REPO_FIELD], qualified);
+        let mut suffix = repo.as_str();
+        while let Some((_, rest)) = suffix.split_once('/') {
+            document.add_text(self.keywords[REPO_FIELD], rest);
+            suffix = rest;
         }
         if let Some(hash) = &entry.git_sha1 {
-            document.add_text(self.keywords[HASH_FIELD], hash.to_string());
+            document.add_text(self.keywords[HASH_FIELD], hash.to_hex());
+        }
+        document.add_text(self.name, &artifact.name);
+        document.add_text(
+            self.base_label,
+            inferred.base_label.as_deref().unwrap_or_default(),
+        );
+        if let Some(sha) = &revision.sha {
+            document.add_text(self.revision_sha, sha.to_hex());
+        }
+        if let Some(org) = repository.repo.org() {
+            document.add_text(self.repo_org, org);
+        }
+        document.add_u64(self.dupe, u64::from(artifact.path_count > 1));
+        if let Some(trigger) = inferred.trigger.as_deref() {
+            document.add_text(self.trigger_text, trigger);
         }
         for value in [
             artifact.name.as_str(),

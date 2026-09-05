@@ -176,6 +176,18 @@ pub(super) struct SearchChange {
     pub(super) artifact_id: i64,
 }
 
+/// What the artifact sweep last measured about duplicated paths, so the facet rail reads one
+/// record rather than scanning every artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 11, version = 1)]
+#[native_db]
+pub(super) struct Summary {
+    #[primary_key]
+    pub(super) id: u8,
+    pub(super) reclaimable_bytes: u64,
+    pub(super) duplicate_artifacts: u64,
+}
+
 /// The high-water marks a later scan continues from, so ids stay stable across runs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 9, version = 1)]
@@ -200,5 +212,6 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<Entry>()?;
     models.define::<Allocator>()?;
     models.define::<SearchChange>()?;
+    models.define::<Summary>()?;
     Ok(models)
 }

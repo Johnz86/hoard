@@ -12,8 +12,9 @@ use redb::{MultimapTableHandle, ReadableTableMetadata, TableHandle};
 use serde::Serialize;
 
 use crate::error::{IndexError, Result};
+use crate::store::DiskPressure;
 
-use self::models::{Manifest, define_models};
+use self::models::{Manifest, Summary, define_models};
 
 pub use self::scan::RescanReport;
 pub use self::search::{SearchPage, SearchRequest};
@@ -145,6 +146,18 @@ impl Catalog {
             allocated_bytes: allocated_bytes(&metadata),
             tables,
         })
+    }
+
+    /// What duplicated paths cost, as the artifact sweep last measured it. A catalog whose
+    /// sweep predates this record reports nothing rather than rescanning every artifact.
+    pub fn disk_pressure(&self) -> Result<DiskPressure> {
+        let summary: Option<Summary> = self.database.r_transaction()?.get().primary(0_u8)?;
+        Ok(
+            summary.map_or_else(DiskPressure::default, |summary| DiskPressure {
+                reclaimable_bytes: summary.reclaimable_bytes,
+                duplicate_blobs: summary.duplicate_artifacts,
+            }),
+        )
     }
 
     fn manifest(&self) -> Result<Manifest> {

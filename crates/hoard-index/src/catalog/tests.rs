@@ -16,7 +16,7 @@ use crate::store::SearchRow;
 
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Manifest, ManifestV1,
-    Repository, RepositoryKey, Revision, SearchChange, SearchText, Source,
+    Repository, RepositoryKey, Revision, SearchChange, SearchText, Source, Summary,
 };
 use super::{Catalog, RescanReport, SearchRequest, models};
 
@@ -1001,6 +1001,38 @@ fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn disk_pressure_is_summarised_after_every_sweep() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("a"))?;
+    fs::create_dir_all(input.join("b"))?;
+    fs::write(input.join("a/one.csv"), "x,y\n1,2\n")?;
+    std::os::unix::fs::symlink(input.join("a/one.csv"), input.join("b/two.csv"))?;
+    fs::write(input.join("a/solo.csv"), "x,y\n3,4\n")?;
+    let config = IndexConfig {
+        sources: vec![SourceConfig {
+            follow_symlinks: true,
+            ..source(&input, "files")
+        }],
+        ..IndexConfig::default()
+    };
+    let mut catalog =
+        Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let pressure = catalog.disk_pressure()?;
+    assert_eq!(pressure.duplicate_blobs, 1);
+    assert_eq!(
+        pressure.reclaimable_bytes,
+        fs::metadata(input.join("a/one.csv"))?.len()
+    );
+    fs::remove_file(input.join("b/two.csv"))?;
+    catalog.rescan(&config, |_, _| {})?;
+    let after = catalog.disk_pressure()?;
+    assert_eq!(after.reclaimable_bytes, 0);
+    assert_eq!(after.duplicate_blobs, 0);
+    Ok(())
+}
+
 fn loose_fixture(directory: &Path) -> Result<(PathBuf, IndexConfig)> {
     let input = directory.join("models");
     fs::create_dir_all(input.join("loras"))?;
@@ -1308,6 +1340,17 @@ fn manifest_encoding_is_frozen() -> Result<()> {
         search_directory: Some("search-v1-1767225600000000000".to_owned()),
         search_generation: 5,
         search_seq: 9,
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn summary_encoding_is_frozen() -> Result<()> {
+    let value = Summary {
+        id: 0,
+        reclaimable_bytes: 4096,
+        duplicate_artifacts: 3,
     };
     insta::assert_snapshot!(frozen_encoding(&value)?);
     Ok(())
