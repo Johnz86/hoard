@@ -25,7 +25,7 @@ use crate::sniff::{self, SniffResult};
 
 use super::models::{
     Allocator, ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Manifest,
-    Repository, RepositoryKey, Revision, SearchText, Source, repository_key,
+    Repository, RepositoryKey, Revision, SearchChange, SearchText, Source, repository_key,
 };
 use crate::error::{IndexError, Result};
 
@@ -75,7 +75,7 @@ impl Catalog {
             report: RescanReport::default(),
         };
         self.walk(&sources, &mut walk, &mut counters, progress)?;
-        self.sweep_artifacts(&counters.touched)?;
+        self.sweep_artifacts(&mut counters)?;
         let transaction = self.database.rw_transaction()?;
         counters.save(&transaction)?;
         let mut manifest: Manifest = transaction
@@ -122,7 +122,7 @@ impl Catalog {
             report: RescanReport::default(),
         };
         self.walk(sources, &mut walk, &mut counters, progress)?;
-        self.sweep_artifacts(&counters.touched)?;
+        self.sweep_artifacts(&mut counters)?;
         let transaction = self.database.rw_transaction()?;
         counters.save(&transaction)?;
         transaction.insert(Manifest {
@@ -194,6 +194,7 @@ impl Catalog {
                             label.as_deref(),
                         )?;
                         store_unit(&transaction, &context, prepared, counters)?;
+                        log_changes(&transaction, counters)?;
                         transaction.commit()?;
                         progress(&source.name, counters.entries);
                     }
@@ -311,9 +312,11 @@ impl Catalog {
             })?;
             if let Some(id) = known.artifact_id {
                 counters.touched.insert(id);
+                counters.pending.push(id);
             }
             walk.report.absent += 1;
         }
+        log_changes(&transaction, counters)?;
         transaction.commit()?;
         Ok(())
     }
@@ -322,27 +325,31 @@ impl Catalog {
     /// deletes the artifact and everything hanging off it once none does. A model split
     /// across shards is reached once per complete copy of its files, not once per file.
     /// The sweep commits in batches, because a fresh scan touches every artifact it wrote.
-    fn sweep_artifacts(&self, touched: &HashSet<i64>) -> Result<()> {
-        let ids: Vec<i64> = touched.iter().copied().collect();
+    fn sweep_artifacts(&self, counters: &mut Counters) -> Result<()> {
+        let ids: Vec<i64> = counters.touched.iter().copied().collect();
         for batch in ids.chunks(CHUNK) {
             let transaction = self.database.rw_transaction()?;
             for id in batch {
-                sweep_artifact(&transaction, *id)?;
+                if sweep_artifact(&transaction, *id)? {
+                    counters.pending.push(*id);
+                }
             }
+            log_changes(&transaction, counters)?;
             transaction.commit()?;
         }
         Ok(())
     }
 }
 
-fn sweep_artifact(transaction: &RwTransaction<'_>, id: i64) -> Result<()> {
+/// Whether the sweep changed what the search index should hold for this artifact.
+fn sweep_artifact(transaction: &RwTransaction<'_>, id: i64) -> Result<bool> {
     let referencing: Vec<Entry> = transaction
         .scan()
         .secondary::<Entry>(EntryKey::artifact_id)?
         .start_with(Some(id))?
         .collect::<native_db::db_type::Result<_>>()?;
     let Some(record) = transaction.get().primary::<ArtifactRecord>(id)? else {
-        return Ok(());
+        return Ok(false);
     };
     let present = referencing
         .iter()
@@ -366,16 +373,18 @@ fn sweep_artifact(transaction: &RwTransaction<'_>, id: i64) -> Result<()> {
             if let Some(text) = transaction.get().primary::<SearchText>(id)? {
                 transaction.remove(text)?;
             }
+            return Ok(true);
         }
         paths if paths != record.path_count => {
             transaction.upsert(ArtifactRecord {
                 path_count: paths,
                 ..record
             })?;
+            return Ok(true);
         }
         _ => {}
     }
-    Ok(())
+    Ok(false)
 }
 
 fn shard_count_of(
@@ -612,6 +621,7 @@ struct Counters {
     entries: u64,
     artifacts_by_identity: HashMap<u128, i64>,
     touched: HashSet<i64>,
+    pending: Vec<i64>,
 }
 
 impl Counters {
@@ -629,6 +639,7 @@ impl Counters {
             entries: allocator.entries,
             artifacts_by_identity: HashMap::new(),
             touched: HashSet::new(),
+            pending: Vec::new(),
         })
     }
 
@@ -645,6 +656,35 @@ impl Counters {
     fn next_repo(&mut self) -> Result<i64> {
         next_id(&mut self.repos)
     }
+}
+
+/// Records, in the transaction that made them, which artifacts the published search index no
+/// longer matches. The sequence continues past both the highest key the log still holds and
+/// the refresh cursor, because a drained log holds neither the numbers it has already spent
+/// nor any proof that a refresh has not already passed them.
+fn log_changes(transaction: &RwTransaction<'_>, counters: &mut Counters) -> Result<()> {
+    if counters.pending.is_empty() {
+        return Ok(());
+    }
+    counters.pending.sort_unstable();
+    counters.pending.dedup();
+    let last: Option<SearchChange> = transaction
+        .scan()
+        .primary::<SearchChange>()?
+        .all()?
+        .next_back()
+        .transpose()?;
+    let manifest: Option<Manifest> = transaction.get().primary(0_u8)?;
+    let spent = last
+        .map_or(0, |change| change.seq)
+        .max(manifest.map_or(0, |manifest| manifest.search_seq));
+    for (offset, artifact_id) in counters.pending.drain(..).enumerate() {
+        transaction.insert(SearchChange {
+            seq: spent + offset as u64 + 1,
+            artifact_id,
+        })?;
+    }
+    Ok(())
 }
 
 fn next_id(counter: &mut u64) -> Result<i64> {
@@ -1247,6 +1287,7 @@ fn store_artifact(
 ) -> Result<ArtifactRecord> {
     if let Some(id) = counters.artifacts_by_identity.get(&draft.identity).copied() {
         counters.touched.insert(id);
+        counters.pending.push(id);
         return transaction
             .get()
             .primary(id)?
@@ -1269,6 +1310,7 @@ fn store_artifact(
     transaction.upsert(record.clone())?;
     counters.artifacts_by_identity.insert(draft.identity, id);
     counters.touched.insert(id);
+    counters.pending.push(id);
     Ok(record)
 }
 

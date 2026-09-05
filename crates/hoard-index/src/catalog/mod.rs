@@ -43,6 +43,8 @@ pub struct CatalogStatus {
     pub node: String,
     pub counts: Vec<(String, u64)>,
     pub search_ready: bool,
+    pub search_built: bool,
+    pub pending_changes: u64,
 }
 
 /// An independent native filesystem catalog. The `catalog` commands use this store;
@@ -94,14 +96,16 @@ impl Catalog {
 
     pub fn status(&self) -> Result<CatalogStatus> {
         let manifest = self.manifest()?;
+        let pending_changes = self.pending_after(manifest.search_seq)?;
         Ok(CatalogStatus {
             format_version: manifest.format_version,
             generation: manifest.generation,
             scanned_at: manifest.scanned_at,
             node: manifest.node,
             counts: manifest.counts,
-            search_ready: manifest.search_directory.is_some()
-                && manifest.search_generation == manifest.generation,
+            search_ready: manifest.search_directory.is_some() && pending_changes == 0,
+            search_built: manifest.search_directory.is_some(),
+            pending_changes,
         })
     }
 

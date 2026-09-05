@@ -20,7 +20,7 @@ catalog by scanning sources. No existing data needs to be retained.
 The parent of the output directory must already exist. A new directory is scanned fresh; an
 existing catalog directory is rescanned in place: unchanged files are not opened, changed
 files are read again, missing files keep their row as absent, and the search index is
-rebuilt afterwards.
+refreshed from the change log afterwards, or built when there is none yet.
 
 ```sh
 cargo run -- catalog scan --directory /existing/path/native-catalog
@@ -89,6 +89,13 @@ the complete trigger string; they do not implement legacy substring matching.
   path counts are swept from the entry index after every scan and orphaned artifacts are
   removed.
 - Storage is reported per redb table, and the database is compacted after every scan.
+- Every transaction that touches an artifact logs its id to a search change table;
+  refresh_search replays the log after a durable cursor, one Tantivy commit per batch,
+  deleting the artifact's documents by term and re-adding its entries, and prunes what it
+  applied. A rescan followed by a refresh updates search without a rebuild.
+- Artifact identities are 128-bit hashes of the identity text, so the unique index holds
+  fixed-width keys.
+- The manifest is at model version 2 and version 1 rows are migrated on open.
 - CLI operations run on blocking threads and report scan/index progress with indicatif.
 
 ## Search document shape
@@ -229,8 +236,9 @@ this catalog. This remains a go for continuing the replacement.
 
 - Convert the existing Store/Connection API and live server, scanner, mirror, cache
   eviction, gossip, watch and CLI callers to native transactions.
-- Path identities render through to_string_lossy; discovery currently never yields two
-  distinct non-UTF-8 paths, and a byte-exact identity must land with the identity redesign.
+- Path identities hash the text to_string_lossy renders; discovery currently never yields
+  two distinct non-UTF-8 paths, and a byte-exact identity must land with the identity
+  redesign.
 - Bound the search collector: it materializes one candidate per matching artifact per
   segment, so the empty query costs memory proportional to the catalog on every call;
   replace it with a bounded heap keyed on (size, artifact id) plus an exact distinct count
@@ -238,13 +246,18 @@ this catalog. This remains a go for continuing the replacement.
 - Shrink the per-entry record further: revision, repository, source and absolute path are
   written out per entry, which is what the 1M catalog is mostly made of. Intern them per
   revision and reference them by id.
-- Add a transactional search outbox with replay so a rescan updates Tantivy incrementally
-  instead of rebuilding it.
 - Implement user overrides/noise, shelves, loadouts, settings, projections, jobs,
   usage, peer cursors and the associated graph constraints/cascades.
 - Preserve complete repository Git metadata and add stable cross-scan identities.
 - Add full hash scheduling, progressive identities and content deduplication.
 - Port the missing-file policies from the existing scan pipeline.
+- Entries carry no node: the manifest's node is the only one, so peer-gossiped entries need
+  a node id per entry when peers land.
+- A rescan re-reads every revision's documents (README, configs, index files) before
+  deciding units; measure this on the workstation cache and skip when every document's
+  stamp is unchanged.
+- Revision ordinals are recomputed from discovery on every rescan; a source that reorders
+  revisions leaves stale ordinals on existing entries.
 - Count a revision's artifact units the way the legacy scanner does for a file whose
   content another revision already claimed. The two scanners disagree on one repository of
   this workstation's cache, which swaps the names of its two artifacts.

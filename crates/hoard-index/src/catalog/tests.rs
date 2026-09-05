@@ -16,7 +16,7 @@ use crate::store::SearchRow;
 
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Manifest, ManifestV1,
-    Repository, RepositoryKey, Revision, SearchText, Source,
+    Repository, RepositoryKey, Revision, SearchChange, SearchText, Source,
 };
 use super::{Catalog, RescanReport, SearchRequest, models};
 
@@ -1364,6 +1364,140 @@ fn scan_hub(directory: &Path, hub: &Path) -> Result<Catalog> {
     let catalog = Catalog::scan_sources(&directory.join("native"), "n", &config, |_, _| {})?;
     catalog.rebuild_search(|_| {})?;
     Ok(catalog)
+}
+
+#[test]
+fn a_rescan_refreshes_the_index_without_a_rebuild() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let native = directory.path().join("native");
+    let mut catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    assert_eq!(catalog.pending_changes()?, 0);
+    assert!(catalog.status()?.search_ready);
+
+    fs::remove_file(input.join("loras/gone.safetensors"))?;
+    fs::write(input.join("loras/new.safetensors"), lora_header())?;
+    let report = catalog.rescan(&config, |_, _| {})?;
+    assert_eq!(report.added, 1);
+    assert_eq!(report.absent, 1);
+    assert!(
+        catalog.pending_changes()? >= 2,
+        "the new artifact and the retracted one are logged"
+    );
+    assert!(!catalog.status()?.search_ready);
+    assert!(
+        search(&catalog, "").is_err(),
+        "a stale index is refused, not served"
+    );
+
+    let applied = catalog.refresh_search(|_| {})?;
+    assert!(applied >= 2);
+    assert_eq!(catalog.pending_changes()?, 0);
+    assert!(catalog.status()?.search_ready);
+    let rows = search(&catalog, "")?;
+    let paths: Vec<&str> = rows.rows.iter().map(|row| row.path.as_str()).collect();
+    assert_eq!(
+        rows.total, 2,
+        "keep and new; gone had no other path: {paths:?}"
+    );
+    assert!(paths.iter().any(|path| path.ends_with("new.safetensors")));
+    assert!(!paths.iter().any(|path| path.ends_with("gone.safetensors")));
+    let read = catalog.database.r_transaction()?;
+    assert_eq!(
+        read.len().primary::<SearchChange>()?,
+        0,
+        "applied changes are pruned"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_refresh_is_idempotent_and_resumes_from_the_cursor() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let native = directory.path().join("native");
+    let mut catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    fs::write(input.join("loras/new.safetensors"), lora_header())?;
+    catalog.rescan(&config, |_, _| {})?;
+    let before = search_total_after_refresh(&catalog)?;
+    let again = catalog.refresh_search(|_| {})?;
+    assert_eq!(again, 0, "nothing after the cursor");
+    assert_eq!(search(&catalog, "")?.total, before);
+    {
+        let transaction = catalog.database.rw_transaction()?;
+        let mut manifest = catalog.manifest()?;
+        manifest.search_seq = 0;
+        transaction.upsert(manifest)?;
+        transaction.commit()?;
+    }
+    assert_eq!(
+        catalog.refresh_search(|_| {})?,
+        0,
+        "pruned rows cannot be replayed twice"
+    );
+    assert_eq!(
+        search(&catalog, "")?.total,
+        before,
+        "a rewound cursor changes no document"
+    );
+    Ok(())
+}
+
+fn search_total_after_refresh(catalog: &Catalog) -> Result<u64> {
+    catalog.refresh_search(|_| {})?;
+    Ok(search(catalog, "")?.total)
+}
+
+#[test]
+fn a_duplicated_shard_set_counts_two_paths_and_a_missing_member_still_one() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let shards = llm_shards();
+    hf_cache_repo(
+        &hub,
+        "Qwen",
+        "Qwen3-Twice",
+        &[
+            ("model-00001-of-00002.safetensors", shards[0].clone()),
+            ("model-00002-of-00002.safetensors", shards[2].clone()),
+        ],
+    )?;
+    let catalog = scan_hub(directory.path(), &hub)?;
+    let one = search(&catalog, "")?;
+    assert_eq!(one.total, 1);
+    assert_eq!(
+        one.rows[0].path_count, 1,
+        "two shards of one set are one path"
+    );
+    assert!(!one.rows[0].dupe);
+    drop(catalog);
+
+    hf_cache_repo(
+        &hub,
+        "Qwen",
+        "Qwen3-Copy",
+        &[
+            ("model-00001-of-00002.safetensors", shards[0].clone()),
+            ("model-00002-of-00002.safetensors", shards[2].clone()),
+        ],
+    )?;
+    let copied = directory.path().join("copied");
+    fs::create_dir(&copied)?;
+    let catalog = scan_hub(&copied, &hub)?;
+    let two = search(&catalog, "")?;
+    assert_eq!(
+        two.total, 1,
+        "the same blobs under two repositories are one model"
+    );
+    assert_eq!(
+        two.rows[0].path_count, 2,
+        "four present shards of a two shard set are two paths"
+    );
+    assert!(two.rows[0].dupe);
+    Ok(())
 }
 
 #[test]

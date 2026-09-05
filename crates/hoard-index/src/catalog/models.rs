@@ -165,6 +165,17 @@ pub(super) struct Entry {
     pub(super) inode: Option<u64>,
 }
 
+/// One artifact whose documents the published search index no longer matches. The sequence
+/// orders the log; a refresh replays every row after the manifest's cursor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 10, version = 1)]
+#[native_db]
+pub(super) struct SearchChange {
+    #[primary_key]
+    pub(super) seq: u64,
+    pub(super) artifact_id: i64,
+}
+
 /// The high-water marks a later scan continues from, so ids stay stable across runs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 9, version = 1)]
@@ -188,5 +199,6 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<Manifest>()?;
     models.define::<Entry>()?;
     models.define::<Allocator>()?;
+    models.define::<SearchChange>()?;
     Ok(models)
 }

@@ -91,9 +91,18 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
                 ),
                 false => None,
             };
-            catalog.rebuild_search(|count| {
-                progress.set_message(format!("Building Tantivy index: {count} entries"));
-            })?;
+            match (rescan.is_some(), catalog.status()?.search_built) {
+                (true, true) => {
+                    catalog.refresh_search(|count| {
+                        progress.set_message(format!("Refreshing Tantivy index: {count} changes"));
+                    })?;
+                }
+                (true, false) | (false, true) | (false, false) => {
+                    catalog.rebuild_search(|count| {
+                        progress.set_message(format!("Building Tantivy index: {count} entries"));
+                    })?;
+                }
+            }
             progress.finish_and_clear();
             let status = catalog.status()?;
             drop(catalog);

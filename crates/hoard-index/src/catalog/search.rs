@@ -8,18 +8,22 @@ use tantivy::collector::{Collector, SegmentCollector};
 use tantivy::fastfield::Column;
 use tantivy::query::{AllQuery, Query, QueryParser};
 use tantivy::schema::{FAST, Field, INDEXED, STRING, Schema, TEXT, TantivyDocument};
-use tantivy::{DocId, Index, Score, SegmentOrdinal, SegmentReader};
+use tantivy::{DocId, Index, Score, SegmentOrdinal, SegmentReader, Term};
 
 use hoard_core::{EntryId, RepoRowId};
 
 use crate::store::SearchRow;
 
-use super::models::{ArtifactRecord, Entry, Manifest, Repository, Revision, SearchText};
+use super::models::{
+    ArtifactRecord, Entry, EntryKey, Manifest, Repository, Revision, SearchChange, SearchText,
+};
 use crate::error::{IndexError, Result};
 
 use super::{Catalog, OpenIndex};
 
 const WRITER_BUDGET: usize = 32 * 1024 * 1024;
+/// How many logged changes one Tantivy commit and one prune transaction cover.
+const REFRESH_BATCH: usize = 4096;
 const REPO_FIELD: usize = 8;
 const HASH_FIELD: usize = 11;
 const KEYWORD_FIELDS: [&str; 13] = [
@@ -79,49 +83,15 @@ impl Catalog {
         let node = self.manifest()?.node;
         let snapshot = self.database.r_transaction()?;
         progress(0);
-        let mut repositories: Option<(i64, Repository)> = None;
-        let mut artifacts: Option<(i64, ArtifactRecord)> = None;
+        let mut resolved = Resolved::default();
         let mut indexed = 0_u64;
         for entry in snapshot.scan().primary::<Entry>()?.all()? {
             let entry = entry?;
-            let Some(artifact_id) = entry.artifact_id else {
+            let Some(document) = document_for(&snapshot, &fields, &entry, &mut resolved, &node)?
+            else {
                 continue;
             };
-            if repositories
-                .as_ref()
-                .is_none_or(|(id, _)| *id != entry.repo_id)
-            {
-                let repository: Repository =
-                    snapshot.get().primary(entry.repo_id)?.ok_or_else(|| {
-                        IndexError::Catalog(format!(
-                            "entry {} references missing repository {}",
-                            entry.id, entry.repo_id
-                        ))
-                    })?;
-                repositories = Some((entry.repo_id, repository));
-            }
-            if artifacts.as_ref().is_none_or(|(id, _)| *id != artifact_id) {
-                let artifact: ArtifactRecord =
-                    snapshot.get().primary(artifact_id)?.ok_or_else(|| {
-                        IndexError::Catalog(format!(
-                            "entry {} references missing artifact {artifact_id}",
-                            entry.id
-                        ))
-                    })?;
-                artifacts = Some((artifact_id, artifact));
-            }
-            let (Some((_, repository)), Some((_, artifact))) = (&repositories, &artifacts) else {
-                return Err(IndexError::Catalog("resolution cache went empty".into()));
-            };
-            let text: Option<SearchText> = snapshot.get().primary(artifact_id)?;
-            let facts = EntryFacts {
-                revision: revision_of(repository, &entry)?,
-                entry: &entry,
-                repository,
-                artifact,
-                node: &node,
-            };
-            writer.add_document(fields.document(&facts, text.as_ref()))?;
+            writer.add_document(document)?;
             indexed += 1;
             if indexed.is_multiple_of(512) {
                 progress(indexed);
@@ -140,12 +110,141 @@ impl Catalog {
         let mut manifest: Manifest = transaction.get().primary(0_u8)?.ok_or_else(|| {
             IndexError::Catalog("scan is incomplete; scan again into a new directory".into())
         })?;
+        let highest: Option<SearchChange> = transaction
+            .scan()
+            .primary::<SearchChange>()?
+            .all()?
+            .next_back()
+            .transpose()?;
+        let drained = highest.map_or(manifest.search_seq, |change| change.seq);
         manifest.search_directory = Some(directory_name.clone());
         manifest.search_generation = manifest.generation;
+        manifest.search_seq = drained;
         transaction.upsert(manifest)?;
         transaction.commit()?;
         self.prune_search_directories(&directory_name);
+        self.prune_changes(drained)
+    }
+
+    /// Applies every logged change after the manifest's cursor to the published index, one
+    /// Tantivy commit per batch, then advances the cursor and prunes what it applied. Returns
+    /// how many changes were applied. Needs a published index; a catalog without one must
+    /// `rebuild_search` first.
+    pub fn refresh_search(&self, mut progress: impl FnMut(u64)) -> Result<u64> {
+        let manifest = self.manifest()?;
+        let directory = manifest
+            .search_directory
+            .ok_or_else(|| IndexError::Catalog("search index needs building".into()))?;
+        let mut batch = self.changes_after(manifest.search_seq)?;
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        let node = manifest.node;
+        let guard = self.open_index(&directory)?;
+        let open = guard
+            .as_ref()
+            .ok_or_else(|| IndexError::Catalog("search index was closed".into()))?;
+        let (_, fields) = Fields::build();
+        let mut writer = open.index.writer_with_num_threads(1, WRITER_BUDGET)?;
+        let mut applied = 0_u64;
+        while let Some(cursor) = batch.last().map(|change| change.seq) {
+            let mut ids: Vec<i64> = batch.iter().map(|change| change.artifact_id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            let snapshot = self.database.r_transaction()?;
+            let mut resolved = Resolved::default();
+            for id in ids {
+                writer.delete_term(Term::from_field_i64(fields.artifact, id));
+                let entries: Vec<Entry> = snapshot
+                    .scan()
+                    .secondary::<Entry>(EntryKey::artifact_id)?
+                    .start_with(Some(id))?
+                    .collect::<native_db::db_type::Result<_>>()?;
+                for entry in &entries {
+                    if let Some(document) =
+                        document_for(&snapshot, &fields, entry, &mut resolved, &node)?
+                    {
+                        writer.add_document(document)?;
+                    }
+                }
+            }
+            drop(snapshot);
+            writer.commit()?;
+            open.reader.reload()?;
+            self.advance_cursor(cursor)?;
+            self.prune_changes(cursor)?;
+            applied += batch.len() as u64;
+            progress(applied);
+            batch = self.changes_after(cursor)?;
+        }
+        writer.wait_merging_threads()?;
+        Ok(applied)
+    }
+
+    /// Changes logged after the cursor, which is what makes `search_ready` false.
+    pub fn pending_changes(&self) -> Result<u64> {
+        self.pending_after(self.manifest()?.search_seq)
+    }
+
+    pub(super) fn pending_after(&self, cursor: u64) -> Result<u64> {
+        let read = self.database.r_transaction()?;
+        let mut pending = 0;
+        for change in read
+            .scan()
+            .primary::<SearchChange>()?
+            .range(cursor.saturating_add(1)..)?
+        {
+            change?;
+            pending += 1;
+        }
+        Ok(pending)
+    }
+
+    fn changes_after(&self, cursor: u64) -> Result<Vec<SearchChange>> {
+        let read = self.database.r_transaction()?;
+        let batch = read
+            .scan()
+            .primary::<SearchChange>()?
+            .range(cursor.saturating_add(1)..)?
+            .take(REFRESH_BATCH)
+            .collect::<native_db::db_type::Result<Vec<_>>>()?;
+        Ok(batch)
+    }
+
+    fn advance_cursor(&self, cursor: u64) -> Result<()> {
+        let transaction = self.database.rw_transaction()?;
+        let mut manifest: Manifest = transaction.get().primary(0_u8)?.ok_or_else(|| {
+            IndexError::Catalog("scan is incomplete; scan again into a new directory".into())
+        })?;
+        manifest.search_seq = cursor;
+        manifest.search_generation = manifest.generation;
+        transaction.upsert(manifest)?;
+        transaction.commit()?;
         Ok(())
+    }
+
+    /// Drops the log rows the cursor has passed. A crash here leaves rows a later refresh
+    /// skips, because the cursor is already past them.
+    fn prune_changes(&self, through: u64) -> Result<()> {
+        let end = through.saturating_add(1);
+        loop {
+            let read = self.database.r_transaction()?;
+            let batch = read
+                .scan()
+                .primary::<SearchChange>()?
+                .range(..end)?
+                .take(REFRESH_BATCH)
+                .collect::<native_db::db_type::Result<Vec<_>>>()?;
+            drop(read);
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let transaction = self.database.rw_transaction()?;
+            for change in batch {
+                transaction.remove(change)?;
+            }
+            transaction.commit()?;
+        }
     }
 
     fn prune_search_directories(&self, keep: &str) {
@@ -218,8 +317,10 @@ impl Catalog {
         let directory = manifest
             .search_directory
             .as_deref()
-            .filter(|_| manifest.search_generation == manifest.generation)
             .ok_or_else(|| IndexError::Catalog("search index needs rebuilding".into()))?;
+        if self.pending_after(manifest.search_seq)? > 0 {
+            return Err(IndexError::Catalog("search index needs refreshing".into()));
+        }
         if !directory.starts_with("search-v1-") || directory.contains(['/', '\\']) {
             return Err(IndexError::Catalog(
                 "invalid search directory in manifest".into(),
@@ -375,6 +476,66 @@ impl Fields {
         }
         document
     }
+}
+
+/// The one-element caches that let a pass over entries resolve each row's repository and
+/// artifact without reading either again per file.
+#[derive(Default)]
+struct Resolved {
+    repository: Option<(i64, Repository)>,
+    artifact: Option<(i64, ArtifactRecord)>,
+}
+
+/// The document one entry contributes, or nothing when the entry stands for no artifact.
+fn document_for(
+    snapshot: &native_db::transaction::RTransaction<'_>,
+    fields: &Fields,
+    entry: &Entry,
+    resolved: &mut Resolved,
+    node: &str,
+) -> Result<Option<TantivyDocument>> {
+    let Some(artifact_id) = entry.artifact_id else {
+        return Ok(None);
+    };
+    if resolved
+        .repository
+        .as_ref()
+        .is_none_or(|(id, _)| *id != entry.repo_id)
+    {
+        let repository: Repository = snapshot.get().primary(entry.repo_id)?.ok_or_else(|| {
+            IndexError::Catalog(format!(
+                "entry {} references missing repository {}",
+                entry.id, entry.repo_id
+            ))
+        })?;
+        resolved.repository = Some((entry.repo_id, repository));
+    }
+    if resolved
+        .artifact
+        .as_ref()
+        .is_none_or(|(id, _)| *id != artifact_id)
+    {
+        let artifact: ArtifactRecord = snapshot.get().primary(artifact_id)?.ok_or_else(|| {
+            IndexError::Catalog(format!(
+                "entry {} references missing artifact {artifact_id}",
+                entry.id
+            ))
+        })?;
+        resolved.artifact = Some((artifact_id, artifact));
+    }
+    let (Some((_, repository)), Some((_, artifact))) = (&resolved.repository, &resolved.artifact)
+    else {
+        return Err(IndexError::Catalog("resolution cache went empty".into()));
+    };
+    let text: Option<SearchText> = snapshot.get().primary(artifact_id)?;
+    let facts = EntryFacts {
+        revision: revision_of(repository, entry)?,
+        entry,
+        repository,
+        artifact,
+        node,
+    };
+    Ok(Some(fields.document(&facts, text.as_ref())))
 }
 
 /// Everything one indexed or returned row needs, with the records an `Entry` only points at
