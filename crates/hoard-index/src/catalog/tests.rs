@@ -693,6 +693,19 @@ fn path_counts_are_final_in_the_stored_row() -> Result<()> {
         rows.iter()
             .all(|entry| entry.row.path_count == 2 && entry.row.dupe)
     );
+    let first: SearchEntry = read
+        .get()
+        .primary(1_i64)?
+        .ok_or_else(|| IndexError::Catalog("first row missing".into()))?;
+    assert_eq!(
+        first.row.path_count, 2,
+        "only the final sweep can have set the first row"
+    );
+    let record: ArtifactRecord = read
+        .get()
+        .primary(first.artifact_id)?
+        .ok_or_else(|| IndexError::Catalog("artifact missing".into()))?;
+    assert_eq!(record.path_count, 2);
     Ok(())
 }
 

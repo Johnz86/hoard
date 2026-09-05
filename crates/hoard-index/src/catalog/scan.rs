@@ -25,8 +25,8 @@ use crate::sniff::{self, SniffResult};
 use crate::store::SearchRow;
 
 use super::models::{
-    ArtifactRecord, ArtifactRecordKey, Entry, Manifest, Repository, Revision, SearchEntry,
-    SearchEntryKey, SearchText, Source,
+    ArtifactRecord, Entry, Manifest, Repository, Revision, SearchEntry, SearchEntryKey, SearchText,
+    Source,
 };
 use crate::error::{IndexError, Result};
 
@@ -141,7 +141,7 @@ impl Catalog {
             }
             transaction.commit()?;
         }
-        self.finalize_path_counts()?;
+        self.finalize_path_counts(&counters)?;
         let transaction = self.database.rw_transaction()?;
         transaction.insert(Manifest {
             id: 0,
@@ -164,22 +164,26 @@ impl Catalog {
 
     /// A row records how many paths its artifact spans, and the last path is only known once
     /// every source has been walked, so the shared artifacts are revisited once at the end.
-    fn finalize_path_counts(&self) -> Result<()> {
+    fn finalize_path_counts(&self, counters: &Counters) -> Result<()> {
         let transaction = self.database.rw_transaction()?;
-        let shared: Vec<ArtifactRecord> = transaction
-            .scan()
-            .primary::<ArtifactRecord>()?
-            .all()?
-            .filter(|record| record.as_ref().map_or(true, |record| record.path_count > 1))
-            .collect::<native_db::db_type::Result<_>>()?;
-        for record in shared {
+        for seen in counters
+            .artifacts_by_identity
+            .values()
+            .filter(|seen| seen.path_count > 1)
+        {
+            let mut record: ArtifactRecord =
+                transaction.get().primary(seen.id)?.ok_or_else(|| {
+                    IndexError::Catalog(format!("artifact {} vanished before the sweep", seen.id))
+                })?;
+            record.path_count = seen.path_count;
+            transaction.upsert(record)?;
             let entries: Vec<SearchEntry> = transaction
                 .scan()
                 .secondary::<SearchEntry>(SearchEntryKey::artifact_id)?
-                .range(record.id..=record.id)?
+                .range(seen.id..=seen.id)?
                 .collect::<native_db::db_type::Result<_>>()?;
             for mut entry in entries {
-                entry.row.path_count = record.path_count;
+                entry.row.path_count = seen.path_count;
                 entry.row.dupe = true;
                 transaction.upsert(entry)?;
             }
@@ -256,11 +260,18 @@ fn validate_output<'a>(
     Ok((output, selected))
 }
 
+/// One artifact identity already written, with the number of paths that have reached it.
+struct SeenArtifact {
+    id: i64,
+    path_count: u32,
+}
+
 #[derive(Default)]
 struct Counters {
     repos: u64,
     artifacts: u64,
     entries: u64,
+    artifacts_by_identity: HashMap<String, SeenArtifact>,
 }
 
 impl Counters {
@@ -696,7 +707,6 @@ fn store_entry(
             row: search_row(entry_id, context, &prepared, &record, state, triage),
             git_sha1: prepared.discovered.git_sha1,
         })?;
-        transaction.upsert(record)?;
     }
     transaction.insert(Entry {
         id: entry_id,
@@ -728,34 +738,39 @@ fn artifact_triage(prepared: &PreparedEntry<'_>, record: &ArtifactRecord, confid
     record.artifact.needs_triage(confidence) || incomplete
 }
 
-/// The record this entry contributes a path to, counted but not yet written: the caller
-/// reads it to build the search row and then stores it by value.
+/// The record this entry contributes a path to. A first path writes the record; a repeated
+/// identity only counts the path in memory and hands back the record already written.
 fn store_artifact(
     transaction: &RwTransaction<'_>,
     prepared: &PreparedEntry<'_>,
     draft: &ArtifactDraft,
     counters: &mut Counters,
 ) -> Result<ArtifactRecord> {
-    let existing: Option<ArtifactRecord> = transaction
-        .get()
-        .secondary(ArtifactRecordKey::identity, draft.identity.as_str())?;
-    let mut artifact = match existing {
-        Some(existing) => existing,
-        None => {
-            let record = artifact_record(next_id(&mut counters.artifacts)?, prepared, draft);
-            transaction.insert(SearchText {
-                artifact_id: record.id,
-                keys: tensor_keys(record.tensors.as_ref()),
-                card: draft.card.clone().unwrap_or_default(),
-            })?;
-            record
-        }
-    };
-    artifact.path_count = artifact
-        .path_count
-        .checked_add(1)
-        .ok_or_else(|| IndexError::Catalog("artifact path count overflow".into()))?;
-    Ok(artifact)
+    if let Some(seen) = counters.artifacts_by_identity.get_mut(&draft.identity) {
+        seen.path_count = seen
+            .path_count
+            .checked_add(1)
+            .ok_or_else(|| IndexError::Catalog("artifact path count overflow".into()))?;
+        return transaction
+            .get()
+            .primary(seen.id)?
+            .ok_or_else(|| IndexError::Catalog(format!("artifact {} vanished mid-scan", seen.id)));
+    }
+    let record = artifact_record(next_id(&mut counters.artifacts)?, prepared, draft);
+    transaction.insert(SearchText {
+        artifact_id: record.id,
+        keys: tensor_keys(record.tensors.as_ref()),
+        card: draft.card.clone().unwrap_or_default(),
+    })?;
+    transaction.insert(record.clone())?;
+    counters.artifacts_by_identity.insert(
+        draft.identity.clone(),
+        SeenArtifact {
+            id: record.id,
+            path_count: 1,
+        },
+    );
+    Ok(record)
 }
 
 fn tensor_keys(tensors: Option<&TensorSummary>) -> String {
@@ -809,7 +824,7 @@ fn artifact_record(id: i64, prepared: &PreparedEntry<'_>, draft: &ArtifactDraft)
     ArtifactRecord {
         id,
         identity: draft.identity.clone(),
-        path_count: 0,
+        path_count: 1,
         artifact: Artifact {
             id: ArtifactId::new(id),
             blob: BlobId::new(id),
