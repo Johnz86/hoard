@@ -1,5 +1,6 @@
 mod models;
 mod query;
+mod read;
 mod scan;
 mod search;
 #[cfg(any(test, feature = "fixtures"))]
@@ -21,6 +22,10 @@ use crate::store::DiskPressure;
 
 use self::models::{ArtifactRecord, Manifest, Repository, Summary, define_models};
 
+pub use self::read::{
+    ArtifactDetailView, EntryDetail, RefDetail, RepositoryDetail, RepositoryFilter, RepositoryPage,
+    RevisionDetail, TriageItem,
+};
 pub use self::scan::RescanReport;
 pub use self::search::{QueryPage, QueryRequest};
 #[cfg(any(test, feature = "fixtures"))]

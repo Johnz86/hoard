@@ -1124,16 +1124,16 @@ fn documents_of_artifact(
 
 /// Everything one indexed or returned row needs, with the records an `Entry` only points at
 /// already resolved: nothing below this line reads the database.
-struct EntryFacts<'a> {
-    entry: &'a Entry,
-    repository: &'a Repository,
-    revision: &'a Revision,
-    artifact: &'a ArtifactRecord,
-    node: &'a str,
-    primary: bool,
+pub(super) struct EntryFacts<'a> {
+    pub(super) entry: &'a Entry,
+    pub(super) repository: &'a Repository,
+    pub(super) revision: &'a Revision,
+    pub(super) artifact: &'a ArtifactRecord,
+    pub(super) node: &'a str,
+    pub(super) primary: bool,
 }
 
-fn revision_of<'a>(repository: &'a Repository, entry: &Entry) -> Result<&'a Revision> {
+pub(super) fn revision_of<'a>(repository: &'a Repository, entry: &Entry) -> Result<&'a Revision> {
     repository
         .revisions
         .get(entry.revision as usize)
@@ -1148,7 +1148,7 @@ fn revision_of<'a>(repository: &'a Repository, entry: &Entry) -> Result<&'a Revi
 /// The UI row an artifact and one of its entries make together. Artifact-wide facts are
 /// stored once per artifact and per-entry facts once per entry; the repository, revision and
 /// node a row shows are resolved here rather than copied onto every path.
-fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
+pub(super) fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
     let EntryFacts {
         entry,
         repository,

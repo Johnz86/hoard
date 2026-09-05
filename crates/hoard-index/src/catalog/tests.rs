@@ -23,7 +23,9 @@ use super::models::{
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
-use super::{Catalog, QueryPage, QueryRequest, RescanReport, builder, models, query};
+use super::{
+    Catalog, QueryPage, QueryRequest, RepositoryFilter, RescanReport, builder, models, query,
+};
 
 fn running_as_root() -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -1420,6 +1422,319 @@ fn a_seeded_catalog_answers_like_a_scanned_one() -> Result<()> {
         "the card is searchable text"
     );
     assert_eq!(catalog.status()?.generation, 2);
+    Ok(())
+}
+
+/// The six artifacts the server world seeds, as the ids the seed handed them.
+struct SeededIds {
+    ckpt: ArtifactId,
+    lora: ArtifactId,
+    unknown: ArtifactId,
+}
+
+/// The world the detail screens read: a checkpoint repository with a card and a config, a
+/// LoRA on two paths, three more single-artifact repositories, and one queued unknown.
+fn seeded_catalog() -> Result<(TempDir, Catalog, SeededIds)> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let ckpt = seeded_artifact(
+        0x11,
+        "sdxl-base-1.0",
+        Some("stability"),
+        Artifact {
+            sha256: Some(Sha256::from_bytes([0x11; 32])),
+            size: 6_938_040_000,
+            role: Role::Ckpt,
+            role_confidence: 0.99,
+            base: Base::new("sdxl"),
+            base_label: Some("sdxl".to_owned()),
+            precision: Some(Precision::new("fp16")),
+            ..seeded_facts()
+        },
+    );
+    let lora = seeded_artifact(
+        0x9f9f,
+        "film-grain-35mm",
+        Some("kohya"),
+        Artifact {
+            sha256: Some(Sha256::from_bytes([0x9f; 32])),
+            size: 239_075_328,
+            role: Role::Lora,
+            role_confidence: 0.98,
+            base: Base::new("sdxl 1.0"),
+            base_label: Some("sdxl 1.0".to_owned()),
+            ..seeded_facts()
+        },
+    );
+    let llm = seeded_artifact(
+        0x33,
+        "llama-3-8b",
+        Some("meta"),
+        Artifact {
+            size: 4_920_000_000,
+            format: ArtifactFormat::Gguf,
+            role: Role::Llm,
+            role_confidence: 0.97,
+            base: Base::new("llama3"),
+            base_label: Some("llama 3".to_owned()),
+            context: Some(8192),
+            ..seeded_facts()
+        },
+    );
+    let vae = seeded_artifact(
+        0x66,
+        "sdxl-vae",
+        Some("madebyollin"),
+        Artifact {
+            size: 334_641_000,
+            role: Role::Vae,
+            role_confidence: 0.93,
+            ..seeded_facts()
+        },
+    );
+    let dataset = seeded_artifact(
+        0x44,
+        "squad",
+        None,
+        Artifact {
+            size: 88_000_000,
+            format: ArtifactFormat::Parquet,
+            role: Role::Ds,
+            role_confidence: 0.99,
+            ..seeded_facts()
+        },
+    );
+    let unknown = SeedArtifact {
+        tensors: Some(queued_tensors()),
+        evidence: vec![
+            Evidence::new("role", "lora", EvidenceSource::Tensor, 0.6)
+                .with_detail("lora_unet prefix on 2 tensors"),
+            Evidence::new("base", "sdxl 1.0", EvidenceSource::Tensor, 0.5),
+        ],
+        ..seeded_artifact(
+            0x55,
+            "mystery",
+            None,
+            Artifact {
+                size: 1_200_000,
+                format: ArtifactFormat::Bin,
+                role: Role::Unk,
+                role_confidence: 0.2,
+                ..seeded_facts()
+            },
+        )
+    };
+    let written = catalog.seed(&[
+        SeedRepository {
+            revisions: vec![SeedRevision {
+                name: "main".to_owned(),
+                sha: Some(CommitSha::from_bytes([0x11; 20])),
+                refs: vec![
+                    ("main".to_owned(), RefKind::Branch),
+                    ("v1.0".to_owned(), RefKind::Tag),
+                ],
+                entries: vec![
+                    seeded_entry("model.safetensors", 6_938_040_000, Some(ckpt)),
+                    seeded_entry("README.md", 84, None),
+                    seeded_entry("config.json", 900, None),
+                ],
+            }],
+            ..seeded_repo("stability/sdxl-base-1.0", RepoType::Models)
+        },
+        seeded_revision(
+            seeded_repo("kohya/film-grain-35mm", RepoType::Models),
+            0x22,
+            vec![
+                seeded_entry(
+                    "film-grain-35mm.safetensors",
+                    239_075_328,
+                    Some(lora.clone()),
+                ),
+                seeded_entry("loras/film-grain-35mm.safetensors", 239_075_328, Some(lora)),
+            ],
+        ),
+        seeded_revision(
+            seeded_repo("meta/llama-3-8b", RepoType::Models),
+            0x33,
+            vec![seeded_entry("model.gguf", 4_920_000_000, Some(llm))],
+        ),
+        seeded_revision(
+            seeded_repo("madebyollin/sdxl-vae", RepoType::Models),
+            0x66,
+            vec![seeded_entry("vae.safetensors", 334_641_000, Some(vae))],
+        ),
+        seeded_revision(
+            seeded_repo("squad", RepoType::Datasets),
+            0x44,
+            vec![seeded_entry("train.parquet", 88_000_000, Some(dataset))],
+        ),
+        seeded_revision(
+            seeded_repo("misc/mystery", RepoType::Models),
+            0x55,
+            vec![SeedEntry {
+                state: State::Triage,
+                ..seeded_entry("mystery.bin", 1_200_000, Some(unknown))
+            }],
+        ),
+    ])?;
+    catalog.rebuild_search(|_| {})?;
+    let id = |identity: u128| {
+        written
+            .iter()
+            .find(|(seeded, _)| *seeded == identity)
+            .map(|(_, id)| *id)
+            .ok_or_else(|| IndexError::Catalog("every seeded identity was written".into()))
+    };
+    let ids = SeededIds {
+        ckpt: id(0x11)?,
+        lora: id(0x9f9f)?,
+        unknown: id(0x55)?,
+    };
+    Ok((directory, catalog, ids))
+}
+
+fn seeded_repo(reference: &str, repo_type: RepoType) -> SeedRepository {
+    SeedRepository {
+        repo: RepoId::parse_ref(repo_type, reference).expect("reference"),
+        source: "cache".to_owned(),
+        kind: SourceKind::HfCache,
+        root_path: PathBuf::from("/data/hub"),
+        revisions: Vec::new(),
+    }
+}
+
+fn seeded_revision(repo: SeedRepository, byte: u8, entries: Vec<SeedEntry>) -> SeedRepository {
+    SeedRepository {
+        revisions: vec![SeedRevision {
+            name: "main".to_owned(),
+            sha: Some(CommitSha::from_bytes([byte; 20])),
+            refs: vec![("main".to_owned(), RefKind::Branch)],
+            entries,
+        }],
+        ..repo
+    }
+}
+
+fn seeded_artifact(
+    identity: u128,
+    name: &str,
+    org: Option<&str>,
+    artifact: Artifact,
+) -> SeedArtifact {
+    SeedArtifact {
+        identity,
+        artifact,
+        name: name.to_owned(),
+        org: org.map(str::to_owned),
+        tensors: None,
+        evidence: Vec::new(),
+        card: None,
+        group_bytes: None,
+        shard_count: None,
+    }
+}
+
+fn seeded_entry(rel_path: &str, size: u64, artifact: Option<SeedArtifact>) -> SeedEntry {
+    let root = match rel_path {
+        "film-grain-35mm.safetensors" => "/mnt/vault/loras",
+        "loras/film-grain-35mm.safetensors" => "/mnt/comfy/models",
+        _ => "/data/hub",
+    };
+    SeedEntry {
+        abs_path: Some(format!("{root}/{rel_path}")),
+        rel_path: rel_path.to_owned(),
+        size,
+        state: State::Local,
+        is_symlink: false,
+        artifact,
+    }
+}
+
+fn queued_tensors() -> TensorSummary {
+    TensorSummary {
+        tensor_count: 2,
+        params: 1_024,
+        dtypes: BTreeMap::from([("F16".to_owned(), 2_u32)]),
+        key_prefixes: vec![("lora_unet".to_owned(), 2)],
+        samples: vec![TensorSample {
+            name: "lora_unet_down.weight".to_owned(),
+            dtype: "F16".to_owned(),
+            shape: vec![32, 768],
+        }],
+        metadata: BTreeMap::new(),
+    }
+}
+
+#[test]
+fn the_read_api_answers_the_inspector_the_repo_screens_and_the_queue() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    let lora = catalog
+        .artifact_row(ids.lora)?
+        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
+    assert_eq!(lora.path_count, 2);
+    assert_eq!(
+        lora.abs_path.as_deref(),
+        Some("/mnt/vault/loras/film-grain-35mm.safetensors")
+    );
+    let entries = catalog.entries_of(ids.lora)?;
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].repo, "models/kohya/film-grain-35mm");
+    assert_eq!(entries[0].revision, "main");
+    assert!(entries.iter().all(|entry| entry.deduped && entry.present));
+    let by_sha = catalog.artifact_by_sha256(&Sha256::from_bytes([0x9f; 32]))?;
+    assert_eq!(by_sha.map(|row| row.artifact_id), Some(ids.lora));
+    let detail = catalog
+        .artifact_detail(ids.unknown)?
+        .ok_or_else(|| IndexError::Catalog("unknown".into()))?;
+    assert_eq!(detail.evidence[0].value, "lora");
+    assert_eq!(
+        detail.tensors.as_ref().map(|tensors| tensors.tensor_count),
+        Some(2)
+    );
+
+    let repo = catalog
+        .repository(&RepoId::parse_ref(
+            RepoType::Models,
+            "stability/sdxl-base-1.0",
+        )?)?
+        .ok_or_else(|| IndexError::Catalog("repo".into()))?;
+    assert_eq!(repo.refs.len(), 2);
+    assert_eq!(repo.refs[0].kind, RefKind::Branch);
+    let main = catalog
+        .resolve_revision(&repo, "main")
+        .ok_or_else(|| IndexError::Catalog("main".into()))?;
+    assert!(catalog.resolve_revision(&repo, "nope").is_none());
+    let files = catalog.revision_entries(repo.id, main.ordinal)?;
+    assert_eq!(files.len(), 3);
+    assert_eq!(catalog.repository_rows(repo.id, 10)?.len(), 1);
+    assert_eq!(
+        catalog.artifact_row(ids.ckpt)?.map(|row| row.repo),
+        Some("models/stability/sdxl-base-1.0".to_owned())
+    );
+    let models = || RepositoryFilter {
+        repo_type: Some(RepoType::Models),
+        present_only: true,
+        ..RepositoryFilter::default()
+    };
+    let page = catalog.repositories(&models(), None, 2)?;
+    assert_eq!(page.rows.len(), 2);
+    assert_eq!(page.total, 5);
+    let next = catalog.repositories(&models(), Some(page.rows[1].id), 10)?;
+    assert_eq!(next.rows.len(), 3, "paging continues after the cursor");
+
+    let queue = catalog.triage_queue(10)?;
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].row.artifact_id, ids.unknown);
+    assert_eq!(queue[0].guess_role, Role::Lora);
+    assert_eq!(queue[0].guess_base.as_deref(), Some("sdxl 1.0"));
+    assert_eq!(queue[0].header.hidden_dim, Some(768));
+    catalog.clear_triage(ids.unknown)?;
+    assert!(catalog.triage_queue(10)?.is_empty());
     Ok(())
 }
 
