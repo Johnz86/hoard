@@ -61,6 +61,10 @@ notify = "8.2"
 mdns-sd = "0.16"
 globset = "0.4"
 gix = { version = "0.87", default-features = false, features = ["sha1", "revision", "parallel"] }
+native_db = { version = "0.8.2", default-features = false }
+native_model = "=0.4.20"
+redb = "2.6"
+tantivy = { version = "0.26.1", default-features = false, features = ["mmap", "lz4-compression"] }
 
 # artifact formats and hashing
 sha1 = "0.11"
