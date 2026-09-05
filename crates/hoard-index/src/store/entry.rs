@@ -230,6 +230,39 @@ fn entries_where(conn: &Connection, clause: &str, key: i64) -> Result<Vec<EntryR
     collect_rows(rows)
 }
 
+/// Every present SERVED path on `node_row` with no path of its own on disk.
+pub fn served_cache_entries(conn: &Connection, node_row: i64) -> Result<Vec<EntryRow>> {
+    entries_where(
+        conn,
+        &format!(
+            "e.node_id = ?1 AND e.present = 1 AND e.abs_path IS NULL AND e.state = '{}'",
+            State::Served.as_str()
+        ),
+        node_row,
+    )
+}
+
+/// Moves present rows back to REMOTE with no progress; the rows are kept.
+pub fn retire_entries(conn: &Connection, ids: &[EntryId]) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let mut retired = 0;
+    {
+        let mut statement = conn.prepare(
+            "UPDATE entry SET state = ?1, pull_progress = NULL, present = 0 \
+             WHERE id = ?2 AND present = 1",
+        )?;
+        for id in ids {
+            retired += statement.execute(params![State::Remote.as_str(), id.get()])?;
+        }
+    }
+    if retired > 0 {
+        refresh_all_path_counts(conn)?;
+    }
+    Ok(retired)
+}
+
 /// Returns a pull a stopped process left mid-flight to REMOTE.
 ///
 /// Only the process running a pull advances it, so an entry still PULLING when this one
@@ -295,6 +328,56 @@ mod tests {
             None,
             "a row the scan marked absent must not answer a request for its path"
         );
+    }
+
+    #[test]
+    fn only_the_paths_the_block_cache_backs_are_offered_to_a_cache_sweep() {
+        let store = Store::open_in_memory().expect("store opens");
+        let conn = store.write().expect("writer");
+        let world = Fixture::build(&conn);
+        let cached = NewEntry {
+            state: State::Served,
+            size: 64,
+            ..NewEntry::new(world.first_revision, "cached.safetensors", world.node_row)
+        };
+        let id = upsert_entry(&conn, &cached, at()).expect("the cached row records");
+
+        let sweepable = served_cache_entries(&conn, world.node_row).expect("rows read");
+
+        assert_eq!(
+            sweepable.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![id],
+            "a scanned file has a path of its own and is the scanner's to settle"
+        );
+    }
+
+    #[test]
+    fn a_path_whose_cached_bytes_went_away_is_retired_to_remote() {
+        let store = Store::open_in_memory().expect("store opens");
+        let conn = store.write().expect("writer");
+        let world = Fixture::build(&conn);
+        let cached = NewEntry {
+            state: State::Served,
+            size: 64,
+            ..NewEntry::new(world.first_revision, "evicted.safetensors", world.node_row)
+        };
+        let id = upsert_entry(&conn, &cached, at()).expect("the cached row records");
+
+        assert_eq!(
+            retire_entries(&conn, &[id]).expect("the retirement runs"),
+            1
+        );
+        let row = entry(&conn, id)
+            .expect("the entry reads")
+            .expect("the row survives its bytes");
+        assert_eq!(row.state, State::Remote);
+        assert!(!row.present);
+        assert_eq!(
+            retire_entries(&conn, &[id]).expect("the retirement runs"),
+            0,
+            "a row already retired is not retired twice"
+        );
+        assert_eq!(retire_entries(&conn, &[]).expect("nothing to do"), 0);
     }
 
     #[test]

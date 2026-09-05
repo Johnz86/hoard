@@ -230,10 +230,16 @@ chunk of the logical file) and `blocks/block_{n:08}.bin`. A block is present iff
 exists with non-zero size; the presence bitmap is rebuilt from one directory scan on open
 and never persisted. Missing blocks are fetched with a `Range` request by exactly one
 downloader (advisory lock on `block_{n:08}.bin.dl.lock`), CRCs are written before the block
-is renamed into place, and a CRC mismatch on read invalidates that block. One eviction pass
+is renamed into place, and a CRC mismatch on read invalidates that block. An eviction pass
 removes whole entries by LRU, FIFO or LARGE_FIRST until the cache is back under
-`cache_size_limit`; nothing schedules a pass automatically yet, so it runs only when
-something calls it.
+`cache_size_limit`. A server with a `cache_size_limit` sweeps once at startup and every hour
+after that; without one nothing is scheduled. An entry whose `blocks/` directory holds a
+`.dl.lock` sidecar younger than the 300 s staleness timeout is being downloaded: it counts
+toward the total but is never removed, so the pass makes room around it rather than failing
+the request waiting on it. `lfs/object_index/` is a registry rather than cached bytes and is
+never a candidate. Each pass ends by reconciling the index: a path this node serves whose
+entry directory is gone in every upstream slot goes back to REMOTE and stops being
+advertised, which is also what settles a cache directory an operator deleted by hand.
 
 Hoard keeps this layout so an existing olah cache directory can be pointed at directly.
 

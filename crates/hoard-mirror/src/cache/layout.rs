@@ -6,7 +6,11 @@ use url::Url;
 
 use crate::error::{MirrorError, Result};
 
-const PEERS_DIR: &str = "peers";
+pub(crate) const PEERS_DIR: &str = "peers";
+
+pub(crate) const LFS_DIR: &str = "lfs";
+
+pub(crate) const OBJECT_INDEX_DIR: &str = "object_index";
 
 /// Which upstream's copy of a file an entry holds.
 ///
@@ -133,7 +137,7 @@ impl CacheLayout {
     ) -> Result<PathBuf> {
         Ok(self
             .base
-            .join("lfs")
+            .join(LFS_DIR)
             .join("files")
             .join(hex_component(dir1)?)
             .join(hex_component(dir2)?)
@@ -152,8 +156,8 @@ impl CacheLayout {
     pub fn lfs_object_index(&self, content_hash: &Sha256) -> PathBuf {
         let hex = content_hash.to_hex();
         self.base
-            .join("lfs")
-            .join("object_index")
+            .join(LFS_DIR)
+            .join(OBJECT_INDEX_DIR)
             .join(&hex[..2])
             .join(format!("{hex}.json"))
     }

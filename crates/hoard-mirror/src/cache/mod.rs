@@ -8,6 +8,8 @@ pub mod entry;
 pub mod layout;
 pub mod meta;
 pub mod policy;
+pub mod reconcile;
+pub mod sweep;
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -27,6 +29,10 @@ pub use meta::{
     write_meta_document,
 };
 pub use policy::{EntryStat, EvictionReport, select_evictions};
+pub use reconcile::reconcile_index;
+pub use sweep::{
+    DEFAULT_EVICTION_INTERVAL, EvictionConfig, EvictionHandle, SweepReport, spawn_eviction, sweep,
+};
 
 use crate::config::MirrorConfig;
 use crate::error::{MirrorError, Result};

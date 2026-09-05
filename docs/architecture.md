@@ -156,6 +156,8 @@ hoard/
           meta.rs            metadata request kinds, their URLs and cache paths
         cache/
           layout.rs  entry.rs  block.rs  policy.rs  meta.rs
+          reconcile.rs       retires index rows whose cache directory is gone
+          sweep.rs           the scheduled eviction plus reconciliation loop
         git/
           smart_http.rs      info/refs and upload-pack via the git binary
           lfs_batch.rs       LFS batch API pointing at resolve

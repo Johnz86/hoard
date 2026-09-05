@@ -11,8 +11,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::cache::block::{
-    BlockBitmap, BlockMeta, COMPRESSION_NONE, block_file_name, block_index_of, block_lock_name,
-    chunk_crc,
+    BlockBitmap, BlockMeta, COMPRESSION_NONE, LOCK_SUFFIX, block_file_name, block_index_of,
+    block_lock_name, chunk_crc,
 };
 use crate::config::Geometry;
 use crate::error::{MirrorError, Result};
@@ -510,7 +510,7 @@ async fn wipe(dir: &Path) -> Result<()> {
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.ends_with(".dl.lock") || name.ends_with(".tmp") {
+        if name.ends_with(LOCK_SUFFIX) || name.ends_with(".tmp") {
             continue;
         }
         match fs::remove_file(entry.path()).await {
@@ -594,9 +594,13 @@ async fn touch(path: &Path) {
 }
 
 async fn is_stale(path: &Path, stale_after: Duration) -> bool {
-    let Ok(metadata) = fs::metadata(path).await else {
-        return false;
-    };
+    match fs::metadata(path).await {
+        Ok(metadata) => is_stale_lock(&metadata, stale_after),
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn is_stale_lock(metadata: &std::fs::Metadata, stale_after: Duration) -> bool {
     metadata
         .modified()
         .ok()

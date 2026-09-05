@@ -3,6 +3,9 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::cache::block::LOCK_SUFFIX;
+use crate::cache::entry::{DEFAULT_LOCK_STALE_AFTER, is_stale_lock};
+use crate::cache::layout::{LFS_DIR, OBJECT_INDEX_DIR};
 use crate::config::CleanStrategy;
 use crate::error::Result;
 
@@ -20,6 +23,8 @@ pub struct EntryStat {
     pub accessed: i64,
     /// Seconds since the epoch of when the unit first appeared.
     pub created: i64,
+    /// A download is still filling this unit, so it is never selected for removal.
+    pub pinned: bool,
 }
 
 /// What one eviction pass did.
@@ -29,13 +34,16 @@ pub struct EvictionReport {
     pub total_bytes: u64,
     pub freed_bytes: u64,
     pub removed: usize,
+    /// Units a live download held open, counted against the total but never removed.
+    pub pinned: usize,
 }
 
 /// Chooses whole units to remove so the tree fits under `limit`.
 ///
 /// Nothing is selected while the total is already within the limit. Units are removed in the
 /// strategy's order until the remaining total fits, so a single unit larger than the limit is
-/// removed along with everything else rather than left behind.
+/// removed along with everything else rather than left behind. A pinned unit still counts
+/// toward the total, so the pass makes room around a download rather than cancelling it.
 pub fn select_evictions(
     entries: &[EntryStat],
     limit: u64,
@@ -46,7 +54,7 @@ pub fn select_evictions(
         return Vec::new();
     }
 
-    let mut ordered: Vec<&EntryStat> = entries.iter().collect();
+    let mut ordered: Vec<&EntryStat> = entries.iter().filter(|entry| !entry.pinned).collect();
     match strategy {
         CleanStrategy::Lru => ordered.sort_by(|a, b| {
             a.accessed
@@ -85,6 +93,7 @@ pub async fn run_once(root: &Path, limit: u64, strategy: CleanStrategy) -> Resul
             total_bytes,
             freed_bytes: 0,
             removed: 0,
+            pinned: entries.iter().filter(|entry| entry.pinned).count(),
         };
         let sizes: HashMap<&Path, u64> = entries
             .iter()
@@ -145,21 +154,33 @@ fn collect_into(dir: &Path, units: &mut Vec<EntryStat>) -> Result<()> {
         }
     }
     for child in children {
+        if is_object_index(dir, &child) {
+            continue;
+        }
         collect_into(&child, units)?;
     }
     Ok(())
 }
 
+fn is_object_index(parent: &Path, child: &Path) -> bool {
+    child
+        .file_name()
+        .is_some_and(|name| name == OBJECT_INDEX_DIR)
+        && parent.file_name().is_some_and(|name| name == LFS_DIR)
+}
+
 fn entry_stat(dir: &Path) -> Result<EntryStat> {
-    let size = directory_size(dir)?;
+    let mut usage = Usage::default();
+    measure(dir, &mut usage)?;
     let marker = dir.join(META_LOCK_FILE);
     let accessed = seconds_modified(&marker).or_else(|| seconds_modified(&dir.join(META_FILE)));
     let created = seconds_created(&dir.join(META_FILE));
     Ok(EntryStat {
         path: dir.to_path_buf(),
-        size,
+        size: usage.bytes,
         accessed: accessed.unwrap_or_default(),
         created: created.or(accessed).unwrap_or_default(),
+        pinned: usage.pinned,
     })
 }
 
@@ -172,6 +193,7 @@ fn response_stat(json: &Path) -> Result<EntryStat> {
         size,
         accessed,
         created: seconds_created(json).unwrap_or(accessed),
+        pinned: false,
     })
 }
 
@@ -186,22 +208,39 @@ fn remove_unit(path: &Path) -> Result<bool> {
     Ok(removed)
 }
 
-fn directory_size(dir: &Path) -> Result<u64> {
-    let mut total = 0;
+#[derive(Debug, Default)]
+struct Usage {
+    bytes: u64,
+    pinned: bool,
+}
+
+fn measure(dir: &Path, usage: &mut Usage) -> Result<()> {
     let read = match std::fs::read_dir(dir) {
         Ok(read) => read,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
+    let in_blocks = dir.file_name().is_some_and(|name| name == BLOCKS_DIR);
     for entry in read {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
-            total += directory_size(&entry.path())?;
-        } else {
-            total += entry.metadata().map_or(0, |meta| meta.len());
+            measure(&entry.path(), usage)?;
+            continue;
+        }
+        let metadata = entry.metadata().ok();
+        usage.bytes += metadata.as_ref().map_or(0, std::fs::Metadata::len);
+        if in_blocks
+            && !usage.pinned
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(LOCK_SUFFIX))
+        {
+            usage.pinned =
+                metadata.is_some_and(|meta| !is_stale_lock(&meta, DEFAULT_LOCK_STALE_AFTER));
         }
     }
-    Ok(total)
+    Ok(())
 }
 
 fn file_size(path: &Path) -> u64 {
@@ -224,9 +263,12 @@ fn seconds(time: SystemTime) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use tempfile::TempDir;
 
     use super::*;
+    use crate::cache::block::block_lock_name;
 
     fn stat(path: &str, size: u64, accessed: i64, created: i64) -> EntryStat {
         EntryStat {
@@ -234,6 +276,7 @@ mod tests {
             size,
             accessed,
             created,
+            pinned: false,
         }
     }
 
@@ -399,5 +442,82 @@ mod tests {
         assert_eq!(report.removed, 0);
         assert_eq!(report.freed_bytes, 0);
         assert!(entry.join("meta.bin").exists());
+    }
+
+    fn entry_with_lock(root: &Path, name: &str, lock_age: Option<std::time::Duration>) -> PathBuf {
+        let dir = root.join("files/models/org").join(name);
+        std::fs::create_dir_all(dir.join(BLOCKS_DIR)).expect("entry dirs");
+        std::fs::write(dir.join(META_FILE), vec![0u8; 64]).expect("meta");
+        std::fs::write(dir.join(META_LOCK_FILE), b"").expect("marker");
+        std::fs::write(dir.join("blocks/block_00000000.bin"), vec![0u8; 512]).expect("block");
+        if let Some(age) = lock_age {
+            let lock = dir.join("blocks").join(block_lock_name(0));
+            std::fs::write(&lock, b"").expect("download lock");
+            let when = SystemTime::now() - age;
+            std::fs::File::options()
+                .write(true)
+                .open(&lock)
+                .expect("lock opens")
+                .set_times(std::fs::FileTimes::new().set_modified(when))
+                .expect("lock backdates");
+        }
+        dir
+    }
+
+    #[tokio::test]
+    async fn an_entry_a_download_still_holds_is_pinned_rather_than_evicted() {
+        let root = TempDir::new().expect("temp dir");
+        let downloading = entry_with_lock(root.path(), "downloading", Some(Duration::from_secs(1)));
+        let idle = entry_with_lock(root.path(), "idle", None);
+
+        let report = run_once(root.path(), 0, CleanStrategy::LargeFirst)
+            .await
+            .expect("eviction runs");
+
+        assert_eq!(report.pinned, 1);
+        assert_eq!(report.removed, 1);
+        assert!(
+            downloading.exists(),
+            "evicting a block being downloaded would fail the request waiting on it"
+        );
+        assert!(!idle.exists(), "the rest of the tree still makes room");
+    }
+
+    #[tokio::test]
+    async fn an_entry_whose_download_lock_went_stale_is_evicted_again() {
+        let root = TempDir::new().expect("temp dir");
+        let abandoned = entry_with_lock(
+            root.path(),
+            "abandoned",
+            Some(DEFAULT_LOCK_STALE_AFTER + Duration::from_secs(60)),
+        );
+
+        let report = run_once(root.path(), 0, CleanStrategy::Lru)
+            .await
+            .expect("eviction runs");
+
+        assert_eq!(report.pinned, 0);
+        assert_eq!(report.removed, 1);
+        assert!(!abandoned.exists());
+    }
+
+    #[tokio::test]
+    async fn the_content_hash_registry_is_not_a_cached_response() {
+        let root = TempDir::new().expect("temp dir");
+        let registry = root.path().join("lfs/object_index/01");
+        std::fs::create_dir_all(&registry).expect("registry dirs");
+        let document = registry.join("0123.json");
+        std::fs::write(&document, br#"{"content_hash":"0123","repos":[]}"#).expect("registry");
+
+        let report = run_once(root.path(), 0, CleanStrategy::Lru)
+            .await
+            .expect("eviction runs");
+
+        assert_eq!(report.units, 0, "the registry is not cached bytes");
+        assert_eq!(report.removed, 0);
+        assert!(
+            document.exists(),
+            "losing the registry would unauthorize every CDN route it answers"
+        );
     }
 }

@@ -298,9 +298,11 @@ pub fn block_file_name(index: u64) -> String {
     format!("block_{index:08}.bin")
 }
 
+pub const LOCK_SUFFIX: &str = ".dl.lock";
+
 /// The single-flight lock sidecar of a block, `block_00000000.bin.dl.lock`.
 pub fn block_lock_name(index: u64) -> String {
-    format!("{}.dl.lock", block_file_name(index))
+    format!("{}{LOCK_SUFFIX}", block_file_name(index))
 }
 
 /// The block index a `blocks/` file name refers to, if it is one.

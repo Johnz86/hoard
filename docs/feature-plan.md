@@ -157,8 +157,8 @@ the proposal but absent from the prototype, so there is no design to build them 
   Range and multi-range, HEAD parity, ETag and LFS headers, listing endpoints.
 - D2 Git clone serving via `gix` including LFS objects.
 - D3 Upstream proxy with the olah block cache format, single-flight block downloads, CRC
-  verification, eviction, access rules, offline mode, visibility probe with retry
-  classification.
+  verification, eviction scheduled hourly and at startup with index reconciliation, access
+  rules, offline mode, visibility probe with retry classification.
 - D4 Ingest completed cache entries into the index so cached files are searchable and
   deduplicated.
 - D5 Xet: strip `x-xet-hash` on served responses, proxy token and bridge routes.
@@ -302,7 +302,7 @@ docs, Claude Code project configuration.
 ### Phase 7: Upstream proxy and block cache
 
 - Access rules, visibility probe, metadata cache, block cache format, single-flight
-  downloads, eviction, offline mode, ingest, Xet handling.
+  downloads, eviction on an hourly schedule, offline mode, ingest, Xet handling.
 - Accept: `wiremock` upstream tests for ranged block fetches, CRC invalidation and offline
   fallback; an existing olah `repos/` directory serves its cached files unchanged.
 

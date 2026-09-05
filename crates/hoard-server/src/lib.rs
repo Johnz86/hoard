@@ -60,6 +60,16 @@ pub async fn start_gossip(state: &AppState) -> Option<hoard_net::GossipHandle> {
     Some(hoard_net::spawn(state.store().clone(), gossip))
 }
 
+/// Starts the background cache sweep, or nothing when no `cache_size_limit` is set.
+pub fn start_eviction(state: &AppState) -> Option<hoard_mirror::cache::EvictionHandle> {
+    state.mirror_config().cache_size_limit?;
+    Some(hoard_mirror::cache::spawn_eviction(
+        state.store().clone(),
+        state.cache().as_ref().clone(),
+        hoard_mirror::cache::EvictionConfig::default(),
+    ))
+}
+
 /// Builds the whole application.
 ///
 /// Route order is load bearing. The hoard API and the Hub API both live under `/api`, and
@@ -359,5 +369,20 @@ mod tests {
             .await
             .expect("jobs read back");
         assert!(running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_cache_sweep_starts_only_once_a_size_limit_gives_it_something_to_sweep_to() {
+        assert!(
+            start_eviction(&state()).is_none(),
+            "an unlimited cache has no floor to evict down to"
+        );
+
+        let mut config = HoardConfig::default();
+        config.mirror.cache_size_limit = Some(1 << 30);
+        let store = Store::open_in_memory().expect("in-memory store opens");
+        let limited = AppState::new(config, store).expect("state builds");
+        let handle = start_eviction(&limited).expect("a limited cache is swept");
+        handle.shutdown().await;
     }
 }
