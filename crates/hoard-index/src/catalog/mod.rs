@@ -6,6 +6,7 @@ mod search;
 pub mod seed;
 #[cfg(test)]
 mod tests;
+mod verdict;
 
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
@@ -18,12 +19,13 @@ use crate::config::IndexConfig;
 use crate::error::{IndexError, Result};
 use crate::store::DiskPressure;
 
-use self::models::{Manifest, Summary, define_models};
+use self::models::{ArtifactRecord, Manifest, Repository, Summary, define_models};
 
 pub use self::scan::RescanReport;
 pub use self::search::{QueryPage, QueryRequest};
 #[cfg(any(test, feature = "fixtures"))]
 pub use self::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
+pub use self::verdict::OverrideRecord;
 
 /// One redb table's share of the catalog file: the rows it holds, the bytes those rows
 /// occupy, and the bytes a compaction would reclaim.
@@ -96,6 +98,8 @@ impl Catalog {
         let transaction = database.rw_transaction()?;
         transaction.migrate::<Manifest>()?;
         transaction.migrate::<Summary>()?;
+        transaction.migrate::<Repository>()?;
+        transaction.migrate::<ArtifactRecord>()?;
         transaction.commit()?;
         let catalog = Self {
             database,

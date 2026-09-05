@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use jiff::Timestamp;
 use rusqlite::{Connection, Row, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use hoard_core::{CommitSha, RepoRowId, RevisionId};
 
@@ -77,7 +77,7 @@ impl NewRevision {
 
 /// Whether a name points at a moving branch or a fixed tag. Ordered so branches sort ahead
 /// of tags, which is the order the REFS tab and the `search_row` view both present.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RefKind {
     Branch,

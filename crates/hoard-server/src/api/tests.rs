@@ -190,10 +190,14 @@ fn seed_catalog(catalog: &Catalog, dir: &Path) -> [ArtifactId; 6] {
     let card = dir.join("README.md").to_string_lossy().into_owned();
     let written = catalog
         .seed(&[
-            seed_repo(
+            seed_repo_with_refs(
                 "stability/sdxl-base-1.0",
                 RepoType::Models,
                 0x11,
+                vec![
+                    ("main".to_owned(), RefKind::Branch),
+                    ("v1.0".to_owned(), RefKind::Tag),
+                ],
                 vec![
                     seed_entry(
                         "model.safetensors",
@@ -351,6 +355,22 @@ fn seed_repo(
     byte: u8,
     entries: Vec<SeedEntry>,
 ) -> SeedRepository {
+    seed_repo_with_refs(
+        reference,
+        repo_type,
+        byte,
+        vec![("main".to_owned(), RefKind::Branch)],
+        entries,
+    )
+}
+
+fn seed_repo_with_refs(
+    reference: &str,
+    repo_type: RepoType,
+    byte: u8,
+    refs: Vec<(String, RefKind)>,
+    entries: Vec<SeedEntry>,
+) -> SeedRepository {
     SeedRepository {
         repo: RepoId::parse_ref(repo_type, reference).expect("reference"),
         source: "cache".to_owned(),
@@ -359,7 +379,7 @@ fn seed_repo(
         revisions: vec![SeedRevision {
             name: "main".to_owned(),
             sha: Some(hoard_core::CommitSha::from_bytes([byte; 20])),
-            refs: vec!["main".to_owned()],
+            refs,
             entries,
         }],
     }

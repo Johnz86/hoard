@@ -25,8 +25,10 @@ use crate::sniff::{self, SniffResult};
 
 use super::models::{
     Allocator, ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Manifest,
-    Repository, RepositoryKey, Revision, SearchChange, SearchText, Source, Summary, repository_key,
+    Override, Ref, Repository, RepositoryKey, Revision, SearchChange, SearchText, Source, Summary,
+    repository_key,
 };
+use super::verdict::apply_override;
 use crate::error::{IndexError, Result};
 
 use super::{Catalog, builder, models};
@@ -755,7 +757,10 @@ fn repository(id: i64, source: &str, repo: &DiscoveredRepo) -> Repository {
                     .refs
                     .iter()
                     .filter(|reference| reference.revision == ordinal)
-                    .map(|reference| reference.name.clone())
+                    .map(|reference| Ref {
+                        name: reference.name.clone(),
+                        kind: reference.kind,
+                    })
                     .collect(),
             })
             .collect(),
@@ -1333,11 +1338,19 @@ fn store_artifact(
     let stored: Option<ArtifactRecord> = transaction
         .get()
         .secondary(ArtifactRecordKey::identity, draft.identity)?;
-    let id = match stored {
+    let id = match &stored {
         Some(stored) => stored.id,
         None => next_id(&mut counters.artifacts)?,
     };
-    let (record, detail) = artifact_record(id, prepared, draft);
+    let (mut record, detail) = artifact_record(id, prepared, draft);
+    if let Some(stored) = stored {
+        record.first_seen = stored.first_seen;
+        record.triage_cleared = stored.triage_cleared;
+    }
+    let verdict: Option<Override> = transaction.get().primary(id)?;
+    if let Some(verdict) = &verdict {
+        apply_override(&mut record, verdict);
+    }
     transaction.upsert(SearchText {
         artifact_id: id,
         keys: tensor_keys(detail.tensors.as_ref()),
@@ -1435,6 +1448,8 @@ fn artifact_record(
         },
         group_bytes,
         shard_count,
+        triage_cleared: false,
+        first_seen: jiff::Timestamp::now().to_string(),
     };
     let detail = ArtifactDetail {
         artifact_id: id,

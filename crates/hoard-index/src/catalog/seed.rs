@@ -7,13 +7,18 @@ use hoard_core::{Artifact, ArtifactId, BlobId, CommitSha, Evidence, RepoId, Stat
 
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
 use crate::error::{IndexError, Result};
+use crate::store::revision::RefKind;
 
 use super::Catalog;
 use super::models::{
-    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, Manifest, Repository, RepositoryKey,
-    Revision, SearchText, Source, repository_key,
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, Manifest, Ref, Repository,
+    RepositoryKey, Revision, SearchText, Source, repository_key,
 };
 use super::scan::{Counters, counts, log_changes, next_id, preference, tensor_keys};
+
+/// The instant every seeded artifact reports as first seen, so a test that renders it reads
+/// one fixed value rather than the wall clock.
+const SEEDED_AT: &str = "2026-09-04T09:10:00Z";
 
 /// One repository a seeded catalog holds, under a source named by [`SeedRepository::source`].
 #[derive(Debug, Clone)]
@@ -29,7 +34,7 @@ pub struct SeedRepository {
 pub struct SeedRevision {
     pub name: String,
     pub sha: Option<CommitSha>,
-    pub refs: Vec<String>,
+    pub refs: Vec<(String, RefKind)>,
     pub entries: Vec<SeedEntry>,
 }
 
@@ -137,7 +142,14 @@ impl Seeding<'_, '_> {
                 .map(|revision| Revision {
                     name: revision.name.clone(),
                     sha: revision.sha,
-                    refs: revision.refs.clone(),
+                    refs: revision
+                        .refs
+                        .iter()
+                        .map(|(name, kind)| Ref {
+                            name: name.clone(),
+                            kind: *kind,
+                        })
+                        .collect(),
                 })
                 .collect(),
         })?;
@@ -239,6 +251,8 @@ impl Seeding<'_, '_> {
             path_count: 1,
             group_bytes: seed.group_bytes,
             shard_count: seed.shard_count,
+            triage_cleared: false,
+            first_seen: SEEDED_AT.to_owned(),
         })?;
         self.by_identity.insert(seed.identity, id);
         self.written.push((seed.identity, ArtifactId::new(id)));

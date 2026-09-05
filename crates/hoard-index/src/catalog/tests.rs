@@ -14,14 +14,16 @@ use crate::config::{IndexConfig, SourceConfig, SourceKind};
 use crate::error::{IndexError, Result};
 use crate::search::{CompileContext, SortKey, SortSpec, parse};
 use crate::store::SearchRow;
+use crate::store::revision::RefKind;
 
 use super::models::{
-    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Manifest, ManifestV1,
-    Repository, RepositoryKey, Revision, SearchChange, SearchText, Source, Summary, SummaryV1,
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, ArtifactRecordV1, Entry, EntryKey, Manifest,
+    ManifestV1, Override, Ref, Repository, RepositoryKey, RepositoryV1, Revision, RevisionV1,
+    SearchChange, SearchText, Source, Summary, SummaryV1,
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
-use super::{Catalog, QueryPage, QueryRequest, RescanReport, models, query};
+use super::{Catalog, QueryPage, QueryRequest, RescanReport, builder, models, query};
 
 fn running_as_root() -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -381,6 +383,132 @@ fn version_one_records_are_migrated_on_open() -> Result<()> {
     );
     let old: Option<SummaryV1> = read.get().primary(0_u8)?;
     assert!(old.is_none(), "the v1 summary table is drained");
+    Ok(())
+}
+
+#[test]
+fn an_override_rewrites_the_artifact_reaches_search_and_survives_a_rescan() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    let before = search(&catalog, "role:lora")?;
+    let id = before.rows[0].artifact_id;
+    catalog.put_override(id, Some(Role::Ctrl), None, Some(Base::new("sdxl 1.0")))?;
+    assert_eq!(
+        search(&catalog, "role:ctrl")?.total,
+        1,
+        "the index sees the verdict without a rebuild"
+    );
+    let verdict = catalog
+        .artifact_override(id)?
+        .ok_or_else(|| IndexError::Catalog("no override".into()))?;
+    assert_eq!(verdict.role, Some(Role::Ctrl));
+    let touched = input.join("loras/keep.safetensors");
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    fs::File::options()
+        .write(true)
+        .open(&touched)?
+        .set_modified(later)?;
+    catalog.rescan(&config, |_, _| {})?;
+    catalog.refresh_search(|_| {})?;
+    let after = search(&catalog, "role:ctrl")?;
+    assert!(
+        after.rows.iter().any(|row| row.artifact_id == id),
+        "a re-inferred artifact keeps its verdict"
+    );
+    assert!(catalog.clear_override(id)?);
+    assert!(!catalog.clear_override(id)?);
+    Ok(())
+}
+
+#[test]
+fn refs_keep_their_kind_and_old_records_migrate_on_open() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    hf_cache_repo(
+        &hub,
+        "acme",
+        "styler",
+        &[("unet/adapter.safetensors", lora_header())],
+    )?;
+    let catalog = scan_hub(directory.path(), &hub)?;
+    let read = catalog.database.r_transaction()?;
+    let repositories: Vec<Repository> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    let refs = &repositories[0].revisions[0].refs;
+    assert!(
+        refs.iter()
+            .any(|reference| reference.name == "main" && reference.kind == RefKind::Branch),
+        "{refs:?}"
+    );
+    let records: Vec<ArtifactRecord> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert!(!records[0].first_seen.is_empty());
+    assert!(!records[0].triage_cleared);
+    drop(read);
+
+    let legacy = tempfile::tempdir()?;
+    {
+        let database = builder().create(models()?, legacy.path().join("catalog.redb"))?;
+        let transaction = database.rw_transaction()?;
+        transaction.insert(ManifestV1 {
+            id: 0,
+            format_version: 5,
+            generation: 1,
+            scanned_at: "then".to_owned(),
+            node: "old".to_owned(),
+            counts: Vec::new(),
+            search_directory: None,
+            search_generation: 0,
+        })?;
+        transaction.insert(ArtifactRecordV1 {
+            id: 9_000,
+            identity: 0x9000,
+            artifact: frozen_artifact(),
+            name: "old".into(),
+            org: None,
+            path_count: 1,
+            group_bytes: None,
+            shard_count: None,
+        })?;
+        let repo = RepoId::new(RepoType::Models, Some("acme".to_owned()), "styler");
+        transaction.insert(RepositoryV1 {
+            id: 11,
+            key: models::repository_key("hub", &repo),
+            source: "hub".to_owned(),
+            repo,
+            root_path: "/hub".to_owned(),
+            default_ref: "main".to_owned(),
+            revisions: vec![RevisionV1 {
+                name: "main".to_owned(),
+                sha: None,
+                refs: vec!["main".to_owned()],
+            }],
+        })?;
+        transaction.commit()?;
+    }
+    let reopened = Catalog::open(legacy.path())?;
+    let read = reopened.database.r_transaction()?;
+    let migrated: Option<ArtifactRecord> = read.get().primary(9_000_i64)?;
+    assert!(
+        migrated.is_some_and(|record| !record.triage_cleared && record.first_seen.is_empty()),
+        "a v1 record is migrated on open"
+    );
+    let repository: Option<Repository> = read.get().primary(11_i64)?;
+    assert_eq!(
+        repository
+            .and_then(|repository| repository.revisions[0].refs.first().map(|ref_| ref_.kind)),
+        Some(RefKind::Branch),
+        "a v1 repository's ref names a branch after migration"
+    );
     Ok(())
 }
 
@@ -1257,7 +1385,7 @@ fn a_seeded_catalog_answers_like_a_scanned_one() -> Result<()> {
         revisions: vec![SeedRevision {
             name: "main".into(),
             sha: Some(CommitSha::from_bytes([0x22; 20])),
-            refs: vec!["main".into()],
+            refs: vec![("main".to_owned(), RefKind::Branch)],
             entries: vec![
                 entry(
                     "film-grain-35mm.safetensors",
@@ -1312,7 +1440,7 @@ fn an_any_base_answers_only_its_own_bucket() -> Result<()> {
         revisions: vec![SeedRevision {
             name: "main".into(),
             sha: None,
-            refs: vec!["main".into()],
+            refs: vec![("main".to_owned(), RefKind::Branch)],
             entries: vec![SeedEntry {
                 rel_path: format!("{name}.safetensors"),
                 abs_path: Some(format!("/data/hub/{name}.safetensors")),
@@ -1617,6 +1745,29 @@ fn repository_encoding_is_frozen() -> Result<()> {
         revisions: vec![Revision {
             name: "main".to_owned(),
             sha: Some(CommitSha::from_bytes([5; 20])),
+            refs: vec![Ref {
+                name: "refs/heads/main".to_owned(),
+                kind: RefKind::Tag,
+            }],
+        }],
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn repository_v1_encoding_is_frozen() -> Result<()> {
+    let repo = RepoId::new(RepoType::Datasets, Some("frozen-org".to_owned()), "frozen");
+    let value = RepositoryV1 {
+        id: 11,
+        key: models::repository_key("frozen", &repo),
+        source: "frozen".to_owned(),
+        repo,
+        root_path: "/frozen/source/datasets--frozen-org--frozen".to_owned(),
+        default_ref: "main".to_owned(),
+        revisions: vec![RevisionV1 {
+            name: "main".to_owned(),
+            sha: Some(CommitSha::from_bytes([5; 20])),
             refs: vec!["refs/heads/main".to_owned()],
         }],
     };
@@ -1635,6 +1786,37 @@ fn artifact_record_encoding_is_frozen() -> Result<()> {
         path_count: 2,
         group_bytes: Some(8192),
         shard_count: Some(3),
+        triage_cleared: true,
+        first_seen: "2026-09-05T00:00:00Z".to_owned(),
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn artifact_record_v1_encoding_is_frozen() -> Result<()> {
+    let value = ArtifactRecordV1 {
+        id: 7,
+        identity: 0x0303_0303_0303_0303_u128,
+        artifact: frozen_artifact(),
+        name: "frozen.safetensors".to_owned(),
+        org: Some("frozen-org".to_owned()),
+        path_count: 2,
+        group_bytes: Some(8192),
+        shard_count: Some(3),
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn override_encoding_is_frozen() -> Result<()> {
+    let value = Override {
+        artifact_id: 7,
+        role: Some(Role::Ctrl),
+        sub_role: Some(SubRole::Mot),
+        base: Some(Base::new("sdxl 1.0")),
+        decided_at: "2026-09-05T00:00:00Z".to_owned(),
     };
     insta::assert_snapshot!(frozen_encoding(&value)?);
     Ok(())

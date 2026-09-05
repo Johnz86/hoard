@@ -2,9 +2,12 @@ use native_db::{Models, ToKey, native_db};
 use native_model::{Model, native_model};
 use serde::{Deserialize, Serialize};
 
-use hoard_core::{Artifact, CommitSha, Evidence, GitSha1, RepoId, State, TensorSummary};
+use hoard_core::{
+    Artifact, Base, CommitSha, Evidence, GitSha1, RepoId, Role, State, SubRole, TensorSummary,
+};
 
 use crate::config::{SourceConfig, SourceKind};
+use crate::store::revision::RefKind;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 1, version = 1)]
@@ -19,6 +22,28 @@ pub(super) struct Source {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 2, version = 1)]
 #[native_db]
+pub(super) struct RepositoryV1 {
+    #[primary_key]
+    pub(super) id: i64,
+    #[secondary_key(unique)]
+    pub(super) key: String,
+    pub(super) source: String,
+    pub(super) repo: RepoId,
+    pub(super) root_path: String,
+    pub(super) default_ref: String,
+    pub(super) revisions: Vec<RevisionV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct RevisionV1 {
+    pub(super) name: String,
+    pub(super) sha: Option<CommitSha>,
+    pub(super) refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 2, version = 2, from = RepositoryV1)]
+#[native_db]
 pub(super) struct Repository {
     #[primary_key]
     pub(super) id: i64,
@@ -31,11 +56,73 @@ pub(super) struct Repository {
     pub(super) revisions: Vec<Revision>,
 }
 
+/// One name a revision answers to, with what the name is: a moving branch or a fixed tag.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct Ref {
+    pub(super) name: String,
+    pub(super) kind: RefKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct Revision {
     pub(super) name: String,
     pub(super) sha: Option<CommitSha>,
-    pub(super) refs: Vec<String>,
+    pub(super) refs: Vec<Ref>,
+}
+
+impl From<RepositoryV1> for Repository {
+    fn from(repository: RepositoryV1) -> Self {
+        Self {
+            id: repository.id,
+            key: repository.key,
+            source: repository.source,
+            repo: repository.repo,
+            root_path: repository.root_path,
+            default_ref: repository.default_ref,
+            revisions: repository
+                .revisions
+                .into_iter()
+                .map(|revision| Revision {
+                    name: revision.name,
+                    sha: revision.sha,
+                    refs: revision
+                        .refs
+                        .into_iter()
+                        .map(|name| Ref {
+                            name,
+                            kind: RefKind::Branch,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<Repository> for RepositoryV1 {
+    fn from(repository: Repository) -> Self {
+        Self {
+            id: repository.id,
+            key: repository.key,
+            source: repository.source,
+            repo: repository.repo,
+            root_path: repository.root_path,
+            default_ref: repository.default_ref,
+            revisions: repository
+                .revisions
+                .into_iter()
+                .map(|revision| RevisionV1 {
+                    name: revision.name,
+                    sha: revision.sha,
+                    refs: revision
+                        .refs
+                        .into_iter()
+                        .map(|reference| reference.name)
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// The identity a repository keeps across scans: its source and its qualified name.
@@ -45,6 +132,22 @@ pub(super) fn repository_key(source: &str, repo: &RepoId) -> String {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 3, version = 1)]
+#[native_db]
+pub(super) struct ArtifactRecordV1 {
+    #[primary_key]
+    pub(super) id: i64,
+    #[secondary_key(unique)]
+    pub(super) identity: u128,
+    pub(super) artifact: Artifact,
+    pub(super) name: String,
+    pub(super) org: Option<String>,
+    pub(super) path_count: u32,
+    pub(super) group_bytes: Option<u64>,
+    pub(super) shard_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 3, version = 2, from = ArtifactRecordV1)]
 #[native_db]
 pub(super) struct ArtifactRecord {
     #[primary_key]
@@ -57,6 +160,54 @@ pub(super) struct ArtifactRecord {
     pub(super) path_count: u32,
     pub(super) group_bytes: Option<u64>,
     pub(super) shard_count: Option<u32>,
+    pub(super) triage_cleared: bool,
+    pub(super) first_seen: String,
+}
+
+impl From<ArtifactRecordV1> for ArtifactRecord {
+    fn from(record: ArtifactRecordV1) -> Self {
+        Self {
+            id: record.id,
+            identity: record.identity,
+            artifact: record.artifact,
+            name: record.name,
+            org: record.org,
+            path_count: record.path_count,
+            group_bytes: record.group_bytes,
+            shard_count: record.shard_count,
+            triage_cleared: false,
+            first_seen: String::new(),
+        }
+    }
+}
+
+impl From<ArtifactRecord> for ArtifactRecordV1 {
+    fn from(record: ArtifactRecord) -> Self {
+        Self {
+            id: record.id,
+            identity: record.identity,
+            artifact: record.artifact,
+            name: record.name,
+            org: record.org,
+            path_count: record.path_count,
+            group_bytes: record.group_bytes,
+            shard_count: record.shard_count,
+        }
+    }
+}
+
+/// A user's verdict on what an artifact is. It outranks inference: the artifact record
+/// carries what the verdict says, and a rescan re-applies it over freshly inferred facts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 12, version = 1)]
+#[native_db]
+pub(super) struct Override {
+    #[primary_key]
+    pub(super) artifact_id: i64,
+    pub(super) role: Option<Role>,
+    pub(super) sub_role: Option<SubRole>,
+    pub(super) base: Option<Base>,
+    pub(super) decided_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -246,17 +397,20 @@ pub(super) struct Allocator {
 /// current and each superseded one marked legacy.
 pub(super) fn define_models() -> super::Result<Models> {
     let mut models = Models::new();
-    models.define::<Source>()?;
+    models.define::<RepositoryV1>()?;
     models.define::<Repository>()?;
+    models.define::<ArtifactRecordV1>()?;
     models.define::<ArtifactRecord>()?;
-    models.define::<ArtifactDetail>()?;
-    models.define::<SearchText>()?;
     models.define::<ManifestV1>()?;
     models.define::<Manifest>()?;
     models.define::<SummaryV1>()?;
     models.define::<Summary>()?;
+    models.define::<Source>()?;
+    models.define::<ArtifactDetail>()?;
+    models.define::<SearchText>()?;
     models.define::<Entry>()?;
     models.define::<Allocator>()?;
+    models.define::<Override>()?;
     models.define::<SearchChange>()?;
     Ok(models)
 }
