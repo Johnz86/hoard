@@ -121,9 +121,16 @@ of the shallowest README in each revision.
   never collapses the rail it was clicked in; `base` buckets are counted by running each
   bucket's own query, because the prefix rule does not group. Node counts are per preferred
   entry, which is the same number the SQL rule gives while a catalog holds one node.
-- Keyword columns are string fast fields, so the collapse collector reads the sort value
-  and the five facet values per retained artifact without a second pass, spelling each
-  ordinal once per segment.
+- Keyword columns are string fast fields, and the collapse collector keeps term ordinals
+  rather than terms: one retained artifact is eighty-eight bytes of integers naming its
+  segment, its sort value and its five facet values. Each segment's columns stay open in
+  the collected result, so a term is spelled only for a page row, a facet bucket or the
+  node set, once per segment and ordinal however many artifacts carry it. Ordinals are
+  lexicographic inside a segment and meaningless across segments, so a page ordered by a
+  term sorts on ordinals while one segment holds every hit and otherwise bounds each
+  segment on its own ordinals and merges the survivors by the terms they spell. A page
+  nearer the end of the order is cut from the reversed order, so a deep offset selects and
+  spells no more than a shallow one.
 - DISK PRESSURE is a summary record the artifact sweep refreshes: the bytes duplicated
   paths waste and how many artifacts waste them.
 - Ids come from a persisted allocator and the generation increments per rescan; artifact
@@ -222,24 +229,24 @@ total. Wave 4 removed it; the rows below it measure `query`, which also counts f
 dimensions and the distinct nodes, so the two sets of timings are not comparable and both
 are kept.
 
-| measure | 100k w1 | 100k w2 | 100k w3 | 100k w4 | 1M w1 | 1M w2 | 1M w3 | 1M w4 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| scan wall | 5.226065725s | 5.900763157s | 5.476153652s | 5.657892353s | 57.77687964s | 75.282972971s | 85.709219721s | 85.449911878s |
-| peak rss growth during scan | 198 MB | 292 MB | 253 MB | 254 MB | 1560 MB | 842 MB | 731 MB | 741 MB |
-| rebuild wall | 596.949484ms | 440.388181ms | 802.170108ms | 943.869337ms | 4.40112116s | 5.294884595s | 8.497179982s | 10.39137641s |
-| peak rss growth during rebuild | 34 MB | 54 MB | 52 MB | 47 MB | 0 MB | 0 MB | 0 MB | 0 MB |
-| on disk, apparent | 518 MB | 261 MB | 261 MB | 265 MB | 4138 MB | 4138 MB | 4138 MB | 4173 MB |
-| on disk, allocated | 288 MB | 243 MB | 213 MB | 216 MB | 2983 MB | 2476 MB | 2112 MB | 2148 MB |
-| search offset 0 | 10.577049ms | 12.251924ms | 9.756606ms | removed | 189.855663ms | 174.943704ms | 216.076995ms | removed |
-| search deep offset | 9.144823ms | 9.106715ms | 8.649164ms | removed | 197.536743ms | 190.89815ms | 217.117028ms | removed |
-| search filtered | 7.200678ms | 7.238805ms | 6.967226ms | removed | 177.39202ms | 168.239764ms | 188.590775ms | removed |
-| query empty by name | not measured | not measured | not measured | 221.111746ms | not measured | not measured | not measured | 3.011389042s |
-| query deep offset | not measured | not measured | not measured | 212.094065ms | not measured | not measured | not measured | 2.982565132s |
-| query role:lora with facets | not measured | not measured | not measured | 135.635441ms | not measured | not measured | not measured | 2.016078812s |
-| query filtered | not measured | not measured | not measured | 300.337912ms | not measured | not measured | not measured | 4.384522112s |
-| peak rss growth during queries | not measured | not measured | not measured | 113 MB | not measured | not measured | not measured | 1190 MB |
-| rescan wall (1,000 changed) | not measured | not measured | 812.140523ms | 816.293704ms | not measured | not measured | 28.5581122s | 29.606316494s |
-| refresh wall | not measured | not measured | 28.341576ms | 31.047147ms | not measured | not measured | 28.598925ms | 35.828931ms |
+| measure | 100k w1 | 100k w2 | 100k w3 | 100k w4 | 100k w5 | 1M w1 | 1M w2 | 1M w3 | 1M w4 | 1M w5 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| scan wall | 5.226065725s | 5.900763157s | 5.476153652s | 5.657892353s | 5.672653469s | 57.77687964s | 75.282972971s | 85.709219721s | 85.449911878s | 84.603774091s |
+| peak rss growth during scan | 198 MB | 292 MB | 253 MB | 254 MB | 254 MB | 1560 MB | 842 MB | 731 MB | 741 MB | 732 MB |
+| rebuild wall | 596.949484ms | 440.388181ms | 802.170108ms | 943.869337ms | 883.471396ms | 4.40112116s | 5.294884595s | 8.497179982s | 10.39137641s | 10.551732892s |
+| peak rss growth during rebuild | 34 MB | 54 MB | 52 MB | 47 MB | 48 MB | 0 MB | 0 MB | 0 MB | 0 MB | 0 MB |
+| on disk, apparent | 518 MB | 261 MB | 261 MB | 265 MB | 265 MB | 4138 MB | 4138 MB | 4138 MB | 4173 MB | 4173 MB |
+| on disk, allocated | 288 MB | 243 MB | 213 MB | 216 MB | 216 MB | 2983 MB | 2476 MB | 2112 MB | 2148 MB | 2148 MB |
+| search offset 0 | 10.577049ms | 12.251924ms | 9.756606ms | removed | removed | 189.855663ms | 174.943704ms | 216.076995ms | removed | removed |
+| search deep offset | 9.144823ms | 9.106715ms | 8.649164ms | removed | removed | 197.536743ms | 190.89815ms | 217.117028ms | removed | removed |
+| search filtered | 7.200678ms | 7.238805ms | 6.967226ms | removed | removed | 177.39202ms | 168.239764ms | 188.590775ms | removed | removed |
+| query empty by name | not measured | not measured | not measured | 221.111746ms | 33.894331ms | not measured | not measured | not measured | 3.011389042s | 577.455193ms |
+| query deep offset | not measured | not measured | not measured | 212.094065ms | 34.319659ms | not measured | not measured | not measured | 2.982565132s | 534.299433ms |
+| query role:lora with facets | not measured | not measured | not measured | 135.635441ms | 28.611903ms | not measured | not measured | not measured | 2.016078812s | 493.170639ms |
+| query filtered | not measured | not measured | not measured | 300.337912ms | 41.425115ms | not measured | not measured | not measured | 4.384522112s | 873.916709ms |
+| peak rss growth during queries | not measured | not measured | not measured | 113 MB | 41 MB | not measured | not measured | not measured | 1190 MB | 409 MB |
+| rescan wall (1,000 changed) | not measured | not measured | 812.140523ms | 816.293704ms | 898.947574ms | not measured | not measured | 28.5581122s | 29.606316494s | 31.851403311s |
+| refresh wall | not measured | not measured | 28.341576ms | 31.047147ms | 31.89983ms | not measured | not measured | 28.598925ms | 35.828931ms | 33.576794ms |
 
 `query role:lora with facets` matches a quarter of the catalog and is the one query here
 whose facet rail costs a second collection: the ROLE dimension is counted with its own key
@@ -277,28 +284,50 @@ Thresholds at 1M entries, absolute now that there is no peer left to compare aga
 RSS growth under 2 GB, allocated disk under 1.5 GB, deep-offset search under 500 ms,
 rebuild no slower than the scan.
 
-Verdict: deep-offset search under 500 ms is missed for the first time and the collector is
-why. The empty query sorted by name takes 3.01 s at 1M against 216 ms for the wave 3
-`search` that returned the same page, and the deep offset costs the same 2.98 s because
-paging still happens after the whole collapsed set exists. The four query timings differ
-only in how much work each one adds on top of that collapse: `fmt:safetensors size:>0`
-matches every artifact and pays a size range scan besides, so it is the slowest at 4.38 s;
-`role:lora` collapses a quarter of the catalog and then collapses the whole index once
-more to count the ROLE dimension with its own key excluded, and still comes in fastest at
-2.02 s. Nothing here is tuned; the collapsed set is the single cause and bounding it is
-the next wave's work, not this one's. Peak RSS growth under 2 GB is still met, but only
-just and no longer because of the scan: the scan grows 741 MB and the queries then grow
-peak RSS by a further 1190 MB, roughly 1.2 KB per artifact, which is the sort value, the
-five facet strings and the base label the collapsed set now carries per retained artifact.
-At 100k the same set costs 113 MB, so it scales exactly with the catalog, as expected.
-Rebuild no slower than the scan is met, 10.4 s against 85.4 s; the rebuild is 1.9 s slower
-than wave 3 because thirteen keyword fields are now string fast columns and two more
-fields are indexed. Allocated disk under 1.5 GB is still missed at 2148 MB, 36 MB more
-than wave 3, and those 36 MB are the fast columns, which is what a grammar that sorts and
-facets on a column costs to store. The scan is unchanged, 85.4 s against 85.7 s, and the
-refresh stays cheap at 35.8 ms for 1,000 changed artifacts. This remains a go for
-continuing the replacement, with the collector named as the one thing that must be fixed
-before search is wired into serve.
+Verdict: every query is four to eight times faster than wave 4 and a deep page now costs
+what a shallow one does, but two of the four rows still miss 500 ms at 1M. `query empty by
+name` is 577 ms against 3.01 s, `query deep offset` 534 ms against 2.98 s, `query role:lora
+with facets` 493 ms against 2.02 s, and `query filtered` 874 ms against 4.38 s. Timing each
+phase of each query at 1M says where the rest sits. The empty query spends 368 ms
+collapsing the index, 14 ms counting distinct nodes, 80 ms counting the five facet
+dimensions, 121 ms selecting and ordering the page, and 0.5 ms reading the rows it returns.
+So neither `page_of` nor `count_buckets` is the cost any more: what is left is the collapse
+itself, one `Hit` per matching artifact into a hash map however few rows the page asks for.
+`role:lora` collapses a quarter of the index in 75 ms and then spends 399 ms in `facets`,
+which is the second whole collapse the ROLE dimension needs to be counted with its own key
+excluded; `fmt:safetensors size:>0` matches everything and pays for that collapse twice,
+328 ms and 426 ms, which is the whole of its 874 ms. Counting is cheap where it is not
+recollecting: five dimensions over a million hits are tallied by ordinal and spelled one
+term per segment and value, which is the 80 ms the empty query pays.
+
+Deep paging is the row that moved most, from 2.98 s to 534 ms at 1M and from 212 ms to
+34 ms at 100k, where it now costs what offset 0 costs. A window nearer the end of the order
+is cut from the reversed order, so offset 999,900 bounds each segment to the 100 candidates
+that can reach the page and spells only those, instead of spelling every name in the
+catalog to merge segments that only compare as strings.
+
+Peak RSS growth during queries is 409 MB against a 300 MB threshold, down from 1190 MB:
+roughly 410 bytes per artifact where wave 4 spent 1.2 KB. A `Hit` is 88 bytes of integers
+rather than seven `String`s, and the term columns each segment carries are the index's own
+mmapped fast fields rather than copies. What is left is the shape of the collapse, not what
+it stores: one entry per matching artifact, plus a second whole collapsed set held beside
+the first while `facets` counts a dimension the query narrows. At 100k the same set costs
+41 MB against 113 MB, so it still scales exactly with the catalog.
+
+Nothing else moved. The scan is 84.6 s against 85.4 s, the rebuild 10.6 s against 10.4 s
+and so still comfortably faster than the scan, allocated disk is unchanged at 2148 MB and
+still misses 1.5 GB, and the refresh stays cheap at 33.6 ms for 1,000 changed artifacts.
+Peak RSS growth under 2 GB is met with room now that the queries no longer add a gigabyte
+to the scan's 732 MB.
+
+Go for putting the catalog into the server's state and keeping it current from every scan,
+which is the next task and which no route reads yet. No-go for switching the index screen
+onto it while a catalog of this size is in play: an empty query at 1M is 577 ms and holds
+409 MB for the duration, and both numbers are the collapsed set rather than anything a page
+or a facet rail does with it. Bounding the collapse, and counting facets without collecting
+a second one, is what has to land before a route reads this index. The catalogs actually
+measured on this workstation hold 477 entries, where every query here is under a
+millisecond of this, so the blocker is scale, not correctness.
 
 ## Remaining replacement work
 
@@ -307,12 +336,14 @@ before search is wired into serve.
 - Path identities hash the text to_string_lossy renders; discovery currently never yields
   two distinct non-UTF-8 paths, and a byte-exact identity must land with the identity
   redesign.
-- Bound the search collector: it materializes one candidate per matching artifact per
-  segment, and that candidate now also carries the sort value, the five facet strings and
-  the base label, so the empty query costs memory proportional to the catalog on every
-  call. Measured at 1M that is 1190 MB of peak RSS growth and 3.0 s against a 500 ms
-  threshold. Replace it with a bounded heap plus an exact distinct count and a separate
-  facet pass before wiring search into serve. This is the one blocking item.
+- Bound the search collector: it still materializes one candidate per matching artifact,
+  now eighty-eight bytes of ordinals rather than seven strings. Measured at 1M that is
+  409 MB of peak RSS growth against a 300 MB threshold and 577 ms for an empty query
+  against 500 ms, of which 368 ms is the collapse itself. Counting a dimension the query
+  narrows collapses the whole index a second time, which is the 874 ms and most of the
+  409 MB of `fmt:safetensors size:>0`. Replace both with a bounded heap plus an exact
+  distinct count and a facet pass that does not recollect. This is the one item blocking a
+  route reading this index at scale.
 - Shrink the per-entry record further: revision, repository, source and absolute path are
   written out per entry, which is what the 1M catalog is mostly made of. Intern them per
   revision and reference them by id.
