@@ -28,11 +28,16 @@ cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
+cargo test --release -p hoard-server --lib assets::
 cargo run -- serve --config hoard.toml
 ```
 
 All four checks must pass before a task is reported done. A `PostToolUse` hook runs
 `rustfmt` on every edited `.rs` file.
+
+`web/` is read from disk in a debug build and embedded in the binary in a release one, so
+the debug checks never touch the code a shipped binary runs. The release asset test is the
+only thing that does; run it whenever `web/` gains or loses a file.
 
 ## Project conventions beyond AGENTS.md
 

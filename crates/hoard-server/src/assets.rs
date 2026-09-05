@@ -95,6 +95,10 @@ fn entity_tag(bytes: &[u8; 32]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -103,6 +107,51 @@ mod tests {
             WebAssets::get("index.html").is_some(),
             "web/index.html must exist"
         );
+    }
+
+    #[test]
+    fn every_shipped_file_under_web_reads_back_out_of_the_binary() {
+        let embedded: BTreeSet<String> = WebAssets::iter().map(Cow::into_owned).collect();
+        let missing: Vec<String> = shipped_sources()
+            .into_iter()
+            .filter(|path| !embedded.contains(path))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "a release build embeds web/ at compile time, so a file left out of the binary \
+             is a blank page that serving from disk never shows: {missing:?}"
+        );
+        for path in &embedded {
+            let file = WebAssets::get(path).expect("an embedded file reads back");
+            assert!(!file.data.is_empty(), "{path} carries no bytes");
+        }
+    }
+
+    /// The files under `web/` that the binary is expected to carry, which is everything the
+    /// `exclude` attributes on `WebAssets` do not drop.
+    fn shipped_sources() -> BTreeSet<String> {
+        fn walk(dir: &Path, root: &Path, found: &mut BTreeSet<String>) {
+            let read = std::fs::read_dir(dir).expect("web/ is readable from the crate root");
+            for entry in read {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    walk(&path, root, found);
+                    continue;
+                }
+                let relative = path.strip_prefix(root).expect("a path under web/");
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if name.starts_with('.') || name.ends_with(".map") {
+                    continue;
+                }
+                found.insert(relative.to_string_lossy().into_owned());
+            }
+        }
+
+        let root = Path::new("../../web");
+        let mut found = BTreeSet::new();
+        walk(root, root, &mut found);
+        assert!(!found.is_empty(), "web/ has files to ship");
+        found
     }
 
     #[tokio::test]
