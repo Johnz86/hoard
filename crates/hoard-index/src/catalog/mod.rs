@@ -2,6 +2,8 @@ mod models;
 mod query;
 mod scan;
 mod search;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod seed;
 #[cfg(test)]
 mod tests;
 
@@ -20,6 +22,8 @@ use self::models::{Manifest, Summary, define_models};
 
 pub use self::scan::RescanReport;
 pub use self::search::{QueryPage, QueryRequest};
+#[cfg(any(test, feature = "fixtures"))]
+pub use self::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 
 /// One redb table's share of the catalog file: the rows it holds, the bytes those rows
 /// occupy, and the bytes a compaction would reclaim.

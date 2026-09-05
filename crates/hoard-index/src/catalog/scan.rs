@@ -325,7 +325,7 @@ impl Catalog {
     /// deletes the artifact and everything hanging off it once none does. A model split
     /// across shards is reached once per complete copy of its files, not once per file.
     /// The sweep commits in batches, because a fresh scan touches every artifact it wrote.
-    fn sweep_artifacts(&self, counters: &mut Counters) -> Result<()> {
+    pub(super) fn sweep_artifacts(&self, counters: &mut Counters) -> Result<()> {
         let ids: Vec<i64> = counters.touched.iter().copied().collect();
         for batch in ids.chunks(CHUNK) {
             let transaction = self.database.rw_transaction()?;
@@ -429,7 +429,7 @@ fn shard_count_of(
     }
 }
 
-fn counts(transaction: &RwTransaction<'_>) -> Result<Vec<(String, u64)>> {
+pub(super) fn counts(transaction: &RwTransaction<'_>) -> Result<Vec<(String, u64)>> {
     Ok(vec![
         ("sources".into(), transaction.len().primary::<Source>()?),
         (
@@ -638,17 +638,17 @@ fn replace_known(
     Ok(())
 }
 
-struct Counters {
+pub(super) struct Counters {
     repos: u64,
-    artifacts: u64,
-    entries: u64,
+    pub(super) artifacts: u64,
+    pub(super) entries: u64,
     artifacts_by_identity: HashMap<u128, i64>,
-    touched: HashSet<i64>,
-    pending: Vec<i64>,
+    pub(super) touched: HashSet<i64>,
+    pub(super) pending: Vec<i64>,
 }
 
 impl Counters {
-    fn load(database: &Database<'static>) -> Result<Self> {
+    pub(super) fn load(database: &Database<'static>) -> Result<Self> {
         let stored: Option<Allocator> = database.r_transaction()?.get().primary(0_u8)?;
         let allocator = stored.unwrap_or(Allocator {
             id: 0,
@@ -666,7 +666,7 @@ impl Counters {
         })
     }
 
-    fn save(&self, transaction: &RwTransaction<'_>) -> Result<()> {
+    pub(super) fn save(&self, transaction: &RwTransaction<'_>) -> Result<()> {
         transaction.upsert(Allocator {
             id: 0,
             repos: self.repos,
@@ -676,7 +676,7 @@ impl Counters {
         Ok(())
     }
 
-    fn next_repo(&mut self) -> Result<i64> {
+    pub(super) fn next_repo(&mut self) -> Result<i64> {
         next_id(&mut self.repos)
     }
 }
@@ -685,7 +685,7 @@ impl Counters {
 /// longer matches. The sequence continues past both the highest key the log still holds and
 /// the refresh cursor, because a drained log holds neither the numbers it has already spent
 /// nor any proof that a refresh has not already passed them.
-fn log_changes(transaction: &RwTransaction<'_>, counters: &mut Counters) -> Result<()> {
+pub(super) fn log_changes(transaction: &RwTransaction<'_>, counters: &mut Counters) -> Result<()> {
     if counters.pending.is_empty() {
         return Ok(());
     }
@@ -710,7 +710,7 @@ fn log_changes(transaction: &RwTransaction<'_>, counters: &mut Counters) -> Resu
     Ok(())
 }
 
-fn next_id(counter: &mut u64) -> Result<i64> {
+pub(super) fn next_id(counter: &mut u64) -> Result<i64> {
     let id = counter
         .checked_add(1)
         .and_then(|value| i64::try_from(value).ok())
@@ -1337,7 +1337,7 @@ fn store_artifact(
     Ok(record)
 }
 
-fn tensor_keys(tensors: Option<&TensorSummary>) -> String {
+pub(super) fn tensor_keys(tensors: Option<&TensorSummary>) -> String {
     tensors.map_or_else(String::new, |summary| {
         summary
             .key_prefixes
@@ -1358,7 +1358,7 @@ fn entry_state(prepared: &PreparedEntry<'_>, triage: bool) -> State {
 
 /// The SQLite index scores a candidate row the same way in `schema_v2.sql`: a node is always
 /// itself here and an entry's blob is always its artifact's blob, so both constants are fixed.
-fn preference(state: State, present: bool) -> i64 {
+pub(super) fn preference(state: State, present: bool) -> i64 {
     let weight = match state {
         State::Served => 3,
         State::Local | State::Triage => 2,

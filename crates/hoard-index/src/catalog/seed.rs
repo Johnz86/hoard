@@ -1,0 +1,247 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use native_db::transaction::RwTransaction;
+
+use hoard_core::{Artifact, ArtifactId, BlobId, CommitSha, Evidence, RepoId, State, TensorSummary};
+
+use crate::config::{IndexConfig, SourceConfig, SourceKind};
+use crate::error::{IndexError, Result};
+
+use super::Catalog;
+use super::models::{
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, Manifest, Repository, RepositoryKey,
+    Revision, SearchText, Source, repository_key,
+};
+use super::scan::{Counters, counts, log_changes, next_id, preference, tensor_keys};
+
+/// One repository a seeded catalog holds, under a source named by [`SeedRepository::source`].
+#[derive(Debug, Clone)]
+pub struct SeedRepository {
+    pub repo: RepoId,
+    pub source: String,
+    pub kind: SourceKind,
+    pub root_path: PathBuf,
+    pub revisions: Vec<SeedRevision>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SeedRevision {
+    pub name: String,
+    pub sha: Option<CommitSha>,
+    pub refs: Vec<String>,
+    pub entries: Vec<SeedEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SeedEntry {
+    pub rel_path: String,
+    pub abs_path: Option<String>,
+    pub size: u64,
+    pub state: State,
+    pub is_symlink: bool,
+    pub artifact: Option<SeedArtifact>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SeedArtifact {
+    /// Entries seeded with the same identity share one artifact and count as its paths.
+    pub identity: u128,
+    pub artifact: Artifact,
+    pub name: String,
+    pub org: Option<String>,
+    pub tensors: Option<TensorSummary>,
+    pub evidence: Vec<Evidence>,
+    pub card: Option<String>,
+    pub group_bytes: Option<u64>,
+    pub shard_count: Option<u32>,
+}
+
+impl Catalog {
+    /// Writes records the way a scan would, for tests that need known rows without
+    /// inference: ids come from the allocator, every artifact is logged for the search
+    /// index, path counts and the summary are swept, and the generation increments.
+    /// Call `rebuild_search` afterwards.
+    pub fn seed(&self, repositories: &[SeedRepository]) -> Result<()> {
+        let mut counters = Counters::load(&self.database)?;
+        let transaction = self.database.rw_transaction()?;
+        {
+            let mut seeding = Seeding {
+                transaction: &transaction,
+                counters: &mut counters,
+                by_identity: HashMap::new(),
+                triage: IndexConfig::default().triage_confidence,
+            };
+            for repository in repositories {
+                seeding.repository(repository)?;
+            }
+        }
+        log_changes(&transaction, &mut counters)?;
+        transaction.commit()?;
+        self.sweep_artifacts(&mut counters)?;
+        let transaction = self.database.rw_transaction()?;
+        counters.save(&transaction)?;
+        let mut manifest: Manifest = transaction
+            .get()
+            .primary(0_u8)?
+            .ok_or_else(|| IndexError::Catalog("manifest missing".into()))?;
+        manifest.generation += 1;
+        manifest.scanned_at = jiff::Timestamp::now().to_string();
+        manifest.counts = counts(&transaction)?;
+        transaction.upsert(manifest)?;
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+/// One `seed` call in progress: the transaction every record lands in, the allocator that
+/// numbers them, and the artifact ids the identities seen so far were given.
+struct Seeding<'a, 'db> {
+    transaction: &'a RwTransaction<'db>,
+    counters: &'a mut Counters,
+    by_identity: HashMap<u128, i64>,
+    triage: f32,
+}
+
+impl Seeding<'_, '_> {
+    fn repository(&mut self, seed: &SeedRepository) -> Result<()> {
+        self.source(seed)?;
+        let key = repository_key(&seed.source, &seed.repo);
+        let stored: Option<Repository> = self
+            .transaction
+            .get()
+            .secondary(RepositoryKey::key, key.as_str())?;
+        let repo_id = match stored {
+            Some(stored) => stored.id,
+            None => self.counters.next_repo()?,
+        };
+        self.transaction.upsert(Repository {
+            id: repo_id,
+            key,
+            source: seed.source.clone(),
+            repo: seed.repo.clone(),
+            root_path: seed.root_path.to_string_lossy().into_owned(),
+            default_ref: seed
+                .revisions
+                .first()
+                .map_or("main", |revision| revision.name.as_str())
+                .to_owned(),
+            revisions: seed
+                .revisions
+                .iter()
+                .map(|revision| Revision {
+                    name: revision.name.clone(),
+                    sha: revision.sha,
+                    refs: revision.refs.clone(),
+                })
+                .collect(),
+        })?;
+        for (ordinal, revision) in seed.revisions.iter().enumerate() {
+            let ordinal = u32::try_from(ordinal)
+                .map_err(|_| IndexError::Catalog("revision ordinal overflow".into()))?;
+            for entry in &revision.entries {
+                self.entry(repo_id, ordinal, entry)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn source(&mut self, seed: &SeedRepository) -> Result<()> {
+        let stored: Option<Source> = self.transaction.get().primary(seed.source.clone())?;
+        if stored.is_some() {
+            return Ok(());
+        }
+        self.transaction.insert(Source {
+            name: seed.source.clone(),
+            config: SourceConfig {
+                name: seed.source.clone(),
+                path: seed.root_path.clone(),
+                kind: seed.kind,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                follow_symlinks: false,
+                repo_per_folder: false,
+            },
+            resolved_kind: seed.kind,
+        })?;
+        Ok(())
+    }
+
+    fn entry(&mut self, repo_id: i64, revision: u32, seed: &SeedEntry) -> Result<()> {
+        let artifact_id = match &seed.artifact {
+            Some(artifact) => Some(self.artifact(artifact)?),
+            None => None,
+        };
+        let triage = seed.state == State::Triage
+            || seed
+                .artifact
+                .as_ref()
+                .is_some_and(|seed| seed.artifact.needs_triage(self.triage));
+        self.transaction.insert(Entry {
+            id: next_id(&mut self.counters.entries)?,
+            repo_id,
+            artifact_id,
+            revision,
+            rel_path: seed.rel_path.clone(),
+            abs_path: seed.abs_path.clone(),
+            size: seed.size,
+            state: seed.state,
+            triage,
+            preference: preference(seed.state, seed.abs_path.is_some()),
+            lfs_pointer: false,
+            is_symlink: seed.is_symlink,
+            git_sha1: None,
+            mtime: None,
+            inode: None,
+        })?;
+        Ok(())
+    }
+
+    /// The record this entry contributes a path to, written once per identity.
+    fn artifact(&mut self, seed: &SeedArtifact) -> Result<i64> {
+        if let Some(id) = self.by_identity.get(&seed.identity).copied() {
+            self.touch(id);
+            return Ok(id);
+        }
+        let stored: Option<ArtifactRecord> = self
+            .transaction
+            .get()
+            .secondary(ArtifactRecordKey::identity, seed.identity)?;
+        let id = match stored {
+            Some(stored) => stored.id,
+            None => next_id(&mut self.counters.artifacts)?,
+        };
+        self.transaction.upsert(SearchText {
+            artifact_id: id,
+            keys: tensor_keys(seed.tensors.as_ref()),
+            card: seed.card.clone().unwrap_or_default(),
+        })?;
+        self.transaction.upsert(ArtifactDetail {
+            artifact_id: id,
+            tensors: seed.tensors.clone(),
+            evidence: seed.evidence.clone(),
+        })?;
+        self.transaction.upsert(ArtifactRecord {
+            id,
+            identity: seed.identity,
+            artifact: Artifact {
+                id: ArtifactId::new(id),
+                blob: BlobId::new(id),
+                ..seed.artifact.clone()
+            },
+            name: seed.name.clone(),
+            org: seed.org.clone(),
+            path_count: 1,
+            group_bytes: seed.group_bytes,
+            shard_count: seed.shard_count,
+        })?;
+        self.by_identity.insert(seed.identity, id);
+        self.touch(id);
+        Ok(id)
+    }
+
+    fn touch(&mut self, id: i64) {
+        self.counters.touched.insert(id);
+        self.counters.pending.push(id);
+    }
+}

@@ -20,6 +20,7 @@ use super::models::{
     Repository, RepositoryKey, Revision, SearchChange, SearchText, Source, Summary,
 };
 use super::search::QueryPath;
+use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::{Catalog, QueryPage, QueryRequest, RescanReport, models, query};
 
 fn running_as_root() -> bool {
@@ -1184,6 +1185,100 @@ fn disk_pressure_is_summarised_after_every_sweep() -> Result<()> {
     let after = catalog.disk_pressure()?;
     assert_eq!(after.reclaimable_bytes, 0);
     assert_eq!(after.duplicate_blobs, 0);
+    Ok(())
+}
+
+#[test]
+fn a_seeded_catalog_answers_like_a_scanned_one() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "n", |_, _| {})?;
+    let lora = SeedArtifact {
+        identity: 0x9f9f,
+        artifact: Artifact {
+            id: ArtifactId::new(0),
+            blob: BlobId::new(0),
+            sha256: Some(Sha256::from_bytes([0x9f; 32])),
+            size: 239_075_328,
+            format: ArtifactFormat::Safetensors,
+            role: Role::Lora,
+            sub_role: None,
+            role_confidence: 0.98,
+            base: Base::new("sdxl 1.0"),
+            base_label: Some("sdxl 1.0".into()),
+            base_confidence: 0.9,
+            precision: Some(Precision::new("fp16")),
+            quant: None,
+            rank: Some(32),
+            alpha: Some(16.0),
+            params: None,
+            context: None,
+            trigger: Some("film grain, 35mm, halation".into()),
+            sniff_version: 1,
+        },
+        name: "film-grain-35mm".into(),
+        org: Some("kohya".into()),
+        tensors: None,
+        evidence: Vec::new(),
+        card: Some("A grain adapter for SDXL.".into()),
+        group_bytes: None,
+        shard_count: None,
+    };
+    let entry = |rel_path: &str, abs_path: &str| SeedEntry {
+        rel_path: rel_path.into(),
+        abs_path: Some(abs_path.into()),
+        size: 239_075_328,
+        state: State::Local,
+        is_symlink: false,
+        artifact: Some(lora.clone()),
+    };
+    catalog.seed(&[SeedRepository {
+        repo: RepoId::parse_ref(RepoType::Models, "kohya/film-grain-35mm")?,
+        source: "cache".into(),
+        kind: SourceKind::HfCache,
+        root_path: "/data/hub".into(),
+        revisions: vec![SeedRevision {
+            name: "main".into(),
+            sha: Some(CommitSha::from_bytes([0x22; 20])),
+            refs: vec!["main".into()],
+            entries: vec![
+                entry(
+                    "film-grain-35mm.safetensors",
+                    "/mnt/vault/loras/film-grain-35mm.safetensors",
+                ),
+                entry(
+                    "loras/film-grain-35mm.safetensors",
+                    "/mnt/comfy/models/loras/film-grain-35mm.safetensors",
+                ),
+            ],
+        }],
+    }])?;
+    catalog.rebuild_search(|_| {})?;
+    let page = search(&catalog, "role:lora")?;
+    assert_eq!(page.total, 1);
+    let row = &page.rows[0];
+    assert_eq!(row.name, "film-grain-35mm");
+    assert_eq!(row.org.as_deref(), Some("kohya"));
+    assert_eq!(row.path_count, 2);
+    assert!(row.dupe);
+    assert_eq!(row.trigger.as_deref(), Some("film grain, 35mm, halation"));
+    assert_eq!(row.revision, "main");
+    assert_eq!(
+        row.abs_path.as_deref(),
+        Some("/mnt/vault/loras/film-grain-35mm.safetensors"),
+        "the lowest entry id is preferred on a tie"
+    );
+    assert_eq!(catalog.disk_pressure()?.duplicate_blobs, 1);
+    assert_eq!(
+        search(&catalog, "grain")?.total,
+        1,
+        "the card is searchable text"
+    );
+    assert_eq!(catalog.status()?.generation, 2);
     Ok(())
 }
 
