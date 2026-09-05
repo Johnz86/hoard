@@ -42,6 +42,16 @@ pub struct StorageReport {
     pub tables: Vec<TableStorage>,
 }
 
+/// The totals the stats screen prints above its tables, as the sweep last measured them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Totals {
+    pub artifacts: u64,
+    pub present_artifacts: u64,
+    pub triage_artifacts: u64,
+    pub indexed_bytes: u64,
+    pub repositories: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CatalogStatus {
     pub format_version: u32,
@@ -85,6 +95,7 @@ impl Catalog {
         let database = builder().open(models()?, directory.join("catalog.redb"))?;
         let transaction = database.rw_transaction()?;
         transaction.migrate::<Manifest>()?;
+        transaction.migrate::<Summary>()?;
         transaction.commit()?;
         let catalog = Self {
             database,
@@ -192,6 +203,19 @@ impl Catalog {
                 duplicate_blobs: summary.duplicate_artifacts,
             }),
         )
+    }
+
+    /// The counts the stats screen prints, as the artifact sweep last measured them. A
+    /// catalog whose sweep predates this record reports zeroes rather than rescanning.
+    pub fn totals(&self) -> Result<Totals> {
+        let summary: Option<Summary> = self.database.r_transaction()?.get().primary(0_u8)?;
+        Ok(summary.map_or_else(Totals::default, |summary| Totals {
+            artifacts: summary.artifacts,
+            present_artifacts: summary.present_artifacts,
+            triage_artifacts: summary.triage_artifacts,
+            indexed_bytes: summary.indexed_bytes,
+            repositories: summary.repositories,
+        }))
     }
 
     fn manifest(&self) -> Result<Manifest> {

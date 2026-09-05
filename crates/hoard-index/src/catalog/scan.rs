@@ -76,7 +76,7 @@ impl Catalog {
             report: RescanReport::default(),
         };
         self.walk(&sources, &mut walk, &mut counters, progress)?;
-        self.sweep_artifacts(&mut counters)?;
+        self.sweep_artifacts(&mut counters, config.triage_confidence)?;
         let transaction = self.database.rw_transaction()?;
         counters.save(&transaction)?;
         let mut manifest: Manifest = transaction
@@ -122,7 +122,7 @@ impl Catalog {
             report: RescanReport::default(),
         };
         self.walk(sources, &mut walk, &mut counters, progress)?;
-        self.sweep_artifacts(&mut counters)?;
+        self.sweep_artifacts(&mut counters, triage)?;
         let transaction = self.database.rw_transaction()?;
         counters.save(&transaction)?;
         transaction.insert(Manifest {
@@ -325,7 +325,7 @@ impl Catalog {
     /// deletes the artifact and everything hanging off it once none does. A model split
     /// across shards is reached once per complete copy of its files, not once per file.
     /// The sweep commits in batches, because a fresh scan touches every artifact it wrote.
-    pub(super) fn sweep_artifacts(&self, counters: &mut Counters) -> Result<()> {
+    pub(super) fn sweep_artifacts(&self, counters: &mut Counters, triage: f32) -> Result<()> {
         let ids: Vec<i64> = counters.touched.iter().copied().collect();
         for batch in ids.chunks(CHUNK) {
             let transaction = self.database.rw_transaction()?;
@@ -337,25 +337,39 @@ impl Catalog {
             log_changes(&transaction, counters)?;
             transaction.commit()?;
         }
-        self.summarise_disk_pressure()
+        self.summarise(triage)
     }
 
-    /// Recounts what duplicated paths cost, which the facet rail reads as DISK PRESSURE.
-    /// An artifact reached by more than one path wastes every copy but the first.
-    fn summarise_disk_pressure(&self) -> Result<()> {
+    /// Recounts what the facet rail reads as DISK PRESSURE and what the stats route prints
+    /// as its totals. An artifact reached by more than one path wastes every copy but the
+    /// first; an artifact no path reaches at all is not indexed bytes on this node.
+    fn summarise(&self, triage: f32) -> Result<()> {
         let read = self.database.r_transaction()?;
         let mut summary = Summary {
             id: 0,
             reclaimable_bytes: 0,
             duplicate_artifacts: 0,
+            artifacts: 0,
+            present_artifacts: 0,
+            triage_artifacts: 0,
+            indexed_bytes: 0,
+            repositories: read.len().primary::<Repository>()?,
         };
         for record in read.scan().primary::<ArtifactRecord>()?.all()? {
             let record = record?;
+            let bytes = record.group_bytes.unwrap_or(record.artifact.size);
+            summary.artifacts += 1;
+            if record.artifact.needs_triage(triage) {
+                summary.triage_artifacts += 1;
+            }
+            if record.path_count > 0 {
+                summary.present_artifacts += 1;
+                summary.indexed_bytes = summary.indexed_bytes.saturating_add(bytes);
+            }
             let copies = u64::from(record.path_count.saturating_sub(1));
             if copies == 0 {
                 continue;
             }
-            let bytes = record.group_bytes.unwrap_or(record.artifact.size);
             summary.reclaimable_bytes = summary
                 .reclaimable_bytes
                 .saturating_add(bytes.saturating_mul(copies));

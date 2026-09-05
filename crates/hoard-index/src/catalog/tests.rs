@@ -17,7 +17,7 @@ use crate::store::SearchRow;
 
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Manifest, ManifestV1,
-    Repository, RepositoryKey, Revision, SearchChange, SearchText, Source, Summary,
+    Repository, RepositoryKey, Revision, SearchChange, SearchText, Source, Summary, SummaryV1,
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
@@ -335,7 +335,7 @@ fn exactly_one_document_per_artifact_is_primary_and_it_is_the_preferred_entry() 
 }
 
 #[test]
-fn a_version_one_manifest_is_migrated_on_open() -> Result<()> {
+fn version_one_records_are_migrated_on_open() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("catalog.redb");
     {
@@ -350,6 +350,11 @@ fn a_version_one_manifest_is_migrated_on_open() -> Result<()> {
             counts: vec![("entries".to_owned(), 1)],
             search_directory: None,
             search_generation: 0,
+        })?;
+        transaction.insert(SummaryV1 {
+            id: 0,
+            reclaimable_bytes: 4096,
+            duplicate_artifacts: 3,
         })?;
         transaction.commit()?;
         let read = database.r_transaction()?;
@@ -368,6 +373,14 @@ fn a_version_one_manifest_is_migrated_on_open() -> Result<()> {
     assert_eq!(migrated.map(|manifest| manifest.search_seq), Some(0));
     let old: Option<ManifestV1> = read.get().primary(0_u8)?;
     assert!(old.is_none(), "the v1 table is drained");
+    let summary: Option<Summary> = read.get().primary(0_u8)?;
+    assert_eq!(
+        summary.map(|summary| (summary.reclaimable_bytes, summary.artifacts)),
+        Some((4096, 0)),
+        "the totals a v1 summary never held start at zero"
+    );
+    let old: Option<SummaryV1> = read.get().primary(0_u8)?;
+    assert!(old.is_none(), "the v1 summary table is drained");
     Ok(())
 }
 
@@ -1295,6 +1308,28 @@ fn loose_fixture(directory: &Path) -> Result<(PathBuf, IndexConfig)> {
 }
 
 #[test]
+fn totals_follow_the_sweep() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let totals = catalog.totals()?;
+    assert_eq!(totals.artifacts, 2);
+    assert_eq!(totals.present_artifacts, 2);
+    assert_eq!(totals.repositories, 1);
+    assert_eq!(
+        totals.indexed_bytes,
+        fs::metadata(input.join("loras/keep.safetensors"))?.len()
+            + fs::metadata(input.join("loras/gone.safetensors"))?.len()
+    );
+    fs::remove_file(input.join("loras/gone.safetensors"))?;
+    catalog.rescan(&config, |_, _| {})?;
+    let after = catalog.totals()?;
+    assert_eq!(after.artifacts, 1, "the orphan was removed");
+    assert_eq!(after.present_artifacts, 1);
+    Ok(())
+}
+
+#[test]
 fn an_unchanged_rescan_reads_no_headers_and_a_deleted_file_is_marked_absent() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
@@ -1597,6 +1632,22 @@ fn manifest_encoding_is_frozen() -> Result<()> {
 #[test]
 fn summary_encoding_is_frozen() -> Result<()> {
     let value = Summary {
+        id: 0,
+        reclaimable_bytes: 4096,
+        duplicate_artifacts: 3,
+        artifacts: 11,
+        present_artifacts: 9,
+        triage_artifacts: 2,
+        indexed_bytes: 65_536,
+        repositories: 4,
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn summary_v1_encoding_is_frozen() -> Result<()> {
+    let value = SummaryV1 {
         id: 0,
         reclaimable_bytes: 4096,
         duplicate_artifacts: 3,

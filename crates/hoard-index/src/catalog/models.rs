@@ -176,16 +176,56 @@ pub(super) struct SearchChange {
     pub(super) artifact_id: i64,
 }
 
-/// What the artifact sweep last measured about duplicated paths, so the facet rail reads one
-/// record rather than scanning every artifact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 11, version = 1)]
+#[native_db]
+pub(super) struct SummaryV1 {
+    #[primary_key]
+    pub(super) id: u8,
+    pub(super) reclaimable_bytes: u64,
+    pub(super) duplicate_artifacts: u64,
+}
+
+/// What the artifact sweep last measured, so the facet rail and the stats route read one
+/// record rather than scanning every artifact.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 11, version = 2, from = SummaryV1)]
 #[native_db]
 pub(super) struct Summary {
     #[primary_key]
     pub(super) id: u8,
     pub(super) reclaimable_bytes: u64,
     pub(super) duplicate_artifacts: u64,
+    pub(super) artifacts: u64,
+    pub(super) present_artifacts: u64,
+    pub(super) triage_artifacts: u64,
+    pub(super) indexed_bytes: u64,
+    pub(super) repositories: u64,
+}
+
+impl From<SummaryV1> for Summary {
+    fn from(summary: SummaryV1) -> Self {
+        Self {
+            id: summary.id,
+            reclaimable_bytes: summary.reclaimable_bytes,
+            duplicate_artifacts: summary.duplicate_artifacts,
+            artifacts: 0,
+            present_artifacts: 0,
+            triage_artifacts: 0,
+            indexed_bytes: 0,
+            repositories: 0,
+        }
+    }
+}
+
+impl From<Summary> for SummaryV1 {
+    fn from(summary: Summary) -> Self {
+        Self {
+            id: summary.id,
+            reclaimable_bytes: summary.reclaimable_bytes,
+            duplicate_artifacts: summary.duplicate_artifacts,
+        }
+    }
 }
 
 /// The high-water marks a later scan continues from, so ids stay stable across runs.
@@ -200,6 +240,10 @@ pub(super) struct Allocator {
     pub(super) entries: u64,
 }
 
+/// Registers every record type. `native_db` compares each definition against every model
+/// already registered rather than only against the other versions of the same model, so a
+/// version 1 model must be defined last: it is what leaves each migrated model marked
+/// current and each superseded one marked legacy.
 pub(super) fn define_models() -> super::Result<Models> {
     let mut models = Models::new();
     models.define::<Source>()?;
@@ -209,9 +253,10 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<SearchText>()?;
     models.define::<ManifestV1>()?;
     models.define::<Manifest>()?;
+    models.define::<SummaryV1>()?;
+    models.define::<Summary>()?;
     models.define::<Entry>()?;
     models.define::<Allocator>()?;
     models.define::<SearchChange>()?;
-    models.define::<Summary>()?;
     Ok(models)
 }

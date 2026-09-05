@@ -63,6 +63,7 @@ impl Catalog {
     /// index, path counts and the summary are swept, and the generation increments.
     /// Call `rebuild_search` afterwards.
     pub fn seed(&self, repositories: &[SeedRepository]) -> Result<()> {
+        let triage = IndexConfig::default().triage_confidence;
         let mut counters = Counters::load(&self.database)?;
         let transaction = self.database.rw_transaction()?;
         {
@@ -70,7 +71,7 @@ impl Catalog {
                 transaction: &transaction,
                 counters: &mut counters,
                 by_identity: HashMap::new(),
-                triage: IndexConfig::default().triage_confidence,
+                triage,
             };
             for repository in repositories {
                 seeding.repository(repository)?;
@@ -78,7 +79,7 @@ impl Catalog {
         }
         log_changes(&transaction, &mut counters)?;
         transaction.commit()?;
-        self.sweep_artifacts(&mut counters)?;
+        self.sweep_artifacts(&mut counters, triage)?;
         let transaction = self.database.rw_transaction()?;
         counters.save(&transaction)?;
         let mut manifest: Manifest = transaction
