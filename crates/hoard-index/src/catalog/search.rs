@@ -127,18 +127,21 @@ impl Catalog {
         let node = self.manifest()?.node;
         let snapshot = self.database.r_transaction()?;
         progress(0);
-        let mut resolved = Resolved::default();
+        let mut indexing = Indexing {
+            snapshot: &snapshot,
+            fields: &fields,
+            node: &node,
+            repository: None,
+        };
         let mut indexed = 0_u64;
-        for entry in snapshot.scan().primary::<Entry>()?.all()? {
-            let entry = entry?;
-            let Some(document) = document_for(&snapshot, &fields, &entry, &mut resolved, &node)?
-            else {
-                continue;
-            };
-            writer.add_document(document)?;
-            indexed += 1;
-            if indexed.is_multiple_of(512) {
-                progress(indexed);
+        for artifact in snapshot.scan().primary::<ArtifactRecord>()?.all()? {
+            let artifact = artifact?;
+            for document in documents_of_artifact(&mut indexing, artifact.id)? {
+                writer.add_document(document)?;
+                indexed += 1;
+                if indexed.is_multiple_of(512) {
+                    progress(indexed);
+                }
             }
         }
         writer.commit()?;
@@ -196,22 +199,19 @@ impl Catalog {
             ids.sort_unstable();
             ids.dedup();
             let snapshot = self.database.r_transaction()?;
-            let mut resolved = Resolved::default();
+            let mut indexing = Indexing {
+                snapshot: &snapshot,
+                fields: &fields,
+                node: &node,
+                repository: None,
+            };
             for id in ids {
                 writer.delete_term(Term::from_field_i64(fields.artifact, id));
-                let entries: Vec<Entry> = snapshot
-                    .scan()
-                    .secondary::<Entry>(EntryKey::artifact_id)?
-                    .start_with(Some(id))?
-                    .collect::<native_db::db_type::Result<_>>()?;
-                for entry in &entries {
-                    if let Some(document) =
-                        document_for(&snapshot, &fields, entry, &mut resolved, &node)?
-                    {
-                        writer.add_document(document)?;
-                    }
+                for document in documents_of_artifact(&mut indexing, id)? {
+                    writer.add_document(document)?;
                 }
             }
+            drop(indexing);
             drop(snapshot);
             writer.commit()?;
             open.reader.reload()?;
@@ -533,9 +533,33 @@ impl Catalog {
                 repository,
                 artifact: &artifact,
                 node,
+                primary: true,
             }));
         }
         Ok(rows)
+    }
+
+    /// How many documents of the published index carry `value` in the u64 field `field`.
+    #[cfg(test)]
+    pub(super) fn count_documents(&self, field: &str, value: u64) -> Result<u64> {
+        let directory = self
+            .manifest()?
+            .search_directory
+            .ok_or_else(|| IndexError::Catalog("search index needs building".into()))?;
+        let guard = self.open_index(&directory)?;
+        let open = guard
+            .as_ref()
+            .ok_or_else(|| IndexError::Catalog("search index was closed".into()))?;
+        let field = open.index.schema().get_field(field)?;
+        let query = tantivy::query::TermQuery::new(
+            Term::from_field_u64(field, value),
+            tantivy::schema::IndexRecordOption::Basic,
+        );
+        let counted = open
+            .reader
+            .searcher()
+            .search(&query, &tantivy::collector::Count)?;
+        Ok(counted as u64)
     }
 }
 
@@ -852,6 +876,7 @@ pub(super) struct Fields {
     pub(super) repo_org: Field,
     pub(super) dupe: Field,
     pub(super) trigger_text: Field,
+    pub(super) primary: Field,
     keywords: [Field; KEYWORD_FIELDS.len()],
 }
 
@@ -870,6 +895,7 @@ impl Fields {
             repo_org: schema.add_text_field("repo_org", STRING),
             dupe: schema.add_u64_field("dupe", INDEXED | FAST),
             trigger_text: schema.add_text_field("trigger_text", TEXT),
+            primary: schema.add_u64_field("primary", INDEXED | FAST),
             keywords: KEYWORD_FIELDS.map(|name| schema.add_text_field(name, STRING | FAST)),
         };
         (schema.build(), fields)
@@ -886,6 +912,7 @@ impl Fields {
             revision,
             artifact,
             node,
+            primary,
         } = facts;
         let inferred = &artifact.artifact;
         let repo = repository.repo.qualified();
@@ -938,6 +965,7 @@ impl Fields {
             document.add_text(self.repo_org, org);
         }
         document.add_u64(self.dupe, u64::from(artifact.path_count > 1));
+        document.add_u64(self.primary, u64::from(*primary));
         if let Some(trigger) = inferred.trigger.as_deref() {
             document.add_text(self.trigger_text, trigger);
         }
@@ -957,64 +985,78 @@ impl Fields {
     }
 }
 
-/// The one-element caches that let a pass over entries resolve each row's repository and
-/// artifact without reading either again per file.
-#[derive(Default)]
-struct Resolved {
+/// One pass over the catalog turning artifacts into documents, with the one-element
+/// repository cache that keeps consecutive entries from reading the same repository again.
+struct Indexing<'a, 'db> {
+    snapshot: &'a native_db::transaction::RTransaction<'db>,
+    fields: &'a Fields,
+    node: &'a str,
     repository: Option<(i64, Repository)>,
-    artifact: Option<(i64, ArtifactRecord)>,
 }
 
-/// The document one entry contributes, or nothing when the entry stands for no artifact.
-fn document_for(
-    snapshot: &native_db::transaction::RTransaction<'_>,
-    fields: &Fields,
-    entry: &Entry,
-    resolved: &mut Resolved,
-    node: &str,
-) -> Result<Option<TantivyDocument>> {
-    let Some(artifact_id) = entry.artifact_id else {
-        return Ok(None);
-    };
-    if resolved
-        .repository
-        .as_ref()
-        .is_none_or(|(id, _)| *id != entry.repo_id)
-    {
-        let repository: Repository = snapshot.get().primary(entry.repo_id)?.ok_or_else(|| {
-            IndexError::Catalog(format!(
-                "entry {} references missing repository {}",
-                entry.id, entry.repo_id
-            ))
-        })?;
-        resolved.repository = Some((entry.repo_id, repository));
+impl Indexing<'_, '_> {
+    fn repository(&mut self, repo_id: i64) -> Result<&Repository> {
+        if self
+            .repository
+            .as_ref()
+            .is_none_or(|(id, _)| *id != repo_id)
+        {
+            let repository: Repository =
+                self.snapshot.get().primary(repo_id)?.ok_or_else(|| {
+                    IndexError::Catalog(format!("an entry references missing repository {repo_id}"))
+                })?;
+            self.repository = Some((repo_id, repository));
+        }
+        self.repository
+            .as_ref()
+            .map(|(_, repository)| repository)
+            .ok_or_else(|| IndexError::Catalog("resolution cache went empty".into()))
     }
-    if resolved
-        .artifact
-        .as_ref()
-        .is_none_or(|(id, _)| *id != artifact_id)
-    {
-        let artifact: ArtifactRecord = snapshot.get().primary(artifact_id)?.ok_or_else(|| {
-            IndexError::Catalog(format!(
-                "entry {} references missing artifact {artifact_id}",
-                entry.id
-            ))
-        })?;
-        resolved.artifact = Some((artifact_id, artifact));
+}
+
+/// Every document one artifact contributes, one per entry that points at it, with `primary`
+/// set on the single entry a row would be assembled from: the highest availability
+/// preference, and on a tie the lowest entry id.
+fn documents_of_artifact(
+    indexing: &mut Indexing<'_, '_>,
+    artifact_id: i64,
+) -> Result<Vec<TantivyDocument>> {
+    let entries: Vec<Entry> = indexing
+        .snapshot
+        .scan()
+        .secondary::<Entry>(EntryKey::artifact_id)?
+        .start_with(Some(artifact_id))?
+        .collect::<native_db::db_type::Result<_>>()?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
     }
-    let (Some((_, repository)), Some((_, artifact))) = (&resolved.repository, &resolved.artifact)
-    else {
-        return Err(IndexError::Catalog("resolution cache went empty".into()));
-    };
+    let snapshot = indexing.snapshot;
+    let fields = indexing.fields;
+    let node = indexing.node;
+    let artifact: ArtifactRecord = snapshot.get().primary(artifact_id)?.ok_or_else(|| {
+        IndexError::Catalog(format!(
+            "an entry references missing artifact {artifact_id}"
+        ))
+    })?;
     let text: Option<SearchText> = snapshot.get().primary(artifact_id)?;
-    let facts = EntryFacts {
-        revision: revision_of(repository, entry)?,
-        entry,
-        repository,
-        artifact,
-        node,
-    };
-    Ok(Some(fields.document(&facts, text.as_ref())))
+    let preferred = entries
+        .iter()
+        .max_by_key(|entry| (entry.preference, Reverse(entry.id)))
+        .map(|entry| entry.id);
+    let mut documents = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let repository = indexing.repository(entry.repo_id)?;
+        let facts = EntryFacts {
+            revision: revision_of(repository, entry)?,
+            entry,
+            repository,
+            artifact: &artifact,
+            node,
+            primary: preferred == Some(entry.id),
+        };
+        documents.push(fields.document(&facts, text.as_ref()));
+    }
+    Ok(documents)
 }
 
 /// Everything one indexed or returned row needs, with the records an `Entry` only points at
@@ -1025,6 +1067,7 @@ struct EntryFacts<'a> {
     revision: &'a Revision,
     artifact: &'a ArtifactRecord,
     node: &'a str,
+    primary: bool,
 }
 
 fn revision_of<'a>(repository: &'a Repository, entry: &Entry) -> Result<&'a Revision> {
@@ -1049,6 +1092,7 @@ fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
         revision,
         artifact,
         node,
+        ..
     } = facts;
     let inferred = &artifact.artifact;
     SearchRow {

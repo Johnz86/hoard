@@ -287,6 +287,52 @@ fn an_identity_is_a_hash_of_its_text_and_two_copies_share_it() -> Result<()> {
 }
 
 #[test]
+fn exactly_one_document_per_artifact_is_primary_and_it_is_the_preferred_entry() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("a"))?;
+    fs::create_dir_all(input.join("b"))?;
+    fs::write(input.join("a/one.csv"), "x,y\n1,2\n")?;
+    std::os::unix::fs::symlink(input.join("a/one.csv"), input.join("b/two.csv"))?;
+    fs::write(input.join("solo.csv"), "x,y\n3,4\n")?;
+    let config = IndexConfig {
+        sources: vec![SourceConfig {
+            follow_symlinks: true,
+            ..source(&input, "files")
+        }],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    let primaries = catalog.count_documents("primary", 1)?;
+    let all = catalog.count_documents("primary", 0)? + primaries;
+    assert_eq!(primaries, 2, "two artifacts, two primary documents");
+    assert_eq!(all, 3, "three entries, three documents");
+    let page = search(&catalog, "dupe:true")?;
+    assert_eq!(page.total, 1);
+    assert!(
+        page.rows[0].path.ends_with("a/one.csv"),
+        "the lowest entry id wins a preference tie: {}",
+        page.rows[0].path
+    );
+    let solo = input.join("solo.csv");
+    fs::write(&solo, "x,y\n5,6\n")?;
+    fs::File::options()
+        .write(true)
+        .open(&solo)?
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))?;
+    catalog.rescan(&config, |_, _| {})?;
+    assert!(catalog.pending_changes()? > 0, "the rewrite is logged");
+    catalog.refresh_search(|_| {})?;
+    assert_eq!(
+        catalog.count_documents("primary", 1)?,
+        2,
+        "a refresh keeps one primary per artifact"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_version_one_manifest_is_migrated_on_open() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("catalog.redb");
