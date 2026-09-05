@@ -147,23 +147,31 @@ investigated further.
 ## Scale
 
 Synthetic loose source of header-only safetensors files, 1,000 per directory, one artifact
-per file, no hashing, release build, each engine measured in its own process
-(`crates/hoard-index/tests/scale.rs`, ignored tests driven by `HOARD_SCALE_ENTRIES`). Both
-engines produced exactly one artifact per file at 1,000 and at 100k.
+per file, no hashing, release build, in its own process
+(`crates/hoard-index/tests/scale.rs`, an ignored test driven by `HOARD_SCALE_ENTRIES`). The
+catalog produced exactly one artifact per file at 1,000, at 100k and at 1M.
 
-| measure | native 100k | sqlite 100k | native 1M | sqlite 1M |
-| --- | --- | --- | --- | --- |
-| scan wall | 3.654141666s | 1831.638053368s | 37.891587731s | killed after 52 min (about 1/8 done: 175 MB of database written against 136 MB for the completed 100k run) |
-| peak rss growth during scan | 958 MB | 356 MB | 8533 MB | 3.3 GB at kill |
-| rebuild wall | 408.688891ms | n/a | 3.580465533s | n/a |
-| on disk | 518 MB | 136 MB | 4138 MB | 175 MB partial |
-| search offset 0 | 7.7755ms | 214.99036ms | 123.835626ms | n/a (scan incomplete) |
-| search deep offset | 8.912689ms | 336.17858ms | 144.921021ms | n/a (scan incomplete) |
-| search filtered | 7.106394ms | 202.099611ms | 123.346183ms | n/a (scan incomplete) |
+Baseline, measured on 2026-09-05 before bounded units and narrow records landed. Native:
+100k scanned in 3.65 s with 958 MB of peak RSS growth and 518 MB on disk; 1M scanned in
+37.9 s with 8533 MB of peak RSS growth and 4138 MB on disk (2739 MB allocated), searching
+in 124 to 145 ms. SQLite: 100k scanned in 1832 s with 356 MB of peak RSS growth and 136 MB
+on disk, searching in 215 to 336 ms; the 1M scan was killed after 52 minutes roughly one
+eighth of the way in. The SQLite measurement was run once to establish this baseline and
+its harness was removed; SQLite is the store being replaced, not a peer to keep measuring.
 
-Proposed thresholds at 1M entries, from the decision spec's switch conditions: native scan
-within 2x of SQLite; native peak RSS growth under 2 GB; native on disk within 3x of SQLite;
-deep-offset search under 500 ms; rebuild no slower than the scan.
+| measure | native 100k | native 1M |
+| --- | --- | --- |
+| scan wall | 3.654141666s | 37.891587731s |
+| peak rss growth during scan | 958 MB | 8533 MB |
+| rebuild wall | 408.688891ms | 3.580465533s |
+| on disk | 518 MB | 4138 MB (2739 MB allocated) |
+| search offset 0 | 7.7755ms | 123.835626ms |
+| search deep offset | 8.912689ms | 144.921021ms |
+| search filtered | 7.106394ms | 123.346183ms |
+
+Thresholds at 1M entries, absolute now that there is no peer left to compare against: peak
+RSS growth under 2 GB, allocated disk under 1.5 GB, deep-offset search under 500 ms,
+rebuild no slower than the scan.
 
 Verdict: native scan within 2x of SQLite is met by a factor of hundreds, 3.7 s against
 1832 s on the same 100k tree, and 37.9 s at 1M against a SQLite scan killed at 52 minutes
