@@ -5,8 +5,10 @@ use tempfile::TempDir;
 
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
 
+use crate::error::{IndexError, Result};
+
 use super::models::{ArtifactRecord, ArtifactRecordKey, Manifest, SearchEntry, Source};
-use super::{Catalog, CatalogError, Result, SearchRequest, models};
+use super::{Catalog, SearchRequest, models};
 
 fn source(path: &Path, name: &str) -> SourceConfig {
     SourceConfig {
@@ -162,13 +164,13 @@ fn duplicate_paths_collapse_after_correlated_entry_filtering() -> Result<()> {
         .primary::<SearchEntry>()?
         .all()?
         .next()
-        .ok_or_else(|| CatalogError::Invalid("missing fixture entry".into()))??;
+        .ok_or_else(|| IndexError::Catalog("missing fixture entry".into()))??;
     let original_node = entry.row.node.clone();
     let artifact_id = entry.artifact_id;
     let mut artifact: ArtifactRecord = transaction
         .get()
         .primary(artifact_id)?
-        .ok_or_else(|| CatalogError::Invalid("missing fixture artifact".into()))?;
+        .ok_or_else(|| IndexError::Catalog("missing fixture artifact".into()))?;
     artifact.path_count = 2;
     transaction.upsert(artifact)?;
     entry.entry_id = 900;
@@ -185,7 +187,7 @@ fn duplicate_paths_collapse_after_correlated_entry_filtering() -> Result<()> {
         .rows
         .iter()
         .find(|row| row.artifact_id.get() == artifact_id)
-        .ok_or_else(|| CatalogError::Invalid("missing shared result".into()))?;
+        .ok_or_else(|| IndexError::Catalog("missing shared result".into()))?;
     assert_eq!(shared.node, original_node);
     assert!(shared.dupe);
     assert_eq!(shared.path_count, 2);
@@ -203,7 +205,7 @@ fn native_secondary_indexes_update_and_abort_atomically() -> Result<()> {
         .primary::<ArtifactRecord>()?
         .all()?
         .next()
-        .ok_or_else(|| CatalogError::Invalid("missing fixture artifact".into()))??;
+        .ok_or_else(|| IndexError::Catalog("missing fixture artifact".into()))??;
     let original = artifact.identity.clone();
     artifact.identity = "replacement".into();
     transaction.upsert(artifact.clone())?;
@@ -288,8 +290,21 @@ fn unpublished_rebuilds_do_not_change_the_previous_search_manifest() -> Result<(
         .r_transaction()?
         .get()
         .primary(0_u8)?
-        .ok_or_else(|| CatalogError::Invalid("missing fixture manifest".into()))?;
+        .ok_or_else(|| IndexError::Catalog("missing fixture manifest".into()))?;
     assert_eq!(reopened_manifest, original);
     assert_eq!(search(&catalog, "")?.total, 2);
+    Ok(())
+}
+
+#[test]
+fn a_catalog_open_elsewhere_reports_the_lock_plainly() -> Result<()> {
+    let (directory, catalog) = fixture()?;
+    let second = Catalog::open(&directory.path().join("native"));
+    let message = match second {
+        Err(IndexError::Catalog(message)) => message,
+        other => panic!("expected a catalog error, got {other:?}"),
+    };
+    assert!(message.contains("another process"), "{message}");
+    drop(catalog);
     Ok(())
 }

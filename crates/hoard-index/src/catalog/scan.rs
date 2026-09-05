@@ -19,7 +19,9 @@ use super::models::{
     ArtifactRecord, ArtifactRecordKey, Manifest, Repository, Revision, SearchEntry, SearchText,
     Source,
 };
-use super::{Catalog, CatalogError, Result, models};
+use crate::error::{IndexError, Result};
+
+use super::{Catalog, models};
 
 const BATCH_SIZE: usize = 128;
 
@@ -103,10 +105,10 @@ impl Catalog {
 
 fn validate_output(directory: &Path, config: &IndexConfig) -> Result<PathBuf> {
     if config.sources.is_empty() {
-        return Err(CatalogError::Invalid("no sources are configured".into()));
+        return Err(IndexError::Catalog("no sources are configured".into()));
     }
     if directory.exists() {
-        return Err(CatalogError::Invalid(
+        return Err(IndexError::Catalog(
             "output directory already exists; choose a fresh directory".into(),
         ));
     }
@@ -116,18 +118,18 @@ fn validate_output(directory: &Path, config: &IndexConfig) -> Result<PathBuf> {
         .unwrap_or(Path::new("."));
     let name = directory
         .file_name()
-        .ok_or_else(|| CatalogError::Invalid("output needs a directory name".into()))?;
+        .ok_or_else(|| IndexError::Catalog("output needs a directory name".into()))?;
     let output = parent.canonicalize()?.join(name);
     let mut names = HashSet::with_capacity(config.sources.len());
     for source in &config.sources {
         if !names.insert(&source.name) {
-            return Err(CatalogError::Invalid(format!(
+            return Err(IndexError::Catalog(format!(
                 "duplicate source name: {}",
                 source.name
             )));
         }
         if output.starts_with(source.path.canonicalize()?) {
-            return Err(CatalogError::Invalid(format!(
+            return Err(IndexError::Catalog(format!(
                 "catalog output is inside scanned source {:?}",
                 source.name
             )));
@@ -153,7 +155,7 @@ fn next_id(counter: &mut u64) -> Result<i64> {
     let id = counter
         .checked_add(1)
         .and_then(|value| i64::try_from(value).ok())
-        .ok_or_else(|| CatalogError::Invalid("catalog identity space exhausted".into()))?;
+        .ok_or_else(|| IndexError::Catalog("catalog identity space exhausted".into()))?;
     *counter = id as u64;
     Ok(id)
 }
@@ -236,7 +238,7 @@ fn prepare_entry(entry: &DiscoveredEntry) -> Result<PreparedEntry<'_>> {
         (None, Some(sha), _) => format!("git:{sha}"),
         (None, None, Some(path)) => format!("path:{}", path.canonicalize()?.display()),
         (None, None, None) => {
-            return Err(CatalogError::Invalid(format!(
+            return Err(IndexError::Catalog(format!(
                 "absent entry has no content identity: {}",
                 entry.rel_path
             )));
@@ -276,7 +278,7 @@ fn store_entry(
     artifact.path_count = artifact
         .path_count
         .checked_add(1)
-        .ok_or_else(|| CatalogError::Invalid("artifact path count overflow".into()))?;
+        .ok_or_else(|| IndexError::Catalog("artifact path count overflow".into()))?;
     if let Some(sniffed) = &prepared.sniffed {
         let text = SearchText {
             artifact_id: artifact.id,

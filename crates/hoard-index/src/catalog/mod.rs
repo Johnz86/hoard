@@ -9,35 +9,12 @@ use std::sync::OnceLock;
 
 use native_db::{Builder, Database, Models};
 use serde::Serialize;
-use thiserror::Error;
+
+use crate::error::{IndexError, Result};
 
 use self::models::{Manifest, define_models};
 
 pub use self::search::{SearchPage, SearchRequest};
-
-pub type Result<T> = std::result::Result<T, CatalogError>;
-
-#[derive(Debug, Error)]
-pub enum CatalogError {
-    #[error("native catalog error: {0}")]
-    Native(#[source] Box<native_db::db_type::Error>),
-    #[error("catalog filesystem error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("catalog conversion error: {0}")]
-    Index(#[from] crate::IndexError),
-    #[error("search index error: {0}")]
-    Search(#[from] tantivy::TantivyError),
-    #[error("invalid catalog: {0}")]
-    Invalid(String),
-    #[error("invalid native search query: {0}")]
-    Query(String),
-}
-
-impl From<native_db::db_type::Error> for CatalogError {
-    fn from(error: native_db::db_type::Error) -> Self {
-        Self::Native(Box::new(error))
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CatalogStatus {
@@ -75,7 +52,7 @@ impl Catalog {
         };
         let manifest = catalog.manifest()?;
         if manifest.format_version != 1 {
-            return Err(CatalogError::Invalid(format!(
+            return Err(IndexError::Catalog(format!(
                 "unsupported format version {}",
                 manifest.format_version
             )));
@@ -106,7 +83,7 @@ impl Catalog {
             .get()
             .primary(0_u8)?
             .ok_or_else(|| {
-                CatalogError::Invalid("scan is incomplete; scan again into a new directory".into())
+                IndexError::Catalog("scan is incomplete; scan again into a new directory".into())
             })
     }
 }
@@ -119,5 +96,5 @@ fn models() -> Result<&'static Models> {
     let _ = MODELS.set(define_models()?);
     MODELS
         .get()
-        .ok_or_else(|| CatalogError::Invalid("model registration failed".into()))
+        .ok_or_else(|| IndexError::Catalog("model registration failed".into()))
 }

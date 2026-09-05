@@ -11,7 +11,9 @@ use tantivy::{DocId, Index, Score, SegmentOrdinal, SegmentReader};
 use crate::store::SearchRow;
 
 use super::models::{ArtifactRecord, SearchEntry, SearchText};
-use super::{Catalog, CatalogError, Result};
+use crate::error::{IndexError, Result};
+
+use super::Catalog;
 
 const WRITER_BUDGET: usize = 32 * 1024 * 1024;
 const KEYWORD_FIELDS: [&str; 13] = [
@@ -83,25 +85,23 @@ impl Catalog {
 
     pub fn search(&self, request: SearchRequest<'_>) -> Result<SearchPage> {
         if request.limit > 1000 {
-            return Err(CatalogError::Query(
-                "page limit must be at most 1000".into(),
-            ));
+            return Err(IndexError::Query("page limit must be at most 1000".into()));
         }
         let manifest = self.manifest()?;
         let directory = manifest
             .search_directory
             .as_deref()
             .filter(|_| manifest.search_generation == manifest.generation)
-            .ok_or_else(|| CatalogError::Invalid("search index needs rebuilding".into()))?;
+            .ok_or_else(|| IndexError::Catalog("search index needs rebuilding".into()))?;
         if !directory.starts_with("search-v1-") || directory.contains(['/', '\\']) {
-            return Err(CatalogError::Invalid(
+            return Err(IndexError::Catalog(
                 "invalid search directory in manifest".into(),
             ));
         }
         let index = Index::open_in_dir(self.directory.join(directory))?;
         let (schema, fields) = Fields::build();
         if index.schema() != schema {
-            return Err(CatalogError::Invalid(
+            return Err(IndexError::Catalog(
                 "search schema differs; rebuild the index".into(),
             ));
         }
@@ -125,14 +125,14 @@ impl Catalog {
             .map(|hit| {
                 let entry: SearchEntry =
                     snapshot.get().primary(hit.entry_id)?.ok_or_else(|| {
-                        CatalogError::Invalid(format!(
+                        IndexError::Catalog(format!(
                             "search references missing entry {}",
                             hit.entry_id
                         ))
                     })?;
                 let artifact: ArtifactRecord =
                     snapshot.get().primary(hit.artifact_id)?.ok_or_else(|| {
-                        CatalogError::Invalid(format!(
+                        IndexError::Catalog(format!(
                             "search references missing artifact {}",
                             hit.artifact_id
                         ))
@@ -155,7 +155,7 @@ fn parsed_query(index: &Index, text: Field, raw: &str) -> Result<Box<dyn Query>>
     parser.set_conjunction_by_default();
     parser
         .parse_query(raw)
-        .map_err(|error| CatalogError::Query(error.to_string()))
+        .map_err(|error| IndexError::Query(error.to_string()))
 }
 
 struct Fields {

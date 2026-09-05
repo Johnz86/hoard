@@ -29,6 +29,15 @@ pub enum IndexError {
     #[error("migration error: {0}")]
     Migration(#[from] rusqlite_migration::Error),
 
+    #[error("native catalog error: {0}")]
+    Native(#[source] Box<native_db::db_type::Error>),
+
+    #[error("search index error: {0}")]
+    Search(#[from] tantivy::TantivyError),
+
+    #[error("invalid catalog: {0}")]
+    Catalog(String),
+
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 
@@ -77,6 +86,19 @@ impl IndexError {
 impl From<tokio::task::JoinError> for IndexError {
     fn from(_: tokio::task::JoinError) -> Self {
         IndexError::TaskJoin
+    }
+}
+
+impl From<native_db::db_type::Error> for IndexError {
+    fn from(error: native_db::db_type::Error) -> Self {
+        match error {
+            native_db::db_type::Error::RedbDatabaseError(
+                redb::DatabaseError::DatabaseAlreadyOpen,
+            ) => IndexError::Catalog(
+                "the catalog is open in another process; wait for it to finish".into(),
+            ),
+            other => IndexError::Native(Box::new(other)),
+        }
     }
 }
 
