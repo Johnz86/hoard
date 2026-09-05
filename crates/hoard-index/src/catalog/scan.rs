@@ -35,7 +35,7 @@ use super::{Catalog, models};
 impl Catalog {
     /// Creates a fresh native catalog directly from configured sources, without opening SQLite.
     /// Existing output directories are refused. Discovery supports the existing source layouts;
-    /// this initial native path indexes files individually and does not group model shards.
+    /// a model split across shard files is one artifact anchored on its lowest shard.
     pub fn scan_sources(
         directory: &Path,
         node: &str,

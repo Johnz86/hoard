@@ -52,6 +52,10 @@ the complete trigger string; they do not implement legacy substring matching.
   sniffed in parallel, its shallowest README and nearest `config.json` feed inference
   exactly as the SQLite scanner does, and the source is written in one transaction.
 - Only weight and dataset formats become artifacts; every file is still an entry record.
+- Shard sets, whether named `model-<n>-of-<m>` or listed by a `*.index.json` weight map,
+  become one artifact anchored on the lowest shard. Members are entries that point at that
+  artifact and have no search row; the anchor's row carries the whole model's size and
+  shard count, and an incomplete set is triage.
 - Unreadable files and git-lfs pointer files are recorded as absent entries without an
   artifact, as the SQLite scanner does.
 - Entries whose inference needs triage carry state `triage`.
@@ -100,27 +104,38 @@ build, output on the same NVMe:
 
 ```
 hoard --config hoard.toml catalog scan --source hf-cache --directory <out>
+hoard catalog search --directory <out> 'state:triage'
 ```
 
-- Wall time: 0.2 s on a warm page cache, under 1 s cold. Only headers are read, and cache
-  blob names already carry the content hash, so no file is hashed.
-- Catalog size: 3.0 MB (`catalog.redb` plus one Tantivy directory).
-- Manifest counts: 1 source, 69 repositories, 134 artifacts, 477 entries.
-- Native `state:triage` returns 80 artifacts.
+- Wall time: 0.3 s on a warm page cache. Only headers are read, and cache blob names
+  already carry the content hash, so no file is hashed.
+- Catalog size: 2.2 MB (2.1 MB `catalog.redb` plus a 44 KB Tantivy directory).
+- Manifest counts: 1 source, 69 repositories, 28 artifacts, 477 entries.
+- Native `state:triage` returns 10 artifacts.
 
 The same source in the SQLite index (`data/hoard.db`) holds 477 entries, 67 repositories,
-28 artifacts and 10 triage artifacts. Entries agree exactly; artifacts do not.
+28 artifacts and 10 triage artifacts. Entries, artifacts and triage now agree exactly; the
+ungrouped shard divergence measured before this change (134 artifacts and 80 triage) is
+gone.
 
-The whole artifact difference is shard grouping. 83 of the 134 native artifacts are named
-`model-<n>-of-<m>.safetensors`; the SQLite scanner collapses each of those sets into one
-artifact named by its repository. The first three names present only in the native catalog
-are `model-00000-of-00014.safetensors`, `model-00001-of-00002.safetensors` and
-`model-00001-of-00003.safetensors`; the first three present only in the SQLite index are
-`Agents-A1`, `NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` and `Qwen3-8B-NVFP4`, which are exactly
-those repository-named shard sets. The triage difference has the same cause: one shard
-header alone rarely carries enough evidence to place a role confidently.
+The two catalogs also agree on every shard set's size and count, including the two
+overlapping sets in `nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4` that both label `model/model`
+and both mark triage: a `*.index.json` claims two of the ten declared files and the naming
+convention takes the remaining eight.
 
-The repository count differs by two (69 native, 67 SQLite). The SQLite index was last
+Two of the 28 names still differ on each side, neither for a grouping reason:
+
+- Native `text_encoder/model.fp16.safetensors`, SQLite `clip_l.safetensors`. The same bytes
+  are in the `comfy` source too. A SQLite artifact row holds one name and `comfy` wrote it;
+  this scan covered `hf-cache` alone.
+- Native `model` and `Ministral-3-14B-Instruct-2512`, SQLite `Ministral-3-14B-Instruct-2512`
+  and `consolidated.safetensors`. The repository has two snapshots: one holds
+  `consolidated.safetensors` alone, the other holds it beside a four shard set. Both
+  catalogs keep the same two artifacts with the same sizes; the names are swapped because a
+  revision names its artifacts by how many artifact units it holds, and the two scanners
+  count the second snapshot's already-seen `consolidated.safetensors` differently.
+
+The repository count still differs by two (69 native, 67 SQLite). The SQLite index was last
 written hours before this scan, so the two runs did not see the same disk. Not
 investigated further.
 
@@ -134,11 +149,10 @@ investigated further.
   usage, peer cursors and the associated graph constraints/cascades.
 - Preserve complete repository Git metadata and add stable cross-scan identities.
 - Add full hash scheduling, progressive identities and content deduplication.
-- Port shard grouping and missing-file policies from the existing scan pipeline. Every
-  shard is currently a separate file, which is the only measured divergence from the
-  SQLite scanner: 83 of 134 artifacts on this workstation's cache are shards that the
-  SQLite scanner collapses into 5 repository-named artifacts, and the ungrouped shard
-  headers also inflate the triage set from 10 to 80.
+- Port the missing-file policies from the existing scan pipeline.
+- Count a revision's artifact units the way the legacy scanner does for a file whose
+  content another revision already claimed. The two scanners disagree on one repository of
+  this workstation's cache, which swaps the names of its two artifacts.
 - Add a read-only open once redb offers one, so searches can run beside a rebuild.
 - Port the complete Hoard grammar, aliases, local-node resolution, exclusions,
   facets, compatibility, shelf expansion and every sorting mode.
