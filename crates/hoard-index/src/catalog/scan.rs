@@ -5,7 +5,7 @@ use native_db::Builder;
 use native_db::transaction::RwTransaction;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
-use hoard_core::{Artifact, ArtifactId, BlobId, EntryId, RepoRowId, State};
+use hoard_core::{Artifact, ArtifactId, BlobId, EntryId, RepoRowId, Sha256, State};
 
 use crate::config::{IndexConfig, SourceConfig};
 use crate::discover::{
@@ -250,11 +250,47 @@ fn revision_name(repo: &DiscoveredRepo, ordinal: usize) -> String {
         })
 }
 
+/// What this disk actually holds for one discovered path, after sniffing has run: an
+/// unreadable file and a git-lfs pointer both stand for bytes that are not here.
+struct Presence {
+    abs_path: Option<PathBuf>,
+    size: u64,
+    sha256: Option<Sha256>,
+    lfs_pointer: bool,
+}
+
+impl Presence {
+    fn of(entry: &DiscoveredEntry, sniffed: Option<&SniffResult>) -> Self {
+        let pointer = sniffed
+            .and_then(|result| result.lfs_pointer.as_ref())
+            .filter(|_| entry.sha256.is_none());
+        match pointer {
+            Some(pointer) => Self {
+                abs_path: None,
+                size: pointer.size,
+                sha256: Some(pointer.sha256),
+                lfs_pointer: true,
+            },
+            None => Self {
+                abs_path: entry.abs_path.clone().filter(|_| sniffed.is_some()),
+                size: entry.size,
+                sha256: entry.sha256,
+                lfs_pointer: entry.lfs_pointer,
+            },
+        }
+    }
+
+    fn present(&self) -> bool {
+        self.abs_path.is_some()
+    }
+}
+
 struct PreparedEntry<'a> {
     discovered: &'a DiscoveredEntry,
     identity: String,
     sniffed: Option<SniffResult>,
     inference: Inference,
+    presence: Presence,
 }
 
 fn prepare_entry(entry: &DiscoveredEntry) -> Result<PreparedEntry<'_>> {
@@ -265,12 +301,18 @@ fn prepare_entry(entry: &DiscoveredEntry) -> Result<PreparedEntry<'_>> {
     let sniffed = entry
         .abs_path
         .as_deref()
-        .map(sniff::sniff_path)
-        .transpose()?;
+        .and_then(|path| match sniff::sniff_path(path) {
+            Ok(result) => Some(result),
+            Err(error) => {
+                tracing::debug!(path = %path.display(), %error, "candidate is unreadable");
+                None
+            }
+        });
+    let presence = Presence::of(entry, sniffed.as_ref());
     let format = sniffed
         .as_ref()
         .map_or(hoard_core::ArtifactFormat::Unknown, |result| result.format);
-    let mut input = InferInput::new(format, path, &entry.rel_path, entry.size);
+    let mut input = InferInput::new(format, path, &entry.rel_path, presence.size);
     if let Some(sniffed) = &sniffed {
         input.tensors = sniffed.tensors.as_ref();
         input.config = sniffed.config.as_ref();
@@ -279,23 +321,31 @@ fn prepare_entry(entry: &DiscoveredEntry) -> Result<PreparedEntry<'_>> {
             .as_ref()
             .map(|readme| readme.frontmatter.as_slice());
     }
-    let identity = match (entry.sha256, entry.git_sha1, entry.abs_path.as_deref()) {
-        (Some(sha), _, _) => format!("sha256:{sha}"),
-        (None, Some(sha), _) => format!("git:{sha}"),
-        (None, None, Some(path)) => format!("path:{}", path.canonicalize()?.display()),
-        (None, None, None) => {
-            return Err(IndexError::Catalog(format!(
-                "absent entry has no content identity: {}",
-                entry.rel_path
-            )));
-        }
-    };
+    let identity = identity(entry, &presence)?;
     Ok(PreparedEntry {
         discovered: entry,
         identity,
         inference: infer::infer(&input),
         sniffed,
+        presence,
     })
+}
+
+fn identity(entry: &DiscoveredEntry, presence: &Presence) -> Result<String> {
+    match (presence.sha256, entry.git_sha1, entry.abs_path.as_deref()) {
+        (Some(sha), _, _) => Ok(format!("sha256:{sha}")),
+        (None, Some(sha), _) => Ok(format!("git:{sha}")),
+        (None, None, Some(path)) => Ok(format!(
+            "path:{}",
+            path.canonicalize()
+                .unwrap_or_else(|_| path.to_path_buf())
+                .display()
+        )),
+        (None, None, None) => Err(IndexError::Catalog(format!(
+            "absent entry has no content identity: {}",
+            entry.rel_path
+        ))),
+    }
 }
 
 struct EntryContext<'a> {
@@ -352,7 +402,7 @@ fn store_entry(
         entry_id,
         artifact_id: artifact.id,
         repo_id: context.repo_id,
-        preference: if prepared.discovered.present() { 15 } else { 9 },
+        preference: if prepared.presence.present() { 15 } else { 9 },
         row,
         git_sha1: prepared.discovered.git_sha1.map(|sha| sha.to_string()),
         repo_org: context.repo.repo.org().map(str::to_owned),
@@ -372,8 +422,8 @@ fn artifact_record(id: i64, prepared: &PreparedEntry<'_>) -> ArtifactRecord {
         artifact: Artifact {
             id: ArtifactId::new(id),
             blob: BlobId::new(id),
-            sha256: prepared.discovered.sha256,
-            size: prepared.discovered.size,
+            sha256: prepared.presence.sha256,
+            size: prepared.presence.size,
             format: prepared
                 .sniffed
                 .as_ref()
@@ -440,7 +490,7 @@ fn search_row(
             RevisionName::Synthetic => None,
         },
         node: context.node.to_owned(),
-        state: if entry.present() {
+        state: if prepared.presence.present() {
             State::Local
         } else {
             State::Remote
@@ -448,7 +498,8 @@ fn search_row(
         pull_progress: None,
         trigger: artifact.trigger.clone(),
         path: entry.rel_path.clone(),
-        abs_path: entry
+        abs_path: prepared
+            .presence
             .abs_path
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
@@ -461,6 +512,6 @@ fn search_row(
         entry_id: EntryId::new(entry_id),
         source: Some(context.source.to_owned()),
         is_symlink: entry.is_symlink,
-        lfs_pointer: entry.lfs_pointer,
+        lfs_pointer: prepared.presence.lfs_pointer,
     }
 }

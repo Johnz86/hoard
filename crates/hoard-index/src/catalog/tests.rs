@@ -349,3 +349,64 @@ fn a_failed_scan_leaves_no_directory_behind() -> Result<()> {
     assert!(!output.exists());
     Ok(())
 }
+
+#[test]
+fn an_unreadable_file_is_recorded_as_absent_instead_of_aborting() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir(&input)?;
+    fs::write(input.join("readable.csv"), "a,b\n1,2\n")?;
+    let locked = input.join("locked.csv");
+    fs::write(&locked, "a,b\n1,2\n")?;
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "test-node",
+        &config,
+        |_, _| {},
+    )?;
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "state:remote")?;
+    assert_eq!(rows.total, 1);
+    assert_eq!(rows.rows[0].name, "locked.csv");
+    assert!(rows.rows[0].abs_path.is_none());
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[test]
+fn an_lfs_pointer_is_indexed_as_the_remote_weights_it_stands_for() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir(&input)?;
+    let oid = "a".repeat(64);
+    fs::write(
+        input.join("model.safetensors"),
+        format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize 123456\n"),
+    )?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "test-node",
+        &config,
+        |_, _| {},
+    )?;
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "")?;
+    assert_eq!(rows.total, 1);
+    let row = &rows.rows[0];
+    assert!(row.lfs_pointer);
+    assert_eq!(row.size, 123_456);
+    assert_eq!(row.state, hoard_core::State::Remote);
+    assert_eq!(row.blob_sha256.map(|sha| sha.to_string()), Some(oid));
+    assert!(row.abs_path.is_none());
+    Ok(())
+}
