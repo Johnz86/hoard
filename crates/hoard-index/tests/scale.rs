@@ -4,8 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use hoard_index::catalog::{Catalog, SearchRequest};
+use hoard_index::catalog::{Catalog, QueryRequest};
 use hoard_index::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
+use hoard_index::search::{CompileContext, SortKey, SortSpec};
 
 const FILES_PER_DIRECTORY: usize = 1000;
 const PAGE: u32 = 100;
@@ -177,27 +178,22 @@ fn native_catalog_at_scale() {
     let rss_after_scan = peak_rss_kb();
     let ((), rebuild_time) = timed(|| catalog.rebuild_search(|_| {}).expect("rebuild succeeds"));
     let rss_after_rebuild = peak_rss_kb();
-    let page = |offset: u32| {
+    let context = CompileContext::new(jiff::Timestamp::now()).with_local_node("scale");
+    let run = |raw: &str, offset: u32| {
         catalog
-            .search(SearchRequest {
-                query: "",
+            .query(QueryRequest {
+                raw,
+                sort: SortSpec::new(SortKey::Name, false),
                 limit: PAGE,
                 offset,
+                context: &context,
             })
-            .expect("search succeeds")
+            .expect("query succeeds")
     };
-    let (first, first_time) = timed(|| page(0));
+    let (first, first_time) = timed(|| run("", 0));
     let deep_offset = u32::try_from(first.total.saturating_sub(u64::from(PAGE))).unwrap_or(0);
-    let (_, deep_time) = timed(|| page(deep_offset));
-    let (_, filtered_time) = timed(|| {
-        catalog
-            .search(SearchRequest {
-                query: "format:safetensors AND size:[0 TO 999999999999]",
-                limit: PAGE,
-                offset: 0,
-            })
-            .expect("filtered search succeeds")
-    });
+    let (_, deep_time) = timed(|| run("", deep_offset));
+    let (_, filtered_time) = timed(|| run("fmt:safetensors size:>0", 0));
     let disk_apparent = directory_size(&output, apparent);
     let disk_allocated = directory_size(&output, allocated);
 

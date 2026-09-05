@@ -12,13 +12,14 @@ use hoard_core::{
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
 
 use crate::error::{IndexError, Result};
+use crate::search::{SortKey, SortSpec};
 use crate::store::SearchRow;
 
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Manifest, ManifestV1,
     Repository, RepositoryKey, Revision, SearchChange, SearchText, Source, Summary,
 };
-use super::{Catalog, RescanReport, SearchRequest, models};
+use super::{Catalog, QueryPage, QueryRequest, RescanReport, models};
 
 fn running_as_root() -> bool {
     use std::os::unix::fs::MetadataExt;
@@ -56,11 +57,25 @@ fn fixture() -> Result<(TempDir, Catalog)> {
     Ok((directory, catalog))
 }
 
-fn search(catalog: &Catalog, query: &str) -> Result<super::SearchPage> {
-    catalog.search(SearchRequest {
-        query,
+fn search(catalog: &Catalog, raw: &str) -> Result<QueryPage> {
+    let context = catalog.compile_context(raw, jiff::Timestamp::now(), Vec::new())?;
+    catalog.query(QueryRequest {
+        raw,
+        sort: SortSpec::default(),
         limit: 50,
         offset: 0,
+        context: &context,
+    })
+}
+
+fn paged(catalog: &Catalog, limit: u32, offset: u32) -> Result<QueryPage> {
+    let context = catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?;
+    catalog.query(QueryRequest {
+        raw: "",
+        sort: SortSpec::default(),
+        limit,
+        offset,
+        context: &context,
     })
 }
 
@@ -127,7 +142,12 @@ fn filtering_ranges_boolean_queries_and_pagination_are_deterministic() -> Result
     let (_directory, catalog) = fixture()?;
     catalog.rebuild_search(|_| {})?;
     let all = search(&catalog, "")?;
-    assert!(all.rows[0].size > all.rows[1].size);
+    let names: Vec<&str> = all.rows.iter().map(|row| row.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["tiny.jsonl", "training.csv"],
+        "the default order is name"
+    );
     assert_eq!(search(&catalog, "format:csv node:test-node")?.total, 1);
     assert_eq!(search(&catalog, "format:csv,jsonl")?.total, 2);
     assert_eq!(
@@ -137,48 +157,14 @@ fn filtering_ranges_boolean_queries_and_pagination_are_deterministic() -> Result
     );
     assert_eq!(search(&catalog, "size:<=20b")?.total, 1);
     assert_eq!(search(&catalog, "training")?.total, 1);
-    let first = catalog.search(SearchRequest {
-        query: "",
-        limit: 1,
-        offset: 0,
-    })?;
-    let second = catalog.search(SearchRequest {
-        query: "",
-        limit: 1,
-        offset: 1,
-    })?;
+    let first = paged(&catalog, 1, 0)?;
+    let second = paged(&catalog, 1, 1)?;
     assert_eq!(first.total, 2);
     assert_eq!(first.rows, vec![all.rows[0].clone()]);
     assert_eq!(second.rows, vec![all.rows[1].clone()]);
-    assert!(
-        catalog
-            .search(SearchRequest {
-                query: "",
-                limit: 0,
-                offset: 0
-            })?
-            .rows
-            .is_empty()
-    );
-    assert!(
-        catalog
-            .search(SearchRequest {
-                query: "",
-                limit: 50,
-                offset: u32::MAX
-            })?
-            .rows
-            .is_empty()
-    );
-    assert!(
-        catalog
-            .search(SearchRequest {
-                query: "",
-                limit: 1001,
-                offset: 0
-            })
-            .is_err()
-    );
+    assert!(paged(&catalog, 0, 0)?.rows.is_empty());
+    assert!(paged(&catalog, 50, u32::MAX)?.rows.is_empty());
+    assert!(paged(&catalog, 1001, 0).is_err());
     assert_eq!(
         search(&catalog, "unknown_field:csv")?.total,
         0,
@@ -1008,6 +994,120 @@ fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
 }
 
 #[test]
+fn the_grammar_sorts_facets_and_counts_like_the_index_screen() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("loras"))?;
+    fs::write(input.join("loras/b-style.safetensors"), lora_header())?;
+    fs::write(input.join("loras/a-style.safetensors"), lora_header())?;
+    fs::write(input.join("data.csv"), "x,y\n1,2\n")?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    let by_name = catalog.query(QueryRequest {
+        raw: "",
+        sort: SortSpec::new(SortKey::Name, false),
+        limit: 10,
+        offset: 0,
+        context: &catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?,
+    })?;
+    assert_eq!(by_name.total, 3);
+    assert_eq!(by_name.nodes, 1);
+    let names: Vec<&str> = by_name.rows.iter().map(|row| row.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["a-style.safetensors", "b-style.safetensors", "data.csv"]
+    );
+    let roles: Vec<(&str, u64)> = by_name
+        .facets
+        .role
+        .iter()
+        .map(|bucket| (bucket.value.as_str(), bucket.count))
+        .collect();
+    assert!(roles.contains(&("lora", 2)), "{roles:?}");
+    assert!(
+        by_name
+            .facets
+            .format
+            .iter()
+            .any(|bucket| bucket.value == "csv" && bucket.count == 1)
+    );
+
+    let filtered = search(&catalog, "role:lora")?;
+    assert_eq!(filtered.total, 2);
+    assert!(
+        filtered
+            .facets
+            .role
+            .iter()
+            .any(|bucket| bucket.value == "lora" && bucket.active)
+    );
+    assert!(
+        filtered
+            .facets
+            .format
+            .iter()
+            .all(|bucket| bucket.value != "csv"),
+        "format buckets are counted within the role filter"
+    );
+    assert!(
+        filtered
+            .facets
+            .role
+            .iter()
+            .any(|bucket| bucket.value != "lora"),
+        "role buckets are counted with the role filter excluded: {:?}",
+        filtered.facets.role
+    );
+    assert_eq!(search(&catalog, "-role:lora")?.total, 1);
+    assert_eq!(search(&catalog, "role:lora,ds")?.total, 3);
+    assert_eq!(search(&catalog, "size:>1000000")?.total, 0);
+    assert_eq!(search(&catalog, "used:>30d")?.total, 0);
+    assert_eq!(search(&catalog, "node:self")?.total, 3);
+    assert_eq!(search(&catalog, "dupe:true")?.total, 0);
+    assert_eq!(search(&catalog, "style")?.total, 2);
+    assert_eq!(
+        search(&catalog, "~sty")?.total,
+        2,
+        "fuzzy text is a prefix match"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_shelf_and_a_compat_target_resolve_against_the_catalog() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("loras"))?;
+    fs::write(input.join("loras/style.safetensors"), lora_header())?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    let shelves = vec![("adapters".to_owned(), "role:lora".to_owned())];
+    let context = catalog.compile_context("shelf:adapters", jiff::Timestamp::now(), shelves)?;
+    let page = catalog.query(QueryRequest {
+        raw: "shelf:adapters",
+        sort: SortSpec::default(),
+        limit: 10,
+        offset: 0,
+        context: &context,
+    })?;
+    assert_eq!(page.total, 1);
+    let context = catalog.compile_context("compat:style", jiff::Timestamp::now(), Vec::new())?;
+    assert!(
+        context.compat.is_some(),
+        "the target resolves through free text"
+    );
+    Ok(())
+}
+
+#[test]
 fn disk_pressure_is_summarised_after_every_sweep() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("files");
@@ -1703,11 +1803,7 @@ fn shards_group_across_chunk_boundaries() -> Result<()> {
         .collect();
     hf_cache_repo(&hub, "acme", "wide", &borrowed)?;
     let catalog = scan_hub(directory.path(), &hub)?;
-    let rows = catalog.search(SearchRequest {
-        query: "",
-        limit: 1000,
-        offset: 0,
-    })?;
+    let rows = paged(&catalog, 1000, 0)?;
     assert_eq!(rows.total, 301, "300 standalone files plus one shard set");
     let set: Vec<&SearchRow> = rows
         .rows

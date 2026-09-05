@@ -18,7 +18,7 @@ use crate::store::DiskPressure;
 use self::models::{Manifest, Summary, define_models};
 
 pub use self::scan::RescanReport;
-pub use self::search::{SearchPage, SearchRequest};
+pub use self::search::{QueryPage, QueryRequest};
 
 /// One redb table's share of the catalog file: the rows it holds, the bytes those rows
 /// occupy, and the bytes a compaction would reclaim.

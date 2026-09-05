@@ -96,7 +96,8 @@ fn canonical_key(key: &str) -> String {
     }
 }
 
-fn quoted(value: &str) -> String {
+/// Quotes a grammar value that would otherwise tokenize as more than one word.
+pub fn quoted(value: &str) -> String {
     match value.contains(char::is_whitespace) || value.contains('"') {
         true => format!("\"{}\"", value.replace('"', "")),
         false => value.to_owned(),

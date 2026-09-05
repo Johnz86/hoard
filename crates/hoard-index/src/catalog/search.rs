@@ -5,14 +5,20 @@ use std::sync::RwLockReadGuard;
 
 use serde::Serialize;
 use tantivy::collector::{Collector, SegmentCollector};
+use tantivy::columnar::StrColumn;
 use tantivy::fastfield::Column;
+use tantivy::query::{BooleanQuery, QueryClone};
 use tantivy::schema::{FAST, Field, INDEXED, STRING, Schema, TEXT, TantivyDocument};
-use tantivy::{DocId, Index, Score, SegmentOrdinal, SegmentReader, Term};
+use tantivy::{DocId, Index, Score, Searcher, SegmentOrdinal, SegmentReader, Term};
 
 use hoard_core::{EntryId, RepoRowId};
 
-use crate::search::{CompileContext, parse};
-use crate::store::SearchRow;
+use crate::search::facets::quoted;
+use crate::search::{
+    CompatTarget, CompileContext, FACET_DIMENSIONS, Facets, ParsedQuery, SortKey, SortSpec,
+    TokenKind, parse,
+};
+use crate::store::{FacetBucket, SearchRow};
 
 use super::models::{
     ArtifactRecord, Entry, EntryKey, Manifest, Repository, Revision, SearchChange, SearchText,
@@ -25,6 +31,16 @@ use super::{Catalog, OpenIndex};
 const WRITER_BUDGET: usize = 32 * 1024 * 1024;
 /// How many logged changes one Tantivy commit and one prune transaction cover.
 const REFRESH_BATCH: usize = 4096;
+/// The largest page one query may ask for.
+const PAGE_LIMIT: u32 = 1000;
+/// How many rows a `compat:` probe reads before choosing a target.
+const COMPAT_PROBE: u32 = 32;
+const BASE_DIMENSION: usize = 1;
+const NODE_DIMENSION: usize = 4;
+const BASE_LABEL_COLUMN: &str = "base_label";
+/// The five facet dimensions, named as the columns a collapsed hit carries them in.
+const FACET_COLUMNS: [&str; FACET_DIMENSIONS.len()] =
+    ["role", "base", "format", "precision", "node"];
 pub(super) const ROLE_FIELD: usize = 0;
 pub(super) const SUB_ROLE_FIELD: usize = 1;
 pub(super) const BASE_FIELD: usize = 2;
@@ -54,21 +70,28 @@ const KEYWORD_FIELDS: [&str; 13] = [
     "trigger",
 ];
 
-/// Native search speaks Hoard's own query grammar. Shelves and `compat:` targets need a
-/// context this entry point does not carry yet, so a query naming one is refused.
-#[derive(Debug, Clone, Copy)]
-pub struct SearchRequest<'a> {
-    pub query: &'a str,
+/// One query of Hoard's own grammar, the one the search bar, `hoard ls` and shelves speak.
+/// The context carries what the text does not: the shelves, the local node alias and the
+/// resolved `compat:` target, all of which [`Catalog::compile_context`] produces.
+#[derive(Debug, Clone)]
+pub struct QueryRequest<'a> {
+    pub raw: &'a str,
+    pub sort: SortSpec,
     pub limit: u32,
     pub offset: u32,
+    pub context: &'a CompileContext,
 }
 
-/// Artifacts are sorted by descending size, then ID. Entry selection happens after filtering,
-/// choosing the highest availability preference and then the lowest entry ID.
+/// A page of artifacts with the counts the index screen prints beside it. Entry selection
+/// happens after filtering, choosing the highest availability preference and then the
+/// lowest entry id; `nodes` counts the nodes those preferred entries sit on.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct SearchPage {
-    pub total: u64,
+pub struct QueryPage {
+    pub query: ParsedQuery,
     pub rows: Vec<SearchRow>,
+    pub total: u64,
+    pub nodes: u64,
+    pub facets: Facets,
 }
 
 impl Catalog {
@@ -320,9 +343,64 @@ impl Catalog {
             .map_err(|_| IndexError::Catalog("search cache poisoned".into()))
     }
 
-    pub fn search(&self, request: SearchRequest<'_>) -> Result<SearchPage> {
-        if request.limit > 1000 {
-            return Err(IndexError::Query("page limit must be at most 1000".into()));
+    /// Everything `compile` needs that the query text does not carry: the shelves given,
+    /// this catalog's node as the local alias, and the `compat:` target resolved by
+    /// querying this catalog (a `repo:` probe first, then free text, preferring a host role).
+    pub fn compile_context(
+        &self,
+        raw: &str,
+        now: jiff::Timestamp,
+        shelves: Vec<(String, String)>,
+    ) -> Result<CompileContext> {
+        let mut context = CompileContext::new(now)
+            .with_local_node(self.manifest()?.node)
+            .with_shelves(shelves);
+        let parsed = parse(raw);
+        let Some(token) = parsed
+            .tokens
+            .iter()
+            .find(|token| token.kind == TokenKind::Compat)
+        else {
+            return Ok(context);
+        };
+        if let Some(target) = self.compat_target(&token.normalized, now)? {
+            context = context.with_compat(target);
+        }
+        Ok(context)
+    }
+
+    /// What a `compat:` value names, because the rule reads a role and a base rather than a
+    /// string. A repository reference wins over free text, and a host wins over an adapter.
+    fn compat_target(&self, value: &str, now: jiff::Timestamp) -> Result<Option<CompatTarget>> {
+        let context = CompileContext::new(now);
+        for probe in [format!("repo:{}", quoted(value)), quoted(value)] {
+            let page = self.query(QueryRequest {
+                raw: &probe,
+                sort: SortSpec::new(SortKey::Size, true),
+                limit: COMPAT_PROBE,
+                offset: 0,
+                context: &context,
+            })?;
+            if let Some(row) = page
+                .rows
+                .iter()
+                .find(|row| row.role.is_host())
+                .or_else(|| page.rows.first())
+            {
+                return Ok(Some(CompatTarget::new(row.role, row.base.clone())));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Runs one query of Hoard's grammar: the page of rows in the requested order, the
+    /// distinct artifact and node totals, and every facet dimension counted with its own
+    /// key excluded. Refuses a stale or unbuilt index.
+    pub fn query(&self, request: QueryRequest<'_>) -> Result<QueryPage> {
+        if request.limit > PAGE_LIMIT {
+            return Err(IndexError::Query(format!(
+                "page limit must be at most {PAGE_LIMIT}"
+            )));
         }
         let manifest = self.manifest()?;
         let directory = manifest
@@ -342,32 +420,83 @@ impl Catalog {
             .as_ref()
             .ok_or_else(|| IndexError::Catalog("search index was closed".into()))?;
         let (_, fields) = Fields::build();
-        let context =
-            CompileContext::new(jiff::Timestamp::now()).with_local_node(manifest.node.clone());
-        let query = query::compile(
-            &parse(request.query).tokens,
-            None,
-            &QueryFields {
-                fields: &fields,
-                context: &context,
-            },
+        let bound = QueryFields {
+            fields: &fields,
+            context: request.context,
+        };
+        let parsed = parse(request.raw);
+        let searcher = open.reader.searcher();
+        let hits = searcher.search(
+            query::compile(&parsed.tokens, None, &bound)?.as_ref(),
+            &ArtifactCollector { sort: request.sort },
         )?;
-        let candidates = open
-            .reader
-            .searcher()
-            .search(query.as_ref(), &ArtifactCollector)?;
-        let total = candidates.len() as u64;
-        let mut hits: Vec<_> = candidates.into_values().collect();
-        let page_end = (u64::from(request.offset) + u64::from(request.limit)).min(total) as usize;
-        if page_end < hits.len() {
-            hits.select_nth_unstable_by_key(page_end, Hit::sort_key);
-            hits.truncate(page_end);
+        let total = hits.len() as u64;
+        let nodes = hits
+            .values()
+            .map(|hit| hit.facets[NODE_DIMENSION].as_str())
+            .collect::<std::collections::HashSet<&str>>()
+            .len() as u64;
+        let facets = self.facets(&searcher, &parsed, &bound, &hits)?;
+        let rows = self.rows(page_of(hits, &request), &manifest.node)?;
+        Ok(QueryPage {
+            query: parsed,
+            rows,
+            total,
+            nodes,
+            facets,
+        })
+    }
+
+    /// Each dimension counted over the collapsed set its own key does not narrow, which is
+    /// what keeps a facet click from reducing the rail it was clicked in to one bucket.
+    fn facets(
+        &self,
+        searcher: &Searcher,
+        parsed: &ParsedQuery,
+        bound: &QueryFields<'_>,
+        hits: &HashMap<i64, Hit>,
+    ) -> Result<Facets> {
+        let mut dimensions: [Vec<FacetBucket>; FACET_DIMENSIONS.len()] =
+            std::array::from_fn(|_| Vec::new());
+        for (index, (key, _)) in FACET_DIMENSIONS.iter().enumerate() {
+            let excluded = query::compile(&parsed.tokens, Some(key), bound)?;
+            let narrowed = match parsed.tokens_with_key(key).next() {
+                Some(_) => Some(searcher.search(excluded.as_ref(), &collector())?),
+                None => None,
+            };
+            let labelled = index == BASE_DIMENSION;
+            let mut buckets = count_buckets(narrowed.as_ref().unwrap_or(hits), index, labelled);
+            if labelled {
+                for bucket in &mut buckets {
+                    let scoped = BooleanQuery::intersection(vec![
+                        excluded.box_clone(),
+                        query::base_filter(bound.fields, &bucket.value),
+                    ]);
+                    bucket.count = searcher.search(&scoped, &collector())?.len() as u64;
+                }
+                order_buckets(&mut buckets);
+            }
+            dimensions[index] = buckets;
         }
-        hits.sort_unstable_by_key(Hit::sort_key);
+        let [role, base, format, precision, node] = dimensions;
+        let mut facets = Facets {
+            role,
+            base,
+            format,
+            precision,
+            node,
+            disk_pressure: self.disk_pressure()?,
+        };
+        facets.mark_query(parsed);
+        Ok(facets)
+    }
+
+    /// The rows one page of collapsed hits stands for. Nothing but this page is read back.
+    fn rows(&self, hits: Vec<Hit>, node: &str) -> Result<Vec<SearchRow>> {
         let snapshot = self.database.r_transaction()?;
         let mut repositories: HashMap<i64, Repository> = HashMap::new();
-        let mut rows = Vec::with_capacity(hits.len().saturating_sub(request.offset as usize));
-        for hit in hits.into_iter().skip(request.offset as usize) {
+        let mut rows = Vec::with_capacity(hits.len());
+        for hit in hits {
             let entry: Entry = snapshot.get().primary(hit.entry_id)?.ok_or_else(|| {
                 IndexError::Catalog(format!("search references missing entry {}", hit.entry_id))
             })?;
@@ -396,11 +525,99 @@ impl Catalog {
                 entry: &entry,
                 repository,
                 artifact: &artifact,
-                node: &manifest.node,
+                node,
             }));
         }
-        Ok(SearchPage { total, rows })
+        Ok(rows)
     }
+}
+
+/// The requested page of the collapsed set, ordered by the sort column and then by artifact
+/// id so paging is stable however many artifacts share a value.
+fn page_of(hits: HashMap<i64, Hit>, request: &QueryRequest<'_>) -> Vec<Hit> {
+    let descending = request.sort.descending;
+    let mut hits: Vec<Hit> = hits.into_values().collect();
+    let total = hits.len() as u64;
+    let page_end = (u64::from(request.offset) + u64::from(request.limit)).min(total) as usize;
+    if page_end < hits.len() {
+        hits.select_nth_unstable_by(page_end, |left, right| precedes(left, right, descending));
+        hits.truncate(page_end);
+    }
+    hits.sort_unstable_by(|left, right| precedes(left, right, descending));
+    hits.split_off((request.offset as usize).min(hits.len()))
+}
+
+fn precedes(left: &Hit, right: &Hit, descending: bool) -> std::cmp::Ordering {
+    let ordering = left.sort.cmp(&right.sort);
+    let ordering = match descending {
+        true => ordering.reverse(),
+        false => ordering,
+    };
+    ordering.then_with(|| left.artifact_id.cmp(&right.artifact_id))
+}
+
+fn collector() -> ArtifactCollector {
+    ArtifactCollector {
+        sort: SortSpec::new(SortKey::Size, true),
+    }
+}
+
+/// One value of one dimension while it is being counted, with the spelling every artifact in
+/// it agreed on, if they did.
+#[derive(Default)]
+struct Tally<'a> {
+    count: u64,
+    label: Option<&'a str>,
+    seen: bool,
+}
+
+impl<'a> Tally<'a> {
+    fn observe(&mut self, label: &'a str) {
+        let offered = (!label.is_empty()).then_some(label);
+        match self.seen {
+            false => {
+                self.seen = true;
+                self.label = offered;
+            }
+            true if self.label != offered => self.label = None,
+            true => {}
+        }
+    }
+}
+
+fn count_buckets(hits: &HashMap<i64, Hit>, dimension: usize, labelled: bool) -> Vec<FacetBucket> {
+    let mut tallies: HashMap<&str, Tally<'_>> = HashMap::new();
+    for hit in hits.values() {
+        let value = hit.facets[dimension].as_str();
+        if value.is_empty() {
+            continue;
+        }
+        let tally = tallies.entry(value).or_default();
+        tally.count += 1;
+        if labelled {
+            tally.observe(hit.base_label.as_str());
+        }
+    }
+    let mut buckets: Vec<FacetBucket> = tallies
+        .into_iter()
+        .map(|(value, tally)| FacetBucket {
+            value: value.to_owned(),
+            label: tally.label.map(str::to_owned),
+            count: tally.count,
+            active: false,
+        })
+        .collect();
+    order_buckets(&mut buckets);
+    buckets
+}
+
+fn order_buckets(buckets: &mut [FacetBucket]) {
+    buckets.sort_unstable_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.value.cmp(&right.value))
+    });
 }
 
 pub(super) struct Fields {
@@ -655,33 +872,116 @@ fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The value a hit is ordered by. Every hit of one query carries the same variant, because
+/// one query has one sort column.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SortValue {
+    Text(String),
+    Number(u64),
+}
+
+/// One artifact's best entry, with everything ordering and the facet rail need, so a page
+/// and its counts are produced without reading the database per hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Hit {
     artifact_id: i64,
     entry_id: i64,
     preference: i64,
-    size: u64,
+    sort: SortValue,
+    facets: [String; FACET_COLUMNS.len()],
+    base_label: String,
 }
 
 impl Hit {
-    fn sort_key(&self) -> (Reverse<u64>, i64) {
-        (Reverse(self.size), self.artifact_id)
+    fn retain(self, hits: &mut HashMap<i64, Self>) {
+        match hits.entry(self.artifact_id) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                if self.preferred_over(slot.get()) {
+                    slot.insert(self);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(self);
+            }
+        }
     }
 
-    fn retain(self, hits: &mut HashMap<i64, Self>) {
-        hits.entry(self.artifact_id)
-            .and_modify(|current| {
-                if (self.preference, Reverse(self.entry_id))
-                    > (current.preference, Reverse(current.entry_id))
-                {
-                    *current = self;
-                }
-            })
-            .or_insert(self);
+    fn preferred_over(&self, other: &Self) -> bool {
+        (self.preference, Reverse(self.entry_id)) > (other.preference, Reverse(other.entry_id))
     }
 }
 
-struct ArtifactCollector;
+/// A string fast column with the ordinals this segment has already spelled out, so a value
+/// repeated across a segment is decoded once.
+#[derive(Default)]
+struct StringColumn {
+    column: Option<StrColumn>,
+    spelled: HashMap<u64, String>,
+}
+
+impl StringColumn {
+    fn open(segment: &SegmentReader, name: &str) -> tantivy::Result<Self> {
+        Ok(Self {
+            column: segment.fast_fields().str(name)?,
+            spelled: HashMap::new(),
+        })
+    }
+
+    fn value(&mut self, doc: DocId) -> tantivy::Result<String> {
+        let Some(column) = &self.column else {
+            return Ok(String::new());
+        };
+        let Some(ordinal) = column.term_ords(doc).next() else {
+            return Ok(String::new());
+        };
+        if let Some(spelled) = self.spelled.get(&ordinal) {
+            return Ok(spelled.clone());
+        }
+        let mut value = String::new();
+        if !column.ord_to_str(ordinal, &mut value)? {
+            value.clear();
+        }
+        self.spelled.insert(ordinal, value.clone());
+        Ok(value)
+    }
+}
+
+/// How one segment reads the sort column: the size fast field, a string column, or nothing
+/// at all for a column the native catalog does not carry yet.
+enum SortColumn {
+    Size,
+    Absent,
+    Text(StringColumn),
+}
+
+impl SortColumn {
+    fn open(segment: &SegmentReader, key: SortKey) -> tantivy::Result<Self> {
+        match key {
+            SortKey::Size => Ok(SortColumn::Size),
+            SortKey::Used => Ok(SortColumn::Absent),
+            SortKey::Role
+            | SortKey::Name
+            | SortKey::Base
+            | SortKey::Format
+            | SortKey::Precision
+            | SortKey::Revision
+            | SortKey::Node
+            | SortKey::State => Ok(SortColumn::Text(StringColumn::open(segment, key.column())?)),
+        }
+    }
+
+    fn value(&mut self, doc: DocId, size: u64) -> tantivy::Result<SortValue> {
+        match self {
+            SortColumn::Size => Ok(SortValue::Number(size)),
+            SortColumn::Absent => Ok(SortValue::Text(String::new())),
+            SortColumn::Text(column) => Ok(SortValue::Text(column.value(doc)?)),
+        }
+    }
+}
+
+struct ArtifactCollector {
+    sort: SortSpec,
+}
 
 impl Collector for ArtifactCollector {
     type Fruit = HashMap<i64, Hit>;
@@ -693,11 +993,18 @@ impl Collector for ArtifactCollector {
         segment: &SegmentReader,
     ) -> tantivy::Result<Self::Child> {
         let fields = segment.fast_fields();
+        let mut facets = FACET_COLUMNS.map(|_| StringColumn::default());
+        for (column, name) in facets.iter_mut().zip(FACET_COLUMNS) {
+            *column = StringColumn::open(segment, name)?;
+        }
         Ok(ArtifactSegmentCollector {
             artifact: fields.i64("artifact_id")?,
             entry: fields.i64("entry_id")?,
             preference: fields.i64("preference")?,
             size: fields.u64("size")?,
+            sort: SortColumn::open(segment, self.sort.key)?,
+            base_label: StringColumn::open(segment, BASE_LABEL_COLUMN)?,
+            facets,
             hits: HashMap::new(),
             invalid: false,
         })
@@ -726,30 +1033,46 @@ struct ArtifactSegmentCollector {
     entry: Column<i64>,
     preference: Column<i64>,
     size: Column<u64>,
+    sort: SortColumn,
+    base_label: StringColumn,
+    facets: [StringColumn; FACET_COLUMNS.len()],
     hits: HashMap<i64, Hit>,
     invalid: bool,
 }
 
-impl SegmentCollector for ArtifactSegmentCollector {
-    type Fruit = tantivy::Result<HashMap<i64, Hit>>;
-
-    fn collect(&mut self, doc: DocId, _: Score) {
+impl ArtifactSegmentCollector {
+    fn hit(&mut self, doc: DocId) -> tantivy::Result<Option<Hit>> {
         let (Some(artifact_id), Some(entry_id), Some(preference), Some(size)) = (
             self.artifact.first(doc),
             self.entry.first(doc),
             self.preference.first(doc),
             self.size.first(doc),
         ) else {
-            self.invalid = true;
-            return;
+            return Ok(None);
         };
-        Hit {
+        let mut facets = FACET_COLUMNS.map(|_| String::new());
+        for (value, column) in facets.iter_mut().zip(self.facets.iter_mut()) {
+            *value = column.value(doc)?;
+        }
+        Ok(Some(Hit {
             artifact_id,
             entry_id,
             preference,
-            size,
+            sort: self.sort.value(doc, size)?,
+            base_label: self.base_label.value(doc)?,
+            facets,
+        }))
+    }
+}
+
+impl SegmentCollector for ArtifactSegmentCollector {
+    type Fruit = tantivy::Result<HashMap<i64, Hit>>;
+
+    fn collect(&mut self, doc: DocId, _: Score) {
+        match self.hit(doc) {
+            Ok(Some(hit)) => hit.retain(&mut self.hits),
+            Ok(None) | Err(_) => self.invalid = true,
         }
-        .retain(&mut self.hits);
     }
 
     fn harvest(self) -> Self::Fruit {

@@ -164,7 +164,7 @@ fn base_matches(field: Field, value: &str) -> Vec<Box<dyn Query>> {
 /// `base:` as a filter: the family asked for, or a family it prefixes either way, never
 /// `any`. `any` states that an artifact works with every architecture, which is a claim
 /// about compatibility rather than about belonging to a family.
-fn base_filter(schema: &Fields, value: &str) -> Box<dyn Query> {
+pub(super) fn base_filter(schema: &Fields, value: &str) -> Box<dyn Query> {
     let field = schema.keyword(BASE_FIELD);
     Box::new(BooleanQuery::new(vec![
         (Occur::Must, any_of(base_matches(field, value))),

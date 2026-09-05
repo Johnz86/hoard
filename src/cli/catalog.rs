@@ -5,7 +5,8 @@ use anyhow::{Context as _, Result};
 use clap::Subcommand;
 use serde_json::json;
 
-use hoard_index::catalog::{Catalog, SearchRequest};
+use hoard_index::catalog::{Catalog, QueryRequest};
+use hoard_index::search::{SortKey, SortSpec};
 
 use super::scan::progress_bar;
 
@@ -20,13 +21,19 @@ pub enum CatalogCommand {
         #[arg(long)]
         source: Option<String>,
     },
-    /// Search a native catalog using Tantivy syntax, not the legacy Hoard grammar.
+    /// Search a native catalog with Hoard's query grammar, the same one hoard ls and the
+    /// search bar use.
     Search {
         #[arg(long)]
         directory: PathBuf,
-        /// Bare words are ANDed. Example: role:lora AND size:[0 TO 400000000].
+        /// Tokens are ANDed, comma values ORed. Example: role:lora base:sdxl size:<400mb.
         #[arg(default_value = "")]
         query: String,
+        /// One of role, name, base, format, precision, size, revision, node, state, used.
+        #[arg(long, default_value = "name")]
+        sort: String,
+        #[arg(long)]
+        desc: bool,
         #[arg(long, default_value_t = 50)]
         limit: u32,
         #[arg(long, default_value_t = 0)]
@@ -115,14 +122,21 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
         CatalogCommand::Search {
             directory,
             query,
+            sort,
+            desc,
             limit,
             offset,
         } => {
             let catalog = Catalog::open(&directory)?;
-            let result = catalog.search(SearchRequest {
-                query: &query,
+            let context = catalog
+                .compile_context(&query, jiff::Timestamp::now(), Vec::new())
+                .context("resolving the query context")?;
+            let result = catalog.query(QueryRequest {
+                raw: &query,
+                sort: SortSpec::new(sort.parse::<SortKey>()?, desc),
                 limit,
                 offset,
+                context: &context,
             })?;
             report(&result)?;
         }
@@ -178,8 +192,8 @@ mod tests {
             "3",
         ])?;
         assert!(matches!(command.command, Command::Catalog {
-            command: CatalogCommand::Search { query, limit: 12, offset: 3, .. }
-        } if query == "role:lora"));
+            command: CatalogCommand::Search { query, sort, desc: false, limit: 12, offset: 3, .. }
+        } if query == "role:lora" && sort == "name"));
         Ok(())
     }
 }

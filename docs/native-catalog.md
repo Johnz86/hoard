@@ -26,7 +26,8 @@ refreshed from the change log afterwards, or built when there is none yet.
 cargo run -- catalog scan --directory /existing/path/native-catalog
 cargo run -- --config hoard.toml catalog scan --source cache --directory /existing/path/native-cache
 cargo run -- catalog search --directory /existing/path/native-catalog 'format:gguf'
-cargo run -- catalog search --directory /existing/path/native-catalog 'role:lora AND size:[0 TO 400000000]'
+cargo run -- catalog search --directory /existing/path/native-catalog 'role:lora size:<400mb'
+cargo run -- catalog search --directory /existing/path/native-catalog --sort size --desc 'base:sdxl'
 cargo run -- catalog status --directory /existing/path/native-catalog
 cargo run -- catalog rebuild --directory /existing/path/native-catalog
 ```
@@ -35,17 +36,46 @@ Only one process may open a catalog directory at a time; redb takes an exclusive
 run `search`, `status` and `rebuild` one after another. A scan that fails removes the
 directory it started; a source whose root is missing is skipped with a warning.
 
-Search uses Tantivy query syntax. Bare words are ANDed; quoted phrases, `AND`, `OR`,
-`NOT`, exact field filters and numeric byte ranges are supported. It does not yet
-compile Hoard's existing search grammar, shelves or compatibility expressions.
-Keywords use exact spelling. Results use descending size and ascending artifact ID;
-`--limit` is capped at 1,000 and `--offset` selects the page.
+Search speaks Hoard's own query grammar, the one the search bar, `hoard ls` and shelves
+use. Tokens combine with AND, a token's comma-separated values with OR, and a leading `-`
+negates the whole token. Every token kind compiles:
 
-Exact fields: `role`, `sub_role`, `base`, `format`, `precision`, `node`, `state`,
-`source`, `repo`, `revision`, `org`, `hash`, `trigger`. `size` is a numeric byte count.
-Free text indexes names, organizations, bases, triggers, tensor key prefixes and
-the body of the shallowest README in each revision. Trigger field filters currently match
-the complete trigger string; they do not implement legacy substring matching.
+- `role:` matches the role, and narrows to a sub-role when the spelling names one, so
+  `role:ip-adapter` is `lora` with sub-role `ipa`.
+- `base:` (also `arch:`) matches a family or a family it prefixes either way, and never
+  matches `any`, which is a claim about compatibility rather than about a family.
+- `format:` (`fmt:`), `precision:` (`prec:`, `quant:`), `state:` and `source:` (`src:`) are
+  equality on that column.
+- `node:` (`host:`) matches the node, resolving `self`, `me`, `local` and `here` to this
+  catalog's own node.
+- `rev:` (`revision:`, `tag:`, `branch:`) matches the revision name or a prefix of its sha.
+- `repo:` matches the qualified name or any suffix of it, so `repo:name` finds
+  `models/org/name`.
+- `org:` (`owner:`) matches the artifact's org or the repository's org.
+- `hash:` (`sha:`, `sha256:`) matches a sha256 exactly or by prefix, and a git blob sha
+  exactly.
+- `trigger:` (`triggers:`) matches the whole trigger string or one of its words.
+- `dupe:` (`duplicate:`) selects artifacts reached by more than one path.
+- `size:` compares a byte count with `<`, `<=`, `>`, `>=` or none for equality; a bare
+  number is megabytes, so byte counts need the `b` suffix.
+- `used:` matches nothing, because the native catalog carries no usage yet.
+- `compat:` resolves its value against this catalog and then matches the roles and bases
+  that plug into it; a value naming nothing is not an error, it resolves to no target and
+  the token is refused.
+- `shelf:` expands the named shelf's stored query, up to four levels deep.
+- Anything else is free text: every word has to appear, and `~` in front also accepts the
+  words as prefixes. A key the grammar does not know is free text carrying a warning.
+
+Two documented divergences from the SQL compiler: free text and `trigger:` match whole
+words or the whole stored string rather than substrings, and `used:` matches nothing.
+
+`--sort` takes `role`, `name`, `base`, `format`, `precision`, `size`, `revision`, `node`,
+`state` or `used`, defaults to `name`, and `--desc` reverses it; every order ends on
+ascending artifact id so paging is stable. `--limit` is capped at 1,000 and `--offset`
+selects the page.
+
+Free text indexes names, organizations, bases, triggers, tensor key prefixes and the body
+of the shallowest README in each revision.
 
 ## What is implemented
 
@@ -85,6 +115,17 @@ the complete trigger string; they do not implement legacy substring matching.
   pays for neither a fresh mmap directory nor a directory watcher.
 - A custom Tantivy collector produces exact distinct artifact totals and chooses the
   preferred entry after filtering. Only the result page is loaded from native_db.
+- One `Catalog::query` answers a whole index screen: the page in any of the ten sort
+  orders, the distinct artifact and node totals, and the five facet dimensions. Each
+  dimension is counted over the query with its own key excluded, so clicking a bucket
+  never collapses the rail it was clicked in; `base` buckets are counted by running each
+  bucket's own query, because the prefix rule does not group. Node counts are per preferred
+  entry, which is the same number the SQL rule gives while a catalog holds one node.
+- Keyword columns are string fast fields, so the collapse collector reads the sort value
+  and the five facet values per retained artifact without a second pass, spelling each
+  ordinal once per segment.
+- DISK PRESSURE is a summary record the artifact sweep refreshes: the bytes duplicated
+  paths waste and how many artifacts waste them.
 - Ids come from a persisted allocator and the generation increments per rescan; artifact
   path counts are swept from the entry index after every scan and orphaned artifacts are
   removed.
@@ -248,9 +289,10 @@ remains a go for continuing the replacement.
   two distinct non-UTF-8 paths, and a byte-exact identity must land with the identity
   redesign.
 - Bound the search collector: it materializes one candidate per matching artifact per
-  segment, so the empty query costs memory proportional to the catalog on every call;
-  replace it with a bounded heap keyed on (size, artifact id) plus an exact distinct count
-  before wiring search into serve.
+  segment, and that candidate now also carries the sort value, the five facet strings and
+  the base label, so the empty query costs memory proportional to the catalog on every
+  call; replace it with a bounded heap plus an exact distinct count and a separate facet
+  pass before wiring search into serve.
 - Shrink the per-entry record further: revision, repository, source and absolute path are
   written out per entry, which is what the 1M catalog is mostly made of. Intern them per
   revision and reference them by id.
@@ -270,8 +312,6 @@ remains a go for continuing the replacement.
   content another revision already claimed. The two scanners disagree on one repository of
   this workstation's cache, which swaps the names of its two artifacts.
 - Add a read-only open once redb offers one, so searches can run beside a rebuild.
-- Port the complete Hoard grammar, aliases, local-node resolution, exclusions,
-  facets, compatibility, shelf expansion and every sorting mode.
 - Benchmark realistic catalogs and add process-kill/power-loss recovery tests.
   Current tests check transaction abort and publication boundaries, not power loss.
 
