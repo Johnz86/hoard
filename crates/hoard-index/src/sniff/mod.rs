@@ -220,7 +220,7 @@ fn looks_like_onnx(path: &Path, head: &[u8]) -> bool {
     head.first() == Some(&0x08) || head.windows(4).any(|window| window == b"onnx")
 }
 
-fn name_format(path: &Path) -> Option<ArtifactFormat> {
+pub(crate) fn name_format(path: &Path) -> Option<ArtifactFormat> {
     let name = path.file_name()?.to_str()?.to_ascii_lowercase();
     match name.as_str() {
         "model_index.json" => return Some(ArtifactFormat::Diffusers),

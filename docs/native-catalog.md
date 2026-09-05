@@ -48,9 +48,12 @@ the complete trigger string; they do not implement legacy substring matching.
 ## What is implemented
 
 - Existing HF-cache, Git and loose-source discovery feeds the native store directly.
-- Header sniffing and inference reuse the existing Rust implementations. A revision is
-  sniffed in parallel, its shallowest README and nearest `config.json` feed inference
-  exactly as the SQLite scanner does, and the source is written in one transaction.
+- Header sniffing and inference reuse the existing Rust implementations. A revision's
+  documents (README, configs, index files) are sniffed first and give every later unit its
+  inference context; each shard set and each chunk of 256 standalone files is then sniffed
+  in parallel, prepared and committed as its own transaction, so memory grows with a unit,
+  not with a source. Whether a repository names its single artifact is decided from file
+  names before the weights are read.
 - Only weight and dataset formats become artifacts; every file is still an entry record.
 - Shard sets, whether named `model-<n>-of-<m>` or listed by a `*.index.json` weight map,
   become one artifact anchored on the lowest shard. Members are entries that point at that
@@ -97,10 +100,9 @@ O(A + K log K), where K is offset plus limit. Deep pagination and broad queries
 still require memory proportional to matching artifacts. This needs measurement
 before a large-scale adoption decision; no throughput claim is made here.
 
-Tantivy uses one writer thread with a 32 MiB indexing budget. A source is written in one
-redb transaction, so nothing of a source is durable until it finishes and a killed scan
-removes the directory; the whole-revision sniff is bounded by a revision's file count, not
-by the source.
+Tantivy uses one writer thread with a 32 MiB indexing budget. Nothing larger than a unit is
+held in memory or in an open transaction; a killed scan still removes its directory because
+the manifest is written last.
 
 ## Measured
 

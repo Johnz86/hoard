@@ -12,6 +12,7 @@ use hoard_core::{
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
 
 use crate::error::{IndexError, Result};
+use crate::store::SearchRow;
 
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, Manifest, Repository, Revision,
@@ -1173,5 +1174,52 @@ fn two_shard_sets_in_one_directory_are_told_apart_by_stem() -> Result<()> {
         ["draft", "model"],
         "two sets at the root are named by stem"
     );
+    Ok(())
+}
+
+#[test]
+fn shards_group_across_chunk_boundaries() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let shards = llm_shards();
+    let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(302);
+    files.push((
+        "model-00001-of-00002.safetensors".to_owned(),
+        shards[0].clone(),
+    ));
+    for index in 0..300 {
+        files.push((
+            format!("model-00001-z{index:03}.safetensors"),
+            lora_header(),
+        ));
+    }
+    files.push((
+        "model-00002-of-00002.safetensors".to_owned(),
+        shards[2].clone(),
+    ));
+    let borrowed: Vec<(&str, Vec<u8>)> = files
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+        .collect();
+    hf_cache_repo(&hub, "acme", "wide", &borrowed)?;
+    let catalog = scan_hub(directory.path(), &hub)?;
+    let rows = catalog.search(SearchRequest {
+        query: "",
+        limit: 1000,
+        offset: 0,
+    })?;
+    assert_eq!(rows.total, 301, "300 standalone files plus one shard set");
+    let set: Vec<&SearchRow> = rows
+        .rows
+        .iter()
+        .filter(|row| row.shard_count == 2)
+        .collect();
+    assert_eq!(
+        set.len(),
+        1,
+        "the set is one artifact even with 300 files between its shards"
+    );
+    assert_eq!(set[0].path, "model-00001-of-00002.safetensors");
     Ok(())
 }

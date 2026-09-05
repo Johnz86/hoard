@@ -80,15 +80,8 @@ impl Catalog {
             progress(&format!("discovering {}", source.name), counters.entries);
             let discovered = discover::discover(source, &NoiseFilter::default())?;
             let kind = discovered.kind();
-            let transaction = self.database.rw_transaction()?;
-            transaction.insert(Source {
-                name: source.name.clone(),
-                config: (*source).clone(),
-                resolved_kind: kind,
-            })?;
-            for repo in discovered.repos() {
-                let repo_id = counters.next_repo()?;
-                transaction.insert(repository(repo_id, &source.name, repo))?;
+            let repo_ids = self.store_source(source, kind, discovered.repos(), &mut counters)?;
+            for (repo, repo_id) in discovered.repos().iter().zip(repo_ids) {
                 for (ordinal, revision) in repo.revisions.iter().enumerate() {
                     let context = EntryContext {
                         node,
@@ -102,42 +95,20 @@ impl Catalog {
                         ordinal: u32::try_from(ordinal)
                             .map_err(|_| IndexError::Catalog("revision ordinal overflow".into()))?,
                     };
-                    let mut anchors: HashMap<usize, (i64, bool)> = HashMap::new();
-                    let mut members = Vec::new();
-                    for prepared in prepare_revision(&context)? {
-                        match &prepared.role {
-                            EntryRole::Member { group } => members.push((*group, prepared)),
-                            EntryRole::Anchor(facts) => {
-                                let group = facts.group;
-                                let stored = store_entry(
-                                    &transaction,
-                                    &context,
-                                    prepared,
-                                    None,
-                                    &mut counters,
-                                )?;
-                                if let Some(stored) = stored {
-                                    anchors.insert(group, stored);
-                                }
-                            }
-                            EntryRole::Standalone => {
-                                store_entry(&transaction, &context, prepared, None, &mut counters)?;
-                            }
-                        }
+                    let documents = revision_documents(&revision.entries);
+                    let sets = shard_sets_by_name(&revision.entries, &documents);
+                    let units = revision_units(&revision.entries, sets);
+                    let plan = revision_plan(&context, documents, &units);
+                    let labels = set_labels(&plan.naming, &units);
+                    for (unit, label) in units.iter().zip(labels) {
+                        let transaction = self.database.rw_transaction()?;
+                        let prepared = prepare_unit(&context, &plan, unit, label.as_deref())?;
+                        store_unit(&transaction, &context, prepared, &mut counters)?;
+                        transaction.commit()?;
+                        progress(&source.name, counters.entries);
                     }
-                    for (group, prepared) in members {
-                        store_entry(
-                            &transaction,
-                            &context,
-                            prepared,
-                            anchors.get(&group).copied(),
-                            &mut counters,
-                        )?;
-                    }
-                    progress(&source.name, counters.entries);
                 }
             }
-            transaction.commit()?;
         }
         self.finalize_path_counts(&counters)?;
         let transaction = self.database.rw_transaction()?;
@@ -158,6 +129,31 @@ impl Catalog {
         })?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Writes the records a source needs before any of its files are read, and hands back
+    /// the identity given to each repository in discovery order.
+    fn store_source(
+        &self,
+        source: &SourceConfig,
+        kind: SourceKind,
+        repos: &[DiscoveredRepo],
+        counters: &mut Counters,
+    ) -> Result<Vec<i64>> {
+        let transaction = self.database.rw_transaction()?;
+        transaction.insert(Source {
+            name: source.name.clone(),
+            config: source.clone(),
+            resolved_kind: kind,
+        })?;
+        let mut ids = Vec::with_capacity(repos.len());
+        for repo in repos {
+            let repo_id = counters.next_repo()?;
+            transaction.insert(repository(repo_id, &source.name, repo))?;
+            ids.push(repo_id);
+        }
+        transaction.commit()?;
+        Ok(ids)
     }
 
     /// An artifact records how many paths reach it, and the last path is only known once
@@ -367,7 +363,7 @@ pub(super) fn creates_artifact(
     presence: &Presence,
     role: &EntryRole,
 ) -> bool {
-    format.is_artifact() && !presence.pointer_bytes && !matches!(role, EntryRole::Member { .. })
+    format.is_artifact() && !presence.pointer_bytes && !matches!(role, EntryRole::Member)
 }
 
 /// What one file that becomes an artifact contributes: only such a file pays for inference,
@@ -389,9 +385,7 @@ struct PreparedEntry<'a> {
 }
 
 /// One model split across files, as the revision's grouping pass settled it.
-#[derive(Clone)]
 pub(super) struct GroupFacts {
-    group: usize,
     label: String,
     bytes: u64,
     shard_count: u32,
@@ -404,8 +398,11 @@ pub(super) struct GroupFacts {
 pub(super) enum EntryRole {
     Standalone,
     Anchor(GroupFacts),
-    Member { group: usize },
+    Member,
 }
+
+/// The largest number of standalone files one transaction covers.
+const CHUNK: usize = 256;
 
 /// Everything the per entry pass of one revision reads besides the entry itself.
 struct RevisionPlan<'a> {
@@ -413,29 +410,77 @@ struct RevisionPlan<'a> {
     context: InferenceContext,
 }
 
-/// The shard sets of one revision whose anchor was read and holds an artifact, addressed by
-/// entry position. Members of any other set stay the files they are.
-fn shard_sets(entries: &[DiscoveredEntry], sniffed: &[Option<SniffResult>]) -> Vec<ShardSet> {
-    let documents: HashMap<usize, serde_json::Value> = entries
+/// The documents a revision holds and the inference context they make. They are few and
+/// small, so every later unit is described without the revision's weights being held.
+struct RevisionDocuments {
+    context: InferenceContext,
+    index_documents: HashMap<usize, serde_json::Value>,
+}
+
+/// Reads only the documents that describe a revision: cards, configs and index files.
+fn revision_documents(entries: &[DiscoveredEntry]) -> RevisionDocuments {
+    let positions: Vec<usize> = entries
         .iter()
-        .zip(sniffed)
         .enumerate()
-        .filter(|(_, (entry, _))| shard::is_index_document(file_name(&entry.rel_path)))
-        .filter_map(|(position, (entry, result))| {
-            index_document(entry, result.as_ref()).map(|document| (position, document))
+        .filter(|(_, entry)| is_document(entry))
+        .map(|(position, _)| position)
+        .collect();
+    let sniffed: Vec<Option<SniffResult>> = positions
+        .par_iter()
+        .map(|position| sniff_entry(&entries[*position]))
+        .collect();
+    let context = InferenceContext::from_results(positions.iter().zip(&sniffed).filter_map(
+        |(position, result)| {
+            result
+                .as_ref()
+                .map(|result| (entries[*position].rel_path.as_str(), result))
+        },
+    ));
+    let index_documents = positions
+        .iter()
+        .zip(&sniffed)
+        .filter(|(position, _)| shard::is_index_document(file_name(&entries[**position].rel_path)))
+        .filter_map(|(position, result)| {
+            index_document(&entries[*position], result.as_ref())
+                .map(|document| (*position, document))
         })
         .collect();
+    RevisionDocuments {
+        context,
+        index_documents,
+    }
+}
+
+fn is_document(entry: &DiscoveredEntry) -> bool {
+    let name = file_name(&entry.rel_path);
+    shard::is_index_document(name)
+        || matches!(
+            sniff::name_format(Path::new(name)),
+            Some(
+                ArtifactFormat::Readme
+                    | ArtifactFormat::Config
+                    | ArtifactFormat::Diffusers
+                    | ArtifactFormat::Transformers
+            )
+        )
+}
+
+fn names_an_artifact(entry: &DiscoveredEntry) -> bool {
+    sniff::name_format(Path::new(file_name(&entry.rel_path)))
+        .is_some_and(ArtifactFormat::is_artifact)
+}
+
+/// Shard sets from names and index documents alone. Whether a set's anchor really holds
+/// weights is decided when the set is sniffed as a unit.
+fn shard_sets_by_name(entries: &[DiscoveredEntry], documents: &RevisionDocuments) -> Vec<ShardSet> {
     let mut positions = Vec::new();
     let mut candidates = Vec::new();
-    for (position, (entry, result)) in entries.iter().zip(sniffed).enumerate() {
-        let readable = result
-            .as_ref()
-            .is_some_and(|result| result.lfs_pointer.is_none());
-        if !readable || !shard::is_shard_file(file_name(&entry.rel_path)) {
+    for (position, entry) in entries.iter().enumerate() {
+        if entry.abs_path.is_none() || !shard::is_shard_file(file_name(&entry.rel_path)) {
             continue;
         }
         let mut candidate = ShardCandidate::new(entry.rel_path.as_str());
-        if let Some(document) = documents.get(&position) {
+        if let Some(document) = documents.index_documents.get(&position) {
             candidate = candidate.with_index_document(document);
         }
         positions.push(position);
@@ -451,114 +496,174 @@ fn shard_sets(entries: &[DiscoveredEntry], sniffed: &[Option<SniffResult>]) -> V
                 .collect(),
             ..set
         })
-        .filter(|set| {
-            sniffed[set.anchor()]
-                .as_ref()
-                .is_some_and(|result| result.format.is_artifact())
-        })
         .collect()
 }
 
-/// One artifact per set, described by the union of its shard headers and weighing them all.
-fn group_facts(
-    sets: &[ShardSet],
-    sniffed: &[Option<SniffResult>],
-    presences: &[Presence],
-    naming: &Naming<'_>,
-) -> Vec<GroupFacts> {
-    let mut labels: Vec<String> = sets.iter().map(|set| shard_label(naming, set)).collect();
-    let stems: Vec<String> = sets.iter().map(|set| set.stem.clone()).collect();
-    disambiguate_labels(&mut labels, &stems);
-    sets.iter()
-        .zip(labels)
-        .enumerate()
-        .map(|(group, (set, label))| {
-            let parts: Vec<&TensorSummary> = set
-                .members
-                .iter()
-                .filter_map(|member| sniffed[*member].as_ref())
-                .filter_map(|result| result.tensors.as_ref())
-                .collect();
-            GroupFacts {
-                group,
-                label,
-                bytes: set
-                    .members
-                    .iter()
-                    .map(|member| presences[*member].size)
-                    .sum(),
-                shard_count: u32::try_from(set.members.len()).unwrap_or(u32::MAX),
-                tensors: (!parts.is_empty()).then(|| shard::merge_tensor_summaries(&parts)),
-                incomplete: set.is_incomplete(),
-            }
-        })
-        .collect()
+/// The largest amount of a revision that is sniffed, prepared and committed at once.
+enum Unit {
+    Set(ShardSet),
+    Chunk(Vec<usize>),
 }
 
-fn entry_roles(count: usize, sets: &[ShardSet], facts: &[GroupFacts]) -> Vec<EntryRole> {
-    let mut roles: Vec<EntryRole> = (0..count).map(|_| EntryRole::Standalone).collect();
-    for (set, facts) in sets.iter().zip(facts) {
-        for member in &set.members {
-            roles[*member] = match *member == set.anchor() {
-                true => EntryRole::Anchor(facts.clone()),
-                false => EntryRole::Member { group: facts.group },
-            };
+impl Unit {
+    fn positions(&self) -> &[usize] {
+        match self {
+            Unit::Set(set) => &set.members,
+            Unit::Chunk(positions) => positions,
         }
     }
-    roles
 }
 
-/// Sniffs a whole revision in parallel, then prepares every file against the revision's own
-/// documents, so a README or config beside the weights describes them the way it does in the
-/// SQLite scanner.
-fn prepare_revision<'a>(context: &EntryContext<'a>) -> Result<Vec<PreparedEntry<'a>>> {
-    let entries = &context.revision.entries;
-    let sniffed: Vec<Option<SniffResult>> = entries.par_iter().map(sniff_entry).collect();
-    let presences: Vec<Presence> = entries
-        .iter()
-        .zip(&sniffed)
-        .map(|(entry, result)| Presence::of(entry, result.as_ref()))
-        .collect();
-    let inference_context = InferenceContext::from_results(
-        entries.iter().zip(&sniffed).filter_map(|(entry, result)| {
-            result
-                .as_ref()
-                .map(|result| (entry.rel_path.as_str(), result))
-        }),
-    );
-    let sets = shard_sets(entries, &sniffed);
+fn revision_units(entries: &[DiscoveredEntry], sets: Vec<ShardSet>) -> Vec<Unit> {
     let grouped: HashSet<usize> = sets
         .iter()
         .flat_map(|set| set.members.iter().copied())
         .collect();
-    let standalone = sniffed
+    let standalone: Vec<usize> = (0..entries.len())
+        .filter(|position| !grouped.contains(position))
+        .collect();
+    sets.into_iter()
+        .map(Unit::Set)
+        .chain(
+            standalone
+                .chunks(CHUNK)
+                .map(|chunk| Unit::Chunk(chunk.to_vec())),
+        )
+        .collect()
+}
+
+/// How many artifacts a revision will hold, decided from file names before any weight is
+/// read, because whether the repository names its single artifact must be settled once for
+/// every unit.
+fn revision_plan<'a>(
+    context: &EntryContext<'a>,
+    documents: RevisionDocuments,
+    units: &[Unit],
+) -> RevisionPlan<'a> {
+    let entries = &context.revision.entries;
+    let artifacts: usize = units
         .iter()
-        .enumerate()
-        .filter(|(position, result)| {
-            !grouped.contains(position)
-                && result
-                    .as_ref()
-                    .is_some_and(|result| result.format.is_artifact())
+        .map(|unit| match unit {
+            Unit::Set(_) => 1,
+            Unit::Chunk(positions) => positions
+                .iter()
+                .filter(|position| names_an_artifact(&entries[**position]))
+                .count(),
         })
-        .count();
-    let plan = RevisionPlan {
+        .sum();
+    RevisionPlan {
         naming: Naming {
             repo: &context.repo.repo,
             root_path: &context.repo.root_path,
             kind: context.kind,
-            single: standalone + sets.len() <= 1,
+            single: artifacts <= 1,
         },
-        context: inference_context,
+        context: documents.context,
+    }
+}
+
+/// One label per unit, in unit order: a set's disambiguated label, and nothing for a chunk
+/// of files that each stand for themselves.
+fn set_labels(naming: &Naming<'_>, units: &[Unit]) -> Vec<Option<String>> {
+    let sets: Vec<&ShardSet> = units
+        .iter()
+        .filter_map(|unit| match unit {
+            Unit::Set(set) => Some(set),
+            Unit::Chunk(_) => None,
+        })
+        .collect();
+    let mut labels: Vec<String> = sets.iter().map(|set| shard_label(naming, set)).collect();
+    let stems: Vec<String> = sets.iter().map(|set| set.stem.clone()).collect();
+    disambiguate_labels(&mut labels, &stems);
+    let mut per_unit: Vec<Option<String>> = Vec::with_capacity(units.len());
+    per_unit.extend(labels.into_iter().map(Some));
+    per_unit.resize(units.len(), None);
+    per_unit
+}
+
+/// One artifact per set, described by the union of its shard headers and weighing them all.
+fn group_facts(
+    set: &ShardSet,
+    sniffed: &[Option<SniffResult>],
+    presences: &[Presence],
+    label: String,
+) -> GroupFacts {
+    let parts: Vec<&TensorSummary> = sniffed
+        .iter()
+        .filter_map(|result| result.as_ref())
+        .filter_map(|result| result.tensors.as_ref())
+        .collect();
+    GroupFacts {
+        label,
+        bytes: presences.iter().map(|presence| presence.size).sum(),
+        shard_count: u32::try_from(presences.len()).unwrap_or(u32::MAX),
+        tensors: (!parts.is_empty()).then(|| shard::merge_tensor_summaries(&parts)),
+        incomplete: set.is_incomplete(),
+    }
+}
+
+/// A set whose anchor turned out to hold no weights is not a model: its files go back to
+/// standing for themselves.
+fn unit_roles(
+    unit: &Unit,
+    sniffed: &[Option<SniffResult>],
+    presences: &[Presence],
+    label: Option<&str>,
+) -> Vec<EntryRole> {
+    let alone = || (0..sniffed.len()).map(|_| EntryRole::Standalone).collect();
+    let set = match unit {
+        Unit::Set(set) => set,
+        Unit::Chunk(_) => return alone(),
     };
-    let facts = group_facts(&sets, &sniffed, &presences, &plan.naming);
-    let roles = entry_roles(entries.len(), &sets, &facts);
-    entries
+    let anchored = sniffed
+        .first()
+        .and_then(Option::as_ref)
+        .is_some_and(|result| result.format.is_artifact())
+        && presences
+            .first()
+            .is_some_and(|presence| !presence.pointer_bytes);
+    if !anchored {
+        return alone();
+    }
+    let facts = group_facts(
+        set,
+        sniffed,
+        presences,
+        label.unwrap_or_default().to_owned(),
+    );
+    std::iter::once(EntryRole::Anchor(facts))
+        .chain(std::iter::repeat_with(|| EntryRole::Member).take(sniffed.len().saturating_sub(1)))
+        .collect()
+}
+
+/// Sniffs one unit in parallel and prepares its files against the revision's documents, so
+/// a README or config beside the weights describes them the way it does in the SQLite
+/// scanner. Nothing larger than a unit is read at once.
+fn prepare_unit<'a>(
+    context: &EntryContext<'a>,
+    plan: &RevisionPlan<'_>,
+    unit: &Unit,
+    label: Option<&str>,
+) -> Result<Vec<PreparedEntry<'a>>> {
+    let entries = &context.revision.entries;
+    let positions = unit.positions();
+    let sniffed: Vec<Option<SniffResult>> = positions
+        .par_iter()
+        .map(|position| sniff_entry(&entries[*position]))
+        .collect();
+    let presences: Vec<Presence> = positions
+        .iter()
+        .zip(&sniffed)
+        .map(|(position, result)| Presence::of(&entries[*position], result.as_ref()))
+        .collect();
+    let roles = unit_roles(unit, &sniffed, &presences, label);
+    positions
         .par_iter()
         .zip(sniffed.into_par_iter())
         .zip(presences.into_par_iter())
         .zip(roles.into_par_iter())
-        .map(|(((entry, sniffed), presence), role)| {
-            prepare_entry(entry, sniffed, presence, role, &plan)
+        .map(|(((position, sniffed), presence), role)| {
+            prepare_entry(&entries[*position], sniffed, presence, role, plan)
         })
         .collect()
 }
@@ -597,7 +702,7 @@ fn prepare_entry<'a>(
             facts.tensors.as_ref(),
             Some(facts.label.as_str()),
         ),
-        EntryRole::Standalone | EntryRole::Member { .. } => (
+        EntryRole::Standalone | EntryRole::Member => (
             presence.size,
             sniffed.as_ref().and_then(|result| result.tensors.as_ref()),
             None,
@@ -660,6 +765,33 @@ struct EntryContext<'a> {
     triage: f32,
     kind: SourceKind,
     ordinal: u32,
+}
+
+/// Writes one unit. A shard member carries no artifact of its own, so it is stored after
+/// the anchor that establishes the artifact and the triage verdict it shares.
+fn store_unit(
+    transaction: &RwTransaction<'_>,
+    context: &EntryContext<'_>,
+    prepared: Vec<PreparedEntry<'_>>,
+    counters: &mut Counters,
+) -> Result<()> {
+    let mut anchor = None;
+    let mut members = Vec::new();
+    for prepared in prepared {
+        match &prepared.role {
+            EntryRole::Member => members.push(prepared),
+            EntryRole::Anchor(_) => {
+                anchor = store_entry(transaction, context, prepared, None, counters)?;
+            }
+            EntryRole::Standalone => {
+                store_entry(transaction, context, prepared, None, counters)?;
+            }
+        }
+    }
+    for prepared in members {
+        store_entry(transaction, context, prepared, anchor, counters)?;
+    }
+    Ok(())
 }
 
 /// Writes one file. A shard member carries no artifact of its own: it is handed the
@@ -738,7 +870,7 @@ fn store_entry(
 fn artifact_triage(prepared: &PreparedEntry<'_>, record: &ArtifactRecord, confidence: f32) -> bool {
     let incomplete = match &prepared.role {
         EntryRole::Anchor(facts) => facts.incomplete,
-        EntryRole::Standalone | EntryRole::Member { .. } => false,
+        EntryRole::Standalone | EntryRole::Member => false,
     };
     record.artifact.needs_triage(confidence) || incomplete
 }
@@ -822,7 +954,7 @@ fn artifact_record(
             Some(facts.bytes),
             Some(facts.shard_count),
         ),
-        EntryRole::Standalone | EntryRole::Member { .. } => (
+        EntryRole::Standalone | EntryRole::Member => (
             prepared
                 .sniffed
                 .as_ref()
