@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -5,15 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use hoard_core::{ArtifactId, Base, Role};
 use hoard_index::IndexError;
-use hoard_index::store::entry::entries_for_artifact;
-use hoard_index::store::overrides::NoiseRow;
-use hoard_index::store::{artifact, overrides};
-use hoard_index::triage::header_facts;
+use hoard_index::catalog::{Catalog, TriageItem};
+use hoard_index::store::overrides::{self, NoiseRow};
+use hoard_index::store::row::SearchRow;
 
 use crate::api::artifacts::artifact_id;
-use crate::api::common::{
-    Conn, Fact, PageParams, RowView, authorize, facts, require_row, row_by_artifact,
-};
+use crate::api::common::{Fact, PageParams, RowView, authorize, blocking, facts};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -47,6 +46,33 @@ pub struct TriageView {
     pub row: RowView,
     pub guess: GuessView,
     pub header: HeaderView,
+}
+
+impl From<&TriageItem> for TriageView {
+    fn from(item: &TriageItem) -> Self {
+        Self {
+            row: RowView::from(&item.row),
+            guess: GuessView {
+                role: item.guess_role,
+                base: item.guess_base.clone(),
+                confidence: item.confidence,
+            },
+            header: HeaderView {
+                tensor_count: item.header.tensor_count,
+                key_prefixes: item
+                    .header
+                    .key_prefixes
+                    .iter()
+                    .map(|(prefix, count)| PrefixView {
+                        prefix: prefix.clone(),
+                        count: *count,
+                    })
+                    .collect(),
+                hidden_dim: item.header.hidden_dim,
+                dtype: item.header.dtype.clone(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -85,24 +111,9 @@ pub async fn list(
     Query(params): Query<PageParams>,
 ) -> ApiResult<Json<Vec<TriageView>>> {
     let limit = params.limit();
-    let rows = state
-        .store()
-        .call(move |conn| {
-            let mut out = Vec::new();
-            for record in artifact::triage_queue(conn, limit)? {
-                let Some(row) = row_by_artifact(conn, record.artifact.id)? else {
-                    continue;
-                };
-                out.push(TriageView {
-                    guess: guess(conn, record.artifact.id, &row)?,
-                    header: header(conn, record.artifact.id)?,
-                    row: RowView::from(&row),
-                });
-            }
-            Ok(out)
-        })
-        .await?;
-    Ok(Json(rows))
+    let catalog = Arc::clone(state.catalog());
+    let queue = blocking(move || catalog.triage_queue(limit)).await?;
+    Ok(Json(queue.iter().map(TriageView::from).collect()))
 }
 
 pub async fn confirm(
@@ -128,21 +139,18 @@ pub async fn confirm(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(Base::new);
-    let view = state
-        .store()
-        .call_mut(move |conn| {
-            overrides::put_override(conn, id, Some(role), sub_role, base)?;
-            artifact::set_triage(conn, id, false)?;
-            let row = require_row(conn, id)?;
-            Ok(ConfirmView {
-                artifact_id: id,
-                role: row.role,
-                base: crate::api::common::base_label(&row.base, row.base_label.as_deref()),
-                facts: facts(&row),
-            })
-        })
-        .await?;
-    Ok(Json(view))
+    let catalog = Arc::clone(state.catalog());
+    let row = blocking(move || {
+        catalog.put_override(id, Some(role), sub_role, base)?;
+        require_row(&catalog, id)
+    })
+    .await?;
+    Ok(Json(ConfirmView {
+        artifact_id: id,
+        role: row.role,
+        base: crate::api::common::base_label(&row.base, row.base_label.as_deref()),
+        facts: facts(&row),
+    }))
 }
 
 pub async fn reject(
@@ -152,27 +160,34 @@ pub async fn reject(
 ) -> ApiResult<Json<RejectView>> {
     authorize(&state, &headers)?;
     let id = artifact_id(&id)?;
-    let view = state
+    let catalog = Arc::clone(state.catalog());
+    let noise = blocking(move || {
+        let entries = catalog.entries_of(id)?;
+        if entries.is_empty() {
+            return Err(IndexError::not_found("artifact", id.to_string()));
+        }
+        Ok(entries
+            .into_iter()
+            .map(|entry| entry.abs_path.unwrap_or(entry.rel_path))
+            .collect::<Vec<_>>())
+    })
+    .await?;
+    let paths = noise.clone();
+    state
         .store()
         .call_mut(move |conn| {
-            let entries = entries_for_artifact(conn, id)?;
-            if entries.is_empty() {
-                return Err(IndexError::not_found("artifact", id.to_string()));
+            for path in &paths {
+                overrides::add_noise(conn, path, Some("rejected from triage"))?;
             }
-            let mut noise = Vec::with_capacity(entries.len());
-            for entry in &entries {
-                let path = entry.abs_path.clone().unwrap_or_else(|| entry.path.clone());
-                overrides::add_noise(conn, &path, Some("rejected from triage"))?;
-                noise.push(path);
-            }
-            artifact::set_triage(conn, id, false)?;
-            Ok(RejectView {
-                artifact_id: id,
-                noise,
-            })
+            Ok(())
         })
         .await?;
-    Ok(Json(view))
+    let catalog = Arc::clone(state.catalog());
+    blocking(move || catalog.clear_triage(id)).await?;
+    Ok(Json(RejectView {
+        artifact_id: id,
+        noise,
+    }))
 }
 
 pub async fn noise(State(state): State<AppState>) -> ApiResult<Json<Vec<NoiseRow>>> {
@@ -196,50 +211,10 @@ pub async fn delete_noise(
     Ok(Json(NoiseDeleted { id, removed }))
 }
 
-/// The queue's guess: the strongest recorded evidence for a field, falling back to what the
-/// artifact itself carries.
-fn guess(
-    conn: &Conn,
-    id: ArtifactId,
-    row: &hoard_index::store::row::SearchRow,
-) -> Result<GuessView, IndexError> {
-    let evidence = artifact::evidence(conn, id)?;
-    let strongest = |field: &str| {
-        evidence
-            .iter()
-            .find(|item| item.field == field)
-            .map(|item| (item.value.clone(), item.confidence))
-    };
-    let (role, confidence) = match strongest("role") {
-        Some((value, confidence)) => (
-            Role::from_alias(&value).unwrap_or(row.role),
-            confidence.max(row.role_confidence),
-        ),
-        None => (row.role, row.role_confidence),
-    };
-    let base = strongest("base")
-        .map(|(value, _)| value)
-        .or_else(|| crate::api::common::base_label(&row.base, row.base_label.as_deref()));
-    Ok(GuessView {
-        role,
-        base,
-        confidence,
-    })
-}
-
-fn header(conn: &Conn, id: ArtifactId) -> Result<HeaderView, IndexError> {
-    let Some(summary) = artifact::tensor_summary(conn, id)? else {
-        return Ok(HeaderView::default());
-    };
-    let header = header_facts(&summary);
-    Ok(HeaderView {
-        tensor_count: header.tensor_count,
-        key_prefixes: header
-            .key_prefixes
-            .into_iter()
-            .map(|(prefix, count)| PrefixView { prefix, count })
-            .collect(),
-        hidden_dim: header.hidden_dim,
-        dtype: header.dtype,
-    })
+/// The artifact one identity names, or the 404 the routes answer with when the catalog
+/// holds no such row.
+fn require_row(catalog: &Catalog, id: ArtifactId) -> Result<SearchRow, IndexError> {
+    catalog
+        .artifact_row(id)?
+        .ok_or_else(|| IndexError::not_found("artifact", id.to_string()))
 }

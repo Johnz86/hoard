@@ -238,8 +238,11 @@ GET /api/v1/search?q=... -> shelves (SQLite) -> Catalog::compile_context
   -> Catalog::query on a blocking thread -> page, totals, five facet dimensions
 ```
 
-`GET /api/v1/stats` and `hoard ls` read the same catalog. Every other route still reads
-SQLite.
+`GET /api/v1/stats` and `hoard ls` read the same catalog, and so do the artifact inspector,
+compat, pull command, override and blob views, the repository list, detail, files, card and
+compat, and the triage queue with its confirm and reject. Usage counts, the noise list a
+rejection writes, shelves, loadouts, projection, sources and jobs, nodes and peers,
+settings, the Hub and git faces, the mirror and gossip still read SQLite.
 
 Nodes:
 

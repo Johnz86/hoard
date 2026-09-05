@@ -104,6 +104,10 @@ of the shallowest README in each revision.
 - Known content hashes or canonical paths establish identity. No full model hashing
   occurs in this initial native scan path. Two unrelated paths with unknown hashes
   remain separate artifacts, even if their bytes match.
+- The artifact inspector, compat, pull command, override and blob views, the repository
+  list, detail, files, card and compat, and the triage queue with its confirm and reject
+  read and write the native catalog. A user's verdict is a native record applied to the
+  artifact and re-applied after a rescan.
 - Native records survive process reopen. Tantivy can be rebuilt without source
   model files or a SQLite database.
 - A completion manifest is published after all scan batches commit. An interrupted
@@ -366,9 +370,10 @@ than a correctness one.
 
 ## Remaining replacement work
 
-- Move the routes still on SQLite to the catalog: artifact detail, compat, blob detail,
-  repos, triage, shelves, loadouts, projection, sources and jobs, nodes and peers, settings,
-  the Hub and git faces, the mirror's ingest and gossip.
+- Move the routes still on SQLite to the catalog: usage (`/repos/.../usage`, the `usage`
+  block of the artifact detail, `pulls on lan`), noise (`/triage/noise`, the noise rows a
+  rejection writes), shelves, loadouts, projection, sources and jobs, nodes and peers,
+  settings, the Hub and git faces, the mirror and gossip.
 - Convert the existing Store/Connection API and live scanner, mirror, cache eviction,
   gossip, watch and CLI callers to native transactions.
 - Path identities hash the text to_string_lossy renders; discovery currently never yields
