@@ -1353,7 +1353,7 @@ async fn a_repository_detail_carries_the_header_refs_and_pull_box() {
     assert_eq!(body["repo"], "models/stability/sdxl-base-1.0");
     assert_eq!(body["type"], "models");
     assert_eq!(body["role_full"], "CHECKPOINT");
-    assert_eq!(body["state_full"], "SERVED \u{b7} hoard.lan:7099");
+    assert_eq!(body["state_full"], "LOCAL");
     assert!(
         body["revision_summary"]
             .as_str()

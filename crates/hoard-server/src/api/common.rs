@@ -14,9 +14,8 @@ use hoard_index::catalog::EntryDetail;
 use hoard_index::search::{
     CompatTarget, CompileContext, ParsedQuery, SortKey, SortSpec, TokenKind, compile, quoted,
 };
-use hoard_index::store::entry::EntryRow;
 use hoard_index::store::row::{SearchRow, SqlValue};
-use hoard_index::store::{revision, search_exec, shelf};
+use hoard_index::store::{search_exec, shelf};
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -397,49 +396,6 @@ pub fn entry_views(entries: &[EntryDetail], host: &str) -> Vec<EntryView> {
             symlink: entry.is_symlink,
         })
         .collect()
-}
-
-/// Renders entries with the ref name each revision answers to, falling back to the short
-/// sha exactly as the `search_row` view does.
-pub fn revision_entry_views(
-    conn: &Conn,
-    entries: &[EntryRow],
-    host: &str,
-) -> Result<Vec<EntryView>, IndexError> {
-    let mut labels: Vec<(RepoRowId, Vec<(hoard_core::RevisionId, String)>)> = Vec::new();
-    let mut views = Vec::with_capacity(entries.len());
-    for entry in entries {
-        if !labels.iter().any(|(repo, _)| *repo == entry.repo) {
-            let refs = revision::refs_for_repo(conn, entry.repo)?
-                .into_iter()
-                .map(|reference| (reference.revision, reference.name))
-                .collect();
-            labels.push((entry.repo, refs));
-        }
-        let revision = labels
-            .iter()
-            .find(|(repo, _)| *repo == entry.repo)
-            .and_then(|(_, refs)| {
-                refs.iter()
-                    .find(|(id, _)| *id == entry.revision)
-                    .map(|(_, name)| name.clone())
-            })
-            .unwrap_or_else(|| entry.revision_sha.short());
-        views.push(EntryView {
-            repo: entry.repo_qualified.clone(),
-            revision,
-            path: entry.abs_path.clone().unwrap_or_else(|| entry.path.clone()),
-            node: entry.node.clone(),
-            label: match entry.is_symlink {
-                true => format!("{} {MIDDOT} symlink", entry.node),
-                false => entry.node.clone(),
-            },
-            state: entry.state,
-            state_label: state_label(entry.state, entry.pull_progress, Some(host)),
-            symlink: entry.is_symlink,
-        });
-    }
-    Ok(views)
 }
 
 /// The display spelling of a base family, `sdxl 1.0` rather than the `sdxl10` key.
