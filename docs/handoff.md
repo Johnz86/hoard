@@ -20,11 +20,11 @@ first; this document assumes it.
   dependency research; they stay. The wave plan files under `docs/superpowers/plans/` are
   deleted - git keeps them, and a stale plan in the tree is a trap for the next agent.
 - Phases 0 to 9 are done, 10 and 11 are partial. `docs/feature-plan.md` holds the table.
-- At `3b27564` all four checks pass: `cargo fmt --check`, clippy with `-D warnings`,
-  `cargo test --workspace` at 745 passed, 0 failed, 3 ignored, and `cargo build --workspace`.
+- At `fe9445b` all four checks pass: `cargo fmt --check`, clippy with `-D warnings`,
+  `cargo test --workspace` at 746 passed, 0 failed, 3 ignored, and `cargo build --workspace`.
   The three ignored are the scale harness, the mDNS test that needs a multicast route and the
-  sniffer test that reads the local model caches. `cargo doc --workspace --no-deps` emits two
-  warnings, listed below.
+  sniffer test that reads the local model caches. `cargo doc --workspace --no-deps` emits no
+  warning.
 
 ## Running the loop
 
@@ -116,9 +116,11 @@ Decisions someone has to take:
 
 Smaller things, each verified:
 
-- `/api/v1/sources` filters out every source whose name starts with the peer prefix
-  (`catalog/read.rs::sources`), so peer namespaces do not appear in the listing. The SOURCES
-  tab in `web/` was not re-checked against that behaviour after the change.
+- The SOURCES tab offers a SCAN button on every row the route lists, including the `mirror`
+  and `pulls` rows the ingest and pull paths write. Neither is named by the configuration, so
+  `resolve_source` answers 404 and the panel toasts `scan failed`. The button is honest for a
+  configured source and dead for those two; whether they should carry one, or appear at all,
+  is a UI decision nobody has taken.
 - Peer-only artifacts no longer appear in the triage queue. `Catalog::triage_queue` pages
   `state:triage` from the search index, and a peer-advertised artifact is filed as remote
   entries, which never carry that state. Whether a peer's triage should be visible at all is
