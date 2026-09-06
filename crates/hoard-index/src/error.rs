@@ -29,6 +29,16 @@ pub enum IndexError {
     #[error("invalid catalog: {0}")]
     Catalog(String),
 
+    #[error(
+        "catalog at {directory} has format {found}, this build writes {expected}: \
+         delete the directory and scan again"
+    )]
+    CatalogFormat {
+        directory: PathBuf,
+        found: u32,
+        expected: u32,
+    },
+
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 

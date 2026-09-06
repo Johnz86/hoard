@@ -30,10 +30,7 @@ use crate::config::IndexConfig;
 use crate::error::{IndexError, Result};
 use crate::row::DiskPressure;
 
-use self::models::{
-    ArtifactRecord, Entry, EntryV3, Manifest, Node, NodeV1, Repository, RepositoryV3, Source,
-    SourceV2, Summary, define_models,
-};
+use self::models::{Manifest, Summary, define_models};
 
 pub use self::digest::{DigestApplied, DigestEntry, DigestPage, RemoteEntry};
 pub use self::hashing::{HashReport, content_key};
@@ -54,6 +51,10 @@ pub use self::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 pub use self::usage::{ArtifactUsage, PullRow, UsageDay, UsageEvent, UsageReport};
 pub use self::userdata::{NewProjection, NoiseRecord, ProjectionRecord, ShelfRecord};
 pub use self::verdict::OverrideRecord;
+
+/// The one shape this build reads and writes. A catalog whose manifest names another is
+/// rebuilt from disk rather than converted.
+pub const FORMAT_VERSION: u32 = 1;
 
 /// One redb table's share of the catalog file: the rows it holds, the bytes those rows
 /// occupy, and the bytes a compaction would reclaim.
@@ -121,40 +122,22 @@ impl std::fmt::Debug for Catalog {
 }
 
 impl Catalog {
-    /// Opens a completed scan; incomplete scans and unknown format versions are rejected.
+    /// Opens a completed scan; an incomplete scan and a catalog of another format are
+    /// rejected.
     pub fn open(directory: &Path) -> Result<Self> {
         let database = builder().open(models()?, directory.join("catalog.redb"))?;
-        let transaction = database.rw_transaction()?;
-        let counts_are_stale = transaction.len().primary::<RepositoryV3>()? > 0
-            || transaction.len().primary::<SourceV2>()? > 0
-            || transaction.len().primary::<NodeV1>()? > 0;
-        let paths_are_absolute = transaction.len().primary::<EntryV3>()? > 0;
-        transaction.migrate::<Manifest>()?;
-        transaction.migrate::<Summary>()?;
-        transaction.migrate::<Repository>()?;
-        transaction.migrate::<ArtifactRecord>()?;
-        transaction.migrate::<Source>()?;
-        transaction.migrate::<Entry>()?;
-        transaction.migrate::<Node>()?;
-        transaction.commit()?;
         let catalog = Self {
             database,
             directory: directory.to_path_buf(),
             search_cache: RwLock::new(None),
         };
-        if paths_are_absolute {
-            catalog.fold_paths_under_their_roots()?;
-        }
-        if counts_are_stale {
-            catalog.recount_derived()?;
-            catalog.recount_summary()?;
-        }
         let manifest = catalog.manifest()?;
-        if manifest.format_version != 5 {
-            return Err(IndexError::Catalog(format!(
-                "unsupported format version {}",
-                manifest.format_version
-            )));
+        if manifest.format_version != FORMAT_VERSION {
+            return Err(IndexError::CatalogFormat {
+                directory: directory.to_path_buf(),
+                found: manifest.format_version,
+                expected: FORMAT_VERSION,
+            });
         }
         catalog.seed_builtin_shelves()?;
         catalog.ensure_self_row(&manifest.node)?;

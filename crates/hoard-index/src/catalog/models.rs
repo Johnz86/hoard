@@ -14,33 +14,10 @@ use crate::discover::RefKind;
 
 use super::jobs::JobState;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 1, version = 1)]
-#[native_db]
-pub(super) struct SourceV1 {
-    #[primary_key]
-    pub(super) name: String,
-    pub(super) config: SourceConfig,
-    pub(super) resolved_kind: SourceKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 1, version = 2, from = SourceV1)]
-#[native_db]
-pub(super) struct SourceV2 {
-    #[primary_key]
-    pub(super) name: String,
-    pub(super) config: SourceConfig,
-    pub(super) resolved_kind: SourceKind,
-    pub(super) file_count: u64,
-    pub(super) byte_count: u64,
-    pub(super) last_scan: Option<String>,
-}
-
 /// A nominated root, with what the last walk of it counted. A source no scan has reached
 /// yet reports no last scan and zeroes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 1, version = 3, from = SourceV2)]
+#[native_model(id = 1, version = 1)]
 #[native_db]
 pub(super) struct Source {
     #[primary_key]
@@ -56,113 +33,10 @@ pub(super) struct Source {
     pub(super) pending_hashes: u64,
 }
 
-impl From<SourceV1> for SourceV2 {
-    fn from(source: SourceV1) -> Self {
-        Self {
-            name: source.name,
-            config: source.config,
-            resolved_kind: source.resolved_kind,
-            file_count: 0,
-            byte_count: 0,
-            last_scan: None,
-        }
-    }
-}
-
-impl From<SourceV2> for SourceV1 {
-    fn from(source: SourceV2) -> Self {
-        Self {
-            name: source.name,
-            config: source.config,
-            resolved_kind: source.resolved_kind,
-        }
-    }
-}
-
-impl From<SourceV2> for Source {
-    fn from(source: SourceV2) -> Self {
-        Self {
-            name: source.name,
-            config: source.config,
-            resolved_kind: source.resolved_kind,
-            file_count: source.file_count,
-            byte_count: source.byte_count,
-            last_scan: source.last_scan,
-            pending_hashes: 0,
-        }
-    }
-}
-
-impl From<Source> for SourceV2 {
-    fn from(source: Source) -> Self {
-        Self {
-            name: source.name,
-            config: source.config,
-            resolved_kind: source.resolved_kind,
-            file_count: source.file_count,
-            byte_count: source.byte_count,
-            last_scan: source.last_scan,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 2, version = 1)]
-#[native_db]
-pub(super) struct RepositoryV1 {
-    #[primary_key]
-    pub(super) id: i64,
-    #[secondary_key(unique)]
-    pub(super) key: String,
-    pub(super) source: String,
-    pub(super) repo: RepoId,
-    pub(super) root_path: String,
-    pub(super) default_ref: String,
-    pub(super) revisions: Vec<RevisionV1>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(super) struct RevisionV1 {
-    pub(super) name: String,
-    pub(super) sha: Option<CommitSha>,
-    pub(super) refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 2, version = 2, from = RepositoryV1)]
-#[native_db]
-pub(super) struct RepositoryV2 {
-    #[primary_key]
-    pub(super) id: i64,
-    #[secondary_key(unique)]
-    pub(super) key: String,
-    pub(super) source: String,
-    pub(super) repo: RepoId,
-    pub(super) root_path: String,
-    pub(super) default_ref: String,
-    pub(super) revisions: Vec<RevisionV2>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 2, version = 3, from = RepositoryV2)]
-#[native_db]
-pub(super) struct RepositoryV3 {
-    #[primary_key]
-    pub(super) id: i64,
-    #[secondary_key(unique)]
-    pub(super) key: String,
-    pub(super) source: String,
-    pub(super) repo: RepoId,
-    pub(super) root_path: String,
-    pub(super) git_dir: Option<String>,
-    pub(super) default_ref: String,
-    pub(super) revisions: Vec<Revision>,
-}
-
 /// A repository as a scan found it, with the clone directory the git face serves from and
 /// what each revision's commit says about itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 2, version = 4, from = RepositoryV3)]
+#[native_model(id = 2, version = 1)]
 #[native_db]
 pub(super) struct Repository {
     #[primary_key]
@@ -192,13 +66,6 @@ pub(super) struct Ref {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(super) struct RevisionV2 {
-    pub(super) name: String,
-    pub(super) sha: Option<CommitSha>,
-    pub(super) refs: Vec<Ref>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct Revision {
     pub(super) name: String,
     pub(super) sha: Option<CommitSha>,
@@ -209,141 +76,6 @@ pub(super) struct Revision {
     pub(super) committed: Option<String>,
 }
 
-impl From<RepositoryV3> for Repository {
-    fn from(repository: RepositoryV3) -> Self {
-        Self {
-            id: repository.id,
-            key: repository.key,
-            source: repository.source,
-            repo: repository.repo,
-            root_path: repository.root_path,
-            git_dir: repository.git_dir,
-            default_ref: repository.default_ref,
-            revisions: repository.revisions,
-            present_files: 0,
-            present_bytes: 0,
-        }
-    }
-}
-
-impl From<Repository> for RepositoryV3 {
-    fn from(repository: Repository) -> Self {
-        Self {
-            id: repository.id,
-            key: repository.key,
-            source: repository.source,
-            repo: repository.repo,
-            root_path: repository.root_path,
-            git_dir: repository.git_dir,
-            default_ref: repository.default_ref,
-            revisions: repository.revisions,
-        }
-    }
-}
-
-impl From<RepositoryV2> for RepositoryV3 {
-    fn from(repository: RepositoryV2) -> Self {
-        Self {
-            id: repository.id,
-            key: repository.key,
-            source: repository.source,
-            repo: repository.repo,
-            root_path: repository.root_path,
-            git_dir: None,
-            default_ref: repository.default_ref,
-            revisions: repository
-                .revisions
-                .into_iter()
-                .map(|revision| Revision {
-                    name: revision.name,
-                    sha: revision.sha,
-                    refs: revision.refs,
-                    title: None,
-                    author: None,
-                    committed: None,
-                })
-                .collect(),
-        }
-    }
-}
-
-impl From<RepositoryV3> for RepositoryV2 {
-    fn from(repository: RepositoryV3) -> Self {
-        Self {
-            id: repository.id,
-            key: repository.key,
-            source: repository.source,
-            repo: repository.repo,
-            root_path: repository.root_path,
-            default_ref: repository.default_ref,
-            revisions: repository
-                .revisions
-                .into_iter()
-                .map(|revision| RevisionV2 {
-                    name: revision.name,
-                    sha: revision.sha,
-                    refs: revision.refs,
-                })
-                .collect(),
-        }
-    }
-}
-
-impl From<RepositoryV1> for RepositoryV2 {
-    fn from(repository: RepositoryV1) -> Self {
-        Self {
-            id: repository.id,
-            key: repository.key,
-            source: repository.source,
-            repo: repository.repo,
-            root_path: repository.root_path,
-            default_ref: repository.default_ref,
-            revisions: repository
-                .revisions
-                .into_iter()
-                .map(|revision| RevisionV2 {
-                    name: revision.name,
-                    sha: revision.sha,
-                    refs: revision
-                        .refs
-                        .into_iter()
-                        .map(|name| Ref {
-                            name,
-                            kind: RefKind::Branch,
-                        })
-                        .collect(),
-                })
-                .collect(),
-        }
-    }
-}
-
-impl From<RepositoryV2> for RepositoryV1 {
-    fn from(repository: RepositoryV2) -> Self {
-        Self {
-            id: repository.id,
-            key: repository.key,
-            source: repository.source,
-            repo: repository.repo,
-            root_path: repository.root_path,
-            default_ref: repository.default_ref,
-            revisions: repository
-                .revisions
-                .into_iter()
-                .map(|revision| RevisionV1 {
-                    name: revision.name,
-                    sha: revision.sha,
-                    refs: revision
-                        .refs
-                        .into_iter()
-                        .map(|reference| reference.name)
-                        .collect(),
-                })
-                .collect(),
-        }
-    }
-}
-
 /// The identity a repository keeps across scans: its source and its qualified name.
 pub(super) fn repository_key(source: &str, repo: &RepoId) -> String {
     format!("{source}\0{}", repo.qualified())
@@ -351,22 +83,6 @@ pub(super) fn repository_key(source: &str, repo: &RepoId) -> String {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 3, version = 1)]
-#[native_db]
-pub(super) struct ArtifactRecordV1 {
-    #[primary_key]
-    pub(super) id: i64,
-    #[secondary_key(unique)]
-    pub(super) identity: u128,
-    pub(super) artifact: Artifact,
-    pub(super) name: String,
-    pub(super) org: Option<String>,
-    pub(super) path_count: u32,
-    pub(super) group_bytes: Option<u64>,
-    pub(super) shard_count: Option<u32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 3, version = 2, from = ArtifactRecordV1)]
 #[native_db]
 pub(super) struct ArtifactRecord {
     #[primary_key]
@@ -383,183 +99,8 @@ pub(super) struct ArtifactRecord {
     pub(super) first_seen: String,
 }
 
-impl From<ArtifactRecordV1> for ArtifactRecord {
-    fn from(record: ArtifactRecordV1) -> Self {
-        Self {
-            id: record.id,
-            identity: record.identity,
-            artifact: record.artifact,
-            name: record.name,
-            org: record.org,
-            path_count: record.path_count,
-            group_bytes: record.group_bytes,
-            shard_count: record.shard_count,
-            triage_cleared: false,
-            first_seen: String::new(),
-        }
-    }
-}
-
-impl From<ArtifactRecord> for ArtifactRecordV1 {
-    fn from(record: ArtifactRecord) -> Self {
-        Self {
-            id: record.id,
-            identity: record.identity,
-            artifact: record.artifact,
-            name: record.name,
-            org: record.org,
-            path_count: record.path_count,
-            group_bytes: record.group_bytes,
-            shard_count: record.shard_count,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 7, version = 1)]
-#[native_db]
-pub(super) struct EntryV1 {
-    #[primary_key]
-    pub(super) id: i64,
-    #[secondary_key]
-    pub(super) repo_id: i64,
-    #[secondary_key(optional)]
-    pub(super) artifact_id: Option<i64>,
-    pub(super) revision: u32,
-    pub(super) rel_path: String,
-    pub(super) abs_path: Option<String>,
-    pub(super) size: u64,
-    pub(super) state: State,
-    pub(super) triage: bool,
-    pub(super) preference: i64,
-    pub(super) lfs_pointer: bool,
-    pub(super) is_symlink: bool,
-    pub(super) git_sha1: Option<GitSha1>,
-    pub(super) mtime: Option<i64>,
-    pub(super) inode: Option<u64>,
-}
-
 /// The node an entry's bytes sit on. Every writer names this node until peers land.
 pub const LOCAL_NODE: i64 = 1;
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 7, version = 2, from = EntryV1)]
-#[native_db]
-pub(super) struct EntryV2 {
-    #[primary_key]
-    pub(super) id: i64,
-    #[secondary_key]
-    pub(super) repo_id: i64,
-    #[secondary_key(optional)]
-    pub(super) artifact_id: Option<i64>,
-    pub(super) revision: u32,
-    pub(super) rel_path: String,
-    pub(super) abs_path: Option<String>,
-    pub(super) size: u64,
-    pub(super) state: State,
-    pub(super) triage: bool,
-    pub(super) preference: i64,
-    pub(super) lfs_pointer: bool,
-    pub(super) is_symlink: bool,
-    pub(super) sha256: Option<Sha256>,
-    #[secondary_key(optional)]
-    pub(super) content: Option<u128>,
-    pub(super) git_sha1: Option<GitSha1>,
-    pub(super) mtime: Option<i64>,
-    pub(super) inode: Option<u64>,
-    #[secondary_key]
-    pub(super) node: i64,
-    pub(super) pass: u64,
-    pub(super) pull_progress: Option<f32>,
-}
-
-impl From<EntryV1> for EntryV2 {
-    fn from(entry: EntryV1) -> Self {
-        Self {
-            id: entry.id,
-            repo_id: entry.repo_id,
-            artifact_id: entry.artifact_id,
-            revision: entry.revision,
-            rel_path: entry.rel_path,
-            abs_path: entry.abs_path,
-            size: entry.size,
-            state: entry.state,
-            triage: entry.triage,
-            preference: entry.preference,
-            lfs_pointer: entry.lfs_pointer,
-            is_symlink: entry.is_symlink,
-            sha256: None,
-            content: None,
-            git_sha1: entry.git_sha1,
-            mtime: entry.mtime,
-            inode: entry.inode,
-            node: LOCAL_NODE,
-            pass: 0,
-            pull_progress: None,
-        }
-    }
-}
-
-impl From<EntryV2> for EntryV1 {
-    fn from(entry: EntryV2) -> Self {
-        Self {
-            id: entry.id,
-            repo_id: entry.repo_id,
-            artifact_id: entry.artifact_id,
-            revision: entry.revision,
-            rel_path: entry.rel_path,
-            abs_path: entry.abs_path,
-            size: entry.size,
-            state: entry.state,
-            triage: entry.triage,
-            preference: entry.preference,
-            lfs_pointer: entry.lfs_pointer,
-            is_symlink: entry.is_symlink,
-            git_sha1: entry.git_sha1,
-            mtime: entry.mtime,
-            inode: entry.inode,
-        }
-    }
-}
-
-/// One path, with the content hashes read from it and the node that holds it. `content` is
-/// the identity a sha256 makes, so a lookup by content hash is a secondary key read rather
-/// than a scan; `location` names the one path a revision of a repository holds, so finding
-/// it is one key read and reading a whole revision is one prefix scan.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 7, version = 3, from = EntryV2)]
-#[native_db]
-pub(super) struct EntryV3 {
-    #[primary_key]
-    pub(super) id: i64,
-    #[secondary_key]
-    pub(super) repo_id: i64,
-    #[secondary_key(optional)]
-    pub(super) artifact_id: Option<i64>,
-    pub(super) revision: u32,
-    pub(super) rel_path: String,
-    pub(super) abs_path: Option<String>,
-    pub(super) size: u64,
-    pub(super) state: State,
-    pub(super) triage: bool,
-    pub(super) preference: i64,
-    pub(super) lfs_pointer: bool,
-    pub(super) is_symlink: bool,
-    pub(super) sha256: Option<Sha256>,
-    #[secondary_key(optional)]
-    pub(super) content: Option<u128>,
-    pub(super) git_sha1: Option<GitSha1>,
-    pub(super) mtime: Option<i64>,
-    pub(super) inode: Option<u64>,
-    #[secondary_key]
-    pub(super) node: i64,
-    pub(super) pass: u64,
-    pub(super) pull_progress: Option<f32>,
-    /// [`location_key`] of this row's repository, revision and relative path. Every writer
-    /// that changes one of those three must write it again.
-    #[secondary_key(unique)]
-    pub(super) location: String,
-}
 
 /// Where the bytes of an entry sit relative to its repository root.
 ///
@@ -618,7 +159,7 @@ impl Placement {
 /// not indexed: every reader that used to scan by it is scoped by source or repository
 /// instead, and how many rows a node holds is on the node's own record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 7, version = 4, from = EntryV3)]
+#[native_model(id = 7, version = 1)]
 #[native_db]
 pub(super) struct Entry {
     #[primary_key]
@@ -698,127 +239,6 @@ pub(super) fn entry_at(
     )?)
 }
 
-impl From<EntryV2> for EntryV3 {
-    fn from(entry: EntryV2) -> Self {
-        Self {
-            location: location_key(entry.repo_id, entry.revision, &entry.rel_path),
-            id: entry.id,
-            repo_id: entry.repo_id,
-            artifact_id: entry.artifact_id,
-            revision: entry.revision,
-            rel_path: entry.rel_path,
-            abs_path: entry.abs_path,
-            size: entry.size,
-            state: entry.state,
-            triage: entry.triage,
-            preference: entry.preference,
-            lfs_pointer: entry.lfs_pointer,
-            is_symlink: entry.is_symlink,
-            sha256: entry.sha256,
-            content: entry.content,
-            git_sha1: entry.git_sha1,
-            mtime: entry.mtime,
-            inode: entry.inode,
-            node: entry.node,
-            pass: entry.pass,
-            pull_progress: entry.pull_progress,
-        }
-    }
-}
-
-impl From<EntryV3> for EntryV2 {
-    fn from(entry: EntryV3) -> Self {
-        Self {
-            id: entry.id,
-            repo_id: entry.repo_id,
-            artifact_id: entry.artifact_id,
-            revision: entry.revision,
-            rel_path: entry.rel_path,
-            abs_path: entry.abs_path,
-            size: entry.size,
-            state: entry.state,
-            triage: entry.triage,
-            preference: entry.preference,
-            lfs_pointer: entry.lfs_pointer,
-            is_symlink: entry.is_symlink,
-            sha256: entry.sha256,
-            content: entry.content,
-            git_sha1: entry.git_sha1,
-            mtime: entry.mtime,
-            inode: entry.inode,
-            node: entry.node,
-            pass: entry.pass,
-            pull_progress: entry.pull_progress,
-        }
-    }
-}
-
-impl From<EntryV3> for Entry {
-    fn from(entry: EntryV3) -> Self {
-        Self {
-            placed: match entry.abs_path {
-                Some(path) => Placement::At(path),
-                None => Placement::Absent,
-            },
-            id: entry.id,
-            repo_id: entry.repo_id,
-            artifact_id: entry.artifact_id,
-            revision: entry.revision,
-            rel_path: entry.rel_path,
-            size: entry.size,
-            state: entry.state,
-            triage: entry.triage,
-            preference: entry.preference,
-            lfs_pointer: entry.lfs_pointer,
-            is_symlink: entry.is_symlink,
-            sha256: entry.sha256,
-            content: entry.content,
-            git_sha1: entry.git_sha1,
-            mtime: entry.mtime,
-            inode: entry.inode,
-            node: entry.node,
-            pass: entry.pass,
-            pull_progress: entry.pull_progress,
-            location: entry.location,
-        }
-    }
-}
-
-/// The upgrade names every migrated path in full; `Catalog::open` then folds the ones that
-/// sit under their repository's root, which is the only place the root is known. Going back
-/// the other way cannot rebuild a path the row no longer carries, so a folded row reads as
-/// absent to a version that predates [`Placement`].
-impl From<Entry> for EntryV3 {
-    fn from(entry: Entry) -> Self {
-        Self {
-            abs_path: match entry.placed {
-                Placement::At(path) => Some(path),
-                Placement::Absent | Placement::UnderRoot => None,
-            },
-            id: entry.id,
-            repo_id: entry.repo_id,
-            artifact_id: entry.artifact_id,
-            revision: entry.revision,
-            rel_path: entry.rel_path,
-            size: entry.size,
-            state: entry.state,
-            triage: entry.triage,
-            preference: entry.preference,
-            lfs_pointer: entry.lfs_pointer,
-            is_symlink: entry.is_symlink,
-            sha256: entry.sha256,
-            content: entry.content,
-            git_sha1: entry.git_sha1,
-            mtime: entry.mtime,
-            inode: entry.inode,
-            node: entry.node,
-            pass: entry.pass,
-            pull_progress: entry.pull_progress,
-            location: entry.location,
-        }
-    }
-}
-
 /// A user's verdict on what an artifact is. It outranks inference: the artifact record
 /// carries what the verdict says, and a rescan re-applies it over freshly inferred facts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -856,21 +276,6 @@ pub(super) struct SearchText {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 6, version = 1)]
 #[native_db]
-pub(super) struct ManifestV1 {
-    #[primary_key]
-    pub(super) id: u8,
-    pub(super) format_version: u32,
-    pub(super) generation: u64,
-    pub(super) scanned_at: String,
-    pub(super) node: String,
-    pub(super) counts: Vec<(String, u64)>,
-    pub(super) search_directory: Option<String>,
-    pub(super) search_generation: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 6, version = 2, from = ManifestV1)]
-#[native_db]
 pub(super) struct Manifest {
     #[primary_key]
     pub(super) id: u8,
@@ -884,37 +289,6 @@ pub(super) struct Manifest {
     pub(super) search_seq: u64,
 }
 
-impl From<Manifest> for ManifestV1 {
-    fn from(manifest: Manifest) -> Self {
-        Self {
-            id: manifest.id,
-            format_version: manifest.format_version,
-            generation: manifest.generation,
-            scanned_at: manifest.scanned_at,
-            node: manifest.node,
-            counts: manifest.counts,
-            search_directory: manifest.search_directory,
-            search_generation: manifest.search_generation,
-        }
-    }
-}
-
-impl From<ManifestV1> for Manifest {
-    fn from(manifest: ManifestV1) -> Self {
-        Self {
-            id: manifest.id,
-            format_version: manifest.format_version,
-            generation: manifest.generation,
-            scanned_at: manifest.scanned_at,
-            node: manifest.node,
-            counts: manifest.counts,
-            search_directory: manifest.search_directory,
-            search_generation: manifest.search_generation,
-            search_seq: 0,
-        }
-    }
-}
-
 /// One artifact whose documents the published search index no longer matches. The sequence
 /// orders the log; a refresh replays every row after the manifest's cursor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -926,36 +300,11 @@ pub(super) struct SearchChange {
     pub(super) artifact_id: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 11, version = 1)]
-#[native_db]
-pub(super) struct SummaryV1 {
-    #[primary_key]
-    pub(super) id: u8,
-    pub(super) reclaimable_bytes: u64,
-    pub(super) duplicate_artifacts: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 11, version = 2, from = SummaryV1)]
-#[native_db]
-pub(super) struct SummaryV2 {
-    #[primary_key]
-    pub(super) id: u8,
-    pub(super) reclaimable_bytes: u64,
-    pub(super) duplicate_artifacts: u64,
-    pub(super) artifacts: u64,
-    pub(super) present_artifacts: u64,
-    pub(super) triage_artifacts: u64,
-    pub(super) indexed_bytes: u64,
-    pub(super) repositories: u64,
-}
-
 /// What the artifact sweep last measured, so the facet rail and the stats route read one
 /// record rather than scanning every artifact. `advertised_artifacts` is what a peer's
 /// digest reports as its total: the hashed records this node holds a path to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 11, version = 3, from = SummaryV2)]
+#[native_model(id = 11, version = 1)]
 #[native_db]
 pub(super) struct Summary {
     #[primary_key]
@@ -968,62 +317,6 @@ pub(super) struct Summary {
     pub(super) indexed_bytes: u64,
     pub(super) repositories: u64,
     pub(super) advertised_artifacts: u64,
-}
-
-impl From<SummaryV1> for SummaryV2 {
-    fn from(summary: SummaryV1) -> Self {
-        Self {
-            id: summary.id,
-            reclaimable_bytes: summary.reclaimable_bytes,
-            duplicate_artifacts: summary.duplicate_artifacts,
-            artifacts: 0,
-            present_artifacts: 0,
-            triage_artifacts: 0,
-            indexed_bytes: 0,
-            repositories: 0,
-        }
-    }
-}
-
-impl From<SummaryV2> for SummaryV1 {
-    fn from(summary: SummaryV2) -> Self {
-        Self {
-            id: summary.id,
-            reclaimable_bytes: summary.reclaimable_bytes,
-            duplicate_artifacts: summary.duplicate_artifacts,
-        }
-    }
-}
-
-impl From<SummaryV2> for Summary {
-    fn from(summary: SummaryV2) -> Self {
-        Self {
-            id: summary.id,
-            reclaimable_bytes: summary.reclaimable_bytes,
-            duplicate_artifacts: summary.duplicate_artifacts,
-            artifacts: summary.artifacts,
-            present_artifacts: summary.present_artifacts,
-            triage_artifacts: summary.triage_artifacts,
-            indexed_bytes: summary.indexed_bytes,
-            repositories: summary.repositories,
-            advertised_artifacts: 0,
-        }
-    }
-}
-
-impl From<Summary> for SummaryV2 {
-    fn from(summary: Summary) -> Self {
-        Self {
-            id: summary.id,
-            reclaimable_bytes: summary.reclaimable_bytes,
-            duplicate_artifacts: summary.duplicate_artifacts,
-            artifacts: summary.artifacts,
-            present_artifacts: summary.present_artifacts,
-            triage_artifacts: summary.triage_artifacts,
-            indexed_bytes: summary.indexed_bytes,
-            repositories: summary.repositories,
-        }
-    }
 }
 
 /// The high-water marks a later scan continues from, so ids stay stable across runs.
@@ -1156,29 +449,10 @@ pub(super) struct Job {
     pub(super) finished: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 21, version = 1)]
-#[native_db]
-pub(super) struct NodeV1 {
-    #[primary_key]
-    pub(super) id: i64,
-    #[secondary_key(unique)]
-    pub(super) node_id: String,
-    pub(super) name: String,
-    pub(super) url: Option<String>,
-    pub(super) is_self: bool,
-    pub(super) online: bool,
-    pub(super) indexed_bytes: u64,
-    pub(super) last_seen: Option<String>,
-    pub(super) cursor: Option<String>,
-    pub(super) synced: Option<String>,
-    pub(super) pass: u64,
-}
-
 /// A machine this install knows about: this one, which is always [`LOCAL_NODE`], plus every
 /// peer discovered or configured.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 21, version = 2, from = NodeV1)]
+#[native_model(id = 21, version = 1)]
 #[native_db]
 pub(super) struct Node {
     #[primary_key]
@@ -1204,74 +478,20 @@ pub(super) struct Node {
     pub(super) filed: u64,
 }
 
-impl From<NodeV1> for Node {
-    fn from(node: NodeV1) -> Self {
-        Self {
-            id: node.id,
-            node_id: node.node_id,
-            name: node.name,
-            url: node.url,
-            is_self: node.is_self,
-            online: node.online,
-            indexed_bytes: node.indexed_bytes,
-            last_seen: node.last_seen,
-            cursor: node.cursor,
-            synced: node.synced,
-            pass: node.pass,
-            filed: 0,
-        }
-    }
-}
-
-impl From<Node> for NodeV1 {
-    fn from(node: Node) -> Self {
-        Self {
-            id: node.id,
-            node_id: node.node_id,
-            name: node.name,
-            url: node.url,
-            is_self: node.is_self,
-            online: node.online,
-            indexed_bytes: node.indexed_bytes,
-            last_seen: node.last_seen,
-            cursor: node.cursor,
-            synced: node.synced,
-            pass: node.pass,
-        }
-    }
-}
-
-/// Registers every record type. `native_db` compares each definition against every model
-/// already registered rather than only against the other versions of the same model, so a
-/// version 1 model must be defined last: it is what leaves each migrated model marked
-/// current and each superseded one marked legacy.
+/// Registers every record type.
 pub(super) fn define_models() -> super::Result<Models> {
     let mut models = Models::new();
-    models.define::<RepositoryV1>()?;
-    models.define::<RepositoryV2>()?;
-    models.define::<RepositoryV3>()?;
-    models.define::<Repository>()?;
-    models.define::<ArtifactRecordV1>()?;
-    models.define::<ArtifactRecord>()?;
-    models.define::<ManifestV1>()?;
-    models.define::<Manifest>()?;
-    models.define::<SummaryV1>()?;
-    models.define::<SummaryV2>()?;
-    models.define::<Summary>()?;
-    models.define::<SourceV1>()?;
-    models.define::<SourceV2>()?;
     models.define::<Source>()?;
-    models.define::<EntryV1>()?;
-    models.define::<EntryV2>()?;
-    models.define::<EntryV3>()?;
-    models.define::<Entry>()?;
-    models.define::<NodeV1>()?;
-    models.define::<Node>()?;
-    models.define::<ArtifactDetail>()?;
+    models.define::<Repository>()?;
+    models.define::<ArtifactRecord>()?;
     models.define::<SearchText>()?;
+    models.define::<Manifest>()?;
+    models.define::<Entry>()?;
+    models.define::<ArtifactDetail>()?;
     models.define::<Allocator>()?;
-    models.define::<Override>()?;
     models.define::<SearchChange>()?;
+    models.define::<Summary>()?;
+    models.define::<Override>()?;
     models.define::<Setting>()?;
     models.define::<Shelf>()?;
     models.define::<Noise>()?;
@@ -1280,5 +500,6 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<ArtifactUse>()?;
     models.define::<LoadoutDoc>()?;
     models.define::<Job>()?;
+    models.define::<Node>()?;
     Ok(models)
 }

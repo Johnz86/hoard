@@ -137,7 +137,7 @@ impl Catalog {
         counters.save(&transaction)?;
         transaction.insert(Manifest {
             id: 0,
-            format_version: 5,
+            format_version: super::FORMAT_VERSION,
             generation: 1,
             scanned_at: jiff::Timestamp::now().to_string(),
             node: node.to_owned(),
@@ -247,131 +247,6 @@ impl Catalog {
                 byte_count,
                 last_scan: Some(at.clone()),
                 ..stored
-            })?;
-        }
-        transaction.commit()?;
-        Ok(())
-    }
-
-    /// Counts again, from the entries themselves, everything the records above them carry:
-    /// each repository's present files and bytes and each source's owed hashes. This is
-    /// what a catalog whose records predate one of those counts needs once on open.
-    /// Folds every entry that names its repository's root joined with its own relative path
-    /// back onto [`Placement::UnderRoot`], which is what the migration from version 3 leaves
-    /// to do: the upgrade names each path in full because it cannot see the repository.
-    ///
-    /// Works one repository at a time and commits in chunks, so the pass costs a repository
-    /// rather than the whole catalog at once.
-    pub(super) fn fold_paths_under_their_roots(&self) -> Result<()> {
-        let read = self.database.r_transaction()?;
-        let repositories: Vec<Repository> = read
-            .scan()
-            .primary()?
-            .all()?
-            .collect::<native_db::db_type::Result<_>>()?;
-        drop(read);
-        for repository in repositories {
-            let read = self.database.r_transaction()?;
-            let rows: Vec<Entry> = read
-                .scan()
-                .secondary::<Entry>(EntryKey::repo_id)?
-                .start_with(repository.id)?
-                .collect::<native_db::db_type::Result<_>>()?;
-            drop(read);
-            let folded: Vec<Entry> = rows
-                .into_iter()
-                .filter(|entry| entry.repo_id == repository.id)
-                .filter_map(|entry| {
-                    let placed = Placement::of(
-                        entry
-                            .placed
-                            .resolve(&repository.root_path, &entry.rel_path)
-                            .as_deref(),
-                        &repository.root_path,
-                        &entry.rel_path,
-                    );
-                    (placed != entry.placed).then_some(Entry { placed, ..entry })
-                })
-                .collect();
-            for batch in folded.chunks(CHUNK) {
-                let transaction = self.database.rw_transaction()?;
-                for entry in batch {
-                    transaction.upsert(entry.clone())?;
-                }
-                transaction.commit()?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn recount_derived(&self) -> Result<()> {
-        let read = self.database.r_transaction()?;
-        let mut counted: HashMap<i64, (u32, u64, u64)> = HashMap::new();
-        let mut filed: HashMap<i64, u64> = HashMap::new();
-        for entry in read.scan().primary::<Entry>()?.all()? {
-            let entry: Entry = entry?;
-            *filed.entry(entry.node).or_default() += 1;
-            if entry.state == State::Remote {
-                continue;
-            }
-            let slot = counted.entry(entry.repo_id).or_insert((0, 0, 0));
-            slot.0 = slot.0.saturating_add(1);
-            slot.1 = slot.1.saturating_add(entry.size);
-            if owes_a_hash(&entry) {
-                slot.2 = slot.2.saturating_add(1);
-            }
-        }
-        let nodes: Vec<Node> = read
-            .scan()
-            .primary()?
-            .all()?
-            .collect::<native_db::db_type::Result<_>>()?;
-        let repositories: Vec<Repository> = read
-            .scan()
-            .primary()?
-            .all()?
-            .collect::<native_db::db_type::Result<_>>()?;
-        let sources: Vec<Source> = read
-            .scan()
-            .primary()?
-            .all()?
-            .collect::<native_db::db_type::Result<_>>()?;
-        drop(read);
-        let mut owed: HashMap<&str, u64> = HashMap::with_capacity(sources.len());
-        let transaction = self.database.rw_transaction()?;
-        for repository in &repositories {
-            let (present_files, present_bytes, pending) =
-                counted.get(&repository.id).copied().unwrap_or((0, 0, 0));
-            *owed.entry(repository.source.as_str()).or_default() += pending;
-            if repository.present_files == present_files
-                && repository.present_bytes == present_bytes
-            {
-                continue;
-            }
-            transaction.upsert(Repository {
-                present_files,
-                present_bytes,
-                ..repository.clone()
-            })?;
-        }
-        for source in sources {
-            let pending_hashes = owed.get(source.name.as_str()).copied().unwrap_or_default();
-            if source.pending_hashes == pending_hashes {
-                continue;
-            }
-            transaction.upsert(Source {
-                pending_hashes,
-                ..source
-            })?;
-        }
-        for node in nodes {
-            let counted = filed.get(&node.id).copied().unwrap_or_default();
-            if node.filed == counted {
-                continue;
-            }
-            transaction.upsert(Node {
-                filed: counted,
-                ..node
             })?;
         }
         transaction.commit()?;

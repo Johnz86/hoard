@@ -6,8 +6,8 @@ use tempfile::TempDir;
 
 use hoard_core::{
     Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, EntryId, Evidence,
-    EvidenceSource, JobId, Loadout, LoadoutPin, NodeId, Precision, RepoId, RepoRowId, RepoType,
-    Role, Sha256, State, SubRole, TensorSample, TensorSummary,
+    EvidenceSource, JobId, Loadout, LoadoutPin, NodeId, Precision, RepoId, RepoType, Role, Sha256,
+    State, TensorSample, TensorSummary,
 };
 
 use crate::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
@@ -18,18 +18,15 @@ use crate::row::SearchRow;
 use crate::search::{CompileContext, SortKey, SortSpec, parse};
 
 use super::models::{
-    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, ArtifactRecordV1, Entry, EntryKey, EntryV1,
-    EntryV2, EntryV3, LOCAL_NODE, Manifest, ManifestV1, Node, NodeV1, Override, Placement, Ref,
-    Repository, RepositoryKey, RepositoryV1, RepositoryV2, RepositoryV3, Revision, RevisionV1,
-    RevisionV2, SearchChange, SearchText, Source, SourceV1, SourceV2, Summary, SummaryV1,
-    SummaryV2,
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, Placement,
+    Repository, RepositoryKey, SearchChange, Source,
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::{
     Catalog, DigestApplied, JobProgress, JobState, MIRROR_SOURCE, NewProjection, PullMark,
     PulledFile, QueryPage, QueryRequest, RemoteEntry, RepositoryDetail, RepositoryFilter,
-    RescanReport, ServedFile, UsageEvent, builder, models, query,
+    RescanReport, ServedFile, UsageEvent, models, query,
 };
 
 fn running_as_root() -> bool {
@@ -357,56 +354,6 @@ fn exactly_one_document_per_artifact_is_primary_and_it_is_the_preferred_entry() 
 }
 
 #[test]
-fn version_one_records_are_migrated_on_open() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join("catalog.redb");
-    {
-        let database = native_db::Builder::new().create(models()?, &path)?;
-        let transaction = database.rw_transaction()?;
-        transaction.insert(ManifestV1 {
-            id: 0,
-            format_version: 5,
-            generation: 3,
-            scanned_at: "then".to_owned(),
-            node: "old".to_owned(),
-            counts: vec![("entries".to_owned(), 1)],
-            search_directory: None,
-            search_generation: 0,
-        })?;
-        transaction.insert(SummaryV1 {
-            id: 0,
-            reclaimable_bytes: 4096,
-            duplicate_artifacts: 3,
-        })?;
-        transaction.commit()?;
-        let read = database.r_transaction()?;
-        let invisible: Option<Manifest> = read.get().primary(0_u8)?;
-        assert!(
-            invisible.is_none(),
-            "a v1 row is not visible to the v2 type until migrated"
-        );
-    }
-    let catalog = Catalog::open(directory.path())?;
-    let status = catalog.status()?;
-    assert_eq!(status.generation, 3);
-    assert_eq!(status.node, "old");
-    let read = catalog.database.r_transaction()?;
-    let migrated: Option<Manifest> = read.get().primary(0_u8)?;
-    assert_eq!(migrated.map(|manifest| manifest.search_seq), Some(0));
-    let old: Option<ManifestV1> = read.get().primary(0_u8)?;
-    assert!(old.is_none(), "the v1 table is drained");
-    let summary: Option<Summary> = read.get().primary(0_u8)?;
-    assert_eq!(
-        summary.map(|summary| (summary.reclaimable_bytes, summary.artifacts)),
-        Some((4096, 0)),
-        "the totals a v1 summary never held start at zero"
-    );
-    let old: Option<SummaryV1> = read.get().primary(0_u8)?;
-    assert!(old.is_none(), "the v1 summary table is drained");
-    Ok(())
-}
-
-#[test]
 fn an_override_rewrites_the_artifact_reaches_search_and_survives_a_rescan() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
@@ -449,7 +396,7 @@ fn an_override_rewrites_the_artifact_reaches_search_and_survives_a_rescan() -> R
 }
 
 #[test]
-fn refs_keep_their_kind_and_old_records_migrate_on_open() -> Result<()> {
+fn refs_keep_their_kind() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let hub = directory.path().join("hub");
     fs::create_dir(&hub)?;
@@ -479,62 +426,6 @@ fn refs_keep_their_kind_and_old_records_migrate_on_open() -> Result<()> {
         .collect::<native_db::db_type::Result<_>>()?;
     assert!(!records[0].first_seen.is_empty());
     assert!(!records[0].triage_cleared);
-    drop(read);
-
-    let legacy = tempfile::tempdir()?;
-    {
-        let database = builder().create(models()?, legacy.path().join("catalog.redb"))?;
-        let transaction = database.rw_transaction()?;
-        transaction.insert(ManifestV1 {
-            id: 0,
-            format_version: 5,
-            generation: 1,
-            scanned_at: "then".to_owned(),
-            node: "old".to_owned(),
-            counts: Vec::new(),
-            search_directory: None,
-            search_generation: 0,
-        })?;
-        transaction.insert(ArtifactRecordV1 {
-            id: 9_000,
-            identity: 0x9000,
-            artifact: frozen_artifact(),
-            name: "old".into(),
-            org: None,
-            path_count: 1,
-            group_bytes: None,
-            shard_count: None,
-        })?;
-        let repo = RepoId::new(RepoType::Models, Some("acme".to_owned()), "styler");
-        transaction.insert(RepositoryV1 {
-            id: 11,
-            key: models::repository_key("hub", &repo),
-            source: "hub".to_owned(),
-            repo,
-            root_path: "/hub".to_owned(),
-            default_ref: "main".to_owned(),
-            revisions: vec![RevisionV1 {
-                name: "main".to_owned(),
-                sha: None,
-                refs: vec!["main".to_owned()],
-            }],
-        })?;
-        transaction.commit()?;
-    }
-    let reopened = Catalog::open(legacy.path())?;
-    let read = reopened.database.r_transaction()?;
-    let migrated: Option<ArtifactRecord> = read.get().primary(9_000_i64)?;
-    assert!(
-        migrated.is_some_and(|record| !record.triage_cleared && record.first_seen.is_empty()),
-        "a v1 record is migrated on open"
-    );
-    let repository: Option<Repository> = read.get().primary(11_i64)?;
-    assert_eq!(
-        repository
-            .and_then(|repository| repository.revisions[0].refs.first().map(|ref_| ref_.kind)),
-        Some(RefKind::Branch),
-        "a v1 repository's ref names a branch after migration"
-    );
     Ok(())
 }
 
@@ -1303,7 +1194,7 @@ fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
         .map(|table| table.name.as_str())
         .collect();
     assert!(
-        names.iter().any(|name| name.starts_with("7_4_")),
+        names.iter().any(|name| name.starts_with("7_1_")),
         "the Entry table is listed: {names:?}"
     );
     assert!(
@@ -1313,7 +1204,7 @@ fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
     let entries = report
         .tables
         .iter()
-        .find(|table| table.name.starts_with("7_4_id"))
+        .find(|table| table.name.starts_with("7_1_id"))
         .map(|table| table.entries);
     assert_eq!(entries, Some(2));
     let reopened = Catalog::open(&native)?;
@@ -2384,72 +2275,6 @@ fn a_git_clone_keeps_its_git_dir_and_commit_metadata() -> Result<()> {
 }
 
 #[test]
-fn a_version_2_repository_is_migrated_on_open() -> Result<()> {
-    let legacy = tempfile::tempdir()?;
-    let repo = RepoId::new(RepoType::Models, Some("acme".to_owned()), "styler");
-    {
-        let database = builder().create(models()?, legacy.path().join("catalog.redb"))?;
-        let transaction = database.rw_transaction()?;
-        transaction.insert(ManifestV1 {
-            id: 0,
-            format_version: 5,
-            generation: 1,
-            scanned_at: "then".to_owned(),
-            node: "old".to_owned(),
-            counts: Vec::new(),
-            search_directory: None,
-            search_generation: 0,
-        })?;
-        transaction.insert(Source {
-            name: "hub".to_owned(),
-            config: SourceConfig {
-                name: "hub".to_owned(),
-                ..frozen_source_config()
-            },
-            resolved_kind: SourceKind::Git,
-            file_count: 0,
-            byte_count: 0,
-            last_scan: None,
-            pending_hashes: 0,
-        })?;
-        transaction.insert(RepositoryV2 {
-            id: 11,
-            key: models::repository_key("hub", &repo),
-            source: "hub".to_owned(),
-            repo: repo.clone(),
-            root_path: "/hub".to_owned(),
-            default_ref: "main".to_owned(),
-            revisions: vec![RevisionV2 {
-                name: "main".to_owned(),
-                sha: Some(CommitSha::from_bytes([7; 20])),
-                refs: vec![Ref {
-                    name: "main".to_owned(),
-                    kind: RefKind::Branch,
-                }],
-            }],
-        })?;
-        transaction.commit()?;
-    }
-    let reopened = Catalog::open(legacy.path())?;
-    let detail = reopened
-        .repository(&repo)?
-        .ok_or_else(|| IndexError::Catalog("repo".into()))?;
-    assert_eq!(detail.git_dir, None, "a v2 repository named no clone");
-    assert_eq!(detail.revisions.len(), 1);
-    assert_eq!(detail.revisions[0].title, None);
-    assert_eq!(detail.revisions[0].author, None);
-    assert_eq!(detail.revisions[0].committed, None);
-    assert_eq!(
-        detail.revisions[0].sha,
-        Some(CommitSha::from_bytes([7; 20]))
-    );
-    let read = reopened.database.r_transaction()?;
-    let old: Option<RepositoryV2> = read.get().primary(11_i64)?;
-    assert!(old.is_none(), "the v2 table is drained");
-    Ok(())
-}
-
-#[test]
 fn repository_counts_follow_every_writer() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
@@ -2519,85 +2344,6 @@ fn repository_counts_follow_every_writer() -> Result<()> {
         "the walked repository is intact"
     );
     Ok(())
-}
-
-#[test]
-fn a_migrated_repository_recounts_its_presence() -> Result<()> {
-    let legacy = tempfile::tempdir()?;
-    let repo = RepoId::new(RepoType::Models, Some("acme".to_owned()), "styler");
-    {
-        let database = builder().create(models()?, legacy.path().join("catalog.redb"))?;
-        let transaction = database.rw_transaction()?;
-        transaction.insert(Manifest {
-            id: 0,
-            format_version: 5,
-            generation: 1,
-            scanned_at: "then".to_owned(),
-            node: "old".to_owned(),
-            counts: Vec::new(),
-            search_directory: None,
-            search_generation: 0,
-            search_seq: 0,
-        })?;
-        transaction.insert(Source {
-            name: "hub".to_owned(),
-            config: SourceConfig {
-                name: "hub".to_owned(),
-                ..frozen_source_config()
-            },
-            resolved_kind: SourceKind::Git,
-            file_count: 0,
-            byte_count: 0,
-            last_scan: None,
-            pending_hashes: 0,
-        })?;
-        transaction.insert(RepositoryV3 {
-            id: 11,
-            key: models::repository_key("hub", &repo),
-            source: "hub".to_owned(),
-            repo: repo.clone(),
-            root_path: "/hub".to_owned(),
-            git_dir: None,
-            default_ref: "main".to_owned(),
-            revisions: frozen_revisions(),
-        })?;
-        for (id, size, state) in [(1_i64, 100_u64, State::Local), (2, 500, State::Remote)] {
-            transaction.insert(legacy_entry(id, 11, size, state))?;
-        }
-        transaction.commit()?;
-    }
-    let reopened = Catalog::open(legacy.path())?;
-    let detail = repository_of(&reopened, &repo)?;
-    assert_eq!(detail.present_files, 1, "a remote path holds no bytes here");
-    assert_eq!(detail.present_bytes, 100);
-    Ok(())
-}
-
-fn legacy_entry(id: i64, repo_id: i64, size: u64, state: State) -> Entry {
-    let rel_path = format!("w{id}.safetensors");
-    Entry {
-        id,
-        repo_id,
-        artifact_id: None,
-        revision: 0,
-        location: models::location_key(repo_id, 0, &rel_path),
-        rel_path,
-        placed: Placement::At(format!("/hub/w{id}.safetensors")),
-        size,
-        state,
-        triage: false,
-        preference: 0,
-        lfs_pointer: false,
-        is_symlink: false,
-        sha256: None,
-        content: None,
-        git_sha1: None,
-        mtime: None,
-        inode: None,
-        node: LOCAL_NODE,
-        pass: 0,
-        pull_progress: None,
-    }
 }
 
 #[test]
@@ -2982,112 +2728,6 @@ fn an_entry_under_its_root_stores_no_absolute_path() -> Result<()> {
 }
 
 #[test]
-fn a_version_3_entry_is_migrated_on_open() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let path = directory.path().join("catalog.redb");
-    let repo = RepoId::new(RepoType::Models, Some("old".to_owned()), "rows");
-    {
-        let database = native_db::Builder::new().create(models()?, &path)?;
-        let transaction = database.rw_transaction()?;
-        transaction.insert(Manifest {
-            id: 0,
-            format_version: 5,
-            generation: 1,
-            scanned_at: "then".to_owned(),
-            node: "old".to_owned(),
-            counts: Vec::new(),
-            search_directory: None,
-            search_generation: 0,
-            search_seq: 0,
-        })?;
-        transaction.insert(Repository {
-            id: 1,
-            key: models::repository_key("legacy", &repo),
-            source: "legacy".to_owned(),
-            repo: repo.clone(),
-            root_path: "/legacy/root".to_owned(),
-            git_dir: None,
-            default_ref: "main".to_owned(),
-            revisions: vec![Revision {
-                name: "main".to_owned(),
-                sha: None,
-                refs: vec![Ref {
-                    name: "main".to_owned(),
-                    kind: RefKind::Branch,
-                }],
-                title: None,
-                author: None,
-                committed: None,
-            }],
-            present_files: 2,
-            present_bytes: 128,
-        })?;
-        for (id, abs_path) in [
-            (1_i64, "/legacy/root/under.safetensors"),
-            (2, "/elsewhere/blobs/loose.safetensors"),
-        ] {
-            let rel_path = match id {
-                1 => "under.safetensors",
-                _ => "loose.safetensors",
-            };
-            transaction.insert(EntryV3 {
-                id,
-                repo_id: 1,
-                artifact_id: None,
-                revision: 0,
-                location: models::location_key(1, 0, rel_path),
-                rel_path: rel_path.to_owned(),
-                abs_path: Some(abs_path.to_owned()),
-                size: 64,
-                state: State::Local,
-                triage: false,
-                preference: 19,
-                lfs_pointer: false,
-                is_symlink: false,
-                sha256: None,
-                content: None,
-                git_sha1: None,
-                mtime: Some(1),
-                inode: Some(2),
-                node: LOCAL_NODE,
-                pass: 0,
-                pull_progress: None,
-            })?;
-        }
-        transaction.commit()?;
-    }
-
-    let catalog = Catalog::open(directory.path())?;
-
-    let read = catalog.database.r_transaction()?;
-    let stale: Option<EntryV3> = read.get().primary(1_i64)?;
-    assert!(stale.is_none(), "the v3 table is drained");
-    let under: Option<Entry> = read.get().primary(1_i64)?;
-    assert_eq!(
-        under.map(|entry| entry.placed),
-        Some(Placement::UnderRoot),
-        "a path equal to the root joined with the relative path is folded"
-    );
-    let elsewhere: Option<Entry> = read.get().primary(2_i64)?;
-    assert_eq!(
-        elsewhere.map(|entry| entry.placed),
-        Some(Placement::At(
-            "/elsewhere/blobs/loose.safetensors".to_owned()
-        )),
-        "a path that leaves the root is kept in full"
-    );
-    drop(read);
-    let detail = catalog
-        .revision_entry(RepoRowId::new(1), 0, "under.safetensors")?
-        .ok_or_else(|| IndexError::Catalog("the migrated entry".into()))?;
-    assert_eq!(
-        detail.abs_path.as_deref(),
-        Some("/legacy/root/under.safetensors")
-    );
-    Ok(())
-}
-
-#[test]
 fn totals_follow_the_sweep() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
@@ -3277,429 +2917,6 @@ fn a_changed_file_is_reread_and_a_new_file_continues_the_ids() -> Result<()> {
         .all()?
         .collect::<native_db::db_type::Result<_>>()?;
     assert_eq!(repositories.len(), 1, "the repository keeps its id");
-    Ok(())
-}
-
-fn frozen_encoding<T: native_model::Model>(value: &T) -> Result<String> {
-    native_model::encode(value)
-        .map(hex::encode)
-        .map_err(|error| IndexError::Catalog(error.to_string()))
-}
-
-fn frozen_source_config() -> SourceConfig {
-    SourceConfig {
-        name: "frozen".to_owned(),
-        path: PathBuf::from("/frozen/source"),
-        kind: SourceKind::HfCache,
-        include: vec!["**/*.safetensors".to_owned()],
-        exclude: vec!["**/*.tmp".to_owned()],
-        follow_symlinks: true,
-        repo_per_folder: false,
-    }
-}
-
-fn frozen_artifact() -> Artifact {
-    Artifact {
-        id: ArtifactId::new(7),
-        blob: BlobId::new(9),
-        sha256: Some(Sha256::from_bytes([3; 32])),
-        size: 4096,
-        format: ArtifactFormat::Gguf,
-        role: Role::Lora,
-        sub_role: Some(SubRole::Ipa),
-        role_confidence: 0.875,
-        base: Base::new("sdxl 1.0"),
-        base_label: Some("SDXL 1.0".to_owned()),
-        base_confidence: 0.625,
-        precision: Some(Precision::new("fp16")),
-        quant: Some("q4_k_m".to_owned()),
-        rank: Some(16),
-        alpha: Some(8.0),
-        params: Some(1_234_567),
-        context: Some(8192),
-        trigger: Some("frozen style".to_owned()),
-        sniff_version: 3,
-    }
-}
-
-#[test]
-fn source_encoding_is_frozen() -> Result<()> {
-    let value = Source {
-        name: "frozen".to_owned(),
-        config: frozen_source_config(),
-        resolved_kind: SourceKind::Git,
-        file_count: 12,
-        byte_count: 4096,
-        last_scan: Some("2026-09-04T09:10:00Z".to_owned()),
-        pending_hashes: 5,
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn source_v2_encoding_is_frozen() -> Result<()> {
-    let value = SourceV2 {
-        name: "frozen".to_owned(),
-        config: frozen_source_config(),
-        resolved_kind: SourceKind::Git,
-        file_count: 12,
-        byte_count: 4096,
-        last_scan: Some("2026-09-04T09:10:00Z".to_owned()),
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn source_v1_encoding_is_frozen() -> Result<()> {
-    let value = SourceV1 {
-        name: "frozen".to_owned(),
-        config: frozen_source_config(),
-        resolved_kind: SourceKind::Git,
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-fn frozen_revisions() -> Vec<Revision> {
-    vec![Revision {
-        name: "main".to_owned(),
-        sha: Some(CommitSha::from_bytes([5; 20])),
-        refs: vec![Ref {
-            name: "refs/heads/main".to_owned(),
-            kind: RefKind::Tag,
-        }],
-        title: Some("frozen import".to_owned()),
-        author: Some("frozen-org".to_owned()),
-        committed: Some("2026-01-17T10:22:31Z".to_owned()),
-    }]
-}
-
-#[test]
-fn repository_encoding_is_frozen() -> Result<()> {
-    let repo = RepoId::new(RepoType::Datasets, Some("frozen-org".to_owned()), "frozen");
-    let value = Repository {
-        id: 11,
-        key: models::repository_key("frozen", &repo),
-        source: "frozen".to_owned(),
-        repo,
-        root_path: "/frozen/source/datasets--frozen-org--frozen".to_owned(),
-        git_dir: Some("/frozen/source/datasets--frozen-org--frozen/.git".to_owned()),
-        default_ref: "main".to_owned(),
-        revisions: frozen_revisions(),
-        present_files: 3,
-        present_bytes: 12_288,
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn repository_v3_encoding_is_frozen() -> Result<()> {
-    let repo = RepoId::new(RepoType::Datasets, Some("frozen-org".to_owned()), "frozen");
-    let value = RepositoryV3 {
-        id: 11,
-        key: models::repository_key("frozen", &repo),
-        source: "frozen".to_owned(),
-        repo,
-        root_path: "/frozen/source/datasets--frozen-org--frozen".to_owned(),
-        git_dir: Some("/frozen/source/datasets--frozen-org--frozen/.git".to_owned()),
-        default_ref: "main".to_owned(),
-        revisions: frozen_revisions(),
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn repository_v2_encoding_is_frozen() -> Result<()> {
-    let repo = RepoId::new(RepoType::Datasets, Some("frozen-org".to_owned()), "frozen");
-    let value = RepositoryV2 {
-        id: 11,
-        key: models::repository_key("frozen", &repo),
-        source: "frozen".to_owned(),
-        repo,
-        root_path: "/frozen/source/datasets--frozen-org--frozen".to_owned(),
-        default_ref: "main".to_owned(),
-        revisions: vec![RevisionV2 {
-            name: "main".to_owned(),
-            sha: Some(CommitSha::from_bytes([5; 20])),
-            refs: vec![Ref {
-                name: "refs/heads/main".to_owned(),
-                kind: RefKind::Tag,
-            }],
-        }],
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn repository_v1_encoding_is_frozen() -> Result<()> {
-    let repo = RepoId::new(RepoType::Datasets, Some("frozen-org".to_owned()), "frozen");
-    let value = RepositoryV1 {
-        id: 11,
-        key: models::repository_key("frozen", &repo),
-        source: "frozen".to_owned(),
-        repo,
-        root_path: "/frozen/source/datasets--frozen-org--frozen".to_owned(),
-        default_ref: "main".to_owned(),
-        revisions: vec![RevisionV1 {
-            name: "main".to_owned(),
-            sha: Some(CommitSha::from_bytes([5; 20])),
-            refs: vec!["refs/heads/main".to_owned()],
-        }],
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn artifact_record_encoding_is_frozen() -> Result<()> {
-    let value = ArtifactRecord {
-        id: 7,
-        identity: 0x0303_0303_0303_0303_u128,
-        artifact: frozen_artifact(),
-        name: "frozen.safetensors".to_owned(),
-        org: Some("frozen-org".to_owned()),
-        path_count: 2,
-        group_bytes: Some(8192),
-        shard_count: Some(3),
-        triage_cleared: true,
-        first_seen: "2026-09-05T00:00:00Z".to_owned(),
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn artifact_record_v1_encoding_is_frozen() -> Result<()> {
-    let value = ArtifactRecordV1 {
-        id: 7,
-        identity: 0x0303_0303_0303_0303_u128,
-        artifact: frozen_artifact(),
-        name: "frozen.safetensors".to_owned(),
-        org: Some("frozen-org".to_owned()),
-        path_count: 2,
-        group_bytes: Some(8192),
-        shard_count: Some(3),
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn override_encoding_is_frozen() -> Result<()> {
-    let value = Override {
-        artifact_id: 7,
-        role: Some(Role::Ctrl),
-        sub_role: Some(SubRole::Mot),
-        base: Some(Base::new("sdxl 1.0")),
-        decided_at: "2026-09-05T00:00:00Z".to_owned(),
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn artifact_detail_encoding_is_frozen() -> Result<()> {
-    let value = ArtifactDetail {
-        artifact_id: 7,
-        tensors: Some(TensorSummary {
-            tensor_count: 2,
-            params: 1_234_567,
-            dtypes: BTreeMap::from([("F16".to_owned(), 2_u32)]),
-            key_prefixes: vec![("lora_unet".to_owned(), 2_u32)],
-            samples: vec![TensorSample {
-                name: "lora_unet_down.lora_down.weight".to_owned(),
-                dtype: "F16".to_owned(),
-                shape: vec![16, 768],
-            }],
-            metadata: BTreeMap::from([("ss_network_dim".to_owned(), "16".to_owned())]),
-        }),
-        evidence: vec![
-            Evidence::new("role", "lora", EvidenceSource::Tensor, 0.95)
-                .with_detail("lora_unet_ prefix on 264 tensors"),
-        ],
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn entry_encoding_is_frozen() -> Result<()> {
-    let value = Entry {
-        id: 13,
-        repo_id: 11,
-        artifact_id: Some(7),
-        revision: 1,
-        location: models::location_key(11, 1, "unet/frozen.safetensors"),
-        rel_path: "unet/frozen.safetensors".to_owned(),
-        placed: Placement::At("/frozen/source/unet/frozen.safetensors".to_owned()),
-        size: 4096,
-        state: State::Triage,
-        triage: true,
-        preference: 19,
-        lfs_pointer: true,
-        is_symlink: true,
-        sha256: Some(Sha256::from_bytes([3; 32])),
-        content: Some(0x0303_0303_0303_0303_u128),
-        git_sha1: Some(CommitSha::from_bytes([7; 20])),
-        mtime: Some(1_767_225_600),
-        inode: Some(424_242),
-        node: 1,
-        pass: 4,
-        pull_progress: Some(0.5),
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn entry_v3_encoding_is_frozen() -> Result<()> {
-    let value = EntryV3 {
-        id: 13,
-        repo_id: 11,
-        artifact_id: Some(7),
-        revision: 1,
-        location: models::location_key(11, 1, "unet/frozen.safetensors"),
-        rel_path: "unet/frozen.safetensors".to_owned(),
-        abs_path: Some("/frozen/source/unet/frozen.safetensors".to_owned()),
-        size: 4096,
-        state: State::Triage,
-        triage: true,
-        preference: 19,
-        lfs_pointer: true,
-        is_symlink: true,
-        sha256: Some(Sha256::from_bytes([3; 32])),
-        content: Some(0x0303_0303_0303_0303_u128),
-        git_sha1: Some(CommitSha::from_bytes([7; 20])),
-        mtime: Some(1_767_225_600),
-        inode: Some(424_242),
-        node: 1,
-        pass: 4,
-        pull_progress: Some(0.5),
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn entry_v2_encoding_is_frozen() -> Result<()> {
-    let value = EntryV2 {
-        id: 13,
-        repo_id: 11,
-        artifact_id: Some(7),
-        revision: 1,
-        rel_path: "unet/frozen.safetensors".to_owned(),
-        abs_path: Some("/frozen/source/unet/frozen.safetensors".to_owned()),
-        size: 4096,
-        state: State::Triage,
-        triage: true,
-        preference: 19,
-        lfs_pointer: true,
-        is_symlink: true,
-        sha256: Some(Sha256::from_bytes([3; 32])),
-        content: Some(0x0303_0303_0303_0303_u128),
-        git_sha1: Some(CommitSha::from_bytes([7; 20])),
-        mtime: Some(1_767_225_600),
-        inode: Some(424_242),
-        node: 1,
-        pass: 4,
-        pull_progress: Some(0.5),
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn entry_v1_encoding_is_frozen() -> Result<()> {
-    let value = EntryV1 {
-        id: 13,
-        repo_id: 11,
-        artifact_id: Some(7),
-        revision: 1,
-        rel_path: "unet/frozen.safetensors".to_owned(),
-        abs_path: Some("/frozen/source/unet/frozen.safetensors".to_owned()),
-        size: 4096,
-        state: State::Triage,
-        triage: true,
-        preference: 19,
-        lfs_pointer: true,
-        is_symlink: true,
-        git_sha1: Some(CommitSha::from_bytes([7; 20])),
-        mtime: Some(1_767_225_600),
-        inode: Some(424_242),
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn search_text_encoding_is_frozen() -> Result<()> {
-    let value = SearchText {
-        artifact_id: 7,
-        keys: "lora_unet lora_te".to_owned(),
-        card: "# Frozen\n\nA synthetic card.\n".to_owned(),
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn manifest_encoding_is_frozen() -> Result<()> {
-    let value = Manifest {
-        id: 0,
-        format_version: 2,
-        generation: 5,
-        scanned_at: "2026-09-05T00:00:00Z".to_owned(),
-        node: "frozen-node".to_owned(),
-        counts: vec![("entries".to_owned(), 13)],
-        search_directory: Some("search-v1-1767225600000000000".to_owned()),
-        search_generation: 5,
-        search_seq: 9,
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn node_encoding_is_frozen() -> Result<()> {
-    let value = Node {
-        id: 2,
-        node_id: "laptop-1".to_owned(),
-        name: "laptop".to_owned(),
-        url: Some("http://laptop:7099".to_owned()),
-        is_self: false,
-        online: true,
-        indexed_bytes: 65_536,
-        last_seen: Some("2026-09-06T10:00:00Z".to_owned()),
-        cursor: Some("d1-2a".to_owned()),
-        synced: Some("2026-09-06T10:00:00Z".to_owned()),
-        pass: 3,
-        filed: 9,
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn node_v1_encoding_is_frozen() -> Result<()> {
-    let value = NodeV1 {
-        id: 2,
-        node_id: "laptop-1".to_owned(),
-        name: "laptop".to_owned(),
-        url: Some("http://laptop:7099".to_owned()),
-        is_self: false,
-        online: true,
-        indexed_bytes: 65_536,
-        last_seen: Some("2026-09-06T10:00:00Z".to_owned()),
-        cursor: Some("d1-2a".to_owned()),
-        synced: Some("2026-09-06T10:00:00Z".to_owned()),
-        pass: 3,
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
     Ok(())
 }
 
@@ -3959,66 +3176,6 @@ fn nodes_are_recorded_and_entries_name_their_node() -> Result<()> {
             .collect::<Vec<_>>(),
         ["rig", "laptop-2"]
     );
-    Ok(())
-}
-
-#[test]
-fn summary_encoding_is_frozen() -> Result<()> {
-    let value = Summary {
-        id: 0,
-        reclaimable_bytes: 4096,
-        duplicate_artifacts: 3,
-        artifacts: 11,
-        present_artifacts: 9,
-        triage_artifacts: 2,
-        indexed_bytes: 65_536,
-        repositories: 4,
-        advertised_artifacts: 7,
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn summary_v2_encoding_is_frozen() -> Result<()> {
-    let value = SummaryV2 {
-        id: 0,
-        reclaimable_bytes: 4096,
-        duplicate_artifacts: 3,
-        artifacts: 11,
-        present_artifacts: 9,
-        triage_artifacts: 2,
-        indexed_bytes: 65_536,
-        repositories: 4,
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn summary_v1_encoding_is_frozen() -> Result<()> {
-    let value = SummaryV1 {
-        id: 0,
-        reclaimable_bytes: 4096,
-        duplicate_artifacts: 3,
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
-    Ok(())
-}
-
-#[test]
-fn manifest_v1_encoding_is_frozen() -> Result<()> {
-    let value = ManifestV1 {
-        id: 0,
-        format_version: 2,
-        generation: 5,
-        scanned_at: "2026-09-05T00:00:00Z".to_owned(),
-        node: "frozen-node".to_owned(),
-        counts: vec![("entries".to_owned(), 13)],
-        search_directory: Some("search-v1-1767225600000000000".to_owned()),
-        search_generation: 5,
-    };
-    insta::assert_snapshot!(frozen_encoding(&value)?);
     Ok(())
 }
 
