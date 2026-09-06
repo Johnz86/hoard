@@ -33,6 +33,7 @@
 - Create: `crates/hoard-index/src/catalog/loadouts.rs`
 - Modify: `crates/hoard-index/src/catalog/{mod,read}.rs` (re-exports; `artifact_rows_by_sha256` and `rows_by_repo_path` for pin resolution)
 - Modify: `crates/hoard-server/src/api/loadouts.rs`, `src/cli/loadout.rs`
+- Modify: `crates/hoard-server/src/api/link.rs` (a `shelf_id` resolves through `catalog.shelf(id)`) and `crates/hoard-server/src/api/common.rs` (`compile_context` takes its shelves from `catalog.list_shelves()`; the SQLite `seed_builtin_shelves` call in `api/tests.rs::seed` is deleted once nothing reads it)
 - Test: `crates/hoard-index/src/catalog/tests.rs`, server tests as listed
 
 **Interfaces:**

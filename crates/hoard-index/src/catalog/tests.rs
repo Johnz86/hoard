@@ -6,7 +6,8 @@ use tempfile::TempDir;
 
 use hoard_core::{
     Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, Evidence, EvidenceSource,
-    Precision, RepoId, RepoType, Role, Sha256, State, SubRole, TensorSample, TensorSummary,
+    Loadout, LoadoutPin, Precision, RepoId, RepoType, Role, Sha256, State, SubRole, TensorSample,
+    TensorSummary,
 };
 
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
@@ -1736,6 +1737,52 @@ fn the_read_api_answers_the_inspector_the_repo_screens_and_the_queue() -> Result
     assert_eq!(queue[0].header.hidden_dim, Some(768));
     catalog.clear_triage(ids.unknown)?;
     assert!(catalog.triage_queue(10)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn loadouts_are_stored_by_name_and_pins_resolve_through_the_catalog() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    let lora = catalog
+        .artifact_row(ids.lora)?
+        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
+    let mut document = Loadout::new("night");
+    let mut pin = LoadoutPin::new(RepoId::parse_qualified(&lora.repo)?, lora.path.clone());
+    pin.sha256 = lora.blob_sha256;
+    document.adapters.push(pin.clone());
+
+    let id = catalog.upsert_loadout(&document)?;
+    assert_eq!(
+        catalog.upsert_loadout(&document)?,
+        id,
+        "the same name keeps its id"
+    );
+    let stored = catalog
+        .loadout_by_name("night")?
+        .ok_or_else(|| IndexError::Catalog("night".into()))?;
+    assert_eq!(stored.parse()?.len(), 1);
+    catalog.update_loadout(id, &Loadout::new("night").to_toml()?)?;
+    assert_eq!(
+        catalog
+            .loadout(id)?
+            .map(|record| record.parse().map(|document| document.len()))
+            .transpose()?,
+        Some(0)
+    );
+    assert_eq!(catalog.list_loadouts()?.len(), 1);
+
+    let by_sha = catalog.resolve_pin(&pin)?;
+    assert_eq!(
+        by_sha.len(),
+        2,
+        "both paths of the LoRA answer for its sha256"
+    );
+    pin.sha256 = None;
+    let by_path = catalog.resolve_pin(&pin)?;
+    assert_eq!(by_path.len(), 1);
+    assert_eq!(by_path[0].artifact_id, ids.lora);
+    assert!(catalog.delete_loadout(id)?);
+    assert!(catalog.loadout(id)?.is_none());
     Ok(())
 }
 

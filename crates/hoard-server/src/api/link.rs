@@ -11,7 +11,7 @@ use hoard_core::{ArtifactId, Role, ShelfId};
 use hoard_index::IndexError;
 use hoard_index::catalog::NewProjection;
 use hoard_index::search::{SortKey, SortSpec, compile, parse};
-use hoard_index::store::{search_exec, shelf};
+use hoard_index::store::search_exec;
 
 use crate::api::common::{authorize, blocking, clamp_limit, compile_context};
 use crate::error::{ApiError, ApiResult};
@@ -117,16 +117,22 @@ pub async fn link(
     let raw = body.query.clone();
     let node = state.node_name().to_owned();
     let now = Timestamp::now();
+    let catalog = Arc::clone(state.catalog());
 
     let rows = state
         .store()
         .call(move |conn| {
             let text = match shelf_id {
-                Some(id) => shelf::shelf(conn, id)?.query,
+                Some(id) => {
+                    catalog
+                        .shelf(id)?
+                        .ok_or_else(|| IndexError::not_found("shelf", id.to_string()))?
+                        .query
+                }
                 None => raw.unwrap_or_default(),
             };
             let query = parse(&text);
-            let context = compile_context(conn, &node, &query, now)?;
+            let context = compile_context(conn, &catalog, &node, &query, now)?;
             let compiled = compile(&query, SortSpec::new(SortKey::Size, true), &context)?;
             search_exec::query_rows(
                 conn,

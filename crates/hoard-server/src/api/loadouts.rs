@@ -12,14 +12,14 @@ use hoard_core::{
     PinResolution, RepoId, Role, State as ArtifactState, format_size,
 };
 use hoard_index::IndexError;
-use hoard_index::catalog::NewProjection;
-use hoard_index::store::row::{SearchRow, SqlValue};
-use hoard_index::store::{blob, job, loadout, node, search_exec};
+use hoard_index::catalog::{Catalog, LoadoutRecord, NewProjection};
+use hoard_index::store::row::SearchRow;
+use hoard_index::store::{job, node};
 use hoard_net::identity::NodeIdentity;
 use hoard_net::{PullRequest, Puller};
 
 use crate::api::artifacts::artifact_id;
-use crate::api::common::{Conn, authorize, blocking, require_row};
+use crate::api::common::{Conn, authorize, blocking};
 use crate::api::link::{self, Profile};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -135,23 +135,22 @@ pub struct ExportParams {
 }
 
 pub async fn list(State(state): State<AppState>) -> ApiResult<Json<Vec<LoadoutSummary>>> {
-    let rows = state
-        .store()
-        .call(|conn| {
-            let mut out = Vec::new();
-            for row in loadout::list_loadouts(conn)? {
-                let document = row.parse()?;
-                out.push(LoadoutSummary {
-                    id: row.id,
-                    name: row.name,
-                    items: document.len(),
-                    created_at: row.created_at,
-                    updated_at: row.updated_at,
-                });
-            }
-            Ok(out)
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let rows = blocking(move || {
+        let mut out = Vec::new();
+        for record in catalog.list_loadouts()? {
+            let items = record.parse()?.len();
+            out.push(LoadoutSummary {
+                id: record.id,
+                name: record.name,
+                items,
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+            });
+        }
+        Ok(out)
+    })
+    .await?;
     Ok(Json(rows))
 }
 
@@ -160,11 +159,7 @@ pub async fn detail(
     Path(id): Path<String>,
 ) -> ApiResult<Json<LoadoutView>> {
     let id = loadout_id(&id)?;
-    let node_name = state.node_name().to_owned();
-    let view = state
-        .store()
-        .call(move |conn| view_of(conn, id, &node_name))
-        .await?;
+    let view = view(&state, id).await?;
     Ok(Json(view))
 }
 
@@ -182,13 +177,12 @@ pub async fn create(
         return Err(ApiError::bad_request("a loadout needs a name"));
     }
     let node_name = state.node_name().to_owned();
-    let view = state
-        .store()
-        .call_mut(move |conn| {
-            let id = loadout::upsert_loadout(conn, &document)?;
-            view_of(conn, id, &node_name)
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        let id = catalog.upsert_loadout(&document)?;
+        view_of(&catalog, id, &node_name)
+    })
+    .await?;
     Ok(Json(view))
 }
 
@@ -203,21 +197,21 @@ pub async fn add_item(
     let artifact = artifact_id(&body.artifact_id)?;
     let weight = body.weight;
     let node_name = state.node_name().to_owned();
-    let view = state
-        .store()
-        .call_mut(move |conn| {
-            let row = require_row(conn, artifact)?;
-            let mut document = loadout::loadout(conn, id)?.parse()?;
-            let slot = LoadoutSlot::for_role(row.role).ok_or_else(|| {
-                IndexError::Query(format!("role {} cannot be pinned in a loadout", row.role))
-            })?;
-            document.remove_path(&row.path);
-            document.add(row.role, pin_for(&row, slot, weight)?)?;
-            loadout::update_loadout(conn, id, &document.to_toml()?)?;
-            view_of(conn, id, &node_name)
-        })
-        .await
-        .map_err(unpinnable)?;
+    let catalog = Arc::clone(state.catalog());
+    let view = tokio::task::spawn_blocking(move || {
+        let row = require_catalog_row(&catalog, artifact)?;
+        let mut document = stored(&catalog, id)?.parse()?;
+        let slot = LoadoutSlot::for_role(row.role).ok_or_else(|| {
+            IndexError::Query(format!("role {} cannot be pinned in a loadout", row.role))
+        })?;
+        document.remove_path(&row.path);
+        document.add(row.role, pin_for(&row, slot, weight)?)?;
+        catalog.update_loadout(id, &document.to_toml()?)?;
+        view_of(&catalog, id, &node_name)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(unpinnable)?;
     Ok(Json(view))
 }
 
@@ -230,18 +224,17 @@ pub async fn remove_item(
     let id = loadout_id(&id)?;
     let artifact = artifact_id(&artifact)?;
     let node_name = state.node_name().to_owned();
-    let view = state
-        .store()
-        .call_mut(move |conn| {
-            let row = require_row(conn, artifact)?;
-            let mut document = loadout::loadout(conn, id)?.parse()?;
-            if document.remove_path(&row.path) == 0 {
-                return Err(IndexError::not_found("loadout line", row.path.clone()));
-            }
-            loadout::update_loadout(conn, id, &document.to_toml()?)?;
-            view_of(conn, id, &node_name)
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        let row = require_catalog_row(&catalog, artifact)?;
+        let mut document = stored(&catalog, id)?.parse()?;
+        if document.remove_path(&row.path) == 0 {
+            return Err(IndexError::not_found("loadout line", row.path.clone()));
+        }
+        catalog.update_loadout(id, &document.to_toml()?)?;
+        view_of(&catalog, id, &node_name)
+    })
+    .await?;
     Ok(Json(view))
 }
 
@@ -252,17 +245,16 @@ pub async fn validate(
 ) -> ApiResult<Json<ValidationView>> {
     authorize(&state, &headers)?;
     let id = loadout_id(&id)?;
-    let view = state
-        .store()
-        .call(move |conn| {
-            let violations = loadout::loadout(conn, id)?.parse()?.violations();
-            Ok(ValidationView {
-                id,
-                valid: violations.is_empty(),
-                violations,
-            })
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        let violations = stored(&catalog, id)?.parse()?.violations();
+        Ok(ValidationView {
+            id,
+            valid: violations.is_empty(),
+            violations,
         })
-        .await?;
+    })
+    .await?;
     Ok(Json(view))
 }
 
@@ -291,17 +283,19 @@ pub async fn apply(
         None => DEFAULT_PROFILE,
     };
     let node_name = target.clone();
-    let (view, job_id) = state
+    let known = node_name.clone();
+    state
         .store()
-        .call_mut(move |conn| {
-            if node::node_by_name(conn, &node_name)?.is_none() {
-                return Err(IndexError::not_found("node", node_name.clone()));
-            }
-            let view = view_of(conn, id, &node_name)?;
-            let subject = format!("{} \u{2192} {node_name}", view.name);
-            let job = job::create_job(conn, APPLY_KIND, Some(&subject))?;
-            Ok((view, job))
+        .call(move |conn| match node::node_by_name(conn, &known)? {
+            Some(_) => Ok(()),
+            None => Err(IndexError::not_found("node", known.clone())),
         })
+        .await?;
+    let view = view_for(&state, id, &node_name).await?;
+    let subject = format!("{} \u{2192} {node_name}", view.name);
+    let job_id = state
+        .store()
+        .call_mut(move |conn| job::create_job(conn, APPLY_KIND, Some(&subject)))
         .await?;
 
     let preview = view.apply_preview.clone();
@@ -496,14 +490,23 @@ struct ReadyLine {
 }
 
 async fn plan_of(state: &AppState, id: LoadoutId) -> ApiResult<Vec<PlannedLine>> {
+    let catalog = Arc::clone(state.catalog());
+    let resolved = blocking(move || {
+        let document = stored(&catalog, id)?.parse()?;
+        let mut resolved = Vec::with_capacity(document.len());
+        for (_, pin) in document.pins() {
+            resolved.push((pin.clone(), catalog.resolve_pin(pin)?));
+        }
+        Ok(resolved)
+    })
+    .await?;
+    let local = state.node_name().to_owned();
     let plan = state
         .store()
         .call(move |conn| {
-            let document = loadout::loadout(conn, id)?.parse()?;
-            let local = node::local_node(conn)?.name;
-            let mut lines = Vec::with_capacity(document.len());
-            for (_, pin) in document.pins() {
-                lines.push(plan_line(conn, pin, &local)?);
+            let mut lines = Vec::with_capacity(resolved.len());
+            for (pin, candidates) in &resolved {
+                lines.push(plan_line(conn, pin, candidates, &local)?);
             }
             Ok(lines)
         })
@@ -511,8 +514,12 @@ async fn plan_of(state: &AppState, id: LoadoutId) -> ApiResult<Vec<PlannedLine>>
     Ok(plan)
 }
 
-fn plan_line(conn: &Conn, pin: &LoadoutPin, local: &str) -> Result<PlannedLine, IndexError> {
-    let candidates = resolve_pin(conn, pin)?;
+fn plan_line(
+    conn: &Conn,
+    pin: &LoadoutPin,
+    candidates: &[SearchRow],
+    local: &str,
+) -> Result<PlannedLine, IndexError> {
     let held = candidates
         .iter()
         .find(|row| row.node == local && row.state.has_bytes() && row.abs_path.is_some());
@@ -618,12 +625,8 @@ pub async fn export(
         .filter(|value| !value.is_empty())
         .unwrap_or("toml")
         .to_ascii_lowercase();
-    let node_name = state.node_name().to_owned();
     let public = state.public_url().trim_end_matches('/').to_owned();
-    let view = state
-        .store()
-        .call(move |conn| view_of(conn, id, &node_name))
-        .await?;
+    let view = view(&state, id).await?;
     let text = match format.as_str() {
         "toml" => view.document.clone(),
         "hf-script" => hf_script(&view, &public),
@@ -646,12 +649,37 @@ pub async fn export(
     }))
 }
 
-fn view_of(conn: &Conn, id: LoadoutId, node_name: &str) -> Result<LoadoutView, IndexError> {
-    let record = loadout::loadout(conn, id)?;
+/// The drawer's view of one loadout, resolved against this node.
+async fn view(state: &AppState, id: LoadoutId) -> ApiResult<LoadoutView> {
+    let node_name = state.node_name().to_owned();
+    view_for(state, id, &node_name).await
+}
+
+/// The same view resolved against another node, which is what an apply previews.
+async fn view_for(state: &AppState, id: LoadoutId, node_name: &str) -> ApiResult<LoadoutView> {
+    let catalog = Arc::clone(state.catalog());
+    let node_name = node_name.to_owned();
+    blocking(move || view_of(&catalog, id, &node_name)).await
+}
+
+fn stored(catalog: &Catalog, id: LoadoutId) -> Result<LoadoutRecord, IndexError> {
+    catalog
+        .loadout(id)?
+        .ok_or_else(|| IndexError::not_found("loadout", id.to_string()))
+}
+
+fn require_catalog_row(catalog: &Catalog, id: ArtifactId) -> Result<SearchRow, IndexError> {
+    catalog
+        .artifact_row(id)?
+        .ok_or_else(|| IndexError::not_found("artifact", id.to_string()))
+}
+
+fn view_of(catalog: &Catalog, id: LoadoutId, node_name: &str) -> Result<LoadoutView, IndexError> {
+    let record = stored(catalog, id)?;
     let document = record.parse()?;
     let mut items = Vec::with_capacity(document.len());
     for (slot, pin) in document.pins() {
-        items.push(item_of(conn, slot, pin, node_name)?);
+        items.push(item_of(catalog, slot, pin, node_name)?);
     }
     let preview = preview_of(&items);
     Ok(LoadoutView {
@@ -688,12 +716,12 @@ fn preview_of(items: &[LoadoutItem]) -> ApplyPreview {
 /// A row filed against another node is REMOTE from here, which is exactly what "elsewhere"
 /// means: that node holds the bytes and this one does not.
 fn item_of(
-    conn: &Conn,
+    catalog: &Catalog,
     slot: LoadoutSlot,
     pin: &LoadoutPin,
     node_name: &str,
 ) -> Result<LoadoutItem, IndexError> {
-    let candidates = resolve_pin(conn, pin)?;
+    let candidates = catalog.resolve_pin(pin)?;
     let held = candidates
         .iter()
         .find(|row| row.node == node_name && row.state.has_bytes());
@@ -727,28 +755,6 @@ fn item_of(
         state: row.map(|row| row.state),
         resolution,
     })
-}
-
-fn resolve_pin(conn: &Conn, pin: &LoadoutPin) -> Result<Vec<SearchRow>, IndexError> {
-    if let Some(sha256) = pin.sha256
-        && let Some(record) = blob::blob_by_sha256(conn, &sha256)?
-    {
-        let rows = crate::api::common::rows_for_blob(conn, record.id)?;
-        if !rows.is_empty() {
-            return Ok(rows);
-        }
-    }
-    search_exec::query_rows(
-        conn,
-        "repo = ? AND path = ?",
-        &[
-            SqlValue::text(pin.repo.qualified()),
-            SqlValue::text(&pin.path),
-        ],
-        "",
-        8,
-        0,
-    )
 }
 
 /// The pin an artifact becomes: hashed identity first so the same document resolves on any

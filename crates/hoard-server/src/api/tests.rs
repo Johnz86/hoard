@@ -26,7 +26,6 @@ use hoard_index::store::entry::{NewEntry, upsert_entry};
 use hoard_index::store::node::{NewNode, upsert_node};
 use hoard_index::store::repo::{NewRepo, upsert_repo};
 use hoard_index::store::revision::{NewRevision, RefKind, upsert_ref, upsert_revision};
-use hoard_index::store::shelf::seed_builtin_shelves;
 use hoard_index::store::source::upsert_source;
 
 use crate::api;
@@ -471,7 +470,6 @@ fn seed(
         local,
     )
     .expect("source");
-    seed_builtin_shelves(conn).expect("shelves seed");
 
     let ckpt_repo = repo(conn, local, RepoType::Models, "stability/sdxl-base-1.0");
     let ckpt_rev = revision(

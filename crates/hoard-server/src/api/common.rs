@@ -10,12 +10,12 @@ use hoard_core::{
     Role, Sha256, State, SubRole, format_size,
 };
 use hoard_index::IndexError;
-use hoard_index::catalog::EntryDetail;
+use hoard_index::catalog::{Catalog, EntryDetail};
 use hoard_index::search::{
     CompatTarget, CompileContext, ParsedQuery, SortKey, SortSpec, TokenKind, compile, quoted,
 };
 use hoard_index::store::row::{SearchRow, SqlValue};
-use hoard_index::store::{search_exec, shelf};
+use hoard_index::store::search_exec;
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -178,13 +178,15 @@ pub fn sort_key(sort: Option<&str>, dir: Option<&str>) -> String {
 /// `shelf:` token expands to, this node's name and the resolved `compat:` target.
 pub fn compile_context(
     conn: &Conn,
+    catalog: &Catalog,
     node: &str,
     query: &ParsedQuery,
     now: Timestamp,
 ) -> Result<CompileContext, IndexError> {
-    let shelves = shelf::list_shelves(conn)?
+    let shelves = catalog
+        .list_shelves()?
         .into_iter()
-        .map(|row| (row.name, row.query))
+        .map(|shelf| (shelf.name, shelf.query))
         .collect();
     let mut context = CompileContext::new(now)
         .with_local_node(node.to_owned())

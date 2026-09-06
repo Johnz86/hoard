@@ -475,6 +475,20 @@ pub(super) struct ArtifactUse {
     pub(super) last_used: String,
 }
 
+/// A saved loadout: the TOML document the drawer edits, keyed by the name inside it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 19, version = 1)]
+#[native_db]
+pub(super) struct LoadoutDoc {
+    #[primary_key]
+    pub(super) id: i64,
+    #[secondary_key(unique)]
+    pub(super) name: String,
+    pub(super) document: String,
+    pub(super) created_at: String,
+    pub(super) updated_at: String,
+}
+
 /// Registers every record type. `native_db` compares each definition against every model
 /// already registered rather than only against the other versions of the same model, so a
 /// version 1 model must be defined last: it is what leaves each migrated model marked
@@ -502,5 +516,6 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<Projection>()?;
     models.define::<Usage>()?;
     models.define::<ArtifactUse>()?;
+    models.define::<LoadoutDoc>()?;
     Ok(models)
 }

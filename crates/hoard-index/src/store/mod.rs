@@ -2,7 +2,7 @@
 
 pub mod artifact;
 pub mod blob;
-mod convert;
+pub(crate) mod convert;
 pub mod digest;
 pub mod entry;
 #[cfg(test)]

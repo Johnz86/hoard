@@ -1,11 +1,11 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use clap::Subcommand;
 
 use hoard_core::{Loadout, LoadoutPin};
-use hoard_index::store::Store;
-use hoard_index::store::loadout::{list_loadouts, loadout_by_name, upsert_loadout};
+use hoard_index::catalog::Catalog;
 
 use super::node::Context;
 
@@ -24,20 +24,32 @@ pub enum LoadoutCommand {
 }
 
 pub async fn run(context: Context, command: LoadoutCommand) -> Result<()> {
-    let Context { store, .. } = context;
+    let Context { catalog, .. } = context;
     match command {
-        LoadoutCommand::Show { name } => show(&store, name).await,
-        LoadoutCommand::Resolve { name } => resolve(&store, &name).await,
-        LoadoutCommand::Export { name } => export(&store, &name).await,
-        LoadoutCommand::Import { file } => import(&store, &file).await,
+        LoadoutCommand::Show { name } => show(&catalog, name).await,
+        LoadoutCommand::Resolve { name } => resolve(&catalog, &name).await,
+        LoadoutCommand::Export { name } => export(&catalog, &name).await,
+        LoadoutCommand::Import { file } => import(&catalog, &file).await,
         LoadoutCommand::Validate { file } => validate(&file),
     }
 }
 
-async fn show(store: &Store, name: Option<String>) -> Result<()> {
+/// Runs one catalog read or write off the reactor, since redb is file work.
+async fn on_catalog<T, F>(catalog: &Arc<Catalog>, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Catalog) -> hoard_index::Result<T> + Send + 'static,
+{
+    let catalog = Arc::clone(catalog);
+    Ok(tokio::task::spawn_blocking(move || work(&catalog))
+        .await
+        .context("the catalog task was cancelled")??)
+}
+
+async fn show(catalog: &Arc<Catalog>, name: Option<String>) -> Result<()> {
     match name {
         Some(name) => {
-            let loadout = read(store, &name).await?;
+            let loadout = read(catalog, &name).await?;
             let mut out = format!("{}\n", loadout.name);
             for (slot, pin) in loadout.pins() {
                 out.push_str(&format!(
@@ -50,15 +62,14 @@ async fn show(store: &Store, name: Option<String>) -> Result<()> {
             tracing::info!("{out}");
         }
         None => {
-            let rows = store
-                .call(list_loadouts)
+            let records = on_catalog(catalog, Catalog::list_loadouts)
                 .await
                 .context("reading loadouts")?;
             let mut out = String::new();
-            for row in &rows {
-                out.push_str(&format!("{}\n", row.name));
+            for record in &records {
+                out.push_str(&format!("{}\n", record.name));
             }
-            if rows.is_empty() {
+            if records.is_empty() {
                 out.push_str("no loadouts on this node\n");
             }
             tracing::info!("{out}");
@@ -67,11 +78,11 @@ async fn show(store: &Store, name: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn resolve(store: &Store, name: &str) -> Result<()> {
-    let loadout = read(store, name).await?;
+async fn resolve(catalog: &Arc<Catalog>, name: &str) -> Result<()> {
+    let loadout = read(catalog, name).await?;
     let mut out = String::new();
     for (slot, pin) in loadout.pins() {
-        let status = locate(store, pin).await?;
+        let status = locate(catalog, pin).await?;
         out.push_str(&format!(
             "  {:<11} {:<40} {status}\n",
             slot.as_str(),
@@ -82,39 +93,28 @@ async fn resolve(store: &Store, name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn locate(store: &Store, pin: &LoadoutPin) -> Result<&'static str> {
-    let Some(sha) = pin.sha256 else {
-        return Ok("missing");
-    };
-    let blob = store
-        .call(move |conn| hoard_index::store::blob::blob_by_sha256(conn, &sha))
+async fn locate(catalog: &Arc<Catalog>, pin: &LoadoutPin) -> Result<&'static str> {
+    let wanted = pin.clone();
+    let rows = on_catalog(catalog, move |catalog| catalog.resolve_pin(&wanted))
         .await
-        .context("reading the blob")?;
-    let Some(blob) = blob else {
-        return Ok("missing");
-    };
-    let entries = store
-        .call(move |conn| hoard_index::store::entry::entries_for_blob(conn, blob.id))
-        .await
-        .context("reading entries")?;
-    Ok(if entries.iter().any(|entry| entry.abs_path.is_some()) {
-        "present"
-    } else {
-        "elsewhere"
+        .context("resolving the pin")?;
+    Ok(match rows.first() {
+        None => "missing",
+        Some(_) if rows.iter().any(|row| row.abs_path.is_some()) => "present",
+        Some(_) => "elsewhere",
     })
 }
 
-async fn export(store: &Store, name: &str) -> Result<()> {
-    let loadout = read(store, name).await?;
+async fn export(catalog: &Arc<Catalog>, name: &str) -> Result<()> {
+    let loadout = read(catalog, name).await?;
     tracing::info!("{}", loadout.to_toml().context("rendering the loadout")?);
     Ok(())
 }
 
-async fn import(store: &Store, file: &PathBuf) -> Result<()> {
+async fn import(catalog: &Arc<Catalog>, file: &PathBuf) -> Result<()> {
     let loadout = parse(file)?;
     let stored = loadout.clone();
-    store
-        .call_mut(move |conn| upsert_loadout(conn, &stored))
+    on_catalog(catalog, move |catalog| catalog.upsert_loadout(&stored))
         .await
         .context("storing the loadout")?;
     tracing::info!(name = %loadout.name, pins = loadout.len(), "loadout imported");
@@ -140,12 +140,11 @@ fn parse(file: &PathBuf) -> Result<Loadout> {
     Loadout::parse(&text).with_context(|| format!("parsing {}", file.display()))
 }
 
-async fn read(store: &Store, name: &str) -> Result<Loadout> {
-    let owned = name.to_owned();
-    let row = store
-        .call(move |conn| loadout_by_name(conn, &owned))
+async fn read(catalog: &Arc<Catalog>, name: &str) -> Result<Loadout> {
+    let wanted = name.to_owned();
+    let record = on_catalog(catalog, move |catalog| catalog.loadout_by_name(&wanted))
         .await
         .context("reading the loadout")?
         .ok_or_else(|| anyhow::anyhow!("no loadout named {name} on this node"))?;
-    row.parse().context("parsing the stored loadout")
+    record.parse().context("parsing the stored loadout")
 }

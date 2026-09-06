@@ -1,3 +1,4 @@
+mod loadouts;
 mod models;
 mod query;
 mod read;
@@ -24,6 +25,7 @@ use crate::store::DiskPressure;
 
 use self::models::{ArtifactRecord, Manifest, Repository, Summary, define_models};
 
+pub use self::loadouts::LoadoutRecord;
 pub use self::read::{
     ArtifactDetailView, EntryDetail, RefDetail, RepositoryDetail, RepositoryFilter, RepositoryPage,
     RevisionDetail, TriageItem,

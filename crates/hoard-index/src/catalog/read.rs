@@ -136,6 +136,51 @@ impl Catalog {
         Ok(page.rows.into_iter().next())
     }
 
+    /// Every path of the artifact one content hash names, as rows.
+    pub(super) fn artifact_rows_by_sha256(&self, sha: &Sha256) -> Result<Vec<SearchRow>> {
+        let Some(found) = self.artifact_by_sha256(sha)? else {
+            return Ok(Vec::new());
+        };
+        let snapshot = self.database.r_transaction()?;
+        let node = self.manifest()?.node;
+        let mut reader = Reader::new(&snapshot, &node);
+        let id = found.artifact_id.get();
+        let Some(record) = reader.record(id)? else {
+            return Ok(Vec::new());
+        };
+        let last_used = last_used_in(&snapshot, id)?;
+        let entries = reader.entries_of_artifact(id)?;
+        let mut rows = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            rows.push(reader.row_of(&record, entry, last_used)?);
+        }
+        Ok(rows)
+    }
+
+    /// The rows one repository holds at one relative path. A file that is not an artifact
+    /// has no row and is skipped.
+    pub(super) fn rows_by_repo_path(&self, repo: &RepoId, path: &str) -> Result<Vec<SearchRow>> {
+        let Some(repository) = self.repository(repo)? else {
+            return Ok(Vec::new());
+        };
+        let snapshot = self.database.r_transaction()?;
+        let node = self.manifest()?.node;
+        let mut reader = Reader::new(&snapshot, &node);
+        let entries = reader.entries_of_repo(repository.id.get())?;
+        let mut rows = Vec::new();
+        for entry in entries.iter().filter(|entry| entry.rel_path == path) {
+            let Some(artifact) = entry.artifact_id else {
+                continue;
+            };
+            let Some(record) = reader.record(artifact)? else {
+                continue;
+            };
+            let last_used = last_used_in(&snapshot, artifact)?;
+            rows.push(reader.row_of(&record, entry, last_used)?);
+        }
+        Ok(rows)
+    }
+
     pub fn artifact_detail(&self, id: ArtifactId) -> Result<Option<ArtifactDetailView>> {
         let snapshot = self.database.r_transaction()?;
         let Some(record) = snapshot.get().primary::<ArtifactRecord>(id.get())? else {
@@ -525,7 +570,6 @@ impl<'a, 'db> Reader<'a, 'db> {
     }
 
     fn row(&mut self, record: &ArtifactRecord) -> Result<Option<SearchRow>> {
-        let node = self.node;
         let Some(entry) = self
             .entries_of_artifact(record.id)?
             .into_iter()
@@ -534,17 +578,27 @@ impl<'a, 'db> Reader<'a, 'db> {
             return Ok(None);
         };
         let last_used = last_used_in(self.snapshot, record.id)?;
+        Ok(Some(self.row_of(record, &entry, last_used)?))
+    }
+
+    fn row_of(
+        &mut self,
+        record: &ArtifactRecord,
+        entry: &Entry,
+        last_used: Option<jiff::Timestamp>,
+    ) -> Result<SearchRow> {
+        let node = self.node;
         let repository = self.repository(entry.repo_id)?;
-        let revision = revision_of(repository, &entry)?;
-        Ok(Some(assemble_row(&EntryFacts {
-            entry: &entry,
+        let revision = revision_of(repository, entry)?;
+        Ok(assemble_row(&EntryFacts {
+            entry,
             repository,
             revision,
             artifact: record,
             node,
             primary: true,
             last_used,
-        })))
+        }))
     }
 
     fn detail(&mut self, entry: &Entry, deduped: bool) -> Result<EntryDetail> {
