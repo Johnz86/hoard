@@ -3,7 +3,8 @@ use native_model::{Model, native_model};
 use serde::{Deserialize, Serialize};
 
 use hoard_core::{
-    Artifact, Base, CommitSha, Evidence, GitSha1, RepoId, Role, State, SubRole, TensorSummary,
+    Artifact, Base, CommitSha, Evidence, GitSha1, RepoId, Role, Sha256, State, SubRole,
+    TensorSummary,
 };
 
 use crate::config::{SourceConfig, SourceKind};
@@ -235,6 +236,116 @@ impl From<ArtifactRecord> for ArtifactRecordV1 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 7, version = 1)]
+#[native_db]
+pub(super) struct EntryV1 {
+    #[primary_key]
+    pub(super) id: i64,
+    #[secondary_key]
+    pub(super) repo_id: i64,
+    #[secondary_key(optional)]
+    pub(super) artifact_id: Option<i64>,
+    pub(super) revision: u32,
+    pub(super) rel_path: String,
+    pub(super) abs_path: Option<String>,
+    pub(super) size: u64,
+    pub(super) state: State,
+    pub(super) triage: bool,
+    pub(super) preference: i64,
+    pub(super) lfs_pointer: bool,
+    pub(super) is_symlink: bool,
+    pub(super) git_sha1: Option<GitSha1>,
+    pub(super) mtime: Option<i64>,
+    pub(super) inode: Option<u64>,
+}
+
+/// The node an entry's bytes sit on. Every writer names this node until peers land.
+pub(super) const LOCAL_NODE: i64 = 1;
+
+/// One path, with the content hashes read from it and the node that holds it. `content` is
+/// the identity a sha256 makes, so a lookup by content hash is a secondary key read rather
+/// than a scan.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 7, version = 2, from = EntryV1)]
+#[native_db]
+pub(super) struct Entry {
+    #[primary_key]
+    pub(super) id: i64,
+    #[secondary_key]
+    pub(super) repo_id: i64,
+    #[secondary_key(optional)]
+    pub(super) artifact_id: Option<i64>,
+    pub(super) revision: u32,
+    pub(super) rel_path: String,
+    pub(super) abs_path: Option<String>,
+    pub(super) size: u64,
+    pub(super) state: State,
+    pub(super) triage: bool,
+    pub(super) preference: i64,
+    pub(super) lfs_pointer: bool,
+    pub(super) is_symlink: bool,
+    pub(super) sha256: Option<Sha256>,
+    #[secondary_key(optional)]
+    pub(super) content: Option<u128>,
+    pub(super) git_sha1: Option<GitSha1>,
+    pub(super) mtime: Option<i64>,
+    pub(super) inode: Option<u64>,
+    #[secondary_key]
+    pub(super) node: i64,
+    pub(super) pass: u64,
+    pub(super) pull_progress: Option<f32>,
+}
+
+impl From<EntryV1> for Entry {
+    fn from(entry: EntryV1) -> Self {
+        Self {
+            id: entry.id,
+            repo_id: entry.repo_id,
+            artifact_id: entry.artifact_id,
+            revision: entry.revision,
+            rel_path: entry.rel_path,
+            abs_path: entry.abs_path,
+            size: entry.size,
+            state: entry.state,
+            triage: entry.triage,
+            preference: entry.preference,
+            lfs_pointer: entry.lfs_pointer,
+            is_symlink: entry.is_symlink,
+            sha256: None,
+            content: None,
+            git_sha1: entry.git_sha1,
+            mtime: entry.mtime,
+            inode: entry.inode,
+            node: LOCAL_NODE,
+            pass: 0,
+            pull_progress: None,
+        }
+    }
+}
+
+impl From<Entry> for EntryV1 {
+    fn from(entry: Entry) -> Self {
+        Self {
+            id: entry.id,
+            repo_id: entry.repo_id,
+            artifact_id: entry.artifact_id,
+            revision: entry.revision,
+            rel_path: entry.rel_path,
+            abs_path: entry.abs_path,
+            size: entry.size,
+            state: entry.state,
+            triage: entry.triage,
+            preference: entry.preference,
+            lfs_pointer: entry.lfs_pointer,
+            is_symlink: entry.is_symlink,
+            git_sha1: entry.git_sha1,
+            mtime: entry.mtime,
+            inode: entry.inode,
+        }
+    }
+}
+
 /// A user's verdict on what an artifact is. It outranks inference: the artifact record
 /// carries what the verdict says, and a rescan re-applies it over freshly inferred facts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -329,30 +440,6 @@ impl From<ManifestV1> for Manifest {
             search_seq: 0,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 7, version = 1)]
-#[native_db]
-pub(super) struct Entry {
-    #[primary_key]
-    pub(super) id: i64,
-    #[secondary_key]
-    pub(super) repo_id: i64,
-    #[secondary_key(optional)]
-    pub(super) artifact_id: Option<i64>,
-    pub(super) revision: u32,
-    pub(super) rel_path: String,
-    pub(super) abs_path: Option<String>,
-    pub(super) size: u64,
-    pub(super) state: State,
-    pub(super) triage: bool,
-    pub(super) preference: i64,
-    pub(super) lfs_pointer: bool,
-    pub(super) is_symlink: bool,
-    pub(super) git_sha1: Option<GitSha1>,
-    pub(super) mtime: Option<i64>,
-    pub(super) inode: Option<u64>,
 }
 
 /// One artifact whose documents the published search index no longer matches. The sequence
@@ -564,9 +651,10 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<Summary>()?;
     models.define::<SourceV1>()?;
     models.define::<Source>()?;
+    models.define::<EntryV1>()?;
+    models.define::<Entry>()?;
     models.define::<ArtifactDetail>()?;
     models.define::<SearchText>()?;
-    models.define::<Entry>()?;
     models.define::<Allocator>()?;
     models.define::<Override>()?;
     models.define::<SearchChange>()?;

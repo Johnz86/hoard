@@ -3,16 +3,19 @@ use std::path::PathBuf;
 
 use native_db::transaction::RwTransaction;
 
-use hoard_core::{Artifact, ArtifactId, BlobId, CommitSha, Evidence, RepoId, State, TensorSummary};
+use hoard_core::{
+    Artifact, ArtifactId, BlobId, CommitSha, Evidence, RepoId, Sha256, State, TensorSummary,
+};
 
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
 use crate::error::{IndexError, Result};
 use crate::store::revision::RefKind;
 
 use super::Catalog;
+use super::hashing::content_key;
 use super::models::{
-    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, Manifest, Ref, Repository,
-    RepositoryKey, Revision, SearchText, Source, repository_key,
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, LOCAL_NODE, Manifest, Ref,
+    Repository, RepositoryKey, Revision, SearchText, Source, repository_key,
 };
 use super::scan::{Counters, counts, log_changes, next_id, preference, tensor_keys};
 
@@ -45,6 +48,8 @@ pub struct SeedEntry {
     pub size: u64,
     pub state: State,
     pub is_symlink: bool,
+    pub sha256: Option<Sha256>,
+    pub git_sha1: Option<CommitSha>,
     pub artifact: Option<SeedArtifact>,
 }
 
@@ -226,9 +231,14 @@ impl Seeding<'_, '_> {
             preference: preference(seed.state, seed.abs_path.is_some()),
             lfs_pointer: false,
             is_symlink: seed.is_symlink,
-            git_sha1: None,
+            sha256: seed.sha256,
+            content: seed.sha256.as_ref().map(content_key),
+            git_sha1: seed.git_sha1,
             mtime: None,
             inode: None,
+            node: LOCAL_NODE,
+            pass: 0,
+            pull_progress: None,
         })?;
         Ok(())
     }

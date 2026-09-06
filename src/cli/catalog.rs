@@ -6,8 +6,10 @@ use clap::Subcommand;
 use serde_json::json;
 
 use hoard_index::catalog::{Catalog, QueryRequest};
+use hoard_index::config::HashPolicy;
 use hoard_index::search::{SortKey, SortSpec};
 
+use super::HashWhen;
 use super::scan::progress_bar;
 
 #[derive(Debug, Subcommand)]
@@ -20,6 +22,9 @@ pub enum CatalogCommand {
         directory: PathBuf,
         #[arg(long)]
         source: Option<String>,
+        /// When to compute sha256.
+        #[arg(long, value_enum, default_value_t = HashWhen::Later)]
+        hash: HashWhen,
     },
     /// Search a native catalog with Hoard's query grammar, the same one hoard ls and the
     /// search bar use.
@@ -60,7 +65,11 @@ pub async fn run(config_path: Option<&Path>, command: CatalogCommand) -> Result<
 
 fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<()> {
     match command {
-        CatalogCommand::Scan { directory, source } => {
+        CatalogCommand::Scan {
+            directory,
+            source,
+            hash,
+        } => {
             let mut config = super::node::load_config(config_path)?;
             if let Some(name) = source.as_deref()
                 && config.index.source(name).is_none()
@@ -101,6 +110,16 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
                 ),
                 false => None,
             };
+            let hashing = match HashPolicy::from(hash) {
+                HashPolicy::Now | HashPolicy::Background => Some(
+                    catalog
+                        .hash_pending(&config.index, |hashed| {
+                            progress.set_message(format!("Hashing: {hashed} files"));
+                        })
+                        .context("hashing the native catalog")?,
+                ),
+                HashPolicy::Never => None,
+            };
             match (rescan.is_some(), catalog.status()?.search_built) {
                 (true, true) => {
                     catalog.refresh_search(|count| {
@@ -119,6 +138,7 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
             drop(catalog);
             report(&json!({
                 "rescan": rescan,
+                "hashing": hashing,
                 "status": status,
                 "storage": Catalog::storage(&directory)?,
             }))?;

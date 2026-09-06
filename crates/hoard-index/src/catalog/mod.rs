@@ -1,3 +1,4 @@
+mod hashing;
 mod jobs;
 mod loadouts;
 mod models;
@@ -24,8 +25,9 @@ use crate::config::IndexConfig;
 use crate::error::{IndexError, Result};
 use crate::store::DiskPressure;
 
-use self::models::{ArtifactRecord, Manifest, Repository, Source, Summary, define_models};
+use self::models::{ArtifactRecord, Entry, Manifest, Repository, Source, Summary, define_models};
 
+pub use self::hashing::HashReport;
 pub use self::jobs::JobRecord;
 pub use self::loadouts::LoadoutRecord;
 pub use self::read::{
@@ -117,6 +119,7 @@ impl Catalog {
         transaction.migrate::<Repository>()?;
         transaction.migrate::<ArtifactRecord>()?;
         transaction.migrate::<Source>()?;
+        transaction.migrate::<Entry>()?;
         transaction.commit()?;
         let catalog = Self {
             database,

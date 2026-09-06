@@ -44,6 +44,9 @@ pub struct EntryDetail {
     pub lfs_pointer: bool,
     pub artifact_id: Option<ArtifactId>,
     pub deduped: bool,
+    pub sha256: Option<Sha256>,
+    pub git_sha1: Option<CommitSha>,
+    pub pull_progress: Option<f32>,
 }
 
 /// What only the inspector reads: the header the sniffer measured, the evidence behind the
@@ -109,12 +112,11 @@ pub struct SourceRecord {
     pub file_count: u64,
     pub byte_count: u64,
     pub last_scan: Option<jiff::Timestamp>,
+    pub pending_hashes: u64,
 }
 
-impl TryFrom<Source> for SourceRecord {
-    type Error = IndexError;
-
-    fn try_from(stored: Source) -> Result<Self> {
+impl SourceRecord {
+    fn of(stored: Source, pending_hashes: u64) -> Result<Self> {
         Ok(Self {
             name: stored.name,
             path: stored.config.path,
@@ -122,6 +124,7 @@ impl TryFrom<Source> for SourceRecord {
             file_count: stored.file_count,
             byte_count: stored.byte_count,
             last_scan: parse_opt_timestamp(stored.last_scan)?,
+            pending_hashes,
         })
     }
 }
@@ -138,15 +141,22 @@ pub struct TriageItem {
 }
 
 impl Catalog {
-    /// Every nominated root this catalog holds, ordered by name.
+    /// Every nominated root this catalog holds, ordered by name, with the files each still
+    /// owes a content hash.
     pub fn sources(&self) -> Result<Vec<SourceRecord>> {
+        let pending = self.pending_by_source()?;
         let read = self.database.r_transaction()?;
         let rows: Vec<Source> = read
             .scan()
             .primary()?
             .all()?
             .collect::<native_db::db_type::Result<_>>()?;
-        rows.into_iter().map(SourceRecord::try_from).collect()
+        rows.into_iter()
+            .map(|row| {
+                let owed = pending.get(&row.name).copied().unwrap_or_default();
+                SourceRecord::of(row, owed)
+            })
+            .collect()
     }
 
     /// The artifact's preferred entry as a row: the highest availability preference, and on
@@ -560,14 +570,14 @@ fn repository_detail(repository: &Repository, kind: SourceKind, node: &str) -> R
 
 /// One read transaction with the repositories it has already resolved, so a screen that
 /// walks many entries of one repository reads that record once.
-struct Reader<'a, 'db> {
+pub(super) struct Reader<'a, 'db> {
     snapshot: &'a RTransaction<'db>,
     node: &'a str,
     repositories: HashMap<i64, Repository>,
 }
 
 impl<'a, 'db> Reader<'a, 'db> {
-    fn new(snapshot: &'a RTransaction<'db>, node: &'a str) -> Self {
+    pub(super) fn new(snapshot: &'a RTransaction<'db>, node: &'a str) -> Self {
         Self {
             snapshot,
             node,
@@ -575,7 +585,7 @@ impl<'a, 'db> Reader<'a, 'db> {
         }
     }
 
-    fn record(&self, id: i64) -> Result<Option<ArtifactRecord>> {
+    pub(super) fn record(&self, id: i64) -> Result<Option<ArtifactRecord>> {
         Ok(self.snapshot.get().primary(id)?)
     }
 
@@ -641,7 +651,7 @@ impl<'a, 'db> Reader<'a, 'db> {
         }))
     }
 
-    fn detail(&mut self, entry: &Entry, deduped: bool) -> Result<EntryDetail> {
+    pub(super) fn detail(&mut self, entry: &Entry, deduped: bool) -> Result<EntryDetail> {
         let node = self.node;
         let repository = self.repository(entry.repo_id)?;
         let revision = revision_of(repository, entry)?;
@@ -672,5 +682,8 @@ fn entry_detail(
         lfs_pointer: entry.lfs_pointer,
         artifact_id: entry.artifact_id.map(ArtifactId::new),
         deduped,
+        sha256: entry.sha256,
+        git_sha1: entry.git_sha1,
+        pull_progress: entry.pull_progress,
     }
 }

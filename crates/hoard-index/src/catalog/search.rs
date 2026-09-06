@@ -1196,7 +1196,7 @@ pub(super) fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
         revision_sha: revision.sha,
         node: (*node).to_owned(),
         state: entry.state,
-        pull_progress: None,
+        pull_progress: entry.pull_progress,
         trigger: inferred.trigger.clone(),
         path: entry.rel_path.clone(),
         abs_path: entry.abs_path.clone(),

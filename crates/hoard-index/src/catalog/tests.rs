@@ -18,9 +18,9 @@ use crate::store::SearchRow;
 use crate::store::revision::RefKind;
 
 use super::models::{
-    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, ArtifactRecordV1, Entry, EntryKey, Manifest,
-    ManifestV1, Override, Ref, Repository, RepositoryKey, RepositoryV1, Revision, RevisionV1,
-    SearchChange, SearchText, Source, SourceV1, Summary, SummaryV1,
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, ArtifactRecordV1, Entry, EntryKey, EntryV1,
+    Manifest, ManifestV1, Override, Ref, Repository, RepositoryKey, RepositoryV1, Revision,
+    RevisionV1, SearchChange, SearchText, Source, SourceV1, Summary, SummaryV1,
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
@@ -1170,7 +1170,7 @@ fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
         .map(|table| table.name.as_str())
         .collect();
     assert!(
-        names.iter().any(|name| name.starts_with("7_1_")),
+        names.iter().any(|name| name.starts_with("7_2_")),
         "the Entry table is listed: {names:?}"
     );
     assert!(
@@ -1180,7 +1180,7 @@ fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
     let entries = report
         .tables
         .iter()
-        .find(|table| table.name.starts_with("7_1_id"))
+        .find(|table| table.name.starts_with("7_2_id"))
         .map(|table| table.entries);
     assert_eq!(entries, Some(2));
     let reopened = Catalog::open(&native)?;
@@ -1379,6 +1379,8 @@ fn a_seeded_catalog_answers_like_a_scanned_one() -> Result<()> {
         size: 239_075_328,
         state: State::Local,
         is_symlink: false,
+        sha256: None,
+        git_sha1: None,
         artifact: Some(lora.clone()),
     };
     catalog.seed(&[SeedRepository {
@@ -1653,6 +1655,8 @@ fn seeded_entry(rel_path: &str, size: u64, artifact: Option<SeedArtifact>) -> Se
         size,
         state: State::Local,
         is_symlink: false,
+        sha256: None,
+        git_sha1: None,
         artifact,
     }
 }
@@ -1875,6 +1879,8 @@ fn an_any_base_answers_only_its_own_bucket() -> Result<()> {
                 size: 1_024,
                 state: State::Local,
                 is_symlink: false,
+                sha256: None,
+                git_sha1: None,
                 artifact: Some(SeedArtifact {
                     identity,
                     artifact: Artifact {
@@ -2316,6 +2322,34 @@ fn artifact_detail_encoding_is_frozen() -> Result<()> {
 #[test]
 fn entry_encoding_is_frozen() -> Result<()> {
     let value = Entry {
+        id: 13,
+        repo_id: 11,
+        artifact_id: Some(7),
+        revision: 1,
+        rel_path: "unet/frozen.safetensors".to_owned(),
+        abs_path: Some("/frozen/source/unet/frozen.safetensors".to_owned()),
+        size: 4096,
+        state: State::Triage,
+        triage: true,
+        preference: 19,
+        lfs_pointer: true,
+        is_symlink: true,
+        sha256: Some(Sha256::from_bytes([3; 32])),
+        content: Some(0x0303_0303_0303_0303_u128),
+        git_sha1: Some(CommitSha::from_bytes([7; 20])),
+        mtime: Some(1_767_225_600),
+        inode: Some(424_242),
+        node: 1,
+        pass: 4,
+        pull_progress: Some(0.5),
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn entry_v1_encoding_is_frozen() -> Result<()> {
+    let value = EntryV1 {
         id: 13,
         repo_id: 11,
         artifact_id: Some(7),
@@ -3229,6 +3263,111 @@ fn usage_is_logged_summarised_and_reaches_the_used_token() -> Result<()> {
     assert_eq!(
         by_use.rows[0].artifact_id, row.artifact_id,
         "the used artifact sorts first descending"
+    );
+    Ok(())
+}
+
+#[test]
+fn hashing_gives_every_file_a_sha256_and_merges_two_copies_into_one_artifact() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("a"))?;
+    fs::create_dir_all(input.join("b"))?;
+    fs::write(input.join("a/style.safetensors"), lora_header())?;
+    fs::write(input.join("b/style-copy.safetensors"), lora_header())?;
+    fs::write(input.join("a/other.csv"), "x,y\n1,2\n")?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    assert_eq!(catalog.pending_hashes()?, 3);
+    assert_eq!(
+        catalog.totals()?.artifacts,
+        3,
+        "two copies are two artifacts until hashed"
+    );
+    let report = catalog.hash_pending(&config, |_| {})?;
+    assert_eq!(report.hashed, 3);
+    assert_eq!(report.merged, 1);
+    assert_eq!(report.unreadable, 0);
+    assert_eq!(catalog.pending_hashes()?, 0);
+    assert_eq!(
+        catalog.totals()?.artifacts,
+        2,
+        "the copies are one artifact now"
+    );
+    catalog.rebuild_search(|_| {})?;
+    let page = search(&catalog, "role:lora")?;
+    assert_eq!(page.total, 1);
+    assert_eq!(page.rows[0].path_count, 2);
+    assert!(page.rows[0].blob_sha256.is_some());
+    assert!(page.rows[0].dupe);
+    let read = catalog.database.r_transaction()?;
+    let entries: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert!(entries.iter().all(|entry| entry.sha256.is_some()));
+    assert!(
+        entries.iter().all(|entry| entry.git_sha1.is_some()),
+        "small files also get a git sha1"
+    );
+    drop(read);
+    let sha = page.rows[0]
+        .blob_sha256
+        .ok_or_else(|| IndexError::Catalog("sha".into()))?;
+    assert_eq!(
+        catalog.artifact_by_sha256(&sha)?.map(|row| row.artifact_id),
+        Some(page.rows[0].artifact_id)
+    );
+    let holders = catalog.entries_by_sha256(&[sha])?;
+    assert_eq!(holders.len(), 1, "two copies collapse to one holder");
+    assert_eq!(holders[0].1.sha256, Some(sha));
+    assert!(holders[0].1.deduped);
+    assert_eq!(
+        catalog.hash_pending(&config, |_| {})?.hashed,
+        0,
+        "nothing is hashed twice"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_rescan_after_hashing_keeps_the_merged_artifact() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("a"))?;
+    fs::create_dir_all(input.join("b"))?;
+    fs::write(input.join("a/style.safetensors"), lora_header())?;
+    fs::write(input.join("b/style-copy.safetensors"), lora_header())?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    catalog.hash_pending(&config, |_| {})?;
+    let report = catalog.rescan(&config, |_, _| {})?;
+    assert_eq!(report.unchanged, 2, "hashed files are unchanged files");
+    assert_eq!(catalog.totals()?.artifacts, 1);
+    fs::write(input.join("a/style.safetensors"), plain_header())?;
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    fs::File::options()
+        .write(true)
+        .open(input.join("a/style.safetensors"))?
+        .set_modified(later)?;
+    catalog.rescan(&config, |_, _| {})?;
+    assert_eq!(
+        catalog.pending_hashes()?,
+        1,
+        "a changed file loses its hash until rehashed"
+    );
+    catalog.hash_pending(&config, |_| {})?;
+    assert_eq!(
+        catalog.totals()?.artifacts,
+        2,
+        "different content, two artifacts again"
     );
     Ok(())
 }

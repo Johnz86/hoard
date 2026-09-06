@@ -21,10 +21,11 @@ use crate::scan::{
 use crate::shard::{self, ShardCandidate, ShardSet, file_name};
 use crate::sniff::{self, SniffResult};
 
+use super::hashing::content_key;
 use super::models::{
-    Allocator, ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Manifest,
-    Override, Ref, Repository, RepositoryKey, Revision, SearchChange, SearchText, Source, Summary,
-    repository_key,
+    Allocator, ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE,
+    Manifest, Override, Ref, Repository, RepositoryKey, Revision, SearchChange, SearchText, Source,
+    Summary, repository_key,
 };
 use super::verdict::apply_override;
 use crate::error::{IndexError, Result};
@@ -1357,9 +1358,14 @@ fn store_entry(
         preference: preference(state, prepared.presence.present()),
         lfs_pointer: prepared.presence.lfs_pointer,
         is_symlink: prepared.discovered.is_symlink,
+        sha256: prepared.presence.sha256,
+        content: prepared.presence.sha256.as_ref().map(content_key),
         git_sha1: prepared.discovered.git_sha1,
         mtime: prepared.discovered.stamp.map(|stamp| stamp.mtime),
         inode: prepared.discovered.stamp.map(|stamp| stamp.inode),
+        node: LOCAL_NODE,
+        pass: 0,
+        pull_progress: None,
     })?;
     Ok(stored)
 }

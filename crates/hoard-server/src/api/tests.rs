@@ -369,6 +369,8 @@ fn seed_entry(
         size,
         state: ArtifactState::Local,
         is_symlink: false,
+        sha256: None,
+        git_sha1: None,
         artifact,
     }
 }
@@ -1930,7 +1932,10 @@ async fn sources_scans_and_jobs_are_listed() {
     assert_eq!(sources.as_array().expect("sources").len(), 1);
     assert_eq!(sources[0]["kind"], "hf-cache");
     assert_eq!(sources[0]["path"], "/data/hub");
-    assert_eq!(sources[0]["pending_hashes"], 0);
+    assert_eq!(
+        sources[0]["pending_hashes"], 9,
+        "every seeded path is still waiting for a content hash"
+    );
 
     let started = post(
         &world.state,

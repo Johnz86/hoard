@@ -365,7 +365,11 @@ fn locate_blobs(conn: &Connection, ids: &[BlobId]) -> Result<HashMap<i64, PathBu
     Ok(located)
 }
 
-fn content_hashes(path: &Path, size: u64, threshold: u64) -> Result<(Sha256, Option<GitSha1>)> {
+pub(crate) fn content_hashes(
+    path: &Path,
+    size: u64,
+    threshold: u64,
+) -> Result<(Sha256, Option<GitSha1>)> {
     let sha256 = hash::sha256_file(path)?;
     let git_sha1 = match size < threshold {
         true => Some(hash::git_blob_sha1(path)?),

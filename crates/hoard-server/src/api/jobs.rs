@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use hoard_core::{JobId, SourceId, format_size};
 use hoard_index::IndexError;
-use hoard_index::catalog::{Catalog, JobProgress, JobRecord, JobState, RescanReport, SourceRecord};
+use hoard_index::catalog::{
+    Catalog, HashReport, JobProgress, JobRecord, JobState, RescanReport, SourceRecord,
+};
 use hoard_index::config::HashPolicy;
 use hoard_index::scan::ScanOptions;
 
@@ -22,7 +24,7 @@ const SCAN_KIND: &str = hoard_index::scan::SCAN_JOB;
 ///
 /// Sources carry no identity of their own in the catalog yet, so `id` is the source's
 /// one-based position in this listing, which is also how a scan request naming an id is
-/// read back. `blobs` and `pending_hashes` read zero because the catalog does not hash.
+/// read back. `blobs` reads zero because the catalog counts paths, not blobs.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SourceView {
     pub id: SourceId,
@@ -96,7 +98,7 @@ fn source_view(position: usize, record: SourceRecord, node: &str) -> SourceView 
         bytes: record.byte_count,
         bytes_human: format_size(record.byte_count),
         last_scan: record.last_scan,
-        pending_hashes: 0,
+        pending_hashes: record.pending_hashes,
     }
 }
 
@@ -166,10 +168,20 @@ async fn run_scan(
     job: JobId,
 ) -> Result<RescanReport, IndexError> {
     let config = state.config().index.clone();
+    let hash = options.hash;
     phase(state, job, "scanning the sources").await?;
     hoard_index::scan::scan(state.store(), &config, options, &|_| {}).await?;
     phase(state, job, "rescanning the native catalog").await?;
-    refresh_catalog(state, config).await
+    let report = rescan_catalog(state, config.clone()).await?;
+    match hash {
+        HashPolicy::Now | HashPolicy::Background => {
+            phase(state, job, "hashing").await?;
+            hash_catalog(state, config).await?;
+        }
+        HashPolicy::Never => {}
+    }
+    refresh_catalog(state).await?;
+    Ok(report)
 }
 
 async fn phase(state: &AppState, job: JobId, phase: &str) -> Result<(), IndexError> {
@@ -194,19 +206,29 @@ async fn settle_scan(
     .await?
 }
 
-/// Walks the sources again into the native catalog and applies what changed to its search
-/// index, on a blocking thread because both are file and database work.
-async fn refresh_catalog(
+/// Walks the sources again into the native catalog, on a blocking thread because it is file
+/// and database work.
+async fn rescan_catalog(
     state: &AppState,
     config: hoard_index::config::IndexConfig,
 ) -> Result<RescanReport, IndexError> {
-    let catalog = std::sync::Arc::clone(state.catalog());
-    tokio::task::spawn_blocking(move || -> Result<RescanReport, IndexError> {
-        let report = catalog.rescan(&config, |_, _| {})?;
-        catalog.refresh_search(|_| {})?;
-        Ok(report)
-    })
-    .await?
+    let catalog = Arc::clone(state.catalog());
+    tokio::task::spawn_blocking(move || catalog.rescan(&config, |_, _| {})).await?
+}
+
+/// Hashes what the walk left unhashed, which is what gives copies of one file one artifact.
+async fn hash_catalog(
+    state: &AppState,
+    config: hoard_index::config::IndexConfig,
+) -> Result<HashReport, IndexError> {
+    let catalog = Arc::clone(state.catalog());
+    tokio::task::spawn_blocking(move || catalog.hash_pending(&config, |_| {})).await?
+}
+
+/// Applies to the search index what the walk and the hashing changed.
+async fn refresh_catalog(state: &AppState) -> Result<u64, IndexError> {
+    let catalog = Arc::clone(state.catalog());
+    tokio::task::spawn_blocking(move || catalog.refresh_search(|_| {})).await?
 }
 
 /// Reads what a scan request named: a configured source name, or the name, id or path of a

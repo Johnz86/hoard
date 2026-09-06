@@ -104,6 +104,8 @@ fn seed_catalog(catalog: &Catalog, root: &Path) {
                     size: SMALL_SIZE as u64,
                     state: ArtifactState::Local,
                     is_symlink: false,
+                    sha256: Some(Sha256::from_bytes(SMALL_SHA256)),
+                    git_sha1: None,
                     artifact: Some(SeedArtifact {
                         identity: 0x9f9f,
                         artifact: Artifact {

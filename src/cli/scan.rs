@@ -60,7 +60,7 @@ pub async fn run(context: Context, source: Option<String>, hash: HashPolicy) -> 
     }
 
     let bar = progress_bar();
-    let report = rescan_catalog(catalog, config.index.clone(), &bar).await?;
+    let report = rescan_catalog(catalog, config.index.clone(), hash, &bar).await?;
     bar.finish_and_clear();
     tracing::info!(
         unchanged = report.unchanged,
@@ -72,20 +72,38 @@ pub async fn run(context: Context, source: Option<String>, hash: HashPolicy) -> 
     Ok(())
 }
 
-/// Walks the sources again into the native catalog and applies what changed to its search
-/// index. Both are blocking work, so they run off the runtime's threads.
+/// Walks the sources again into the native catalog, hashes what the walk left unhashed
+/// unless the run was asked not to, and applies what changed to its search index. All three
+/// are blocking work, so they run off the runtime's threads.
 async fn rescan_catalog(
     catalog: Arc<hoard_index::catalog::Catalog>,
     config: hoard_index::config::IndexConfig,
+    hash: HashPolicy,
     bar: &Arc<ProgressBar>,
 ) -> Result<RescanReport> {
     let walking = Arc::clone(bar);
+    let hashing = Arc::clone(bar);
     let indexing = Arc::clone(bar);
     tokio::task::spawn_blocking(move || -> Result<RescanReport, IndexError> {
         let report = catalog.rescan(&config, |phase, count| {
             walking.set_message(format!("{phase}: {count} entries"));
             walking.tick();
         })?;
+        match hash {
+            HashPolicy::Now | HashPolicy::Background => {
+                let hashed = catalog.hash_pending(&config, |count| {
+                    hashing.set_message(format!("Hashing the native catalog: {count} files"));
+                    hashing.tick();
+                })?;
+                tracing::info!(
+                    hashed = hashed.hashed,
+                    merged = hashed.merged,
+                    unreadable = hashed.unreadable,
+                    "native catalog hashed"
+                );
+            }
+            HashPolicy::Never => {}
+        }
         catalog.refresh_search(|count| {
             indexing.set_message(format!("Refreshing the native index: {count} changes"));
             indexing.tick();
