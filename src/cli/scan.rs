@@ -3,116 +3,92 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use hoard_core::format_size;
-use hoard_index::config::HashPolicy;
-use hoard_index::scan::{self, ScanOptions, ScanProgress};
-use hoard_index::{IndexError, catalog::RescanReport};
+use hoard_index::catalog::{Catalog, HashReport, RescanReport};
+use hoard_index::config::{HashPolicy, IndexConfig};
+use hoard_index::{IndexError, catalog};
 
 use super::node::Context;
 
 pub async fn run(context: Context, source: Option<String>, hash: HashPolicy) -> Result<()> {
     let Context {
-        config,
-        store,
-        catalog,
+        config, catalog, ..
     } = context;
     if config.index.sources.is_empty() {
         anyhow::bail!("no sources are configured; add [[index.sources]] to hoard.toml");
     }
-    if let Some(name) = source.as_deref()
-        && config.index.source(name).is_none()
-    {
-        anyhow::bail!("no source named {name} in hoard.toml");
-    }
+    let index = match source.as_deref() {
+        Some(name) => {
+            let named = config
+                .index
+                .source(name)
+                .ok_or_else(|| anyhow::anyhow!("no source named {name} in hoard.toml"))?;
+            config.index.over(vec![named.clone()])
+        }
+        None => config.index.clone(),
+    };
 
     let bar = progress_bar();
-    let ticker = Arc::clone(&bar);
-    let report = scan::scan(
-        &store,
-        &config.index,
-        ScanOptions { source, hash },
-        &move |progress: ScanProgress| tick(&ticker, &progress),
-    )
-    .await
-    .context("scanning")?;
+    let (report, hashed) = rescan(catalog, index, hash, &bar).await?;
     bar.finish_and_clear();
 
-    tracing::info!(
-        files = report.files,
-        blobs = report.blobs,
-        artifacts = report.artifacts,
-        triage = report.triage,
-        bytes = %format_size(report.bytes),
-        ms = report.elapsed_ms,
-        "scan complete"
-    );
-
-    if hash == HashPolicy::Background {
-        let bar = progress_bar();
-        let ticker = Arc::clone(&bar);
-        let hashed = scan::hash_pending(&store, &config.index, &move |progress| {
-            tick(&ticker, &progress)
-        })
-        .await
-        .context("hashing")?;
-        bar.finish_and_clear();
-        tracing::info!(hashed, "background hashing complete");
+    match hashed {
+        Some(hashed) => tracing::info!(
+            unchanged = report.unchanged,
+            changed = report.changed,
+            added = report.added,
+            absent = report.absent,
+            hashed = hashed.hashed,
+            merged = hashed.merged,
+            "scan complete"
+        ),
+        None => tracing::info!(
+            unchanged = report.unchanged,
+            changed = report.changed,
+            added = report.added,
+            absent = report.absent,
+            "scan complete"
+        ),
     }
-
-    let bar = progress_bar();
-    let report = rescan_catalog(catalog, config.index.clone(), hash, &bar).await?;
-    bar.finish_and_clear();
-    tracing::info!(
-        unchanged = report.unchanged,
-        changed = report.changed,
-        added = report.added,
-        absent = report.absent,
-        "native catalog rescanned"
-    );
     Ok(())
 }
 
-/// Walks the sources again into the native catalog, hashes what the walk left unhashed
-/// unless the run was asked not to, and applies what changed to its search index. All three
-/// are blocking work, so they run off the runtime's threads.
-async fn rescan_catalog(
-    catalog: Arc<hoard_index::catalog::Catalog>,
-    config: hoard_index::config::IndexConfig,
+/// Walks the sources into the native catalog, hashes what the walk left unhashed unless the
+/// run was asked not to, and applies what changed to the search index. All three are
+/// blocking work, so they run off the runtime's threads.
+async fn rescan(
+    catalog: Arc<Catalog>,
+    config: IndexConfig,
     hash: HashPolicy,
     bar: &Arc<ProgressBar>,
-) -> Result<RescanReport> {
+) -> Result<(RescanReport, Option<HashReport>)> {
     let walking = Arc::clone(bar);
     let hashing = Arc::clone(bar);
     let indexing = Arc::clone(bar);
-    tokio::task::spawn_blocking(move || -> Result<RescanReport, IndexError> {
-        let report = catalog.rescan(&config, hash, |phase, count| {
-            walking.set_message(format!("{phase}: {count} entries"));
-            walking.tick();
-        })?;
-        match hash {
-            HashPolicy::Now | HashPolicy::Background => {
-                let hashed = catalog.hash_pending(&config, |count| {
-                    hashing.set_message(format!("Hashing the native catalog: {count} files"));
-                    hashing.tick();
-                })?;
-                tracing::info!(
-                    hashed = hashed.hashed,
-                    merged = hashed.merged,
-                    unreadable = hashed.unreadable,
-                    "native catalog hashed"
-                );
-            }
-            HashPolicy::Never => {}
-        }
-        catalog.refresh_search(|count| {
-            indexing.set_message(format!("Refreshing the native index: {count} changes"));
-            indexing.tick();
-        })?;
-        Ok(report)
-    })
+    tokio::task::spawn_blocking(
+        move || -> Result<(RescanReport, Option<catalog::HashReport>), IndexError> {
+            let report = catalog.rescan(&config, hash, |phase, count| {
+                walking.set_message(format!("{phase}: {count} entries"));
+                walking.tick();
+            })?;
+            let hashed = match hash {
+                HashPolicy::Now | HashPolicy::Background => {
+                    Some(catalog.hash_pending(&config, |count| {
+                        hashing.set_message(format!("Hashing: {count} files"));
+                        hashing.tick();
+                    })?)
+                }
+                HashPolicy::Never => None,
+            };
+            catalog.refresh_search(|count| {
+                indexing.set_message(format!("Refreshing the search index: {count} changes"));
+                indexing.tick();
+            })?;
+            Ok((report, hashed))
+        },
+    )
     .await
-    .context("rescanning the native catalog")?
-    .context("rescanning the native catalog")
+    .context("rescanning the catalog")?
+    .context("rescanning the catalog")
 }
 
 pub(super) fn progress_bar() -> Arc<ProgressBar> {
@@ -121,14 +97,4 @@ pub(super) fn progress_bar() -> Arc<ProgressBar> {
         bar.set_style(style);
     }
     Arc::new(bar)
-}
-
-fn tick(bar: &ProgressBar, progress: &ScanProgress) {
-    let current = progress.current.as_deref().unwrap_or_default();
-    let message = match progress.total {
-        Some(total) => format!("{} {}/{total} {current}", progress.phase, progress.done),
-        None => format!("{} {} {current}", progress.phase, progress.done),
-    };
-    bar.set_message(message);
-    bar.tick();
 }

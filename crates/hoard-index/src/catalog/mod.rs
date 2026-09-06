@@ -4,6 +4,7 @@ mod ingest;
 mod jobs;
 mod loadouts;
 mod models;
+mod naming;
 mod nodes;
 mod pulls;
 mod query;

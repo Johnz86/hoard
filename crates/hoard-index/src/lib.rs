@@ -10,7 +10,6 @@ pub mod discover;
 pub mod error;
 pub mod hash;
 pub mod infer;
-pub mod scan;
 pub mod search;
 pub mod shard;
 pub mod sniff;

@@ -21,6 +21,13 @@ use crate::error::{IndexError, Result};
 
 pub use readme::{ReadmeDoc, parse_readme};
 
+/// The version of the sniffing and inference rules an artifact was produced by.
+///
+/// Bump this whenever those rules change. A scan whose recorded version differs ignores the
+/// stamp cache and reads every header again, because the incremental short-circuit is what
+/// otherwise keeps an improved rule from ever reaching an index that already exists.
+pub const SNIFF_VERSION: u32 = 3;
+
 const PROBE_BYTES: u64 = 4096;
 /// Ceiling for the whole-document reads (README, config JSON).
 const DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;

@@ -11,14 +11,14 @@ use hoard_index::IndexError;
 use hoard_index::catalog::{
     Catalog, HashReport, JobProgress, JobRecord, JobState, RescanReport, SourceRecord,
 };
-use hoard_index::config::HashPolicy;
-use hoard_index::scan::ScanOptions;
+use hoard_index::config::{HashPolicy, IndexConfig};
 
 use crate::api::common::{authorize, blocking};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
-const SCAN_KIND: &str = hoard_index::scan::SCAN_JOB;
+/// The `job.kind` a scan records.
+const SCAN_KIND: &str = "scan";
 
 /// One nominated root and what the last scan of it counted.
 ///
@@ -104,9 +104,8 @@ fn source_view(position: usize, record: SourceRecord, node: &str) -> SourceView 
 
 /// Starts a scan and answers with the job it runs under.
 ///
-/// One native job covers the whole run: the SQLite scan the Hub and git faces still read
-/// from, then the catalog rescan and the search refresh. The SQLite scanner opens a job row
-/// of its own, which stays where it is until that scan goes.
+/// One job covers the whole run: the catalog rescan, the hashing it owes and the search
+/// refresh that publishes what changed.
 pub async fn scan(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -129,21 +128,30 @@ pub async fn scan(
     let catalog = Arc::clone(state.catalog());
     let job_id = blocking(move || catalog.create_job(SCAN_KIND, subject.as_deref())).await?;
     let background = state.clone();
-    let options = ScanOptions { source, hash };
+    let config = narrowed(&state.config().index, source.as_deref());
     tokio::spawn(async move {
-        if let Err(error) = hand_off_to_scanner(&background, options, job_id).await {
+        if let Err(error) = hand_off_to_scanner(&background, config, hash, job_id).await {
             tracing::error!(%error, "the scan failed");
         }
     });
     Ok(Json(ScanStarted { job_id }))
 }
 
+/// What one run covers: every configured root, or the one the request named.
+fn narrowed(config: &IndexConfig, source: Option<&str>) -> IndexConfig {
+    match source.and_then(|name| config.source(name)) {
+        Some(named) => config.over(vec![named.clone()]),
+        None => config.clone(),
+    }
+}
+
 async fn hand_off_to_scanner(
     state: &AppState,
-    options: ScanOptions,
+    config: IndexConfig,
+    hash: HashPolicy,
     job: JobId,
 ) -> Result<(), IndexError> {
-    match run_scan(state, options, job).await {
+    match run_scan(state, config, hash, job).await {
         Ok(report) => {
             tracing::info!(
                 unchanged = report.unchanged,
@@ -164,14 +172,11 @@ async fn hand_off_to_scanner(
 
 async fn run_scan(
     state: &AppState,
-    options: ScanOptions,
+    config: IndexConfig,
+    hash: HashPolicy,
     job: JobId,
 ) -> Result<RescanReport, IndexError> {
-    let config = state.config().index.clone();
-    let hash = options.hash;
-    phase(state, job, "scanning the sources").await?;
-    hoard_index::scan::scan(state.store(), &config, options, &|_| {}).await?;
-    phase(state, job, "rescanning the native catalog").await?;
+    phase(state, job, "rescanning the sources").await?;
     let report = rescan_catalog(state, config.clone(), hash).await?;
     match hash {
         HashPolicy::Now | HashPolicy::Background => {
@@ -180,6 +185,7 @@ async fn run_scan(
         }
         HashPolicy::Never => {}
     }
+    phase(state, job, "refreshing search").await?;
     refresh_catalog(state).await?;
     Ok(report)
 }
@@ -210,7 +216,7 @@ async fn settle_scan(
 /// and database work.
 async fn rescan_catalog(
     state: &AppState,
-    config: hoard_index::config::IndexConfig,
+    config: IndexConfig,
     policy: HashPolicy,
 ) -> Result<RescanReport, IndexError> {
     let catalog = Arc::clone(state.catalog());
@@ -218,10 +224,7 @@ async fn rescan_catalog(
 }
 
 /// Hashes what the walk left unhashed, which is what gives copies of one file one artifact.
-async fn hash_catalog(
-    state: &AppState,
-    config: hoard_index::config::IndexConfig,
-) -> Result<HashReport, IndexError> {
+async fn hash_catalog(state: &AppState, config: IndexConfig) -> Result<HashReport, IndexError> {
     let catalog = Arc::clone(state.catalog());
     tokio::task::spawn_blocking(move || catalog.hash_pending(&config, |_| {})).await?
 }

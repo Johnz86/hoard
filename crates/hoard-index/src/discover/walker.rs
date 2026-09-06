@@ -12,12 +12,10 @@ use std::path::{Path, PathBuf};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use parking_lot::Mutex;
-use rusqlite::Connection;
 
 use crate::config::SourceConfig;
 use crate::error::{IndexError, Result};
 use crate::hash::FileStamp;
-use crate::store::overrides::list_noise;
 
 /// The per-source ignore file, honoured with `.gitignore` syntax.
 pub const HOARD_IGNORE: &str = ".hoardignore";
@@ -168,16 +166,7 @@ pub struct NoiseFilter {
 }
 
 impl NoiseFilter {
-    pub fn load(conn: &Connection) -> Result<Self> {
-        let paths = list_noise(conn)?
-            .into_iter()
-            .map(|row| PathBuf::from(row.path))
-            .collect();
-        Ok(Self { paths })
-    }
-
-    /// The same filter from paths a caller already holds, which is how the native catalog
-    /// builds one without a SQLite connection.
+    /// The filter from the paths a rejection recorded.
     pub fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
         Self {
             paths: paths.into_iter().collect(),
@@ -393,9 +382,6 @@ mod tests {
             .map(|found| found.rel_path)
             .collect()
     }
-    use crate::store::Store;
-    use crate::store::overrides::add_noise;
-
     fn write(dir: &Path, relative: &str, bytes: &[u8]) -> PathBuf {
         let path = dir.join(relative);
         if let Some(parent) = path.parent() {
@@ -503,20 +489,10 @@ mod tests {
 
     #[test]
     fn rejected_paths_and_their_children_are_skipped() {
-        let store = Store::open_in_memory().expect("store opens");
         let dir = TempDir::new().expect("temp dir");
         write(dir.path(), "junk/a.safetensors", b"a");
         write(dir.path(), "keep/b.safetensors", b"a");
-        let noise = {
-            let conn = store.write().expect("writer");
-            add_noise(
-                &conn,
-                &dir.path().join("junk").to_string_lossy(),
-                Some("rejected"),
-            )
-            .expect("noise records");
-            NoiseFilter::load(&conn).expect("noise loads")
-        };
+        let noise = NoiseFilter::from_paths([dir.path().join("junk")]);
         assert!(!noise.is_empty());
 
         let files = walk(dir.path(), &WalkOptions::default(), &noise).expect("walk succeeds");

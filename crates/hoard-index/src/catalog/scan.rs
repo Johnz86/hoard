@@ -16,10 +16,6 @@ use crate::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
 use crate::discover::{self, DiscoveredEntry, DiscoveredRepo, DiscoveredRevision, RevisionName};
 use crate::hash::FileStamp;
 use crate::infer::{self, InferInput, Inference};
-use crate::scan::{
-    InferenceContext, Naming, artifact_name, content_hashes, disambiguate_labels, index_document,
-    inference_path, shard_label,
-};
 use crate::shard::{self, ShardCandidate, ShardSet, file_name};
 use crate::sniff::{self, SniffResult};
 
@@ -28,6 +24,10 @@ use super::models::{
     Allocator, ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE,
     Manifest, Override, Ref, Repository, RepositoryKey, Revision, SearchChange, SearchText, Source,
     Summary, repository_key,
+};
+use super::naming::{
+    InferenceContext, Naming, artifact_name, content_hashes, disambiguate_labels, index_document,
+    inference_path, shard_label,
 };
 use super::verdict::apply_override;
 use crate::error::{IndexError, Result};
@@ -1618,7 +1618,7 @@ pub(super) fn record_of(facts: RecordFacts<'_>) -> (ArtifactRecord, ArtifactDeta
             params: inference.params,
             context: inference.context,
             trigger: inference.trigger.clone(),
-            sniff_version: crate::scan::SNIFF_VERSION,
+            sniff_version: crate::sniff::SNIFF_VERSION,
         },
         group_bytes,
         shard_count,

@@ -9,13 +9,13 @@ use hoard_core::{GitSha1, Sha256, State};
 
 use crate::config::IndexConfig;
 use crate::error::Result;
-use crate::scan::content_hashes;
 
 use super::Catalog;
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Override, Repository,
     SearchText,
 };
+use super::naming::content_hashes;
 use super::scan::{Counters, log_changes};
 use super::verdict::apply_override;
 

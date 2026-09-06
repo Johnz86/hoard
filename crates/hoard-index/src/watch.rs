@@ -9,16 +9,16 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::task::JoinHandle;
 
-use crate::config::IndexConfig;
+use crate::catalog::Catalog;
+use crate::config::{HashPolicy, IndexConfig, source_for_path};
 use crate::error::{IndexError, Result};
-use crate::scan::{ScanOptions, ScanProgress, scan, source_for_path};
-use crate::store::Store;
 
 /// How long a burst of events is collected before the sources it touched are rescanned.
 pub const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(750);
@@ -50,7 +50,7 @@ pub struct Watcher {
 
 impl Watcher {
     /// Starts watching every source of `config` that exists on disk.
-    pub fn start(store: &Store, config: &IndexConfig, debounce: Duration) -> Result<Self> {
+    pub fn start(catalog: Arc<Catalog>, config: &IndexConfig, debounce: Duration) -> Result<Self> {
         let (sender, receiver) = channel(EVENT_CAPACITY);
         let mut watcher = notify::recommended_watcher(move |event| forward(&sender, event))
             .map_err(watch_error)?;
@@ -67,7 +67,7 @@ impl Watcher {
             roots.push(source.path.clone());
         }
 
-        let task = tokio::spawn(pump(store.clone(), config.clone(), debounce, receiver));
+        let task = tokio::spawn(pump(catalog, config.clone(), debounce, receiver));
         Ok(Self {
             watcher: Some(watcher),
             roots,
@@ -128,29 +128,50 @@ const fn mutates(kind: EventKind) -> bool {
 }
 
 async fn pump(
-    store: Store,
+    catalog: Arc<Catalog>,
     config: IndexConfig,
     debounce: Duration,
     mut events: Receiver<PathBuf>,
 ) {
-    let quiet: &(dyn Fn(ScanProgress) + Send + Sync) = &|_| {};
     let window = debounce.saturating_mul(MAX_DEBOUNCE_WINDOWS);
     while let Some(first) = events.recv().await {
         let pending = collect_burst(&config, &mut events, first, debounce, window).await;
-        for name in pending {
-            let options = ScanOptions::from_config(&config).for_source(name.clone());
-            match scan(&store, &config, options, quiet).await {
-                Ok(report) => {
-                    tracing::info!(
-                        source = name,
-                        files = report.files,
-                        "rescanned after a change"
-                    );
-                }
-                Err(error) => tracing::warn!(source = name, %error, "watched rescan failed"),
+        if pending.is_empty() {
+            continue;
+        }
+        let narrowed = narrow(&config, &pending);
+        let catalog = Arc::clone(&catalog);
+        let named = pending.into_iter().collect::<Vec<_>>().join(", ");
+        let done = tokio::task::spawn_blocking(move || rescan(&catalog, &narrowed)).await;
+        match done {
+            Ok(Ok(entries)) => {
+                tracing::info!(sources = named, entries, "rescanned after a change")
             }
+            Ok(Err(error)) => tracing::warn!(sources = named, %error, "watched rescan failed"),
+            Err(error) => tracing::warn!(sources = named, %error, "watched rescan was lost"),
         }
     }
+}
+
+/// The configuration a burst asks for: the same settings over only the sources it named.
+fn narrow(config: &IndexConfig, pending: &BTreeSet<String>) -> IndexConfig {
+    config.over(
+        config
+            .sources
+            .iter()
+            .filter(|source| pending.contains(&source.name))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// One rescan of the named sources, its hashing and the search refresh that publishes it.
+/// Returns how many entries the walk touched.
+fn rescan(catalog: &Catalog, config: &IndexConfig) -> Result<u64> {
+    let report = catalog.rescan(config, HashPolicy::Background, |_, _| {})?;
+    catalog.hash_pending(config, |_| {})?;
+    catalog.refresh_search(|_| {})?;
+    Ok(report.unchanged + report.changed + report.added + report.absent)
 }
 
 /// The sources one burst of events names.
@@ -204,7 +225,6 @@ mod tests {
 
     use super::*;
     use crate::config::{SourceConfig, SourceKind};
-    use crate::store::blob::disk_pressure;
 
     fn source(name: &str, path: &Path) -> SourceConfig {
         SourceConfig {
@@ -335,26 +355,28 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("models");
         fs::create_dir_all(root.join("loras")).expect("source root is creatable");
-        let store = Store::open(&dir.path().join("hoard.db")).expect("store opens");
         let config = IndexConfig {
-            data_dir: dir.path().to_path_buf(),
+            data_dir: dir.path().join("data"),
             sources: vec![source("comfy", &root)],
             ..IndexConfig::default()
         };
+        let catalog = Arc::new(
+            Catalog::open_or_scan(&config, "watched", |_, _| {}).expect("the catalog opens"),
+        );
 
-        let mut watcher =
-            Watcher::start(&store, &config, Duration::from_millis(50)).expect("the watcher starts");
+        let mut watcher = Watcher::start(Arc::clone(&catalog), &config, Duration::from_millis(50))
+            .expect("the watcher starts");
         fs::write(root.join("loras/new.safetensors"), safetensors()).expect("fixture is writable");
 
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let pressure = store.call(disk_pressure).await.expect("index reads");
-            let indexed = store
-                .call(|conn| crate::store::blob::unhashed_blobs(conn, 10).map(|rows| rows.len()))
-                .await
-                .expect("index reads");
-            if indexed > 0 {
-                assert_eq!(pressure.duplicate_blobs, 0);
+            let totals = catalog.totals().expect("the catalog reads");
+            if totals.artifacts > 0 {
+                assert_eq!(
+                    catalog.pending_hashes().expect("the catalog reads"),
+                    0,
+                    "the watched rescan hashes what it indexed"
+                );
                 break;
             }
             assert!(

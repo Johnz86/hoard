@@ -6,7 +6,7 @@ use hoard_core::{Artifact, ArtifactFormat, ArtifactId, BlobId, State};
 
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
 use crate::error::{IndexError, Result};
-use crate::scan::SNIFF_VERSION;
+use crate::sniff::SNIFF_VERSION;
 
 use super::Catalog;
 use super::hashing::content_key;

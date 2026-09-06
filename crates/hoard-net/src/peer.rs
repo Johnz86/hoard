@@ -277,9 +277,9 @@ pub struct StateFacts {
 /// actionable, and TRIAGE outranks SERVED because unclassified bytes should not read as
 /// ready to use.
 ///
-/// It is not the only writer of a state. `hoard_index::scan`, `hoard_mirror::ingest` and
-/// `hoard_index::store::digest` each write one directly and all three sit below this crate,
-/// so a scanned file reads LOCAL on the same node where a pulled one reads SERVED, and
+/// It is not the only writer of a state. The catalog's scan, `hoard_mirror::ingest` and the
+/// catalog's digest each write one directly and all three sit below this crate, so a scanned
+/// file reads LOCAL on the same node where a pulled one reads SERVED, and
 /// [`StateFacts::stale`] is decided nowhere at all.
 pub fn derive_state(facts: StateFacts) -> State {
     if facts.pulling {

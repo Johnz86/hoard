@@ -12,7 +12,7 @@ use hoard_core::{Base, CommitSha, RepoId, Role, Sha256, State};
 
 use crate::config::SourceKind;
 use crate::error::Result;
-use crate::scan::SNIFF_VERSION;
+use crate::sniff::SNIFF_VERSION;
 use crate::store::artifact::{NewArtifact, artifact_by_blob, delete_orphan_fts, upsert_artifact};
 use crate::store::blob::{blob_by_sha256, delete_orphan_blobs, set_sha256, upsert_blob};
 use crate::store::convert::{optional_row, timestamp_text, to_u64};
