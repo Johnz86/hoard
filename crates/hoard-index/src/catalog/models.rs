@@ -440,13 +440,10 @@ pub(super) struct EntryV1 {
 /// The node an entry's bytes sit on. Every writer names this node until peers land.
 pub const LOCAL_NODE: i64 = 1;
 
-/// One path, with the content hashes read from it and the node that holds it. `content` is
-/// the identity a sha256 makes, so a lookup by content hash is a secondary key read rather
-/// than a scan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 7, version = 2, from = EntryV1)]
 #[native_db]
-pub(super) struct Entry {
+pub(super) struct EntryV2 {
     #[primary_key]
     pub(super) id: i64,
     #[secondary_key]
@@ -474,7 +471,7 @@ pub(super) struct Entry {
     pub(super) pull_progress: Option<f32>,
 }
 
-impl From<EntryV1> for Entry {
+impl From<EntryV1> for EntryV2 {
     fn from(entry: EntryV1) -> Self {
         Self {
             id: entry.id,
@@ -501,8 +498,8 @@ impl From<EntryV1> for Entry {
     }
 }
 
-impl From<Entry> for EntryV1 {
-    fn from(entry: Entry) -> Self {
+impl From<EntryV2> for EntryV1 {
+    fn from(entry: EntryV2) -> Self {
         Self {
             id: entry.id,
             repo_id: entry.repo_id,
@@ -519,6 +516,128 @@ impl From<Entry> for EntryV1 {
             git_sha1: entry.git_sha1,
             mtime: entry.mtime,
             inode: entry.inode,
+        }
+    }
+}
+
+/// One path, with the content hashes read from it and the node that holds it. `content` is
+/// the identity a sha256 makes, so a lookup by content hash is a secondary key read rather
+/// than a scan; `location` names the one path a revision of a repository holds, so finding
+/// it is one key read and reading a whole revision is one prefix scan.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 7, version = 3, from = EntryV2)]
+#[native_db]
+pub(super) struct Entry {
+    #[primary_key]
+    pub(super) id: i64,
+    #[secondary_key]
+    pub(super) repo_id: i64,
+    #[secondary_key(optional)]
+    pub(super) artifact_id: Option<i64>,
+    pub(super) revision: u32,
+    pub(super) rel_path: String,
+    pub(super) abs_path: Option<String>,
+    pub(super) size: u64,
+    pub(super) state: State,
+    pub(super) triage: bool,
+    pub(super) preference: i64,
+    pub(super) lfs_pointer: bool,
+    pub(super) is_symlink: bool,
+    pub(super) sha256: Option<Sha256>,
+    #[secondary_key(optional)]
+    pub(super) content: Option<u128>,
+    pub(super) git_sha1: Option<GitSha1>,
+    pub(super) mtime: Option<i64>,
+    pub(super) inode: Option<u64>,
+    #[secondary_key]
+    pub(super) node: i64,
+    pub(super) pass: u64,
+    pub(super) pull_progress: Option<f32>,
+    /// [`location_key`] of this row's repository, revision and relative path. Every writer
+    /// that changes one of those three must write it again.
+    #[secondary_key(unique)]
+    pub(super) location: String,
+}
+
+/// The one path a revision of a repository holds, as a key a lookup and a prefix scan can
+/// both use. The two numbers are zero padded to a fixed width so a prefix of the first two
+/// fields never reaches a longer number.
+pub(super) fn location_key(repo_id: i64, revision: u32, rel_path: &str) -> String {
+    let mut key = revision_prefix(repo_id, revision);
+    key.push_str(rel_path);
+    key
+}
+
+/// Everything in a [`location_key`] before the relative path, which is what every entry of
+/// one revision shares.
+pub(super) fn revision_prefix(repo_id: i64, revision: u32) -> String {
+    format!("{repo_id:020}\u{1}{revision:010}\u{1}")
+}
+
+/// The one entry a revision of a repository holds at `rel_path`, as one key read.
+pub(super) fn entry_at(
+    transaction: &native_db::transaction::RwTransaction<'_>,
+    repo_id: i64,
+    revision: u32,
+    rel_path: &str,
+) -> super::Result<Option<Entry>> {
+    Ok(transaction.get().secondary(
+        EntryKey::location,
+        location_key(repo_id, revision, rel_path),
+    )?)
+}
+
+impl From<EntryV2> for Entry {
+    fn from(entry: EntryV2) -> Self {
+        Self {
+            location: location_key(entry.repo_id, entry.revision, &entry.rel_path),
+            id: entry.id,
+            repo_id: entry.repo_id,
+            artifact_id: entry.artifact_id,
+            revision: entry.revision,
+            rel_path: entry.rel_path,
+            abs_path: entry.abs_path,
+            size: entry.size,
+            state: entry.state,
+            triage: entry.triage,
+            preference: entry.preference,
+            lfs_pointer: entry.lfs_pointer,
+            is_symlink: entry.is_symlink,
+            sha256: entry.sha256,
+            content: entry.content,
+            git_sha1: entry.git_sha1,
+            mtime: entry.mtime,
+            inode: entry.inode,
+            node: entry.node,
+            pass: entry.pass,
+            pull_progress: entry.pull_progress,
+        }
+    }
+}
+
+impl From<Entry> for EntryV2 {
+    fn from(entry: Entry) -> Self {
+        Self {
+            id: entry.id,
+            repo_id: entry.repo_id,
+            artifact_id: entry.artifact_id,
+            revision: entry.revision,
+            rel_path: entry.rel_path,
+            abs_path: entry.abs_path,
+            size: entry.size,
+            state: entry.state,
+            triage: entry.triage,
+            preference: entry.preference,
+            lfs_pointer: entry.lfs_pointer,
+            is_symlink: entry.is_symlink,
+            sha256: entry.sha256,
+            content: entry.content,
+            git_sha1: entry.git_sha1,
+            mtime: entry.mtime,
+            inode: entry.inode,
+            node: entry.node,
+            pass: entry.pass,
+            pull_progress: entry.pull_progress,
         }
     }
 }
@@ -966,6 +1085,7 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<SourceV2>()?;
     models.define::<Source>()?;
     models.define::<EntryV1>()?;
+    models.define::<EntryV2>()?;
     models.define::<Entry>()?;
     models.define::<NodeV1>()?;
     models.define::<Node>()?;

@@ -20,7 +20,7 @@ use crate::triage::{TriageHeader, header_facts};
 
 use super::models::{
     ArtifactDetail, ArtifactRecord, Entry, EntryKey, Repository, RepositoryKey, Revision, Source,
-    repository_key,
+    location_key, repository_key, revision_prefix,
 };
 use super::nodes::{NodeNames, PEER_SOURCE};
 use super::search::{EntryFacts, assemble_row, revision_of};
@@ -222,9 +222,14 @@ impl Catalog {
         let snapshot = self.database.r_transaction()?;
         let names = self.node_names(&snapshot)?;
         let mut reader = Reader::new(&snapshot, &names);
-        let entries = reader.entries_of_repo(repository.id.get())?;
+        let mut entries = Vec::with_capacity(repository.revisions.len());
+        for revision in &repository.revisions {
+            if let Some(entry) = reader.entry_at(repository.id.get(), revision.ordinal, path)? {
+                entries.push(entry);
+            }
+        }
         let mut rows = Vec::new();
-        for entry in entries.iter().filter(|entry| entry.rel_path == path) {
+        for entry in &entries {
             let Some(artifact) = entry.artifact_id else {
                 continue;
             };
@@ -400,11 +405,7 @@ impl Catalog {
         let snapshot = self.database.r_transaction()?;
         let names = self.node_names(&snapshot)?;
         let mut reader = Reader::new(&snapshot, &names);
-        let entries: Vec<Entry> = reader
-            .entries_of_repo(repo.get())?
-            .into_iter()
-            .filter(|entry| entry.revision == revision)
-            .collect();
+        let entries = reader.entries_of_revision(repo.get(), revision)?;
         let mut details = Vec::with_capacity(entries.len());
         for entry in &entries {
             let deduped = match entry.artifact_id {
@@ -428,11 +429,7 @@ impl Catalog {
         let snapshot = self.database.r_transaction()?;
         let names = self.node_names(&snapshot)?;
         let mut reader = Reader::new(&snapshot, &names);
-        let Some(entry) = reader
-            .entries_of_repo(repo.get())?
-            .into_iter()
-            .find(|entry| entry.revision == revision && entry.rel_path == rel_path)
-        else {
+        let Some(entry) = reader.entry_at(repo.get(), revision, rel_path)? else {
             return Ok(None);
         };
         let deduped = match entry.artifact_id {
@@ -643,6 +640,29 @@ impl<'a, 'db> Reader<'a, 'db> {
             .secondary::<Entry>(EntryKey::repo_id)?
             .start_with(repo)?
             .collect::<native_db::db_type::Result<_>>()?)
+    }
+
+    /// Every file one revision holds, in path order, as one prefix scan of the location key.
+    pub(super) fn entries_of_revision(&self, repo: i64, revision: u32) -> Result<Vec<Entry>> {
+        Ok(self
+            .snapshot
+            .scan()
+            .secondary::<Entry>(EntryKey::location)?
+            .start_with(revision_prefix(repo, revision).as_str())?
+            .collect::<native_db::db_type::Result<_>>()?)
+    }
+
+    /// The one file a revision holds at `rel_path`, as one key read.
+    pub(super) fn entry_at(
+        &self,
+        repo: i64,
+        revision: u32,
+        rel_path: &str,
+    ) -> Result<Option<Entry>> {
+        Ok(self
+            .snapshot
+            .get()
+            .secondary(EntryKey::location, location_key(repo, revision, rel_path))?)
     }
 
     fn repository(&mut self, id: i64) -> Result<&Repository> {

@@ -19,9 +19,9 @@ use crate::search::{CompileContext, SortKey, SortSpec, parse};
 
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, ArtifactRecordV1, Entry, EntryKey, EntryV1,
-    LOCAL_NODE, Manifest, ManifestV1, Node, NodeV1, Override, Ref, Repository, RepositoryKey,
-    RepositoryV1, RepositoryV2, RepositoryV3, Revision, RevisionV1, RevisionV2, SearchChange,
-    SearchText, Source, SourceV1, SourceV2, Summary, SummaryV1, SummaryV2,
+    EntryV2, LOCAL_NODE, Manifest, ManifestV1, Node, NodeV1, Override, Ref, Repository,
+    RepositoryKey, RepositoryV1, RepositoryV2, RepositoryV3, Revision, RevisionV1, RevisionV2,
+    SearchChange, SearchText, Source, SourceV1, SourceV2, Summary, SummaryV1, SummaryV2,
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
@@ -212,6 +212,7 @@ fn duplicate_paths_collapse_after_correlated_entry_filtering() -> Result<()> {
     transaction.insert(repository)?;
     entry.id = 900;
     entry.repo_id = 900;
+    entry.location = models::location_key(900, entry.revision, &entry.rel_path);
     entry.state = hoard_core::State::Remote;
     entry.preference = 1;
     transaction.insert(entry)?;
@@ -1251,7 +1252,7 @@ fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
         .map(|table| table.name.as_str())
         .collect();
     assert!(
-        names.iter().any(|name| name.starts_with("7_2_")),
+        names.iter().any(|name| name.starts_with("7_3_")),
         "the Entry table is listed: {names:?}"
     );
     assert!(
@@ -1261,7 +1262,7 @@ fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
     let entries = report
         .tables
         .iter()
-        .find(|table| table.name.starts_with("7_2_id"))
+        .find(|table| table.name.starts_with("7_3_id"))
         .map(|table| table.entries);
     assert_eq!(entries, Some(2));
     let reopened = Catalog::open(&native)?;
@@ -2425,12 +2426,14 @@ fn a_migrated_repository_recounts_its_presence() -> Result<()> {
 }
 
 fn legacy_entry(id: i64, repo_id: i64, size: u64, state: State) -> Entry {
+    let rel_path = format!("w{id}.safetensors");
     Entry {
         id,
         repo_id,
         artifact_id: None,
         revision: 0,
-        rel_path: format!("w{id}.safetensors"),
+        location: models::location_key(repo_id, 0, &rel_path),
+        rel_path,
         abs_path: Some(format!("/hub/w{id}.safetensors")),
         size,
         state,
@@ -2447,6 +2450,77 @@ fn legacy_entry(id: i64, repo_id: i64, size: u64, state: State) -> Entry {
         pass: 0,
         pull_progress: None,
     }
+}
+
+#[test]
+fn an_entry_is_found_by_its_location_alone() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let located = |rel_path: &str, size: u64| SeedEntry {
+        node: LOCAL_NODE,
+        rel_path: rel_path.into(),
+        abs_path: Some(format!("/vault/{rel_path}")),
+        size,
+        state: State::Local,
+        is_symlink: false,
+        sha256: None,
+        git_sha1: None,
+        artifact: None,
+    };
+    let revision = |name: &str, entries: Vec<SeedEntry>| SeedRevision {
+        name: name.into(),
+        sha: None,
+        refs: vec![(name.to_owned(), RefKind::Branch)],
+        title: None,
+        author: None,
+        committed: None,
+        entries,
+    };
+    let repo = RepoId::parse_ref(RepoType::Models, "acme/two-revisions")?;
+    catalog.seed(&[SeedRepository {
+        repo: repo.clone(),
+        source: "cache".into(),
+        kind: SourceKind::HfCache,
+        root_path: "/vault".into(),
+        git_dir: None,
+        revisions: vec![
+            revision("main", vec![located("a", 10), located("a/b", 20)]),
+            revision("next", vec![located("a", 30)]),
+        ],
+    }])?;
+    let record = repository_of(&catalog, &repo)?;
+
+    let first = catalog
+        .revision_entry(record.id, 0, "a")?
+        .ok_or_else(|| IndexError::Catalog("no entry at a in revision 0".into()))?;
+    assert_eq!(first.size, 10);
+    let second = catalog
+        .revision_entry(record.id, 1, "a")?
+        .ok_or_else(|| IndexError::Catalog("no entry at a in revision 1".into()))?;
+    assert_eq!(second.size, 30, "each revision holds its own path");
+    assert!(catalog.revision_entry(record.id, 1, "a/b")?.is_none());
+
+    let nested = catalog
+        .revision_entry(record.id, 0, "a/b")?
+        .ok_or_else(|| IndexError::Catalog("no entry at a/b".into()))?;
+    assert_eq!(
+        nested.size, 20,
+        "a path that extends another is its own row"
+    );
+
+    let paths: Vec<String> = catalog
+        .revision_entries(record.id, 0)?
+        .into_iter()
+        .map(|entry| entry.rel_path)
+        .collect();
+    assert_eq!(paths, vec!["a".to_owned(), "a/b".to_owned()]);
+    assert_eq!(catalog.revision_entries(record.id, 1)?.len(), 1);
+    Ok(())
 }
 
 /// How many artifacts the stale check must never read to answer.
@@ -3021,6 +3095,35 @@ fn artifact_detail_encoding_is_frozen() -> Result<()> {
 #[test]
 fn entry_encoding_is_frozen() -> Result<()> {
     let value = Entry {
+        id: 13,
+        repo_id: 11,
+        artifact_id: Some(7),
+        revision: 1,
+        location: models::location_key(11, 1, "unet/frozen.safetensors"),
+        rel_path: "unet/frozen.safetensors".to_owned(),
+        abs_path: Some("/frozen/source/unet/frozen.safetensors".to_owned()),
+        size: 4096,
+        state: State::Triage,
+        triage: true,
+        preference: 19,
+        lfs_pointer: true,
+        is_symlink: true,
+        sha256: Some(Sha256::from_bytes([3; 32])),
+        content: Some(0x0303_0303_0303_0303_u128),
+        git_sha1: Some(CommitSha::from_bytes([7; 20])),
+        mtime: Some(1_767_225_600),
+        inode: Some(424_242),
+        node: 1,
+        pass: 4,
+        pull_progress: Some(0.5),
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn entry_v2_encoding_is_frozen() -> Result<()> {
+    let value = EntryV2 {
         id: 13,
         repo_id: 11,
         artifact_id: Some(7),

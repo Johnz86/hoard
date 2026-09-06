@@ -23,7 +23,7 @@ use super::hashing::content_key;
 use super::models::{
     Allocator, ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE,
     Manifest, Node, Override, Ref, Repository, RepositoryKey, Revision, SearchChange, SearchText,
-    Source, Summary, repository_key,
+    Source, Summary, location_key, repository_key,
 };
 use super::naming::{
     InferenceContext, Naming, artifact_name, content_hashes, disambiguate_labels, index_document,
@@ -1609,6 +1609,11 @@ fn store_entry(
         repo_id: context.repo_id,
         artifact_id,
         revision: context.ordinal,
+        location: location_key(
+            context.repo_id,
+            context.ordinal,
+            &prepared.discovered.rel_path,
+        ),
         rel_path: prepared.discovered.rel_path.clone(),
         abs_path: prepared
             .presence

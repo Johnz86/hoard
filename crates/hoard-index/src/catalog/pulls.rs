@@ -13,8 +13,8 @@ use super::Catalog;
 use super::hashing::content_key;
 use super::ingest::IngestRecord;
 use super::models::{
-    ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, Repository, RepositoryKey,
-    Revision, SearchText, Source, Summary, repository_key,
+    ArtifactRecord, ArtifactRecordKey, Entry, LOCAL_NODE, Repository, RepositoryKey, Revision,
+    SearchText, Source, Summary, entry_at, location_key, repository_key,
 };
 use super::scan::{
     Counters, RecordFacts, log_changes, next_id, preference, record_of, tensor_keys,
@@ -80,7 +80,7 @@ impl Catalog {
     pub fn mark_pull(&self, mark: &PullMark<'_>) -> Result<EntryId> {
         let mut counters = Counters::load(&self.database)?;
         let transaction = self.database.rw_transaction()?;
-        let previous = entry_at(&transaction, mark.slot, mark.rel_path)?;
+        let previous = entry_of_slot(&transaction, mark.slot, mark.rel_path)?;
         let id = match &previous {
             Some(entry) => entry.id,
             None => next_id(&mut counters.entries)?,
@@ -95,6 +95,7 @@ impl Catalog {
             id,
             repo_id: mark.slot.repo.get(),
             revision: mark.slot.revision,
+            location: location_key(mark.slot.repo.get(), mark.slot.revision, mark.rel_path),
             rel_path: mark.rel_path.to_owned(),
             abs_path: Some(mark.abs_path.to_string_lossy().into_owned()),
             size: mark.size,
@@ -121,7 +122,7 @@ impl Catalog {
         let identity = content_key(&file.sha256);
         let (artifact_id, created) = filed_artifact(&transaction, &mut counters, file, identity)?;
         counters.pending.push(artifact_id);
-        let previous = entry_at(&transaction, file.slot, file.rel_path)?;
+        let previous = entry_of_slot(&transaction, file.slot, file.rel_path)?;
         let id = match &previous {
             Some(entry) => entry.id,
             None => next_id(&mut counters.entries)?,
@@ -134,6 +135,7 @@ impl Catalog {
             id,
             repo_id: file.slot.repo.get(),
             revision: file.slot.revision,
+            location: location_key(file.slot.repo.get(), file.slot.revision, file.rel_path),
             rel_path: file.rel_path.to_owned(),
             abs_path: Some(file.abs_path.to_string_lossy().into_owned()),
             size: file.sniff.size,
@@ -185,6 +187,7 @@ fn blank_entry(previous: Option<Entry>) -> Entry {
         repo_id: 0,
         artifact_id: None,
         revision: 0,
+        location: String::new(),
         rel_path: String::new(),
         abs_path: None,
         size: 0,
@@ -377,24 +380,13 @@ fn count_artifact(transaction: &RwTransaction<'_>, size: u64, triage: bool) -> R
     Ok(())
 }
 
-fn entry_at(
+/// The row already at the path a pull is landing on.
+fn entry_of_slot(
     transaction: &RwTransaction<'_>,
     slot: PullSlot,
     rel_path: &str,
 ) -> Result<Option<Entry>> {
-    let scan = transaction.scan();
-    let by_repo = scan.secondary::<Entry>(EntryKey::repo_id)?;
-    let mut of_repo = by_repo.start_with(slot.repo.get())?;
-    of_repo
-        .find(|entry| {
-            entry.as_ref().is_ok_and(|entry| {
-                entry.repo_id == slot.repo.get()
-                    && entry.revision == slot.revision
-                    && entry.rel_path == rel_path
-            })
-        })
-        .transpose()
-        .map_err(IndexError::from)
+    entry_at(transaction, slot.repo.get(), slot.revision, rel_path)
 }
 
 fn ordinal_of(position: usize) -> Result<u32> {

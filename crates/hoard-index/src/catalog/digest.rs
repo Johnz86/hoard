@@ -14,7 +14,8 @@ use super::Catalog;
 use super::hashing::content_key;
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, Node,
-    Repository, RepositoryKey, Revision, SearchText, Source, repository_key,
+    Repository, RepositoryKey, Revision, SearchText, Source, entry_at, location_key,
+    repository_key,
 };
 use super::nodes::PEER_SOURCE;
 use super::read::Reader;
@@ -326,6 +327,7 @@ impl Applying<'_, '_> {
             repo_id,
             artifact_id: Some(artifact_id),
             revision: ordinal,
+            location: location_key(repo_id, ordinal, &row.path),
             rel_path: row.path.clone(),
             abs_path: None,
             size: row.size,
@@ -481,25 +483,6 @@ fn entries_of_node(transaction: &RwTransaction<'_>, node: i64) -> Result<Vec<Ent
         }
     }
     Ok(owned)
-}
-
-fn entry_at(
-    transaction: &RwTransaction<'_>,
-    repo_id: i64,
-    revision: u32,
-    rel_path: &str,
-) -> Result<Option<Entry>> {
-    let scan = transaction.scan();
-    let by_repo = scan.secondary::<Entry>(EntryKey::repo_id)?;
-    let mut of_repo = by_repo.start_with(repo_id)?;
-    of_repo
-        .find(|entry| {
-            entry.as_ref().is_ok_and(|entry| {
-                entry.repo_id == repo_id && entry.revision == revision && entry.rel_path == rel_path
-            })
-        })
-        .transpose()
-        .map_err(IndexError::from)
 }
 
 /// What a retraction leaves of the record its entries pointed at. An artifact no entry

@@ -11,7 +11,7 @@ use crate::infer::{InferInput, infer};
 use super::hashing::content_key;
 use super::models::{
     ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, Repository, RepositoryKey,
-    Revision, SearchText, Source, Summary, repository_key,
+    Revision, SearchText, Source, Summary, entry_at, location_key, repository_key,
 };
 use super::read::Reader;
 use super::scan::{
@@ -149,7 +149,7 @@ impl Ingesting<'_, '_> {
         let repo_id = self.repository(file)?;
         let ordinal = self.revision(repo_id, file.commit)?;
         let classified = self.artifact(file)?;
-        let previous = self.entry_at(repo_id, ordinal, &file.rel_path)?;
+        let previous = entry_at(self.transaction, repo_id, ordinal, &file.rel_path)?;
         let previous_artifact = previous.as_ref().and_then(|entry| entry.artifact_id);
         let artifact_id = classified.as_ref().map(|found| found.id);
         if artifact_id != previous_artifact {
@@ -170,6 +170,7 @@ impl Ingesting<'_, '_> {
             repo_id,
             artifact_id,
             revision: ordinal,
+            location: location_key(repo_id, ordinal, &file.rel_path),
             rel_path: file.rel_path.clone(),
             abs_path: None,
             size: file.size,
@@ -342,22 +343,6 @@ impl Ingesting<'_, '_> {
             created: true,
             triage,
         }))
-    }
-
-    fn entry_at(&self, repo_id: i64, revision: u32, rel_path: &str) -> Result<Option<Entry>> {
-        let scan = self.transaction.scan();
-        let by_repo = scan.secondary::<Entry>(EntryKey::repo_id)?;
-        let mut of_repo = by_repo.start_with(repo_id)?;
-        of_repo
-            .find(|entry| {
-                entry.as_ref().is_ok_and(|entry| {
-                    entry.repo_id == repo_id
-                        && entry.revision == revision
-                        && entry.rel_path == rel_path
-                })
-            })
-            .transpose()
-            .map_err(IndexError::from)
     }
 
     /// Moves one record's path count, which is what marks an artifact deduplicated and what
