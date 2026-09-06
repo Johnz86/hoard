@@ -442,7 +442,6 @@ async fn run_apply(
 
 fn puller(state: &AppState) -> ApiResult<Puller> {
     Puller::new(PullerConfig {
-        store: state.store().clone(),
         catalog: Arc::clone(state.catalog()),
         mirror: Arc::clone(state.mirror()),
         root: state

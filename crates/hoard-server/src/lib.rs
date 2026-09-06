@@ -122,10 +122,11 @@ pub async fn sweep_stale_runs(state: &AppState) -> usize {
 /// one starts is a transfer that died: the FILES tab would show it frozen part way for good,
 /// and nothing would offer to pull it again.
 pub async fn sweep_stale_pulls(state: &AppState) -> usize {
-    let swept = state
-        .store()
-        .call_mut(|conn| hoard_index::store::entry::reset_stale_pulls(conn))
-        .await;
+    let catalog = std::sync::Arc::clone(state.catalog());
+    let swept = tokio::task::spawn_blocking(move || catalog.reset_stale_pulls())
+        .await
+        .unwrap_or_else(|error| Err(hoard_index::IndexError::Catalog(error.to_string())))
+        .map(|count| count as usize);
     match swept {
         Ok(0) => 0,
         Ok(count) => {
@@ -167,15 +168,9 @@ where
 mod tests {
     use axum::body::Body;
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};
-    use hoard_core::{CommitSha, NodeId, RepoId, RepoType, State};
-    use hoard_index::catalog::JobState;
-    use hoard_index::config::SourceKind;
+    use hoard_core::{CommitSha, RepoId, RepoType, State};
+    use hoard_index::catalog::{JobState, PullMark};
     use hoard_index::store::Store;
-    use hoard_index::store::entry::{NewEntry, entry, upsert_entry};
-    use hoard_index::store::node::{NewNode, upsert_node};
-    use hoard_index::store::repo::{NewRepo, upsert_repo};
-    use hoard_index::store::revision::{NewRevision, upsert_revision};
-    use jiff::Timestamp;
     use tower::ServiceExt;
 
     use super::*;
@@ -284,49 +279,34 @@ mod tests {
 
     #[tokio::test]
     async fn a_pull_left_running_by_a_stopped_process_reads_remote_at_startup() {
-        let (_dir, state) = state();
-        let id = state
-            .store()
-            .call_mut(|conn| {
-                let node = upsert_node(
-                    conn,
-                    &NewNode::local(
-                        NodeId::new("workstation-1").expect("a node id"),
-                        "workstation",
-                    ),
-                )?;
-                let repo = upsert_repo(
-                    conn,
-                    &NewRepo::new(
-                        RepoId::new(RepoType::Models, Some("org".to_owned()), "name"),
-                        node,
-                        SourceKind::Loose,
-                    ),
-                )?;
-                let revision = upsert_revision(
-                    conn,
-                    &NewRevision::synthetic(repo, CommitSha::from_bytes([3u8; 20])),
-                )?;
-                let halfway = NewEntry {
-                    state: State::Pulling,
-                    pull_progress: Some(0.6),
-                    ..NewEntry::new(revision, "weights.safetensors", node)
-                };
-                upsert_entry(conn, &halfway, Timestamp::now())
+        let (dir, state) = state();
+        let catalog = state.catalog();
+        let repo = RepoId::new(RepoType::Models, Some("org".to_owned()), "name");
+        let root = dir.path().join("pulled");
+        let slot = catalog
+            .pull_slot(&repo, CommitSha::from_bytes([3u8; 20]), &root)
+            .expect("a pull slot opens");
+        let destination = root.join("weights.safetensors");
+        catalog
+            .mark_pull(&PullMark {
+                slot,
+                rel_path: "weights.safetensors",
+                abs_path: &destination,
+                size: 4096,
+                state: State::Pulling,
+                progress: Some(0.6),
             })
-            .await
             .expect("a pull is recorded mid-flight");
 
         assert_eq!(sweep_stale_pulls(&state).await, 1);
-        let settled = state
-            .store()
-            .call(move |conn| entry(conn, id))
-            .await
+        let settled = catalog
+            .revision_entries(slot.repo, slot.revision)
             .expect("the entry reads back")
+            .into_iter()
+            .next()
             .expect("the entry survives the sweep");
         assert_eq!(settled.state, State::Remote);
         assert_eq!(settled.pull_progress, None);
-
         assert_eq!(
             sweep_stale_pulls(&state).await,
             0,

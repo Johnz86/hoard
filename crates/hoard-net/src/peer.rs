@@ -13,30 +13,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use jiff::Timestamp;
 use serde::Deserialize;
 use sha2::{Digest, Sha256 as Sha256Hasher};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use hoard_core::{
-    ArtifactId, BlobId, CommitSha, EntryId, JobId, NodeId, RepoId, RevisionId, Sha256, State,
-};
-use hoard_index::catalog::{Catalog, JobProgress};
-use hoard_index::config::SourceKind;
+use hoard_core::{ArtifactId, CommitSha, EntryId, JobId, NodeId, RepoId, Sha256, State};
+use hoard_index::catalog::{Catalog, JobProgress, PullMark, PullSlot, PulledFile};
 use hoard_index::hash::git_blob_sha1;
 use hoard_index::infer::{InferInput, infer};
 use hoard_index::sniff::sniff_path;
-use hoard_index::store::Store;
-use hoard_index::store::artifact::{
-    NewArtifact, replace_evidence, set_card, set_tensor_summary, set_triage, upsert_artifact,
-};
-use hoard_index::store::blob::{blob_by_sha256, set_sha256, upsert_blob};
-use hoard_index::store::entry::{NewEntry, upsert_entry};
-use hoard_index::store::node::local_node;
-use hoard_index::store::repo::{NewRepo, repo_by_qualified, upsert_repo};
-use hoard_index::store::revision::{NewRevision, revision_by_sha, upsert_revision};
 use hoard_index::triage::needs_triage;
 use hoard_mirror::resolve::{FileRequest, Mirror, read_range};
 use hoard_mirror::upstream::UpstreamClient;
@@ -360,17 +347,15 @@ pub struct PullOutcome {
     pub sha256: Sha256,
     pub size: u64,
     pub abs_path: PathBuf,
-    pub blob: BlobId,
     pub artifact: ArtifactId,
     pub entry: EntryId,
 }
 
-/// What a [`Puller`] is built from: the index it files pulled entries in, the catalog its
-/// job rows live in, the mirror it fetches through, where bytes land, whether this node
-/// serves them, and the confidence below which a pulled artifact is queued for triage.
+/// What a [`Puller`] is built from: the catalog it files pulled entries and job rows in,
+/// the mirror it fetches through, where bytes land, whether this node serves them, and the
+/// confidence below which a pulled artifact is queued for triage.
 #[derive(Debug, Clone)]
 pub struct PullerConfig {
-    pub store: Store,
     pub catalog: Arc<Catalog>,
     pub mirror: Arc<Mirror>,
     pub root: PathBuf,
@@ -381,7 +366,6 @@ pub struct PullerConfig {
 /// Fetches files from peers through the block-cached proxy path and files them locally.
 #[derive(Debug, Clone)]
 pub struct Puller {
-    store: Store,
     catalog: Arc<Catalog>,
     mirror: Arc<Mirror>,
     client: UpstreamClient,
@@ -398,7 +382,6 @@ impl Puller {
     /// is the LAN, and refusing to cross the LAN is not what offline mode means.
     pub fn new(config: PullerConfig) -> Result<Self> {
         Ok(Self {
-            store: config.store,
             catalog: config.catalog,
             mirror: config.mirror,
             client: UpstreamClient::new(false).map_err(NetError::Mirror)?,
@@ -464,10 +447,10 @@ impl Puller {
 
     async fn run(&self, request: &PullRequest, job: JobId) -> Result<PullOutcome> {
         let destination = self.destination(request);
-        let revision = self.local_revision(request).await?;
+        let slot = self.pull_slot(request).await?;
         let transfer = Transfer {
             request,
-            revision,
+            slot,
             destination: &destination,
             job,
         };
@@ -600,25 +583,12 @@ impl Puller {
         self.mark(transfer, State::Pulling, Some(fraction)).await
     }
 
-    async fn local_revision(&self, request: &PullRequest) -> Result<hoard_core::RevisionId> {
+    async fn pull_slot(&self, request: &PullRequest) -> Result<PullSlot> {
         let repo = request.repo.clone();
         let revision = request.revision;
-        let rows = self
-            .store
-            .call_mut(move |conn| {
-                let node = local_node(conn)?;
-                let qualified = repo.qualified();
-                let repo_row = match repo_by_qualified(conn, &qualified, node.id)? {
-                    Some(existing) => existing.id,
-                    None => upsert_repo(conn, &NewRepo::new(repo, node.id, SourceKind::Loose))?,
-                };
-                Ok(match revision_by_sha(conn, repo_row, &revision)? {
-                    Some(existing) => existing.id,
-                    None => upsert_revision(conn, &NewRevision::new(repo_row, revision))?,
-                })
-            })
-            .await?;
-        Ok(rows)
+        let root = self.root.clone();
+        self.on_catalog(move |catalog| catalog.pull_slot(&repo, revision, &root))
+            .await
     }
 
     async fn mark(
@@ -627,23 +597,21 @@ impl Puller {
         state: State,
         progress: Option<f32>,
     ) -> Result<()> {
-        let path = transfer.request.path.clone();
+        let rel_path = transfer.request.path.clone();
         let size = transfer.request.size;
-        let revision = transfer.revision;
-        let abs_path = transfer.destination.to_string_lossy().into_owned();
-        self.store
-            .call_mut(move |conn| {
-                let node = local_node(conn)?;
-                let mut entry = NewEntry::new(revision, path, node.id);
-                entry.size = size;
-                entry.state = state;
-                entry.pull_progress = progress;
-                entry.abs_path = Some(abs_path);
-                entry.present = state != State::Remote;
-                upsert_entry(conn, &entry, Timestamp::now())?;
-                Ok(())
+        let slot = transfer.slot;
+        let abs_path = transfer.destination.to_path_buf();
+        self.on_catalog(move |catalog| {
+            catalog.mark_pull(&PullMark {
+                slot,
+                rel_path: &rel_path,
+                abs_path: &abs_path,
+                size,
+                state,
+                progress,
             })
-            .await?;
+        })
+        .await?;
         Ok(())
     }
 
@@ -667,55 +635,44 @@ impl Puller {
         sha256: Sha256,
         facts: PulledFacts,
     ) -> Result<PullOutcome> {
-        let request = transfer.request.clone();
-        let revision = transfer.revision;
+        let rel_path = transfer.request.path.clone();
+        let slot = transfer.slot;
         let destination = transfer.destination.to_path_buf();
         let served = self.serve;
-        let threshold = self.triage_confidence;
-        let outcome = self
-            .store
-            .call_mut(move |conn| {
-                let node = local_node(conn)?;
-                let now = Timestamp::now();
-                let blob = match blob_by_sha256(conn, &sha256)? {
-                    Some(existing) => existing.id,
-                    None => upsert_blob(conn, &sha256.to_hex(), facts.size, now)?,
-                };
-                set_sha256(conn, blob, sha256, facts.git_sha1, now)?;
-
-                let triage = needs_triage(&facts.inference, threshold);
-                let artifact = write_artifact(conn, blob, &request, &facts, triage, now)?;
-
-                let mut entry = NewEntry::new(revision, request.path.clone(), node.id);
-                entry.blob = Some(blob);
-                entry.artifact = Some(artifact);
-                entry.abs_path = Some(destination.to_string_lossy().into_owned());
-                entry.size = facts.size;
-                entry.state = derive_state(StateFacts {
-                    held: true,
+        let triage = needs_triage(&facts.inference, self.triage_confidence);
+        let landed = destination.clone();
+        let filed = self
+            .on_catalog(move |catalog| {
+                catalog.file_pulled(&PulledFile {
+                    slot,
+                    rel_path: &rel_path,
+                    abs_path: &landed,
+                    sha256,
+                    git_sha1: facts.git_sha1,
+                    sniff: &facts.sniff,
+                    inference: &facts.inference,
                     served,
                     triage,
-                    ..StateFacts::default()
-                });
-                let entry = upsert_entry(conn, &entry, now)?;
-                Ok(PullOutcome {
-                    sha256,
-                    size: facts.size,
-                    abs_path: destination,
-                    blob,
-                    artifact,
-                    entry,
                 })
             })
             .await?;
-        Ok(outcome)
+        let artifact = filed.artifact.ok_or_else(|| {
+            NetError::Config("a pulled file was filed without a record".to_owned())
+        })?;
+        Ok(PullOutcome {
+            sha256,
+            size: facts.size,
+            abs_path: destination,
+            artifact,
+            entry: filed.entry,
+        })
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Transfer<'a> {
     request: &'a PullRequest,
-    revision: RevisionId,
+    slot: PullSlot,
     destination: &'a Path,
     job: JobId,
 }
@@ -772,45 +729,6 @@ fn read_facts(path: &Path) -> Result<PulledFacts> {
         sniff,
         inference,
     })
-}
-
-fn write_artifact(
-    conn: &<hoard_index::store::Reader as std::ops::Deref>::Target,
-    blob: BlobId,
-    request: &PullRequest,
-    facts: &PulledFacts,
-    triage: bool,
-    now: Timestamp,
-) -> hoard_index::Result<ArtifactId> {
-    let inference = &facts.inference;
-    let mut input = NewArtifact::new(blob, request.file_name());
-    input.sniff_version = hoard_index::scan::SNIFF_VERSION;
-    input.org = request.repo.org().map(str::to_owned);
-    input.format = facts.sniff.format;
-    input.role = inference.role;
-    input.sub_role = inference.sub_role;
-    input.role_confidence = inference.role_confidence;
-    input.base = inference.base.clone();
-    input.base_label = inference.base_label.clone();
-    input.base_confidence = inference.base_confidence;
-    input.precision = inference.precision.clone();
-    input.quant = inference.quant.clone();
-    input.rank = inference.rank;
-    input.alpha = inference.alpha;
-    input.params = inference.params;
-    input.context = inference.context;
-    input.trigger = inference.trigger.clone();
-
-    let id = upsert_artifact(conn, &input, now)?;
-    if let Some(tensors) = &facts.sniff.tensors {
-        set_tensor_summary(conn, id, tensors)?;
-    }
-    replace_evidence(conn, id, &inference.evidence)?;
-    if let Some(readme) = &facts.sniff.readme {
-        set_card(conn, id, &readme.body)?;
-    }
-    set_triage(conn, id, triage)?;
-    Ok(id)
 }
 
 /// The content hash a peer's headers advertise, if they advertise one.
@@ -1324,9 +1242,8 @@ async fn rewind(
 #[cfg(test)]
 mod tests {
     use hoard_core::{NodeId, RepoType};
+    use hoard_index::catalog::EntryDetail;
     use hoard_index::search::{SortKey, SortSpec};
-    use hoard_index::store::entry::{EntryRow, entries_for_revision};
-    use hoard_index::store::node::{NewNode, upsert_node};
     use hoard_mirror::access::{AccessPolicy, AccessRule};
     use hoard_mirror::cache::BlockCache;
     use hoard_mirror::config::{Geometry, MirrorConfig};
@@ -1370,34 +1287,12 @@ mod tests {
     }
 
     struct World {
-        store: Store,
         catalog: Arc<Catalog>,
         cache: Arc<BlockCache>,
         puller: Puller,
     }
 
-    /// A native catalog with no configured sources, for the job rows a pull writes.
-    fn test_catalog(root: &Path) -> Arc<Catalog> {
-        let config = hoard_index::config::IndexConfig {
-            data_dir: root.join("native-data"),
-            sources: Vec::new(),
-            ..hoard_index::config::IndexConfig::default()
-        };
-        Arc::new(Catalog::open_or_scan(&config, "workstation", |_, _| {}).expect("catalog opens"))
-    }
-
     async fn world(root: &TempDir) -> World {
-        let store = Store::open_in_memory().expect("store opens");
-        store
-            .call_mut(|conn| {
-                upsert_node(
-                    conn,
-                    &NewNode::local(NodeId::new("workstation-1").expect("id"), "workstation"),
-                )?;
-                Ok(())
-            })
-            .await
-            .expect("local node records");
         let config = Arc::new(MirrorConfig {
             geometry: Geometry::new(1 << 20, 1 << 16).expect("valid geometry"),
             proxy: vec![AccessRule::glob("*", true), AccessRule::glob("*/*", true)],
@@ -1414,7 +1309,7 @@ mod tests {
             "https://huggingface.co",
         )
         .expect("hub builds");
-        let catalog = test_catalog(root.path());
+        let catalog = catalog_with_local(root);
         let mirror = Arc::new(Mirror::new(
             Arc::clone(&catalog),
             Arc::clone(&cache),
@@ -1422,7 +1317,6 @@ mod tests {
             upstream,
         ));
         let puller = Puller::new(PullerConfig {
-            store: store.clone(),
             catalog: Arc::clone(&catalog),
             mirror,
             root: root.path().join(PULL_DIR),
@@ -1431,38 +1325,42 @@ mod tests {
         })
         .expect("puller builds");
         World {
-            store,
             catalog,
             cache,
             puller,
         }
     }
 
-    async fn pulled_entry(store: &Store, path: &str) -> Option<EntryRow> {
+    /// The row one pulled path holds, read back through the repository the pull filed it in.
+    async fn pulled_entry(catalog: &Arc<Catalog>, path: &str) -> Option<EntryDetail> {
         let wanted = path.to_owned();
-        store
-            .call(move |conn| {
-                let node = local_node(conn)?;
-                let Some(row) = repo_by_qualified(conn, &repo().qualified(), node.id)? else {
-                    return Ok(None);
-                };
-                let Some(revision) = revision_by_sha(conn, row.id, &commit())? else {
-                    return Ok(None);
-                };
-                Ok(entries_for_revision(conn, revision.id)?
-                    .into_iter()
-                    .find(|entry| entry.path == wanted))
-            })
-            .await
-            .expect("entries read")
+        on_catalog(catalog, move |catalog| {
+            let Some(repository) = catalog.repository(&repo())? else {
+                return Ok(None);
+            };
+            let Some(revision) = repository
+                .revisions
+                .iter()
+                .find(|revision| revision.sha == Some(commit()))
+            else {
+                return Ok(None);
+            };
+            Ok(catalog
+                .revision_entries(repository.id, revision.ordinal)?
+                .into_iter()
+                .find(|entry| entry.rel_path == wanted))
+        })
+        .await
+        .expect("entries read")
     }
 
-    async fn indexed(store: &Store, bytes: &[u8]) -> bool {
+    async fn indexed(catalog: &Arc<Catalog>, bytes: &[u8]) -> bool {
         let sha256 = sha256_of(bytes);
-        store
-            .call(move |conn| Ok(blob_by_sha256(conn, &sha256)?.is_some()))
-            .await
-            .expect("blob lookup")
+        on_catalog(catalog, move |catalog| {
+            Ok(!catalog.entries_by_sha256(&[sha256])?.is_empty())
+        })
+        .await
+        .expect("hash lookup")
     }
 
     async fn cached(world: &World, path: &str) -> bool {
@@ -1478,11 +1376,6 @@ mod tests {
     }
 
     async fn peer_answering(server: &MockServer, bytes: &[u8], etag: &str) {
-        Mock::given(method("HEAD"))
-            .and(path("/api/models/kohya/film-grain"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(server)
-            .await;
         Mock::given(method("GET"))
             .and(path("/api/models/kohya/film-grain"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1610,7 +1503,6 @@ mod tests {
     #[test]
     fn a_pull_lands_under_the_repository_and_revision_it_came_from() {
         let dir = TempDir::new().expect("temp dir");
-        let store = Store::open_in_memory().expect("store opens");
         let config = Arc::new(MirrorConfig::default());
         let cache = Arc::new(BlockCache::at_root(Arc::clone(&config), dir.path()));
         let access = Arc::new(AccessPolicy::default());
@@ -1619,10 +1511,9 @@ mod tests {
             "https://huggingface.co",
         )
         .expect("hub builds");
-        let catalog = test_catalog(dir.path());
+        let catalog = catalog_with_local(&dir);
         let mirror = Arc::new(Mirror::new(Arc::clone(&catalog), cache, access, upstream));
         let puller = Puller::new(PullerConfig {
-            store,
             catalog,
             mirror,
             root: PathBuf::from("/srv/pulled"),
@@ -1672,20 +1563,7 @@ mod tests {
         assert_eq!(outcome.size, bytes.len() as u64);
         assert!(outcome.abs_path.exists());
 
-        let rows = world
-            .store
-            .call(|conn| {
-                hoard_index::store::search_exec::query_rows(
-                    conn,
-                    "state = ?",
-                    &["served".into()],
-                    "",
-                    10,
-                    0,
-                )
-            })
-            .await
-            .expect("rows read");
+        let rows = rows_of(&world.catalog, "state:served").await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].blob_sha256, Some(sha256_of(&bytes)));
         assert_eq!(rows[0].state, State::Served);
@@ -1744,25 +1622,19 @@ mod tests {
         assert!(!world.puller.destination(&request).exists());
         assert!(!partial_path(&world.puller.destination(&request)).exists());
 
-        let requested = sha256_of(b"different bytes entirely");
-        let claimed = world
-            .store
-            .call(move |conn| Ok(blob_by_sha256(conn, &requested)?.is_some()))
-            .await
-            .expect("blob lookup");
         assert!(
-            !claimed,
+            !indexed(&world.catalog, b"different bytes entirely").await,
             "the bytes hoard asked for never entered the index"
         );
         assert!(
-            !indexed(&world.store, &bytes).await,
+            !indexed(&world.catalog, &bytes).await,
             "the bytes the peer served never entered the index either"
         );
         assert!(
             !cached(&world, "loras/film-grain.safetensors").await,
             "the bytes the peer served never entered the shared cache"
         );
-        let entry = pulled_entry(&world.store, "loras/film-grain.safetensors")
+        let entry = pulled_entry(&world.catalog, "loras/film-grain.safetensors")
             .await
             .expect("the refused pull leaves an entry");
         assert_eq!(entry.state, State::Remote);
@@ -1813,10 +1685,10 @@ mod tests {
             .expect_err("an answer nothing can check is refused");
         assert!(matches!(error, NetError::Unverifiable { .. }));
         assert!(!world.puller.destination(&request).exists());
-        assert!(!indexed(&world.store, &bytes).await);
+        assert!(!indexed(&world.catalog, &bytes).await);
         assert!(!cached(&world, "loras/film-grain.safetensors").await);
         assert_eq!(
-            pulled_entry(&world.store, "loras/film-grain.safetensors")
+            pulled_entry(&world.catalog, "loras/film-grain.safetensors")
                 .await
                 .expect("the refused pull leaves an entry")
                 .state,
@@ -1854,7 +1726,7 @@ mod tests {
         let destination = world.puller.destination(&request);
         assert!(!destination.exists());
         assert!(!partial_path(&destination).exists());
-        let entry = pulled_entry(&world.store, "loras/film-grain.safetensors")
+        let entry = pulled_entry(&world.catalog, "loras/film-grain.safetensors")
             .await
             .expect("the failed pull leaves an entry");
         assert_eq!(entry.state, State::Remote);
@@ -1865,7 +1737,6 @@ mod tests {
     #[test]
     fn a_pull_never_lands_outside_the_pull_root() {
         let dir = TempDir::new().expect("temp dir");
-        let store = Store::open_in_memory().expect("store opens");
         let config = Arc::new(MirrorConfig::default());
         let cache = Arc::new(BlockCache::at_root(Arc::clone(&config), dir.path()));
         let upstream = Hub::new(
@@ -1873,7 +1744,7 @@ mod tests {
             "https://huggingface.co",
         )
         .expect("hub builds");
-        let catalog = test_catalog(dir.path());
+        let catalog = catalog_with_local(&dir);
         let mirror = Arc::new(Mirror::new(
             Arc::clone(&catalog),
             cache,
@@ -1881,7 +1752,6 @@ mod tests {
             upstream,
         ));
         let puller = Puller::new(PullerConfig {
-            store,
             catalog,
             mirror,
             root: PathBuf::from("/srv/pulled"),
@@ -2025,11 +1895,17 @@ mod tests {
 
     /// A catalog with no configured sources, holding only this node's own row.
     fn catalog_with_local(root: &TempDir) -> Arc<Catalog> {
-        let catalog = test_catalog(root.path());
+        let config = hoard_index::config::IndexConfig {
+            data_dir: root.path().join("native-data"),
+            sources: Vec::new(),
+            ..hoard_index::config::IndexConfig::default()
+        };
+        let catalog =
+            Catalog::open_or_scan(&config, "workstation", |_, _| {}).expect("catalog opens");
         catalog
             .ensure_local_node(&NodeId::new("workstation-1").expect("id"), "workstation")
             .expect("local node records");
-        catalog
+        Arc::new(catalog)
     }
 
     /// The rows one query answers, with the search index caught up to what was just filed.
@@ -2037,7 +1913,7 @@ mod tests {
         let raw = raw.to_owned();
         on_catalog(catalog, move |catalog| {
             catalog.refresh_search(|_| {})?;
-            let context = catalog.compile_context(&raw, Timestamp::now(), Vec::new())?;
+            let context = catalog.compile_context(&raw, jiff::Timestamp::now(), Vec::new())?;
             Ok(catalog
                 .query(hoard_index::catalog::QueryRequest {
                     raw: &raw,

@@ -26,9 +26,9 @@ use super::models::{
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::{
-    Catalog, DigestApplied, JobProgress, JobState, MIRROR_SOURCE, NewProjection, QueryPage,
-    QueryRequest, RemoteEntry, RepositoryFilter, RescanReport, ServedFile, UsageEvent, builder,
-    models, query,
+    Catalog, DigestApplied, JobProgress, JobState, MIRROR_SOURCE, NewProjection, PullMark,
+    PulledFile, QueryPage, QueryRequest, RemoteEntry, RepositoryFilter, RescanReport, ServedFile,
+    UsageEvent, builder, models, query,
 };
 
 fn running_as_root() -> bool {
@@ -2809,6 +2809,89 @@ fn node_encoding_is_frozen() -> Result<()> {
         pass: 3,
     };
     insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn a_pull_is_marked_while_moving_and_filed_when_verified() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = Catalog::open_or_scan(
+        &IndexConfig {
+            data_dir: directory.path().join("native"),
+            ..IndexConfig::default()
+        },
+        "workstation",
+        |_, _| {},
+    )?;
+    let repo = RepoId::parse_ref(RepoType::Models, "kohya/film-grain")?;
+    let root = directory.path().join("pulled");
+    let slot = catalog.pull_slot(&repo, CommitSha::from_bytes([0x22; 20]), &root)?;
+    assert_eq!(
+        catalog.pull_slot(&repo, CommitSha::from_bytes([0x22; 20]), &root)?,
+        slot
+    );
+    let destination = root.join("loras/film-grain.safetensors");
+    let marked = catalog.mark_pull(&PullMark {
+        slot,
+        rel_path: "loras/film-grain.safetensors",
+        abs_path: &destination,
+        size: 96,
+        state: State::Pulling,
+        progress: Some(0.5),
+    })?;
+    let entries = catalog.revision_entries(slot.repo, slot.revision)?;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].state, State::Pulling);
+    assert_eq!(entries[0].pull_progress, Some(0.5));
+    assert_eq!(catalog.reset_stale_pulls()?, 1);
+    assert_eq!(
+        catalog.revision_entries(slot.repo, slot.revision)?[0].state,
+        State::Remote
+    );
+    fs::create_dir_all(
+        destination
+            .parent()
+            .ok_or_else(|| IndexError::Catalog("parent".into()))?,
+    )?;
+    fs::write(&destination, lora_header())?;
+    let sniff = crate::sniff::sniff_path(&destination)?;
+    let mut input = crate::infer::InferInput::new(
+        sniff.format,
+        &destination,
+        "film-grain.safetensors",
+        sniff.size,
+    );
+    if let Some(tensors) = &sniff.tensors {
+        input = input.with_tensors(tensors);
+    }
+    let inference = crate::infer::infer(&input);
+    let filed = catalog.file_pulled(&PulledFile {
+        slot,
+        rel_path: "loras/film-grain.safetensors",
+        abs_path: &destination,
+        sha256: Sha256::from_bytes([0x42; 32]),
+        git_sha1: None,
+        sniff: &sniff,
+        inference: &inference,
+        served: true,
+        triage: false,
+    })?;
+    assert_eq!(filed.entry, marked, "the marked row is the filed row");
+    let entries = catalog.revision_entries(slot.repo, slot.revision)?;
+    assert_eq!(entries[0].state, State::Served);
+    assert_eq!(entries[0].sha256, Some(Sha256::from_bytes([0x42; 32])));
+    assert_eq!(entries[0].pull_progress, None);
+    catalog.rebuild_search(|_| {})?;
+    let row = catalog
+        .artifact_by_sha256(&Sha256::from_bytes([0x42; 32]))?
+        .ok_or_else(|| IndexError::Catalog("row".into()))?;
+    assert_eq!(row.role, Role::Lora);
+    assert_eq!(row.state, State::Served);
+    assert_eq!(
+        catalog.digest(None, 10)?.total,
+        1,
+        "a pulled artifact is offered onward"
+    );
     Ok(())
 }
 
