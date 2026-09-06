@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use hoard_core::{ArtifactId, Base, Role};
 use hoard_index::IndexError;
-use hoard_index::catalog::{Catalog, TriageItem};
-use hoard_index::store::overrides::{self, NoiseRow};
+use hoard_index::catalog::{Catalog, NoiseRecord, TriageItem};
 use hoard_index::store::row::SearchRow;
 
 use crate::api::artifacts::artifact_id;
@@ -173,25 +172,23 @@ pub async fn reject(
     })
     .await?;
     let paths = noise.clone();
-    state
-        .store()
-        .call_mut(move |conn| {
-            for path in &paths {
-                overrides::add_noise(conn, path, Some("rejected from triage"))?;
-            }
-            Ok(())
-        })
-        .await?;
     let catalog = Arc::clone(state.catalog());
-    blocking(move || catalog.clear_triage(id)).await?;
+    blocking(move || {
+        for path in &paths {
+            catalog.add_noise(path, Some("rejected from triage"))?;
+        }
+        catalog.clear_triage(id)
+    })
+    .await?;
     Ok(Json(RejectView {
         artifact_id: id,
         noise,
     }))
 }
 
-pub async fn noise(State(state): State<AppState>) -> ApiResult<Json<Vec<NoiseRow>>> {
-    let rows = state.store().call(overrides::list_noise).await?;
+pub async fn noise(State(state): State<AppState>) -> ApiResult<Json<Vec<NoiseRecord>>> {
+    let catalog = Arc::clone(state.catalog());
+    let rows = blocking(move || catalog.list_noise()).await?;
     Ok(Json(rows))
 }
 
@@ -201,10 +198,8 @@ pub async fn delete_noise(
     headers: HeaderMap,
 ) -> ApiResult<Json<NoiseDeleted>> {
     authorize(&state, &headers)?;
-    let removed = state
-        .store()
-        .call_mut(move |conn| overrides::remove_noise(conn, id))
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let removed = blocking(move || catalog.remove_noise(id)).await?;
     if !removed {
         return Err(ApiError::not_found(format!("noise path {id}")));
     }

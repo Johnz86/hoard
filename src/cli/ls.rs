@@ -5,7 +5,6 @@ use hoard_core::format_size;
 use hoard_index::IndexError;
 use hoard_index::catalog::{QueryPage, QueryRequest};
 use hoard_index::search::{self, SortKey, SortSpec};
-use hoard_index::store::shelf::list_shelves;
 
 use super::node::Context as CliContext;
 
@@ -17,7 +16,7 @@ pub async fn run(
     sort: String,
     ascending: bool,
 ) -> Result<()> {
-    let CliContext { store, catalog, .. } = context;
+    let CliContext { catalog, .. } = context;
     let raw = query.unwrap_or_default();
     for warning in &search::parse(&raw).warnings {
         tracing::warn!(%warning, "query warning");
@@ -26,16 +25,13 @@ pub async fn run(
     let key: SortKey = sort
         .parse()
         .map_err(|_| anyhow::anyhow!("unknown sort column: {sort}"))?;
-    let shelves = store
-        .call(list_shelves)
-        .await
-        .context("reading shelves")?
-        .into_iter()
-        .map(|shelf| (shelf.name, shelf.query))
-        .collect();
-
     let sort = SortSpec::new(key, !ascending);
     let page = tokio::task::spawn_blocking(move || -> Result<QueryPage, IndexError> {
+        let shelves = catalog
+            .list_shelves()?
+            .into_iter()
+            .map(|shelf| (shelf.name, shelf.query))
+            .collect();
         let context = catalog.compile_context(&raw, Timestamp::now(), shelves)?;
         catalog.query(QueryRequest {
             raw: &raw,

@@ -2937,3 +2937,56 @@ fn open_or_scan_creates_then_reopens_and_tolerates_no_sources() -> Result<()> {
     assert_eq!(search(&none, "")?.total, 0);
     Ok(())
 }
+
+#[test]
+fn shelves_settings_and_noise_live_in_the_catalog_and_noise_reaches_the_scan() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let shelves = catalog.list_shelves()?;
+    assert_eq!(shelves.len(), 6, "the builtin shelves are seeded");
+    assert!(shelves.iter().all(|shelf| shelf.builtin));
+    assert_eq!(shelves[0].position, 0);
+    let created = catalog.create_shelf("grainy", "role:lora film", 9)?;
+    assert!(!created.builtin);
+    assert!(
+        catalog.create_shelf("grainy", "x", 1).is_err(),
+        "names are unique"
+    );
+    let updated = catalog.update_shelf(created.id, "grainy", "role:lora base:sdxl", 9)?;
+    assert_eq!(updated.query, "role:lora base:sdxl");
+    assert!(catalog.delete_shelf(created.id)?);
+    assert_eq!(catalog.seed_builtin_shelves()?, 6);
+    assert_eq!(catalog.list_shelves()?.len(), 6, "re-seeding is idempotent");
+
+    catalog.put_setting("theme", "dark")?;
+    assert_eq!(catalog.get_setting("theme")?.as_deref(), Some("dark"));
+    catalog.put_setting("theme", "light")?;
+    assert_eq!(
+        catalog.all_settings()?.get("theme").map(String::as_str),
+        Some("light")
+    );
+    assert!(catalog.remove_setting("theme")?);
+    assert!(!catalog.remove_setting("theme")?);
+
+    let gone = input
+        .join("loras/gone.safetensors")
+        .to_string_lossy()
+        .into_owned();
+    let id = catalog.add_noise(&gone, Some("rejected from triage"))?;
+    assert_eq!(
+        catalog.add_noise(&gone, None)?,
+        id,
+        "adding the same path again keeps its id"
+    );
+    assert!(catalog.is_noise(&gone)?);
+    assert_eq!(catalog.list_noise()?.len(), 1);
+    let report = catalog.rescan(&config, |_, _| {})?;
+    assert_eq!(
+        report.absent, 1,
+        "a noisy path is walked past, so its row goes absent"
+    );
+    assert!(catalog.remove_noise(id)?);
+    assert!(!catalog.is_noise(&gone)?);
+    Ok(())
+}

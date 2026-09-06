@@ -176,6 +176,14 @@ impl NoiseFilter {
         Ok(Self { paths })
     }
 
+    /// The same filter from paths a caller already holds, which is how the native catalog
+    /// builds one without a SQLite connection.
+    pub fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            paths: paths.into_iter().collect(),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.paths.is_empty()
     }

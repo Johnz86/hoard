@@ -7,6 +7,7 @@ mod search;
 pub mod seed;
 #[cfg(test)]
 mod tests;
+mod userdata;
 mod verdict;
 
 use std::path::{Path, PathBuf};
@@ -30,6 +31,7 @@ pub use self::scan::RescanReport;
 pub use self::search::{QueryPage, QueryRequest};
 #[cfg(any(test, feature = "fixtures"))]
 pub use self::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
+pub use self::userdata::{NoiseRecord, ShelfRecord};
 pub use self::verdict::OverrideRecord;
 
 /// One redb table's share of the catalog file: the rows it holds, the bytes those rows
@@ -118,6 +120,7 @@ impl Catalog {
                 manifest.format_version
             )));
         }
+        catalog.seed_builtin_shelves()?;
         Ok(catalog)
     }
 

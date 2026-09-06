@@ -11,10 +11,10 @@ use hoard_core::format_size;
 use hoard_index::IndexError;
 use hoard_index::catalog::{QueryPage, QueryRequest, Totals};
 use hoard_index::search::SortSpec;
+use hoard_index::store::node;
 use hoard_index::store::row::FacetBucket;
-use hoard_index::store::{node, setting};
 
-use crate::api::common::authorize;
+use crate::api::common::{authorize, blocking};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -217,10 +217,8 @@ async fn catalog_totals(state: &AppState) -> Result<(Totals, QueryPage), IndexEr
 }
 
 pub async fn settings(State(state): State<AppState>) -> ApiResult<Json<SettingsView>> {
-    let view = state
-        .store()
-        .call(|conn| Ok(SettingsView::from_stored(&setting::all_settings(conn)?)))
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || Ok(SettingsView::from_stored(&catalog.all_settings()?))).await?;
     Ok(Json(view))
 }
 
@@ -231,15 +229,14 @@ pub async fn put_settings(
 ) -> ApiResult<Json<SettingsView>> {
     authorize(&state, &headers)?;
     let body = body.validated()?;
-    let view = state
-        .store()
-        .call_mut(move |conn| {
-            for (key, value) in body.pairs() {
-                setting::put_setting(conn, key, &value)?;
-            }
-            Ok(SettingsView::from_stored(&setting::all_settings(conn)?))
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        for (key, value) in body.pairs() {
+            catalog.put_setting(key, &value)?;
+        }
+        Ok(SettingsView::from_stored(&catalog.all_settings()?))
+    })
+    .await?;
     Ok(Json(view))
 }
 

@@ -391,6 +391,44 @@ pub(super) struct Allocator {
     pub(super) entries: u64,
 }
 
+/// One key of the shell's presentation state, as the settings sheet writes it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 13, version = 1)]
+#[native_db]
+pub(super) struct Setting {
+    #[primary_key]
+    pub(super) key: String,
+    pub(super) value: String,
+}
+
+/// A saved query. The six shelves hoard ships with are seeded on every open and keep the
+/// positions the design gives them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 14, version = 1)]
+#[native_db]
+pub(super) struct Shelf {
+    #[primary_key]
+    pub(super) id: i64,
+    #[secondary_key(unique)]
+    pub(super) name: String,
+    pub(super) query: String,
+    pub(super) builtin: bool,
+    pub(super) position: i64,
+}
+
+/// A path a rejection marked as noise, which later scans walk past.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 15, version = 1)]
+#[native_db]
+pub(super) struct Noise {
+    #[primary_key]
+    pub(super) id: i64,
+    #[secondary_key(unique)]
+    pub(super) path: String,
+    pub(super) reason: Option<String>,
+    pub(super) added_at: String,
+}
+
 /// Registers every record type. `native_db` compares each definition against every model
 /// already registered rather than only against the other versions of the same model, so a
 /// version 1 model must be defined last: it is what leaves each migrated model marked
@@ -412,5 +450,8 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<Allocator>()?;
     models.define::<Override>()?;
     models.define::<SearchChange>()?;
+    models.define::<Setting>()?;
+    models.define::<Shelf>()?;
+    models.define::<Noise>()?;
     Ok(models)
 }

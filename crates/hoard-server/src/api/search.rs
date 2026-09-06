@@ -10,7 +10,6 @@ use hoard_index::IndexError;
 use hoard_index::catalog::{QueryPage, QueryRequest};
 use hoard_index::search::{FACET_DIMENSIONS, Facets, ParsedQuery, SortSpec, parse, quoted};
 use hoard_index::store::row::DiskPressure;
-use hoard_index::store::shelf;
 
 use crate::api::common::{
     MIDDOT, RowView, clamp_limit, decode_cursor, next_cursor, sort_key, sort_spec,
@@ -116,8 +115,8 @@ pub async fn search(
     }))
 }
 
-/// One page of the catalog, compiled against the shelves the store still holds and read on
-/// a blocking thread because the catalog and its index are file work.
+/// One page of the catalog, compiled against the shelves it holds and read on a blocking
+/// thread because the catalog and its index are file work.
 async fn run_query(
     state: &AppState,
     raw: String,
@@ -125,18 +124,14 @@ async fn run_query(
     limit: u32,
     offset: u32,
 ) -> Result<QueryPage, IndexError> {
-    let shelves = state
-        .store()
-        .call(|conn| {
-            Ok(shelf::list_shelves(conn)?
-                .into_iter()
-                .map(|row| (row.name, row.query))
-                .collect::<Vec<_>>())
-        })
-        .await?;
     let catalog = Arc::clone(state.catalog());
     let now = Timestamp::now();
     tokio::task::spawn_blocking(move || {
+        let shelves = catalog
+            .list_shelves()?
+            .into_iter()
+            .map(|row| (row.name, row.query))
+            .collect();
         let context = catalog.compile_context(&raw, now, shelves)?;
         catalog.query(QueryRequest {
             raw: &raw,

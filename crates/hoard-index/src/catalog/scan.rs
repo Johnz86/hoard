@@ -11,9 +11,7 @@ use serde::Serialize;
 use hoard_core::{Artifact, ArtifactFormat, ArtifactId, BlobId, Sha256, State, TensorSummary};
 
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
-use crate::discover::{
-    self, DiscoveredEntry, DiscoveredRepo, DiscoveredRevision, NoiseFilter, RevisionName,
-};
+use crate::discover::{self, DiscoveredEntry, DiscoveredRepo, DiscoveredRevision, RevisionName};
 use crate::hash::FileStamp;
 use crate::infer::{self, InferInput, Inference};
 use crate::scan::{
@@ -97,11 +95,15 @@ impl Catalog {
     fn create(directory: PathBuf) -> Result<Self> {
         std::fs::create_dir(&directory)?;
         match builder().create(models()?, directory.join("catalog.redb")) {
-            Ok(database) => Ok(Self {
-                database,
-                directory,
-                search_cache: std::sync::RwLock::new(None),
-            }),
+            Ok(database) => {
+                let catalog = Self {
+                    database,
+                    directory,
+                    search_cache: std::sync::RwLock::new(None),
+                };
+                catalog.seed_builtin_shelves()?;
+                Ok(catalog)
+            }
             Err(error) => {
                 remove_partial(&directory);
                 Err(error.into())
@@ -151,9 +153,10 @@ impl Catalog {
         counters: &mut Counters,
         mut progress: impl FnMut(&str, u64),
     ) -> Result<()> {
+        let noise = self.noise_filter()?;
         for source in sources {
             progress(&format!("discovering {}", source.name), counters.entries);
-            let discovered = discover::discover(source, &NoiseFilter::default())?;
+            let discovered = discover::discover(source, &noise)?;
             let kind = discovered.kind();
             let repo_ids = self.store_source(source, kind, discovered.repos(), counters)?;
             for (repo, repo_id) in discovered.repos().iter().zip(repo_ids) {
