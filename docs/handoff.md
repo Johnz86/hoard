@@ -74,9 +74,9 @@ them.
 4. **Land the wave.** From the main checkout on `master`:
    `git merge --squash wave/<name>`, then one commit whose subject and body are the plan's
    wave commit, ending with the two attribution trailer lines this session was given. Then
-   `git worktree remove ../hoard-<name> && git branch -D wave/<name>`. The plan file goes
-   with the worktree. Update this handoff inside the wave (a task of the plan) so it lands in
-   the same commit, never as a commit of its own.
+   `git worktree remove --force ../hoard-<name> && git branch -D wave/<name>`; the force is
+   for the untracked plan file, which goes with the worktree. Update this handoff inside the
+   wave (a task of the plan) so it lands in the same commit, never as a commit of its own.
 
 For anything touching `crates/hoard-index/src/catalog/`, read
 `.claude/skills/hoard-catalog/SKILL.md` first: the module map, the write path, and the

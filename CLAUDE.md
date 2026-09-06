@@ -120,7 +120,7 @@ git worktree add ../hoard-<name> -b wave/<name>        # the dispatcher, from th
 # run hoard-verify in the worktree; dispatch perf-reviewer or rust-reviewer on master..HEAD
 git merge --squash wave/<name>                          # back on master
 git commit -m "<the plan's wave commit, with the trailer lines>"
-git worktree remove ../hoard-<name> && git branch -D wave/<name>
+git worktree remove --force ../hoard-<name> && git branch -D wave/<name>   # --force: the plan is untracked
 ```
 
 The implementer's per-task commits are checkpoints on the branch; they never reach `master`.
