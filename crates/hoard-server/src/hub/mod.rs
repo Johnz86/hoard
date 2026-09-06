@@ -14,6 +14,7 @@ mod tests;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, FromRequestParts};
@@ -23,6 +24,8 @@ use axum::http::request::Parts;
 use axum::routing::{get, post};
 
 use hoard_core::{RepoId, RepoType, clean_repo_path};
+use hoard_index::IndexError;
+use hoard_index::catalog::Catalog;
 use hoard_mirror::upstream::Authorization;
 
 use crate::error::{HubError, HubResult};
@@ -231,4 +234,18 @@ impl<S: Send + Sync> FromRequestParts<S> for Client {
                 .map(|ConnectInfo(address)| address.ip().to_string())
         })))
     }
+}
+
+/// Runs one catalog read off the reactor. The catalog is a file, so a Hub route reads it on
+/// a blocking thread and reports a failed read the way every other index failure is.
+pub(crate) async fn on_catalog<T, F>(catalog: &Arc<Catalog>, f: F) -> HubResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Catalog) -> Result<T, IndexError> + Send + 'static,
+{
+    let catalog = Arc::clone(catalog);
+    tokio::task::spawn_blocking(move || f(&catalog))
+        .await
+        .map_err(|_| HubError::from(IndexError::TaskJoin))?
+        .map_err(HubError::from)
 }

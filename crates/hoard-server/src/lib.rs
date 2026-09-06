@@ -8,6 +8,8 @@ pub mod git;
 pub mod hub;
 pub mod layers;
 pub mod state;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod ui;
 
 use std::future::Future;
@@ -26,12 +28,16 @@ pub use state::AppState;
 /// no network at all logs and serves on, because the Hub and git faces are useful alone.
 pub async fn start_gossip(state: &AppState) -> Option<hoard_net::GossipHandle> {
     let config = state.config();
-    let local = match state
-        .store()
-        .call(hoard_index::store::node::local_node)
+    let catalog = std::sync::Arc::clone(state.catalog());
+    let listed = tokio::task::spawn_blocking(move || catalog.list_nodes())
         .await
-    {
-        Ok(row) => row,
+        .unwrap_or_else(|error| Err(hoard_index::IndexError::Catalog(error.to_string())));
+    let local = match listed.map(|nodes| nodes.into_iter().find(|node| node.is_self)) {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            tracing::warn!("this node is not recorded yet; federation is off");
+            return None;
+        }
         Err(error) => {
             tracing::warn!(%error, "this node is not recorded yet; federation is off");
             return None;
@@ -57,14 +63,17 @@ pub async fn start_gossip(state: &AppState) -> Option<hoard_net::GossipHandle> {
         .with_discovery(mode)
         .with_statics(config.peers.statics.clone())
         .with_token(token);
-    Some(hoard_net::spawn(state.store().clone(), gossip))
+    Some(hoard_net::spawn(
+        std::sync::Arc::clone(state.catalog()),
+        gossip,
+    ))
 }
 
 /// Starts the background cache sweep, or nothing when no `cache_size_limit` is set.
 pub fn start_eviction(state: &AppState) -> Option<hoard_mirror::cache::EvictionHandle> {
     state.mirror_config().cache_size_limit?;
     Some(hoard_mirror::cache::spawn_eviction(
-        state.store().clone(),
+        std::sync::Arc::clone(state.catalog()),
         state.cache().as_ref().clone(),
         hoard_mirror::cache::EvictionConfig::default(),
     ))
@@ -104,19 +113,10 @@ const KILLED: &str = "the process running this job was stopped";
 /// running when this one starts is a run that was killed: the JOBS tab would otherwise show
 /// it at whatever percentage it died at, forever.
 pub async fn sweep_stale_runs(state: &AppState) -> usize {
-    let swept = state
-        .store()
-        .call_mut(|conn| {
-            let running = hoard_index::store::job::list_jobs(
-                conn,
-                Some(hoard_index::store::job::JobState::Running),
-            )?;
-            for row in &running {
-                hoard_index::store::job::fail_job(conn, row.id, KILLED)?;
-            }
-            Ok(running.len())
-        })
-        .await;
+    let catalog = std::sync::Arc::clone(state.catalog());
+    let swept = tokio::task::spawn_blocking(move || catalog.sweep_running_jobs(KILLED))
+        .await
+        .unwrap_or_else(|error| Err(hoard_index::IndexError::Catalog(error.to_string())));
     match swept {
         Ok(0) => 0,
         Ok(count) => {
@@ -136,10 +136,11 @@ pub async fn sweep_stale_runs(state: &AppState) -> usize {
 /// one starts is a transfer that died: the FILES tab would show it frozen part way for good,
 /// and nothing would offer to pull it again.
 pub async fn sweep_stale_pulls(state: &AppState) -> usize {
-    let swept = state
-        .store()
-        .call_mut(|conn| hoard_index::store::entry::reset_stale_pulls(conn))
-        .await;
+    let catalog = std::sync::Arc::clone(state.catalog());
+    let swept = tokio::task::spawn_blocking(move || catalog.reset_stale_pulls())
+        .await
+        .unwrap_or_else(|error| Err(hoard_index::IndexError::Catalog(error.to_string())))
+        .map(|count| count as usize);
     match swept {
         Ok(0) => 0,
         Ok(count) => {
@@ -181,26 +182,22 @@ where
 mod tests {
     use axum::body::Body;
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};
-    use hoard_core::{CommitSha, NodeId, RepoId, RepoType, State};
-    use hoard_index::config::SourceKind;
-    use hoard_index::store::Store;
-    use hoard_index::store::entry::{NewEntry, entry, upsert_entry};
-    use hoard_index::store::job::{JobState, create_job, job, list_jobs};
-    use hoard_index::store::node::{NewNode, upsert_node};
-    use hoard_index::store::repo::{NewRepo, upsert_repo};
-    use hoard_index::store::revision::{NewRevision, upsert_revision};
-    use jiff::Timestamp;
+    use hoard_core::{CommitSha, RepoId, RepoType, State};
+    use hoard_index::catalog::{JobState, PullMark};
     use tower::ServiceExt;
 
     use super::*;
 
-    fn state() -> AppState {
-        let store = Store::open_in_memory().expect("in-memory store opens");
-        AppState::new(HoardConfig::default(), store).expect("state builds")
+    fn state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let catalog = crate::testing::empty_catalog(dir.path(), "test");
+        let state = AppState::new(HoardConfig::default(), catalog).expect("state builds");
+        (dir, state)
     }
 
     async fn through_the_stack(request: Request<Body>) -> axum::response::Response {
-        app(state())
+        let (_dir, state) = state();
+        app(state)
             .oneshot(request)
             .await
             .expect("the assembled application answers")
@@ -294,49 +291,34 @@ mod tests {
 
     #[tokio::test]
     async fn a_pull_left_running_by_a_stopped_process_reads_remote_at_startup() {
-        let state = state();
-        let id = state
-            .store()
-            .call_mut(|conn| {
-                let node = upsert_node(
-                    conn,
-                    &NewNode::local(
-                        NodeId::new("workstation-1").expect("a node id"),
-                        "workstation",
-                    ),
-                )?;
-                let repo = upsert_repo(
-                    conn,
-                    &NewRepo::new(
-                        RepoId::new(RepoType::Models, Some("org".to_owned()), "name"),
-                        node,
-                        SourceKind::Loose,
-                    ),
-                )?;
-                let revision = upsert_revision(
-                    conn,
-                    &NewRevision::synthetic(repo, CommitSha::from_bytes([3u8; 20])),
-                )?;
-                let halfway = NewEntry {
-                    state: State::Pulling,
-                    pull_progress: Some(0.6),
-                    ..NewEntry::new(revision, "weights.safetensors", node)
-                };
-                upsert_entry(conn, &halfway, Timestamp::now())
+        let (dir, state) = state();
+        let catalog = state.catalog();
+        let repo = RepoId::new(RepoType::Models, Some("org".to_owned()), "name");
+        let root = dir.path().join("pulled");
+        let slot = catalog
+            .pull_slot(&repo, CommitSha::from_bytes([3u8; 20]), &root)
+            .expect("a pull slot opens");
+        let destination = root.join("weights.safetensors");
+        catalog
+            .mark_pull(&PullMark {
+                slot,
+                rel_path: "weights.safetensors",
+                abs_path: &destination,
+                size: 4096,
+                state: State::Pulling,
+                progress: Some(0.6),
             })
-            .await
             .expect("a pull is recorded mid-flight");
 
         assert_eq!(sweep_stale_pulls(&state).await, 1);
-        let settled = state
-            .store()
-            .call(move |conn| entry(conn, id))
-            .await
+        let settled = catalog
+            .revision_entries(slot.repo, slot.revision)
             .expect("the entry reads back")
+            .into_iter()
+            .next()
             .expect("the entry survives the sweep");
         assert_eq!(settled.state, State::Remote);
         assert_eq!(settled.pull_progress, None);
-
         assert_eq!(
             sweep_stale_pulls(&state).await,
             0,
@@ -346,43 +328,44 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_left_running_by_a_stopped_process_is_failed_at_startup() {
-        let state = state();
+        let (_dir, state) = state();
         let id = state
-            .store()
-            .call_mut(|conn| create_job(conn, "scan", Some("cache")))
-            .await
+            .catalog()
+            .create_job("scan", Some("cache"))
             .expect("a job starts");
 
         assert_eq!(sweep_stale_runs(&state).await, 1);
         let settled = state
-            .store()
-            .call(move |conn| job(conn, id))
-            .await
-            .expect("the job reads back");
+            .catalog()
+            .job(id)
+            .expect("the job reads back")
+            .expect("the job survives the sweep");
         assert_eq!(settled.state, JobState::Failed);
         assert_eq!(settled.error.as_deref(), Some(KILLED));
 
         assert_eq!(sweep_stale_runs(&state).await, 0, "the sweep is idempotent");
         let running = state
-            .store()
-            .call(|conn| list_jobs(conn, Some(JobState::Running)))
-            .await
+            .catalog()
+            .list_jobs(Some(JobState::Running))
             .expect("jobs read back");
         assert!(running.is_empty());
     }
 
     #[tokio::test]
     async fn the_cache_sweep_starts_only_once_a_size_limit_gives_it_something_to_sweep_to() {
+        let (unlimited_dir, unlimited) = state();
         assert!(
-            start_eviction(&state()).is_none(),
+            start_eviction(&unlimited).is_none(),
             "an unlimited cache has no floor to evict down to"
         );
 
         let mut config = HoardConfig::default();
         config.mirror.cache_size_limit = Some(1 << 30);
-        let store = Store::open_in_memory().expect("in-memory store opens");
-        let limited = AppState::new(config, store).expect("state builds");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let catalog = crate::testing::empty_catalog(dir.path(), "test");
+        let limited = AppState::new(config, catalog).expect("state builds");
         let handle = start_eviction(&limited).expect("a limited cache is swept");
         handle.shutdown().await;
+        drop(unlimited_dir);
     }
 }

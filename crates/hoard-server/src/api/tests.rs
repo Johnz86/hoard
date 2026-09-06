@@ -10,25 +10,17 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 use hoard_core::{
-    ArtifactFormat, ArtifactId, Base, Evidence, EvidenceSource, NodeId, Precision, RepoId,
-    RepoRowId, RepoType, RevisionId, Role, Sha256, State as ArtifactState, TensorSample,
-    TensorSummary,
+    Artifact, ArtifactFormat, ArtifactId, Base, BlobId, Evidence, EvidenceSource, NodeId,
+    Precision, RepoId, RepoType, Role, Sha256, State as ArtifactState, TensorSample, TensorSummary,
+};
+use hoard_index::catalog::{
+    Catalog, LOCAL_NODE, RemoteEntry, SeedArtifact, SeedEntry, SeedRepository, SeedRevision,
+    UsageEvent, content_key,
 };
 use hoard_index::config::{SourceConfig, SourceKind};
-use hoard_index::store::Store;
-use hoard_index::store::artifact::{NewArtifact, upsert_artifact};
-use hoard_index::store::blob::{set_sha256, upsert_blob};
-use hoard_index::store::entry::{NewEntry, upsert_entry};
-use hoard_index::store::node::{NewNode, upsert_node};
-use hoard_index::store::repo::{NewRepo, upsert_repo};
-use hoard_index::store::revision::{NewRevision, RefKind, upsert_ref, upsert_revision};
-use hoard_index::store::shelf::seed_builtin_shelves;
-use hoard_index::store::source::upsert_source;
-use hoard_index::store::usage::{UsageEvent, bump_artifact_use, log_usage};
-use hoard_index::store::{artifact, usage};
+use hoard_index::discover::RefKind;
 
 use crate::api;
-use crate::api::common::Conn;
 use crate::config::HoardConfig;
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -42,6 +34,10 @@ const UNK_SIZE: u64 = 1_200_000;
 
 const CARD: &str = "---\nlicense: apache-2.0\ntags:\n  - lora\n---\n\n# Film grain\n\nA grain \
                     adapter for SDXL.\n";
+
+/// The hash the LoRA is known by, which is what makes the laptop's copy of it the same
+/// artifact as the two this node holds.
+const LORA_SHA256: Sha256 = Sha256::from_bytes([0x9f; 32]);
 
 /// A seeded index: five repositories across every role the design colours, a blob on three
 /// paths, a peer copy and a queue item, plus a README on disk.
@@ -59,11 +55,6 @@ struct World {
 fn seeded() -> World {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), CARD).expect("card writes");
-    let store = Store::open_in_memory().expect("store opens");
-    let ids = {
-        let conn = store.write().expect("writer");
-        seed(&conn, dir.path())
-    };
     let hub = dir.path().join("hub");
     std::fs::create_dir_all(&hub).expect("hub dir");
     let mut config = HoardConfig::default();
@@ -81,404 +72,391 @@ fn seeded() -> World {
     config.server.public_url = Some("http://hoard.lan:7099".to_owned());
     config.node.name = "workstation".to_owned();
     config.mirror.cache_root = Some(dir.path().join("repos"));
+    let catalog = crate::testing::empty_catalog(dir.path(), &config.node.name);
+    let native = seed_catalog(&catalog, dir.path());
+    seed_catalog_usage(&catalog, native[0]);
     World {
-        state: AppState::new(config, store).expect("state builds"),
+        state: AppState::new(config, catalog).expect("state builds"),
         _dir: dir,
-        lora: ids.0,
-        ckpt: ids.1,
-        llm: ids.2,
-        vae: ids.3,
-        dataset: ids.4,
-        unknown: ids.5,
+        lora: native[0],
+        ckpt: native[1],
+        llm: native[2],
+        vae: native[3],
+        dataset: native[4],
+        unknown: native[5],
     }
 }
 
-fn at() -> Timestamp {
-    "2026-09-04T09:10:00Z".parse().expect("timestamp parses")
+const CKPT_IDENTITY: u128 = 0x11;
+const LLM_IDENTITY: u128 = 0x33;
+const VAE_IDENTITY: u128 = 0x66;
+const DS_IDENTITY: u128 = 0x44;
+const UNK_IDENTITY: u128 = 0x55;
+
+/// The world every route test reads: five repositories across every role the design
+/// colours, the LoRA on two local paths and a third on the laptop, one queued artifact, and
+/// a README on disk. Returns the artifact ids in the order the tests name them.
+fn seed_catalog(catalog: &Catalog, dir: &Path) -> [ArtifactId; 6] {
+    let ckpt = SeedArtifact {
+        org: Some("stability".to_owned()),
+        ..seed_artifact(
+            CKPT_IDENTITY,
+            "sdxl-base-1.0",
+            Artifact {
+                sha256: Some(Sha256::from_bytes([0x11; 32])),
+                base: Base::new("sdxl"),
+                base_label: Some("sdxl".to_owned()),
+                base_confidence: 0.95,
+                precision: Some(Precision::new("fp16")),
+                ..facts(CKPT_SIZE, ArtifactFormat::Safetensors, Role::Ckpt, 0.99)
+            },
+        )
+    };
+    let lora = SeedArtifact {
+        org: Some("kohya".to_owned()),
+        card: Some(CARD.to_owned()),
+        ..seed_artifact(
+            content_key(&LORA_SHA256),
+            "film-grain-35mm",
+            Artifact {
+                sha256: Some(LORA_SHA256),
+                base: Base::new("sdxl 1.0"),
+                base_label: Some("sdxl 1.0".to_owned()),
+                base_confidence: 0.9,
+                precision: Some(Precision::new("fp16")),
+                rank: Some(32),
+                alpha: Some(16.0),
+                trigger: Some("film grain, 35mm, halation".to_owned()),
+                ..facts(LORA_SIZE, ArtifactFormat::Safetensors, Role::Lora, 0.98)
+            },
+        )
+    };
+    let llm = SeedArtifact {
+        org: Some("meta".to_owned()),
+        ..seed_artifact(
+            LLM_IDENTITY,
+            "llama-3-8b",
+            Artifact {
+                base: Base::new("llama3"),
+                base_label: Some("llama 3".to_owned()),
+                base_confidence: 0.9,
+                precision: Some(Precision::new("q4_k_m")),
+                context: Some(8192),
+                ..facts(LLM_SIZE, ArtifactFormat::Gguf, Role::Llm, 0.97)
+            },
+        )
+    };
+    let vae = SeedArtifact {
+        org: Some("madebyollin".to_owned()),
+        ..seed_artifact(
+            VAE_IDENTITY,
+            "sdxl-vae",
+            Artifact {
+                base_label: Some("any".to_owned()),
+                precision: Some(Precision::new("fp32")),
+                ..facts(VAE_SIZE, ArtifactFormat::Safetensors, Role::Vae, 0.93)
+            },
+        )
+    };
+    let dataset = seed_artifact(
+        DS_IDENTITY,
+        "squad",
+        facts(DS_SIZE, ArtifactFormat::Parquet, Role::Ds, 0.99),
+    );
+    let unknown = SeedArtifact {
+        tensors: Some(mystery_tensors()),
+        evidence: mystery_evidence(),
+        ..seed_artifact(
+            UNK_IDENTITY,
+            "mystery",
+            facts(UNK_SIZE, ArtifactFormat::Bin, Role::Unk, 0.2),
+        )
+    };
+    let card = dir.join("README.md").to_string_lossy().into_owned();
+    let written = catalog
+        .seed(&[
+            seed_repo_with_refs(
+                "stability/sdxl-base-1.0",
+                RepoType::Models,
+                0x11,
+                vec![
+                    ("main".to_owned(), RefKind::Branch),
+                    ("v1.0".to_owned(), RefKind::Tag),
+                ],
+                vec![
+                    seed_entry(
+                        "model.safetensors",
+                        "/data/hub/sdxl/model.safetensors",
+                        CKPT_SIZE,
+                        Some(ckpt),
+                    ),
+                    seed_entry("README.md", &card, CARD.len() as u64, None),
+                    seed_entry("config.json", "/data/hub/sdxl/config.json", 900, None),
+                ],
+            ),
+            seed_repo(
+                "kohya/film-grain-35mm",
+                RepoType::Models,
+                0x22,
+                vec![
+                    seed_entry(
+                        "film-grain-35mm.safetensors",
+                        "/mnt/vault/loras/film-grain-35mm.safetensors",
+                        LORA_SIZE,
+                        Some(lora.clone()),
+                    ),
+                    seed_entry(
+                        "loras/film-grain-35mm.safetensors",
+                        "/mnt/comfy/models/loras/film-grain-35mm.safetensors",
+                        LORA_SIZE,
+                        Some(lora),
+                    ),
+                ],
+            ),
+            seed_repo(
+                "meta/llama-3-8b",
+                RepoType::Models,
+                0x33,
+                vec![seed_entry(
+                    "model.gguf",
+                    "/data/llm/llama-3-8b.gguf",
+                    LLM_SIZE,
+                    Some(llm),
+                )],
+            ),
+            seed_repo(
+                "madebyollin/sdxl-vae",
+                RepoType::Models,
+                0x66,
+                vec![seed_entry(
+                    "vae.safetensors",
+                    "/data/vae/sdxl-vae.safetensors",
+                    VAE_SIZE,
+                    Some(vae),
+                )],
+            ),
+            seed_repo(
+                "squad",
+                RepoType::Datasets,
+                0x44,
+                vec![seed_entry(
+                    "train.parquet",
+                    "/data/ds/squad/train.parquet",
+                    DS_SIZE,
+                    Some(dataset),
+                )],
+            ),
+            seed_repo(
+                "misc/mystery",
+                RepoType::Models,
+                0x55,
+                vec![SeedEntry {
+                    node: LOCAL_NODE,
+                    state: ArtifactState::Triage,
+                    ..seed_entry(
+                        "mystery.bin",
+                        "/data/loose/mystery.bin",
+                        UNK_SIZE,
+                        Some(unknown),
+                    )
+                }],
+            ),
+        ])
+        .expect("the catalog seeds");
+    seed_catalog_peer(catalog);
+    catalog.rebuild_search(|_| {}).expect("the index builds");
+    [
+        content_key(&LORA_SHA256),
+        CKPT_IDENTITY,
+        LLM_IDENTITY,
+        VAE_IDENTITY,
+        DS_IDENTITY,
+        UNK_IDENTITY,
+    ]
+    .map(|identity| {
+        written
+            .iter()
+            .find(|(seeded, _)| *seeded == identity)
+            .map(|(_, id)| *id)
+            .expect("every seeded identity was written")
+    })
 }
 
-#[allow(clippy::type_complexity)]
-fn seed(
-    conn: &Conn,
-    dir: &Path,
-) -> (
-    ArtifactId,
-    ArtifactId,
-    ArtifactId,
-    ArtifactId,
-    ArtifactId,
-    ArtifactId,
-) {
-    let local = upsert_node(
-        conn,
-        &NewNode::local(NodeId::new("workstation-1").expect("id"), "workstation"),
-    )
-    .expect("node");
-    let peer = upsert_node(
-        conn,
-        &NewNode::peer(
-            NodeId::new("laptop-1").expect("id"),
+/// The laptop and the third path of the LoRA it holds, filed the way a digest poll would.
+fn seed_catalog_peer(catalog: &Catalog) {
+    let laptop = catalog
+        .upsert_peer(
+            &NodeId::new("laptop-1").expect("id"),
             "laptop",
-            "http://laptop:7099",
-        ),
-    )
-    .expect("peer");
-    let source = upsert_source(
-        conn,
-        "cache",
-        Path::new("/data/hub"),
-        SourceKind::HfCache,
-        local,
-    )
-    .expect("source");
-    seed_builtin_shelves(conn).expect("shelves seed");
-
-    let ckpt_repo = repo(conn, local, RepoType::Models, "stability/sdxl-base-1.0");
-    let ckpt_rev = revision(
-        conn,
-        ckpt_repo,
-        0x11,
-        &[("main", RefKind::Branch), ("v1.0", RefKind::Tag)],
-    );
-    let ckpt_blob = upsert_blob(conn, "xxh3:ckpt", CKPT_SIZE, at()).expect("blob");
-    set_sha256(conn, ckpt_blob, Sha256::from_bytes([0x11; 32]), None, at()).expect("hash");
-    let ckpt = upsert_artifact(
-        conn,
-        &NewArtifact {
-            format: ArtifactFormat::Safetensors,
-            role: Role::Ckpt,
-            role_confidence: 0.99,
-            base: Base::new("sdxl"),
-            base_label: Some("sdxl".to_owned()),
-            base_confidence: 0.95,
-            precision: Some(Precision::new("fp16")),
-            org: Some("stability".to_owned()),
-            ..NewArtifact::new(ckpt_blob, "sdxl-base-1.0")
-        },
-        at(),
-    )
-    .expect("artifact");
-    entry(
-        conn,
-        ckpt_rev,
-        "model.safetensors",
-        local,
-        source,
-        Some(ckpt_blob),
-        Some(ckpt),
-        CKPT_SIZE,
-        "/data/hub/sdxl/model.safetensors",
-        ArtifactState::Served,
-    );
-    upsert_entry(
-        conn,
-        &NewEntry {
-            source: Some(source),
-            abs_path: Some(dir.join("README.md").to_string_lossy().into_owned()),
-            size: CARD.len() as u64,
-            state: ArtifactState::Served,
-            ..NewEntry::new(ckpt_rev, "README.md", local)
-        },
-        at(),
-    )
-    .expect("entry");
-    upsert_entry(
-        conn,
-        &NewEntry {
-            source: Some(source),
-            abs_path: Some("/data/hub/sdxl/config.json".to_owned()),
-            size: 900,
-            state: ArtifactState::Served,
-            ..NewEntry::new(ckpt_rev, "config.json", local)
-        },
-        at(),
-    )
-    .expect("entry");
-
-    let lora_repo = repo(conn, local, RepoType::Models, "kohya/film-grain-35mm");
-    let lora_rev = revision(conn, lora_repo, 0x22, &[("main", RefKind::Branch)]);
-    let lora_blob = upsert_blob(conn, "xxh3:lora", LORA_SIZE, at()).expect("blob");
-    set_sha256(conn, lora_blob, Sha256::from_bytes([0x9f; 32]), None, at()).expect("hash");
-    let lora = upsert_artifact(
-        conn,
-        &NewArtifact {
-            format: ArtifactFormat::Safetensors,
-            role: Role::Lora,
-            role_confidence: 0.98,
-            base: Base::new("sdxl 1.0"),
-            base_label: Some("sdxl 1.0".to_owned()),
-            base_confidence: 0.9,
-            precision: Some(Precision::new("fp16")),
-            rank: Some(32),
-            alpha: Some(16.0),
-            trigger: Some("film grain, 35mm, halation".to_owned()),
-            org: Some("kohya".to_owned()),
-            ..NewArtifact::new(lora_blob, "film-grain-35mm")
-        },
-        at(),
-    )
-    .expect("artifact");
-    entry(
-        conn,
-        lora_rev,
-        "film-grain-35mm.safetensors",
-        local,
-        source,
-        Some(lora_blob),
-        Some(lora),
-        LORA_SIZE,
-        "/mnt/vault/loras/film-grain-35mm.safetensors",
-        ArtifactState::Served,
-    );
-    entry(
-        conn,
-        lora_rev,
-        "loras/film-grain-35mm.safetensors",
-        local,
-        source,
-        Some(lora_blob),
-        Some(lora),
-        LORA_SIZE,
-        "/mnt/comfy/models/loras/film-grain-35mm.safetensors",
-        ArtifactState::Served,
-    );
-
-    let peer_repo = repo(conn, peer, RepoType::Models, "kohya/film-grain-35mm");
-    let peer_rev = revision(conn, peer_repo, 0x22, &[("main", RefKind::Branch)]);
-    upsert_entry(
-        conn,
-        &NewEntry {
-            blob: Some(lora_blob),
-            artifact: Some(lora),
-            size: LORA_SIZE,
-            state: ArtifactState::Remote,
-            ..NewEntry::new(peer_rev, "loras/film-grain-35mm.safetensors", peer)
-        },
-        at(),
-    )
-    .expect("entry");
-
-    let llm_repo = repo(conn, local, RepoType::Models, "meta/llama-3-8b");
-    let llm_rev = revision(conn, llm_repo, 0x33, &[("main", RefKind::Branch)]);
-    let llm_blob = upsert_blob(conn, "xxh3:llm", LLM_SIZE, at()).expect("blob");
-    let llm = upsert_artifact(
-        conn,
-        &NewArtifact {
-            format: ArtifactFormat::Gguf,
-            role: Role::Llm,
-            role_confidence: 0.97,
-            base: Base::new("llama3"),
-            base_label: Some("llama 3".to_owned()),
-            base_confidence: 0.9,
-            precision: Some(Precision::new("q4_k_m")),
-            context: Some(8192),
-            org: Some("meta".to_owned()),
-            ..NewArtifact::new(llm_blob, "llama-3-8b")
-        },
-        at(),
-    )
-    .expect("artifact");
-    entry(
-        conn,
-        llm_rev,
-        "model.gguf",
-        local,
-        source,
-        Some(llm_blob),
-        Some(llm),
-        LLM_SIZE,
-        "/data/llm/llama-3-8b.gguf",
-        ArtifactState::Local,
-    );
-
-    let vae_repo = repo(conn, local, RepoType::Models, "madebyollin/sdxl-vae");
-    let vae_rev = revision(conn, vae_repo, 0x66, &[("main", RefKind::Branch)]);
-    let vae_blob = upsert_blob(conn, "xxh3:vae", VAE_SIZE, at()).expect("blob");
-    let vae = upsert_artifact(
-        conn,
-        &NewArtifact {
-            format: ArtifactFormat::Safetensors,
-            role: Role::Vae,
-            role_confidence: 0.93,
-            base: Base::any(),
-            base_label: Some("any".to_owned()),
-            base_confidence: 0.5,
-            precision: Some(Precision::new("fp32")),
-            org: Some("madebyollin".to_owned()),
-            ..NewArtifact::new(vae_blob, "sdxl-vae")
-        },
-        at(),
-    )
-    .expect("artifact");
-    entry(
-        conn,
-        vae_rev,
-        "vae.safetensors",
-        local,
-        source,
-        Some(vae_blob),
-        Some(vae),
-        VAE_SIZE,
-        "/data/vae/sdxl-vae.safetensors",
-        ArtifactState::Served,
-    );
-
-    let ds_repo = repo(conn, local, RepoType::Datasets, "squad");
-    let ds_rev = revision(conn, ds_repo, 0x44, &[("main", RefKind::Branch)]);
-    let ds_blob = upsert_blob(conn, "xxh3:ds", DS_SIZE, at()).expect("blob");
-    let dataset = upsert_artifact(
-        conn,
-        &NewArtifact {
-            format: ArtifactFormat::Parquet,
-            role: Role::Ds,
-            role_confidence: 0.99,
-            ..NewArtifact::new(ds_blob, "squad")
-        },
-        at(),
-    )
-    .expect("artifact");
-    entry(
-        conn,
-        ds_rev,
-        "train.parquet",
-        local,
-        source,
-        Some(ds_blob),
-        Some(dataset),
-        DS_SIZE,
-        "/data/ds/squad/train.parquet",
-        ArtifactState::Served,
-    );
-
-    let unk_repo = repo(conn, local, RepoType::Models, "misc/mystery");
-    let unk_rev = revision(conn, unk_repo, 0x55, &[("main", RefKind::Branch)]);
-    let unk_blob = upsert_blob(conn, "xxh3:unk", UNK_SIZE, at()).expect("blob");
-    let unknown = upsert_artifact(
-        conn,
-        &NewArtifact {
-            format: ArtifactFormat::Bin,
-            role: Role::Unk,
-            role_confidence: 0.2,
-            ..NewArtifact::new(unk_blob, "mystery")
-        },
-        at(),
-    )
-    .expect("artifact");
-    entry(
-        conn,
-        unk_rev,
-        "mystery.bin",
-        local,
-        source,
-        Some(unk_blob),
-        Some(unknown),
-        UNK_SIZE,
-        "/data/loose/mystery.bin",
-        ArtifactState::Triage,
-    );
-    artifact::set_triage(conn, unknown, true).expect("triage");
-    artifact::set_tensor_summary(
-        conn,
-        unknown,
-        &TensorSummary {
-            tensor_count: 2,
-            params: 1_024,
-            dtypes: [("F16".to_owned(), 2u32)].into_iter().collect(),
-            key_prefixes: vec![("lora_unet".to_owned(), 2)],
-            samples: vec![TensorSample {
-                name: "lora_unet_down.weight".to_owned(),
-                dtype: "F16".to_owned(),
-                shape: vec![32, 768],
+            Some("http://laptop:7099"),
+        )
+        .expect("the peer records")
+        .id;
+    let pass = catalog.begin_pass(laptop).expect("a pass starts");
+    catalog
+        .apply_digest(
+            laptop,
+            &[RemoteEntry {
+                sha256: LORA_SHA256,
+                size: LORA_SIZE,
+                role: Role::Lora,
+                base: Base::new("sdxl 1.0"),
+                repo: RepoId::parse_ref(RepoType::Models, "kohya/film-grain-35mm")
+                    .expect("reference"),
+                revision_sha: hoard_core::CommitSha::from_bytes([0x22; 20]),
+                path: "film-grain-35mm.safetensors".to_owned(),
+                name: "film-grain-35mm.safetensors".to_owned(),
             }],
-            metadata: Default::default(),
-        },
-    )
-    .expect("summary");
-    artifact::replace_evidence(
-        conn,
-        unknown,
-        &[
-            Evidence::new("role", "lora", EvidenceSource::Tensor, 0.6)
-                .with_detail("lora_unet prefix on 2 tensors"),
-            Evidence::new("base", "sdxl 1.0", EvidenceSource::Tensor, 0.5),
-        ],
-    )
-    .expect("evidence");
+            pass,
+        )
+        .expect("the peer digest applies");
+}
 
-    for day in 0..3 {
-        log_usage(
-            conn,
-            &UsageEvent {
-                client: Some(format!("client-{day}")),
-                repo: Some(lora_repo),
+/// The three pulls and the one use the LoRA carries, as the USAGE tab and the inspector
+/// read them back out of the catalog.
+fn seed_catalog_usage(catalog: &Catalog, lora: ArtifactId) {
+    let repo = catalog
+        .repository(&RepoId::parse_ref(RepoType::Models, "kohya/film-grain-35mm").expect("ref"))
+        .expect("the repository reads")
+        .expect("the seed wrote it")
+        .id;
+    for client in 0..3 {
+        catalog
+            .log_usage(&UsageEvent {
+                client: Some(format!("client-{client}")),
+                repo: Some(repo),
                 artifact: Some(lora),
                 bytes: LORA_SIZE,
                 rate_bps: Some(1_200_000_000),
                 ..UsageEvent::new("film-grain-35mm.safetensors", at())
-            },
-        )
-        .expect("usage");
+            })
+            .expect("usage logs");
     }
-    bump_artifact_use(conn, lora, at()).expect("use");
-
-    (lora, ckpt, llm, vae, dataset, unknown)
+    catalog.bump_artifact_use(lora, at()).expect("use bumps");
 }
 
-fn repo(conn: &Conn, node: i64, repo_type: RepoType, reference: &str) -> RepoRowId {
-    upsert_repo(
-        conn,
-        &NewRepo::new(
-            RepoId::parse_ref(repo_type, reference).expect("reference"),
-            node,
-            SourceKind::HfCache,
-        ),
-    )
-    .expect("repo")
-}
-
-fn revision(conn: &Conn, repo: RepoRowId, byte: u8, refs: &[(&str, RefKind)]) -> RevisionId {
-    let id = upsert_revision(
-        conn,
-        &NewRevision {
-            committed: Some(at()),
-            title: Some("Initial commit".to_owned()),
-            ..NewRevision::new(repo, hoard_core::CommitSha::from_bytes([byte; 20]))
-        },
-    )
-    .expect("revision");
-    for (name, kind) in refs {
-        upsert_ref(conn, repo, name, *kind, id).expect("ref");
+fn facts(size: u64, format: ArtifactFormat, role: Role, role_confidence: f32) -> Artifact {
+    Artifact {
+        id: ArtifactId::new(0),
+        blob: BlobId::new(0),
+        sha256: None,
+        size,
+        format,
+        role,
+        sub_role: None,
+        role_confidence,
+        base: Base::any(),
+        base_label: None,
+        base_confidence: 0.5,
+        precision: None,
+        quant: None,
+        rank: None,
+        alpha: None,
+        params: None,
+        context: None,
+        trigger: None,
+        sniff_version: 1,
     }
-    id
 }
 
-#[allow(clippy::too_many_arguments)]
-fn entry(
-    conn: &Conn,
-    revision: RevisionId,
-    path: &str,
-    node: i64,
-    source: hoard_core::SourceId,
-    blob: Option<hoard_core::BlobId>,
-    artifact: Option<ArtifactId>,
-    size: u64,
+fn seed_artifact(identity: u128, name: &str, artifact: Artifact) -> SeedArtifact {
+    SeedArtifact {
+        identity,
+        artifact,
+        name: name.to_owned(),
+        org: None,
+        tensors: None,
+        evidence: Vec::new(),
+        card: None,
+        group_bytes: None,
+        shard_count: None,
+    }
+}
+
+fn seed_entry(
+    rel_path: &str,
     abs_path: &str,
-    state: ArtifactState,
-) {
-    upsert_entry(
-        conn,
-        &NewEntry {
-            blob,
-            artifact,
-            source: Some(source),
-            abs_path: Some(abs_path.to_owned()),
-            size,
-            state,
-            ..NewEntry::new(revision, path, node)
-        },
-        at(),
+    size: u64,
+    artifact: Option<SeedArtifact>,
+) -> SeedEntry {
+    SeedEntry {
+        node: LOCAL_NODE,
+        rel_path: rel_path.to_owned(),
+        abs_path: Some(abs_path.to_owned()),
+        size,
+        state: ArtifactState::Local,
+        is_symlink: false,
+        sha256: None,
+        git_sha1: None,
+        artifact,
+    }
+}
+
+fn seed_repo(
+    reference: &str,
+    repo_type: RepoType,
+    byte: u8,
+    entries: Vec<SeedEntry>,
+) -> SeedRepository {
+    seed_repo_with_refs(
+        reference,
+        repo_type,
+        byte,
+        vec![("main".to_owned(), RefKind::Branch)],
+        entries,
     )
-    .expect("entry");
+}
+
+fn seed_repo_with_refs(
+    reference: &str,
+    repo_type: RepoType,
+    byte: u8,
+    refs: Vec<(String, RefKind)>,
+    entries: Vec<SeedEntry>,
+) -> SeedRepository {
+    SeedRepository {
+        repo: RepoId::parse_ref(repo_type, reference).expect("reference"),
+        source: "cache".to_owned(),
+        kind: SourceKind::HfCache,
+        root_path: std::path::PathBuf::from("/data/hub"),
+        git_dir: None,
+        revisions: vec![SeedRevision {
+            name: "main".to_owned(),
+            sha: Some(hoard_core::CommitSha::from_bytes([byte; 20])),
+            refs,
+            title: None,
+            author: None,
+            committed: None,
+            entries,
+        }],
+    }
+}
+
+fn mystery_tensors() -> TensorSummary {
+    TensorSummary {
+        tensor_count: 2,
+        params: 1_024,
+        dtypes: [("F16".to_owned(), 2u32)].into_iter().collect(),
+        key_prefixes: vec![("lora_unet".to_owned(), 2)],
+        samples: vec![TensorSample {
+            name: "lora_unet_down.weight".to_owned(),
+            dtype: "F16".to_owned(),
+            shape: vec![32, 768],
+        }],
+        metadata: Default::default(),
+    }
+}
+
+fn mystery_evidence() -> Vec<Evidence> {
+    vec![
+        Evidence::new("role", "lora", EvidenceSource::Tensor, 0.6)
+            .with_detail("lora_unet prefix on 2 tensors"),
+        Evidence::new("base", "sdxl 1.0", EvidenceSource::Tensor, 0.5),
+    ]
+}
+
+fn at() -> Timestamp {
+    "2026-09-04T09:10:00Z".parse().expect("timestamp parses")
 }
 
 fn router(state: &AppState) -> Router {
@@ -561,9 +539,9 @@ async fn search_answers_the_documented_shape() {
     );
     assert_eq!(body["query"]["warnings"], json!([]));
     assert_eq!(body["total"], 1);
-    assert_eq!(body["nodes"], 2);
+    assert_eq!(body["nodes"], 1);
     assert_eq!(body["next_cursor"], Value::Null);
-    assert_eq!(body["summary"], "1 ARTIFACTS \u{b7} 2 NODES");
+    assert_eq!(body["summary"], "1 ARTIFACTS \u{b7} 1 NODES");
 
     let row = &body["rows"][0];
     assert_eq!(row["artifact_id"], world.lora.to_string());
@@ -583,16 +561,16 @@ async fn search_answers_the_documented_shape() {
     assert_eq!(row["quant"], Value::Null);
     assert_eq!(row["revision"], "main");
     assert_eq!(row["node"], "workstation");
-    assert_eq!(row["state"], "served");
+    assert_eq!(row["state"], "local");
     assert_eq!(row["pull_progress"], Value::Null);
     assert_eq!(row["trigger"], "film grain, 35mm, halation");
     assert_eq!(row["path"], "/mnt/vault/loras/film-grain-35mm.safetensors");
-    assert_eq!(row["path_count"], 3);
+    assert_eq!(row["path_count"], 2);
     assert_eq!(row["size_human"], "239.1 MB");
 
     let pressure = &body["facets"]["disk_pressure"];
     assert_eq!(pressure["duplicate_blobs"], 1);
-    assert_eq!(pressure["reclaimable_bytes"], LORA_SIZE * 2);
+    assert_eq!(pressure["reclaimable_bytes"], LORA_SIZE);
     for dimension in ["role", "base", "format", "precision", "node"] {
         assert!(
             body["facets"][dimension].is_array(),
@@ -795,8 +773,8 @@ async fn an_artifact_lists_its_evidence_entries_duplicates_and_usage() {
             "path": "/mnt/vault/loras/film-grain-35mm.safetensors",
             "node": "workstation",
             "label": "workstation",
-            "state": "served",
-            "state_label": "SERVED \u{b7} workstation",
+            "state": "local",
+            "state_label": "LOCAL",
             "symlink": false
         })
     );
@@ -956,7 +934,7 @@ async fn a_blob_lists_every_path_and_node_holding_it() {
     let body = get(&world.state, &format!("/api/v1/blobs/{sha}")).await;
     assert_eq!(body["sha256"], sha);
     assert_eq!(body["size"], LORA_SIZE);
-    assert_eq!(body["path_count"], 3);
+    assert_eq!(body["path_count"], 2);
     let nodes: Vec<&str> = body["entries"]
         .as_array()
         .expect("entries")
@@ -1038,7 +1016,7 @@ async fn a_repository_detail_carries_the_header_refs_and_pull_box() {
     assert_eq!(body["repo"], "models/stability/sdxl-base-1.0");
     assert_eq!(body["type"], "models");
     assert_eq!(body["role_full"], "CHECKPOINT");
-    assert_eq!(body["state_full"], "SERVED \u{b7} hoard.lan:7099");
+    assert_eq!(body["state_full"], "LOCAL");
     assert!(
         body["revision_summary"]
             .as_str()
@@ -1605,10 +1583,17 @@ async fn settle(state: &AppState, job: &str) -> Value {
 async fn sources_scans_and_jobs_are_listed() {
     let world = seeded();
     let sources = get(&world.state, "/api/v1/sources").await;
-    assert_eq!(sources.as_array().expect("sources").len(), 1);
+    assert_eq!(
+        sources.as_array().expect("sources").len(),
+        1,
+        "a peer's namespace is not a root of files on this node"
+    );
     assert_eq!(sources[0]["kind"], "hf-cache");
     assert_eq!(sources[0]["path"], "/data/hub");
-    assert_eq!(sources[0]["pending_hashes"], 4);
+    assert_eq!(
+        sources[0]["pending_hashes"], 9,
+        "every seeded path is still waiting for a content hash"
+    );
 
     let started = post(
         &world.state,
@@ -1657,9 +1642,8 @@ async fn a_running_job_is_cancelled_once_and_then_conflicts() {
     let world = seeded();
     let running = world
         .state
-        .store()
-        .call_mut(|conn| hoard_index::store::job::create_job(conn, "pull", Some("film-grain")))
-        .await
+        .catalog()
+        .create_job("pull", Some("film-grain"))
         .expect("a job starts");
 
     let listed = get(&world.state, "/api/v1/jobs?state=running").await;
@@ -1770,7 +1754,7 @@ async fn health_stats_and_settings_answer_the_shell() {
 
     let stats = get(&world.state, "/api/v1/stats").await;
     assert_eq!(stats["artifacts"], 6);
-    assert_eq!(stats["repos"], 7);
+    assert_eq!(stats["repos"], 6);
     assert_eq!(stats["triage"], 1);
     assert_eq!(stats["roles"].as_array().expect("roles").len(), 6);
     assert_eq!(stats["cache"]["bytes"], 0);
@@ -2042,16 +2026,42 @@ async fn every_mutating_route_refuses_a_request_without_the_node_token() {
 #[tokio::test]
 async fn usage_rows_stay_readable_after_a_pull_is_logged() {
     let world = seeded();
-    let counted = world
-        .state
-        .store()
-        .call(|conn| {
-            let repos =
-                hoard_index::store::repo::repos_by_qualified(conn, "models/kohya/film-grain-35mm")?;
-            let repo = repos.first().expect("the repo exists").id;
-            usage::distinct_clients(conn, repo)
-        })
-        .await
-        .expect("clients count");
+    let catalog = std::sync::Arc::clone(world.state.catalog());
+    let counted = tokio::task::spawn_blocking(move || {
+        let repo = catalog
+            .repository(&RepoId::parse_ref(
+                RepoType::Models,
+                "kohya/film-grain-35mm",
+            )?)?
+            .expect("the repo exists")
+            .id;
+        catalog.distinct_clients(repo)
+    })
+    .await
+    .expect("join")
+    .expect("clients count");
     assert_eq!(counted, 3);
+}
+
+#[tokio::test]
+async fn a_scan_job_keeps_the_native_catalog_current() {
+    let world = seeded();
+    let started = post(&world.state, "/api/v1/scan", json!({})).await;
+    let job = started["job_id"].as_str().expect("job id").to_owned();
+    settle(&world.state, &job).await;
+    for attempt in 0..20 {
+        let catalog = std::sync::Arc::clone(world.state.catalog());
+        let status = tokio::task::spawn_blocking(move || catalog.status())
+            .await
+            .expect("join")
+            .expect("status");
+        if status.generation >= 2 && status.search_ready {
+            return;
+        }
+        assert!(
+            attempt < 19,
+            "the job never rescanned the catalog: {status:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }

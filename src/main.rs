@@ -15,6 +15,7 @@ async fn main() -> Result<()> {
     let config_path = parsed.config.as_deref();
 
     match parsed.command {
+        Command::Catalog { command } => cli::catalog::run(config_path, command).await,
         Command::Serve { bind } => cli::serve::run(cli::node::open(config_path).await?, bind).await,
         Command::Scan { source, hash } => {
             cli::scan::run(cli::node::open(config_path).await?, source, hash.into()).await

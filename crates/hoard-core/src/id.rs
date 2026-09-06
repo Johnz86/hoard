@@ -320,7 +320,11 @@ macro_rules! row_id {
                     }
                 }
 
-                deserializer.deserialize_any(Visitor)
+                if deserializer.is_human_readable() {
+                    deserializer.deserialize_any(Visitor)
+                } else {
+                    deserializer.deserialize_str(Visitor)
+                }
             }
         }
     };

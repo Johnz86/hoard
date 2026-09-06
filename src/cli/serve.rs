@@ -9,7 +9,10 @@ use hoard_server::AppState;
 use super::node::Context;
 
 pub async fn run(context: Context, bind: Option<String>) -> Result<()> {
-    let Context { mut config, store } = context;
+    let Context {
+        mut config,
+        catalog,
+    } = context;
     if let Some(bind) = bind {
         config.server.bind = bind
             .parse::<SocketAddr>()
@@ -20,7 +23,7 @@ pub async fn run(context: Context, bind: Option<String>) -> Result<()> {
     let node = config.node.name.clone();
     let offline = config.mirror.offline;
 
-    let state = AppState::new(config, store)
+    let state = AppState::new(config, catalog)
         .map_err(|error| anyhow::anyhow!("building the server state: {}", error.code()))?;
     let listener = TcpListener::bind(address)
         .await

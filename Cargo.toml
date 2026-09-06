@@ -52,15 +52,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 indicatif = "0.18"
 
 # storage and discovery
-rusqlite = { version = "0.40", features = ["bundled", "trace"] }
-r2d2 = "0.8"
-r2d2_sqlite = "0.35"
-rusqlite_migration = "2.6"
 ignore = "0.4"
 notify = "8.2"
 mdns-sd = "0.16"
 globset = "0.4"
 gix = { version = "0.87", default-features = false, features = ["sha1", "revision", "parallel"] }
+native_db = { version = "0.8.2", default-features = false }
+native_model = "=0.4.20"
+redb = "2.6"
+tantivy = { version = "0.26.1", default-features = false, features = ["mmap", "lz4-compression"] }
 
 # artifact formats and hashing
 sha1 = "0.11"
@@ -135,6 +135,9 @@ serde_json.workspace = true
 toml.workspace = true
 jiff.workspace = true
 humansize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

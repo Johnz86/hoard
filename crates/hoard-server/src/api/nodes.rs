@@ -4,14 +4,15 @@ use axum::http::HeaderMap;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
+use std::sync::Arc;
+
 use hoard_core::NodeId;
-use hoard_index::store::blob;
-use hoard_index::store::node::{self, NewNode};
+use hoard_index::catalog::NodeRecord;
 use hoard_net::digest::{self, DEFAULT_LIMIT, DigestCursor, MAX_LIMIT};
 use hoard_net::identity::NodeIdentity;
 use hoard_net::{DigestPage, NetError};
 
-use crate::api::common::authorize;
+use crate::api::common::{authorize, blocking};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -28,8 +29,8 @@ pub struct NodeView {
     pub is_self: bool,
 }
 
-impl From<node::NodeRow> for NodeView {
-    fn from(row: node::NodeRow) -> Self {
+impl From<NodeRecord> for NodeView {
+    fn from(row: NodeRecord) -> Self {
         Self {
             id: row.node_id,
             name: row.name,
@@ -56,23 +57,23 @@ pub struct PeerBody {
 }
 
 pub async fn list(State(state): State<AppState>) -> ApiResult<Json<Vec<NodeView>>> {
-    let rows = state
-        .store()
-        .call(|conn| {
-            let (_, held) = blob::local_totals(conn)?;
-            Ok(node::list_nodes(conn)?
-                .into_iter()
-                .map(|row| {
-                    let is_self = row.is_self;
-                    let mut view = NodeView::from(row);
-                    if is_self {
-                        view.indexed_bytes = held;
-                    }
-                    view
-                })
-                .collect())
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let rows = blocking(move || {
+        let held = catalog.totals()?.indexed_bytes;
+        Ok(catalog
+            .list_nodes()?
+            .into_iter()
+            .map(|row| {
+                let is_self = row.is_self;
+                let mut view = NodeView::from(row);
+                if is_self {
+                    view.indexed_bytes = held;
+                }
+                view
+            })
+            .collect())
+    })
+    .await?;
     Ok(Json(rows))
 }
 
@@ -83,7 +84,7 @@ pub async fn digest(
 ) -> ApiResult<Json<DigestPage>> {
     let since = DigestCursor::from_param(params.since.as_deref()).map_err(net_error)?;
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let page = digest::collect(state.store(), since, limit)
+    let page = digest::collect(state.catalog(), since, limit)
         .await
         .map_err(net_error)?;
     Ok(Json(page))
@@ -107,13 +108,15 @@ pub async fn add_peer(
         .to_owned();
     let node_id = peer.id().clone();
     let url = peer.url().to_string();
-    let view = state
-        .store()
-        .call_mut(move |conn| {
-            let row = node::upsert_node(conn, &NewNode::peer(node_id, name, url))?;
-            Ok(NodeView::from(node::node(conn, row)?))
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        Ok(NodeView::from(catalog.upsert_peer(
+            &node_id,
+            &name,
+            Some(&url),
+        )?))
+    })
+    .await?;
     Ok(Json(view))
 }
 

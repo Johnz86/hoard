@@ -1,19 +1,16 @@
 //! The usage log: what every served response records, and the aggregates the USAGE tab,
 //! the `used:` key and the `pulls on lan` fact read back.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use hoard_core::{ArtifactId, RepoRowId};
-use hoard_index::store::Store;
-use hoard_index::store::usage::{
-    PullRow, UsageDay, UsageEvent, bump_artifact_use, distinct_clients, log_usage, recent_pulls,
-    usage_days,
-};
+use hoard_index::catalog::{Catalog, PullRow, UsageDay, UsageEvent};
 use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::error::Result;
-use crate::local::index_repo::{read_index, write_index};
+use crate::local::index_repo::on_catalog;
 
 /// The width of the USAGE tab's bar chart.
 pub const USAGE_WINDOW_DAYS: u32 = 7;
@@ -105,13 +102,13 @@ impl ServedRequest {
     }
 }
 
-/// Appends one served response to the log and marks its artifact as used.
-pub async fn log_served(store: &Store, request: &ServedRequest) -> Result<()> {
+/// Appends one served response to the catalog's log and marks its artifact as used.
+pub async fn log_served(catalog: &Arc<Catalog>, request: &ServedRequest) -> Result<()> {
     let event = request.event();
-    write_index(store, move |conn| {
-        log_usage(conn, &event)?;
+    on_catalog(catalog, move |catalog| {
+        catalog.log_usage(&event)?;
         if let Some(artifact) = event.artifact {
-            bump_artifact_use(conn, artifact, event.at)?;
+            catalog.bump_artifact_use(artifact, event.at)?;
         }
         Ok(())
     })
@@ -135,25 +132,25 @@ impl UsageSummary {
 
 /// The seven day bars, the recent pulls and the client count of one repository.
 pub async fn usage_summary(
-    store: &Store,
+    catalog: &Arc<Catalog>,
     repo: RepoRowId,
     days: u32,
     limit: u32,
 ) -> Result<UsageSummary> {
-    read_index(store, move |conn| {
+    on_catalog(catalog, move |catalog| {
         Ok(UsageSummary {
-            days: usage_days(conn, repo, days.max(1))?,
-            pulls: recent_pulls(conn, repo, limit)?,
-            clients: distinct_clients(conn, repo)?,
+            days: catalog.usage_days(repo, days.max(1))?,
+            pulls: catalog.recent_pulls(repo, limit)?,
+            clients: catalog.distinct_clients(repo)?,
         })
     })
     .await
 }
 
 /// How many times the LAN pulled from a repository over the default window.
-pub async fn pulls_on_lan(store: &Store, repo: RepoRowId) -> Result<u64> {
+pub async fn pulls_on_lan(catalog: &Arc<Catalog>, repo: RepoRowId) -> Result<u64> {
     Ok(
-        usage_summary(store, repo, USAGE_WINDOW_DAYS, RECENT_PULL_LIMIT)
+        usage_summary(catalog, repo, USAGE_WINDOW_DAYS, RECENT_PULL_LIMIT)
             .await?
             .pulls_on_lan(),
     )
@@ -161,38 +158,43 @@ pub async fn pulls_on_lan(store: &Store, repo: RepoRowId) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use hoard_core::{NodeId, RepoId, RepoType};
-    use hoard_index::store::node::{NewNode, upsert_node};
-    use hoard_index::store::repo::{NewRepo, upsert_repo};
+    use std::path::Path;
+
+    use hoard_index::catalog::RepositoryFilter;
+    use hoard_index::config::{IndexConfig, SourceConfig, SourceKind};
 
     use super::*;
-    use hoard_index::config::SourceKind;
 
-    fn store() -> Store {
-        Store::open_in_memory().expect("store opens")
+    /// A catalog over one loose file, which is the smallest world that has a repository
+    /// row for the usage log to point at.
+    fn catalog(directory: &Path) -> Arc<Catalog> {
+        let input = directory.join("models");
+        std::fs::create_dir_all(&input).expect("source directory");
+        std::fs::write(input.join("model.gguf"), b"not really a model").expect("a file to find");
+        let config = IndexConfig {
+            data_dir: directory.join("index"),
+            sources: vec![SourceConfig {
+                name: "loose".to_owned(),
+                path: input,
+                kind: SourceKind::Loose,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                follow_symlinks: false,
+                repo_per_folder: false,
+            }],
+            ..IndexConfig::default()
+        };
+        Arc::new(Catalog::open_or_scan(&config, "hoard", |_, _| {}).expect("catalog opens"))
     }
 
-    fn repo_row(store: &Store) -> RepoRowId {
-        let conn = store.write().expect("writer");
-        let node = upsert_node(
-            &conn,
-            &NewNode {
-                node_id: NodeId::new("node-a").expect("node id"),
-                name: "hoard".to_owned(),
-                url: None,
-                is_self: true,
-            },
-        )
-        .expect("node inserts");
-        upsert_repo(
-            &conn,
-            &NewRepo::new(
-                RepoId::new(RepoType::Models, Some("openai".to_owned()), "whisper"),
-                node,
-                SourceKind::HfCache,
-            ),
-        )
-        .expect("repo inserts")
+    fn only_repo(catalog: &Catalog) -> RepoRowId {
+        catalog
+            .repositories(&RepositoryFilter::default(), None, 10)
+            .expect("repositories list")
+            .rows
+            .first()
+            .expect("the scan found one repository")
+            .id
     }
 
     #[test]
@@ -215,11 +217,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_served_response_lands_in_the_log_and_the_summary() {
-        let store = store();
-        let repo = repo_row(&store);
+        let directory = tempfile::tempdir().expect("temp dir");
+        let catalog = catalog(directory.path());
+        let repo = only_repo(&catalog);
 
         log_served(
-            &store,
+            &catalog,
             &ServedRequest::new("openai/whisper/resolve/main/model.bin", 200)
                 .from_client(Some("10.0.0.7".to_owned()))
                 .for_repo(Some(repo))
@@ -228,7 +231,7 @@ mod tests {
         .await
         .expect("logs");
 
-        let summary = usage_summary(&store, repo, USAGE_WINDOW_DAYS, RECENT_PULL_LIMIT)
+        let summary = usage_summary(&catalog, repo, USAGE_WINDOW_DAYS, RECENT_PULL_LIMIT)
             .await
             .expect("summary reads");
         assert_eq!(summary.days.len(), USAGE_WINDOW_DAYS as usize);
@@ -238,17 +241,32 @@ mod tests {
         assert_eq!(pull.who.as_deref(), Some("10.0.0.7"));
         assert_eq!(pull.bytes, 2_000_000);
         assert_eq!(pull.rate_bps, Some(2_000_000));
-        assert_eq!(pulls_on_lan(&store, repo).await.expect("count"), 1);
+        assert_eq!(pulls_on_lan(&catalog, repo).await.expect("count"), 1);
     }
 
     #[tokio::test]
-    async fn a_repository_nobody_pulled_reports_empty_bars() {
-        let store = store();
-        let repo = repo_row(&store);
-        let summary = usage_summary(&store, repo, USAGE_WINDOW_DAYS, RECENT_PULL_LIMIT)
+    async fn a_response_nobody_can_be_attributed_to_still_lands_in_the_log() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let catalog = catalog(directory.path());
+        let repo = only_repo(&catalog);
+
+        log_served(
+            &catalog,
+            &ServedRequest::new("unknown/repo/resolve/main/model.bin", 200)
+                .from_client(Some("10.0.0.9".to_owned()))
+                .served(1_000, Duration::from_secs(1)),
+        )
+        .await
+        .expect("logs");
+
+        let summary = usage_summary(&catalog, repo, USAGE_WINDOW_DAYS, RECENT_PULL_LIMIT)
             .await
             .expect("summary reads");
-        assert_eq!(summary.pulls_on_lan(), 0);
+        assert_eq!(
+            summary.pulls_on_lan(),
+            0,
+            "a response with no repository belongs to no repository's bars"
+        );
         assert!(summary.pulls.is_empty());
         assert_eq!(summary.clients, 0);
     }

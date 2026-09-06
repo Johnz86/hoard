@@ -1,18 +1,19 @@
 //! The compact index digest nodes exchange.
 //!
 //! A digest is one row per artifact a node holds, small enough that a peer can read a whole
-//! index in a few pages. This module owns the wire shape and the cursor spelling; the SQL
-//! behind both lives in `hoard_index::store::digest`, reached only through the store's
-//! blocking calls.
+//! index in a few pages. This module owns the wire shape and the cursor spelling; the records
+//! behind both live in the catalog, reached only through a blocking task.
 
-use hoard_index::store::Store;
-use hoard_index::store::digest as store_digest;
+use std::sync::Arc;
+
+use hoard_index::catalog::{Catalog, DigestEntry};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use hoard_core::{Base, CommitSha, RepoId, Role, Sha256, State};
 
 use crate::error::{NetError, Result};
+use crate::peer::on_catalog;
 
 /// Rows a digest request returns when it names no limit.
 pub const DEFAULT_LIMIT: u32 = 100;
@@ -28,7 +29,7 @@ pub const MAX_BASE: usize = 64;
 
 const CURSOR_PREFIX: &str = "d1";
 
-pub use hoard_index::store::digest::{DigestApplied, RemoteEntry};
+pub use hoard_index::catalog::{DigestApplied, RemoteEntry};
 
 /// One artifact as a peer learns of it, exactly the shape `GET /api/v1/peers/digest` names.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -93,12 +94,14 @@ impl DigestCursor {
 /// `next_cursor` is where the next page starts, and it is present whenever a page carried
 /// rows: a reader pages until it is handed an empty one, and keeps the last cursor so the
 /// following poll receives only what has been added since.
-pub async fn collect(store: &Store, since: Option<DigestCursor>, limit: u32) -> Result<DigestPage> {
+pub async fn collect(
+    catalog: &Arc<Catalog>,
+    since: Option<DigestCursor>,
+    limit: u32,
+) -> Result<DigestPage> {
     let bound = since.map(DigestCursor::get);
     let limit = limit.clamp(1, MAX_LIMIT);
-    let page = store
-        .call(move |conn| store_digest::collect(conn, bound, limit))
-        .await?;
+    let page = on_catalog(catalog, move |catalog| catalog.digest(bound, limit)).await?;
     Ok(DigestPage {
         rows: page.rows.into_iter().map(row_of).collect(),
         next_cursor: page.next.map(|bound| DigestCursor::new(bound).encode()),
@@ -111,35 +114,44 @@ pub async fn collect(store: &Store, since: Option<DigestCursor>, limit: u32) -> 
 /// Every row is validated first, so a page carrying one unreadable row is refused whole and
 /// leaves the index exactly as it was.
 pub async fn apply(
-    store: &Store,
+    catalog: &Arc<Catalog>,
     peer: &str,
     peer_row: i64,
     page: &DigestPage,
+    pass: u64,
 ) -> Result<DigestApplied> {
     let rows = page
         .rows
         .iter()
         .map(|row| validate(peer, row))
         .collect::<Result<Vec<_>>>()?;
-    let applied = store
-        .call_mut(move |conn| store_digest::apply(conn, peer_row, &rows))
-        .await?;
-    Ok(applied)
+    on_catalog(catalog, move |catalog| {
+        catalog.apply_digest(peer_row, &rows, pass)
+    })
+    .await
 }
 
-/// Drops the peer's rows a full digest pass starting at `pass_started` did not touch.
-pub async fn retract(store: &Store, peer_row: i64, pass_started: Timestamp) -> Result<u64> {
-    let dropped = store
-        .call_mut(move |conn| store_digest::retract(conn, peer_row, pass_started))
-        .await?;
-    Ok(dropped)
+/// Drops the peer's rows the pass numbered `pass` did not re-confirm.
+pub async fn retract(catalog: &Arc<Catalog>, peer_row: i64, pass: u64) -> Result<u64> {
+    on_catalog(catalog, move |catalog| {
+        catalog.retract_digest(peer_row, pass)
+    })
+    .await
+}
+
+/// The pass number a full re-read of a peer's digest stamps every row it confirms with.
+pub async fn begin_pass(catalog: &Arc<Catalog>, peer_row: i64) -> Result<u64> {
+    on_catalog(catalog, move |catalog| catalog.begin_pass(peer_row)).await
+}
+
+/// How many entries this node files for a peer.
+pub async fn filed_for(catalog: &Arc<Catalog>, peer_row: i64) -> Result<u64> {
+    on_catalog(catalog, move |catalog| catalog.filed_for(peer_row)).await
 }
 
 /// The cursor this node last consumed from a peer, restarting the digest if it is corrupt.
-pub async fn read_cursor(store: &Store, peer_row: i64) -> Result<Option<DigestCursor>> {
-    let raw = store
-        .call(move |conn| store_digest::read_cursor(conn, peer_row))
-        .await?;
+pub async fn read_cursor(catalog: &Arc<Catalog>, peer_row: i64) -> Result<Option<DigestCursor>> {
+    let raw = on_catalog(catalog, move |catalog| catalog.peer_cursor(peer_row)).await?;
     Ok(raw
         .as_deref()
         .map(DigestCursor::parse)
@@ -149,19 +161,19 @@ pub async fn read_cursor(store: &Store, peer_row: i64) -> Result<Option<DigestCu
 
 /// Records how far this node has read a peer's digest.
 pub async fn write_cursor(
-    store: &Store,
+    catalog: &Arc<Catalog>,
     peer_row: i64,
     cursor: Option<DigestCursor>,
 ) -> Result<()> {
     let encoded = cursor.map(DigestCursor::encode);
     let at = Timestamp::now();
-    store
-        .call_mut(move |conn| store_digest::write_cursor(conn, peer_row, encoded.as_deref(), at))
-        .await?;
-    Ok(())
+    on_catalog(catalog, move |catalog| {
+        catalog.write_peer_cursor(peer_row, encoded.as_deref(), at)
+    })
+    .await
 }
 
-fn row_of(entry: store_digest::DigestEntry) -> DigestRow {
+fn row_of(entry: DigestEntry) -> DigestRow {
     DigestRow {
         sha256: entry.sha256,
         size: entry.size,
@@ -226,16 +238,14 @@ fn synthetic_sha(sha256: &Sha256) -> CommitSha {
 
 #[cfg(test)]
 mod tests {
-    use hoard_core::{ArtifactFormat, NodeId, RepoType};
-    use hoard_index::config::SourceKind;
-    use hoard_index::scan::SNIFF_VERSION;
-    use hoard_index::store::artifact::{NewArtifact, upsert_artifact};
-    use hoard_index::store::blob::{set_sha256, upsert_blob};
-    use hoard_index::store::entry::{NewEntry, upsert_entry};
-    use hoard_index::store::node::{NewNode, upsert_node};
-    use hoard_index::store::repo::{NewRepo, upsert_repo};
-    use hoard_index::store::revision::{NewRevision, upsert_revision};
-    use hoard_index::store::search_exec;
+    use std::fs;
+    use std::path::Path;
+
+    use hoard_core::{NodeId, RepoType};
+    use hoard_index::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
+    use hoard_index::row::SearchRow;
+    use hoard_index::search::{SortKey, SortSpec};
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -260,48 +270,74 @@ mod tests {
         }
     }
 
-    async fn seeded(count: u8) -> (Store, i64) {
-        let store = Store::open_in_memory().expect("store opens");
-        let peer = store
-            .call_mut(move |conn| {
-                let local = upsert_node(
-                    conn,
-                    &NewNode::local(NodeId::new("workstation-1").expect("id"), "workstation"),
-                )?;
-                let peer = upsert_node(
-                    conn,
-                    &NewNode::peer(
-                        NodeId::new("laptop-1").expect("id"),
-                        "laptop",
-                        "http://laptop:7099",
-                    ),
-                )?;
-                let now = Timestamp::now();
-                let repo = RepoId::new(RepoType::Models, Some("kohya".to_owned()), "local");
-                let repo_row = upsert_repo(conn, &NewRepo::new(repo, local, SourceKind::Loose))?;
-                let revision = upsert_revision(conn, &NewRevision::new(repo_row, commit(9)))?;
-                for seed in 1..=count {
-                    let name = format!("weight-{seed}.safetensors");
-                    let blob = upsert_blob(conn, &format!("fp-{seed}"), u64::from(seed), now)?;
-                    set_sha256(conn, blob, sha256(seed), None, now)?;
-                    let mut artifact = NewArtifact::new(blob, name.clone());
-                    artifact.sniff_version = SNIFF_VERSION;
-                    artifact.format = ArtifactFormat::Safetensors;
-                    artifact.role = Role::Lora;
-                    artifact.base = Base::new("sdxl");
-                    let artifact = upsert_artifact(conn, &artifact, now)?;
-                    let mut entry = NewEntry::new(revision, name, local);
-                    entry.blob = Some(blob);
-                    entry.artifact = Some(artifact);
-                    entry.size = u64::from(seed);
-                    entry.state = State::Served;
-                    upsert_entry(conn, &entry, now)?;
-                }
-                Ok(peer)
+    /// A synthetic safetensors header whose one pair of tensors is named after `tensor`, so
+    /// every seeded file hashes to something of its own.
+    fn safetensors(tensor: &str) -> Vec<u8> {
+        let header = format!(
+            "{{\"lora_unet_{tensor}.lora_down.weight\":\
+             {{\"dtype\":\"F16\",\"shape\":[16,768],\"data_offsets\":[0,24576]}},\
+             \"lora_unet_{tensor}.lora_up.weight\":\
+             {{\"dtype\":\"F16\",\"shape\":[768,16],\"data_offsets\":[24576,49152]}}}}"
+        );
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes
+    }
+
+    /// A catalog holding `count` hashed local artifacts, plus an empty peer node row.
+    fn seeded(root: &Path, count: u8) -> (Arc<Catalog>, i64) {
+        let input = root.join("files");
+        fs::create_dir_all(&input).expect("input directory");
+        for seed in 1..=count {
+            fs::write(
+                input.join(format!("weight-{seed}.safetensors")),
+                safetensors(&format!("t{seed}")),
+            )
+            .expect("fixture writes");
+        }
+        let config = IndexConfig {
+            data_dir: root.join("native-data"),
+            hash_policy: HashPolicy::Now,
+            sources: vec![SourceConfig {
+                name: "files".to_owned(),
+                path: input,
+                kind: SourceKind::Loose,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                follow_symlinks: false,
+                repo_per_folder: false,
+            }],
+            ..IndexConfig::default()
+        };
+        let catalog =
+            Catalog::open_or_scan(&config, "workstation", |_, _| {}).expect("catalog opens");
+        let peer = catalog
+            .upsert_peer(
+                &NodeId::new("laptop-1").expect("id"),
+                "laptop",
+                Some("http://laptop:7099"),
+            )
+            .expect("peer records")
+            .id;
+        (Arc::new(catalog), peer)
+    }
+
+    /// The rows one query answers, with the search index caught up to what was just filed.
+    fn rows_of(catalog: &Catalog, raw: &str) -> Vec<SearchRow> {
+        catalog.refresh_search(|_| {}).expect("index refreshes");
+        let context = catalog
+            .compile_context(raw, Timestamp::now(), Vec::new())
+            .expect("context compiles");
+        catalog
+            .query(hoard_index::catalog::QueryRequest {
+                raw,
+                sort: SortSpec::new(SortKey::default(), false),
+                limit: 50,
+                offset: 0,
+                context: &context,
             })
-            .await
-            .expect("index seeds");
-        (store, peer)
+            .expect("query answers")
+            .rows
     }
 
     #[test]
@@ -331,11 +367,12 @@ mod tests {
 
     #[tokio::test]
     async fn paging_a_digest_skips_no_row_and_repeats_none() {
-        let (store, _) = seeded(7).await;
+        let root = TempDir::new().expect("temp dir");
+        let (catalog, _) = seeded(root.path(), 7);
         let mut seen = Vec::new();
         let mut cursor = None;
         loop {
-            let page = collect(&store, cursor, 3).await.expect("page reads");
+            let page = collect(&catalog, cursor, 3).await.expect("page reads");
             assert_eq!(page.total, 7);
             if page.rows.is_empty() {
                 assert_eq!(page.next_cursor, None);
@@ -356,22 +393,21 @@ mod tests {
 
     #[tokio::test]
     async fn an_applied_digest_lands_as_remote_entries_owned_by_the_peer() {
-        let (store, peer) = seeded(1).await;
+        let root = TempDir::new().expect("temp dir");
+        let (catalog, peer) = seeded(root.path(), 1);
         let page = DigestPage {
             rows: vec![row(20, "loras/film-grain.safetensors")],
             next_cursor: None,
             total: 1,
         };
-        let applied = apply(&store, "laptop", peer, &page)
+        let pass = begin_pass(&catalog, peer).await.expect("pass starts");
+        let applied = apply(&catalog, "laptop", peer, &page, pass)
             .await
             .expect("digest applies");
         assert_eq!(applied.entries, 1);
         assert_eq!(applied.artifacts, 1);
 
-        let found = store
-            .call(|conn| search_exec::query_rows(conn, "node = ?", &["laptop".into()], "", 10, 0))
-            .await
-            .expect("rows read");
+        let found = rows_of(&catalog, "node:laptop");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].state, State::Remote);
         assert_eq!(found[0].path, "loras/film-grain.safetensors");
@@ -380,13 +416,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_malformed_digest_names_the_peer_and_leaves_the_index_untouched() {
-        let (store, peer) = seeded(1).await;
+        let root = TempDir::new().expect("temp dir");
+        let (catalog, peer) = seeded(root.path(), 1);
         let page = DigestPage {
             rows: vec![row(20, "loras/ok.safetensors"), row(21, "   ")],
             next_cursor: None,
             total: 2,
         };
-        let error = apply(&store, "laptop", peer, &page)
+        let pass = begin_pass(&catalog, peer).await.expect("pass starts");
+        let error = apply(&catalog, "laptop", peer, &page, pass)
             .await
             .expect_err("a pathless row is refused");
         assert!(matches!(error, NetError::BadDigest { ref peer, .. } if peer == "laptop"));
@@ -405,11 +443,7 @@ mod tests {
             Err(NetError::BadDigest { .. })
         ));
 
-        let counted = store
-            .call(|conn| search_exec::count_rows(conn, "node = ?", &["laptop".into()]))
-            .await
-            .expect("count reads");
-        assert_eq!(counted, 0);
+        assert_eq!(filed_for(&catalog, peer).await.expect("count reads"), 0);
     }
 
     #[tokio::test]
@@ -431,7 +465,8 @@ mod tests {
             );
         }
 
-        let (store, peer) = seeded(1).await;
+        let root = TempDir::new().expect("temp dir");
+        let (catalog, peer) = seeded(root.path(), 1);
         let mut escaping = row(25, "a.safetensors");
         escaping.repo = "models/../..".to_owned();
         let page = DigestPage {
@@ -439,12 +474,9 @@ mod tests {
             next_cursor: None,
             total: 1,
         };
-        assert!(apply(&store, "laptop", peer, &page).await.is_err());
-        let counted = store
-            .call(|conn| search_exec::count_rows(conn, "node = ?", &["laptop".into()]))
-            .await
-            .expect("count reads");
-        assert_eq!(counted, 0);
+        let pass = begin_pass(&catalog, peer).await.expect("pass starts");
+        assert!(apply(&catalog, "laptop", peer, &page, pass).await.is_err());
+        assert_eq!(filed_for(&catalog, peer).await.expect("count reads"), 0);
     }
 
     #[test]
@@ -486,32 +518,30 @@ mod tests {
         assert_eq!(entry.path, "vae/sdxl-vae.safetensors");
         assert_eq!(entry.name, "sdxl-vae.safetensors");
         assert_eq!(entry.repo.qualified(), "models/kohya/film-grain");
+        assert_eq!(RepoType::Models, entry.repo.repo_type());
     }
 
     #[tokio::test]
     async fn a_peer_cursor_is_remembered_and_a_corrupt_one_restarts_the_digest() {
-        let (store, peer) = seeded(1).await;
-        assert_eq!(read_cursor(&store, peer).await.expect("no cursor"), None);
+        let root = TempDir::new().expect("temp dir");
+        let (catalog, peer) = seeded(root.path(), 1);
+        assert_eq!(read_cursor(&catalog, peer).await.expect("no cursor"), None);
 
-        write_cursor(&store, peer, Some(DigestCursor::new(12)))
+        write_cursor(&catalog, peer, Some(DigestCursor::new(12)))
             .await
             .expect("cursor writes");
         assert_eq!(
-            read_cursor(&store, peer).await.expect("cursor reads"),
+            read_cursor(&catalog, peer).await.expect("cursor reads"),
             Some(DigestCursor::new(12))
         );
 
-        store
-            .call_mut(move |conn| {
-                conn.execute(
-                    "UPDATE peer_cursor SET cursor = 'rubbish' WHERE node_id = ?1",
-                    [peer],
-                )?;
-                Ok(())
-            })
-            .await
+        catalog
+            .write_peer_cursor(peer, Some("rubbish"), Timestamp::now())
             .expect("cursor corrupts");
-        assert_eq!(read_cursor(&store, peer).await.expect("cursor reads"), None);
+        assert_eq!(
+            read_cursor(&catalog, peer).await.expect("cursor reads"),
+            None
+        );
     }
 
     #[test]

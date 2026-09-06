@@ -10,22 +10,16 @@ use tower::ServiceExt;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use hoard_core::{
-    ArtifactFormat, ArtifactId, BlobId, CommitSha, NodeId, RepoId, RepoRowId, RepoType, RevisionId,
-    Role, Sha256, SourceId, State as ArtifactState,
+    Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, RepoId, RepoType, Role, Sha256,
+    State as ArtifactState,
+};
+use hoard_index::catalog::{
+    Catalog, LOCAL_NODE, SeedArtifact, SeedEntry, SeedRepository, SeedRevision, UsageDay,
 };
 use hoard_index::config::SourceKind;
-use hoard_index::store::Store;
-use hoard_index::store::artifact::{NewArtifact, upsert_artifact};
-use hoard_index::store::blob::{set_sha256, upsert_blob};
-use hoard_index::store::entry::{NewEntry, upsert_entry};
-use hoard_index::store::node::{NewNode, upsert_node};
-use hoard_index::store::repo::{NewRepo, upsert_repo};
-use hoard_index::store::revision::{NewRevision, RefKind, upsert_ref, upsert_revision};
-use hoard_index::store::source::upsert_source;
-use hoard_index::store::usage::{UsageDay, usage_days};
+use hoard_index::discover::RefKind;
 use hoard_mirror::access::AccessRule;
 
-use crate::api::common::Conn;
 use crate::config::HoardConfig;
 use crate::state::AppState;
 use crate::{git, hub};
@@ -63,11 +57,6 @@ fn seeded() -> World {
     std::fs::write(root.join(SMALL_PATH), World::small_bytes()).expect("small file");
     std::fs::write(root.join("unet/model.json"), World::small_bytes()).expect("nested file");
     std::fs::write(root.join(LFS_PATH), vec![7u8; LFS_SIZE]).expect("lfs file");
-    let store = Store::open_in_memory().expect("store opens");
-    {
-        let conn = store.write().expect("writer");
-        seed(&conn, root);
-    }
     let mut config = HoardConfig::default();
     config.server.data_dir = root.to_path_buf();
     config.index.data_dir = root.to_path_buf();
@@ -75,9 +64,146 @@ fn seeded() -> World {
     config.node.name = "workstation".to_owned();
     config.mirror.cache_root = Some(root.join("repos"));
     config.mirror.offline = true;
+    let catalog = crate::testing::empty_catalog(root, "test");
+    seed_catalog(&catalog, root);
     World {
-        state: AppState::new(config, store).expect("state builds"),
+        state: AppState::new(config, catalog).expect("state builds"),
         _dir: dir,
+    }
+}
+
+/// Every repository the Hub tests answer for, as native records.
+fn seed_catalog(catalog: &Catalog, root: &Path) {
+    catalog
+        .seed(&[
+            SeedRepository {
+                revisions: vec![SeedRevision {
+                    refs: vec![
+                        ("main".to_owned(), RefKind::Branch),
+                        ("v1.0".to_owned(), RefKind::Tag),
+                    ],
+                    ..seed_revision(
+                        REVISION,
+                        vec![
+                            SeedEntry {
+                                node: LOCAL_NODE,
+                                sha256: Some(Sha256::from_bytes(SMALL_SHA256)),
+                                git_sha1: Some(CommitSha::from_bytes(SMALL_GIT_SHA1)),
+                                artifact: Some(lora_artifact()),
+                                ..seed_entry(root, SMALL_PATH, SMALL_SIZE as u64)
+                            },
+                            SeedEntry {
+                                node: LOCAL_NODE,
+                                sha256: Some(Sha256::from_bytes([0x5c; 32])),
+                                git_sha1: Some(CommitSha::from_bytes([0x5d; 20])),
+                                ..seed_entry(root, NESTED_PATH, SMALL_SIZE as u64)
+                            },
+                            SeedEntry {
+                                node: LOCAL_NODE,
+                                sha256: Some(Sha256::from_bytes(LFS_SHA256)),
+                                ..seed_entry(root, LFS_PATH, LFS_SIZE as u64)
+                            },
+                        ],
+                    )
+                }],
+                ..seed_repo(root, RepoType::Models, LORA_REPO)
+            },
+            SeedRepository {
+                revisions: vec![seed_revision(
+                    [0x33; 20],
+                    vec![SeedEntry {
+                        node: LOCAL_NODE,
+                        sha256: Some(Sha256::from_bytes([0x11; 32])),
+                        git_sha1: Some(CommitSha::from_bytes([0x12; 20])),
+                        ..seed_entry(root, SMALL_PATH, SMALL_SIZE as u64)
+                    }],
+                )],
+                ..seed_repo(root, RepoType::Models, "gpt2")
+            },
+            SeedRepository {
+                revisions: vec![seed_revision(
+                    [0x44; 20],
+                    vec![SeedEntry {
+                        node: LOCAL_NODE,
+                        sha256: Some(Sha256::from_bytes([0x21; 32])),
+                        git_sha1: Some(CommitSha::from_bytes([0x24; 20])),
+                        ..seed_entry(root, SMALL_PATH, SMALL_SIZE as u64)
+                    }],
+                )],
+                ..seed_repo(root, RepoType::Datasets, "stanford/squad")
+            },
+        ])
+        .expect("the catalog seeds");
+}
+
+fn seed_repo(root: &Path, repo_type: RepoType, reference: &str) -> SeedRepository {
+    SeedRepository {
+        repo: RepoId::parse_ref(repo_type, reference).expect("reference"),
+        source: "cache".to_owned(),
+        kind: SourceKind::HfCache,
+        root_path: root.to_path_buf(),
+        git_dir: None,
+        revisions: Vec::new(),
+    }
+}
+
+fn seed_revision(sha: [u8; 20], entries: Vec<SeedEntry>) -> SeedRevision {
+    SeedRevision {
+        name: "main".to_owned(),
+        sha: Some(CommitSha::from_bytes(sha)),
+        refs: vec![("main".to_owned(), RefKind::Branch)],
+        title: Some("Initial commit".to_owned()),
+        author: Some("kohya".to_owned()),
+        committed: Some(at()),
+        entries,
+    }
+}
+
+fn seed_entry(root: &Path, rel_path: &str, size: u64) -> SeedEntry {
+    SeedEntry {
+        node: LOCAL_NODE,
+        rel_path: rel_path.to_owned(),
+        abs_path: Some(root.join(rel_path).to_string_lossy().into_owned()),
+        size,
+        state: ArtifactState::Served,
+        is_symlink: false,
+        sha256: None,
+        git_sha1: None,
+        artifact: None,
+    }
+}
+
+fn lora_artifact() -> SeedArtifact {
+    SeedArtifact {
+        identity: 0x9f9f,
+        artifact: Artifact {
+            id: ArtifactId::new(0),
+            blob: BlobId::new(0),
+            sha256: Some(Sha256::from_bytes(SMALL_SHA256)),
+            size: SMALL_SIZE as u64,
+            format: ArtifactFormat::Safetensors,
+            role: Role::Lora,
+            sub_role: None,
+            role_confidence: 0.9,
+            base: Base::any(),
+            base_label: None,
+            base_confidence: 0.5,
+            precision: None,
+            quant: None,
+            rank: None,
+            alpha: None,
+            params: None,
+            context: None,
+            trigger: None,
+            sniff_version: 1,
+        },
+        name: "film-grain-35mm".to_owned(),
+        org: Some("kohya".to_owned()),
+        tensors: None,
+        evidence: Vec::new(),
+        card: None,
+        group_bytes: None,
+        shard_count: None,
     }
 }
 
@@ -90,208 +216,13 @@ fn mirrored(upstream: &str) -> World {
     config.mirror.upstream = upstream.to_owned();
     config.mirror.proxy = vec![AccessRule::glob("*", true), AccessRule::glob("*/*", true)];
     config.mirror.cache = vec![AccessRule::glob("*", true), AccessRule::glob("*/*", true)];
-    let store = world.state.store().clone();
-    world.state = AppState::new(config, store).expect("state builds");
+    let catalog = std::sync::Arc::clone(world.state.catalog());
+    world.state = AppState::new(config, catalog).expect("state builds");
     world
 }
 
 fn at() -> Timestamp {
     "2026-09-04T09:10:00Z".parse().expect("timestamp parses")
-}
-
-fn seed(conn: &Conn, root: &Path) {
-    let node = upsert_node(
-        conn,
-        &NewNode::local(NodeId::new("workstation-1").expect("id"), "workstation"),
-    )
-    .expect("node");
-    let source = upsert_source(conn, "cache", root, SourceKind::HfCache, node).expect("source");
-
-    let lora = repo(conn, node, RepoType::Models, LORA_REPO);
-    let revision = revision_of(conn, lora, REVISION, &[("main", RefKind::Branch)]);
-    upsert_ref(conn, lora, "v1.0", RefKind::Tag, revision).expect("tag");
-    let small = blob(
-        conn,
-        "xxh3:small",
-        SMALL_SIZE as u64,
-        Sha256::from_bytes(SMALL_SHA256),
-        Some(CommitSha::from_bytes(SMALL_GIT_SHA1)),
-    );
-    let artifact = upsert_artifact(
-        conn,
-        &NewArtifact {
-            format: ArtifactFormat::Safetensors,
-            role: Role::Lora,
-            role_confidence: 0.9,
-            org: Some("kohya".to_owned()),
-            ..NewArtifact::new(small, "film-grain-35mm")
-        },
-        at(),
-    )
-    .expect("artifact");
-    entry(
-        conn,
-        revision,
-        SMALL_PATH,
-        node,
-        source,
-        Some(small),
-        Some(artifact),
-        SMALL_SIZE as u64,
-        &root.join(SMALL_PATH),
-    );
-    let nested = blob(
-        conn,
-        "xxh3:nested",
-        SMALL_SIZE as u64,
-        Sha256::from_bytes([0x5c; 32]),
-        Some(CommitSha::from_bytes([0x5d; 20])),
-    );
-    entry(
-        conn,
-        revision,
-        NESTED_PATH,
-        node,
-        source,
-        Some(nested),
-        None,
-        SMALL_SIZE as u64,
-        &root.join(NESTED_PATH),
-    );
-    let large = blob(
-        conn,
-        "xxh3:lfs",
-        LFS_SIZE as u64,
-        Sha256::from_bytes(LFS_SHA256),
-        None,
-    );
-    entry(
-        conn,
-        revision,
-        LFS_PATH,
-        node,
-        source,
-        Some(large),
-        None,
-        LFS_SIZE as u64,
-        &root.join(LFS_PATH),
-    );
-
-    let orgless = repo(conn, node, RepoType::Models, "gpt2");
-    let orgless_revision = revision_of(conn, orgless, [0x33; 20], &[("main", RefKind::Branch)]);
-    let orgless_blob = blob(
-        conn,
-        "xxh3:gpt2",
-        SMALL_SIZE as u64,
-        Sha256::from_bytes([0x11; 32]),
-        Some(CommitSha::from_bytes([0x12; 20])),
-    );
-    entry(
-        conn,
-        orgless_revision,
-        SMALL_PATH,
-        node,
-        source,
-        Some(orgless_blob),
-        None,
-        SMALL_SIZE as u64,
-        &root.join(SMALL_PATH),
-    );
-
-    let dataset = repo(conn, node, RepoType::Datasets, "stanford/squad");
-    let dataset_revision = revision_of(conn, dataset, [0x44; 20], &[("main", RefKind::Branch)]);
-    let dataset_blob = blob(
-        conn,
-        "xxh3:squad",
-        SMALL_SIZE as u64,
-        Sha256::from_bytes([0x21; 32]),
-        Some(CommitSha::from_bytes([0x24; 20])),
-    );
-    entry(
-        conn,
-        dataset_revision,
-        SMALL_PATH,
-        node,
-        source,
-        Some(dataset_blob),
-        None,
-        SMALL_SIZE as u64,
-        &root.join(SMALL_PATH),
-    );
-}
-
-fn repo(conn: &Conn, node: i64, repo_type: RepoType, reference: &str) -> RepoRowId {
-    upsert_repo(
-        conn,
-        &NewRepo::new(
-            RepoId::parse_ref(repo_type, reference).expect("reference"),
-            node,
-            SourceKind::HfCache,
-        ),
-    )
-    .expect("repo")
-}
-
-fn revision_of(
-    conn: &Conn,
-    repo: RepoRowId,
-    sha: [u8; 20],
-    refs: &[(&str, RefKind)],
-) -> RevisionId {
-    let id = upsert_revision(
-        conn,
-        &NewRevision {
-            committed: Some(at()),
-            title: Some("Initial commit".to_owned()),
-            author: Some("kohya".to_owned()),
-            ..NewRevision::new(repo, CommitSha::from_bytes(sha))
-        },
-    )
-    .expect("revision");
-    for (name, kind) in refs {
-        upsert_ref(conn, repo, name, *kind, id).expect("ref");
-    }
-    id
-}
-
-fn blob(
-    conn: &Conn,
-    fingerprint: &str,
-    size: u64,
-    sha256: Sha256,
-    git_sha1: Option<CommitSha>,
-) -> BlobId {
-    let id = upsert_blob(conn, fingerprint, size, at()).expect("blob");
-    set_sha256(conn, id, sha256, git_sha1, at()).expect("hash");
-    id
-}
-
-#[allow(clippy::too_many_arguments)]
-fn entry(
-    conn: &Conn,
-    revision: RevisionId,
-    path: &str,
-    node: i64,
-    source: SourceId,
-    blob: Option<BlobId>,
-    artifact: Option<ArtifactId>,
-    size: u64,
-    abs_path: &Path,
-) {
-    upsert_entry(
-        conn,
-        &NewEntry {
-            blob,
-            artifact,
-            source: Some(source),
-            abs_path: Some(abs_path.to_string_lossy().into_owned()),
-            size,
-            state: ArtifactState::Served,
-            ..NewEntry::new(revision, path, node)
-        },
-        at(),
-    )
-    .expect("entry");
 }
 
 fn router(state: &AppState) -> Router {
@@ -881,11 +812,17 @@ async fn a_served_response_is_written_to_the_usage_log() {
 /// a bounded wait rather than assuming the response and the row are the same instant.
 async fn pulls_logged(state: &AppState) -> u64 {
     for _ in 0..200 {
-        let days: Vec<UsageDay> = state
-            .store()
-            .call(move |conn| usage_days(conn, RepoRowId::new(1), 7))
-            .await
-            .expect("usage days");
+        let catalog = std::sync::Arc::clone(state.catalog());
+        let days: Vec<UsageDay> = tokio::task::spawn_blocking(move || {
+            let repo = catalog
+                .repository(&RepoId::parse_ref(RepoType::Models, LORA_REPO)?)?
+                .expect("the seeded repository")
+                .id;
+            catalog.usage_days(repo, 7)
+        })
+        .await
+        .expect("join")
+        .expect("usage days");
         let pulls: u64 = days.iter().map(|day| day.pulls).sum();
         if pulls > 0 {
             return pulls;

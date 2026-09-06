@@ -1,4 +1,5 @@
 pub mod apply;
+pub mod catalog;
 pub mod doctor;
 pub mod link;
 pub mod loadout;
@@ -26,6 +27,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Maintain the native catalog: scan into a directory, search it, report status,
+    /// rebuild its search index or compact it. One process at a time.
+    Catalog {
+        #[command(subcommand)]
+        command: catalog::CatalogCommand,
+    },
     /// Serve the Hub API, the git face and the web UI on this node.
     Serve {
         /// Override `[server] bind`.

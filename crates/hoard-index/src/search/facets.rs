@@ -1,9 +1,9 @@
 use hoard_core::Base;
 use serde::{Deserialize, Serialize};
 
+use crate::row::{DiskPressure, FacetBucket};
 use crate::search::grammar::scan;
 use crate::search::token::{ParsedQuery, Token, TokenKind};
-use crate::store::{DiskPressure, FacetBucket};
 
 /// The facet rail, in the order it renders: the query key and the header the UI shows.
 pub const FACET_DIMENSIONS: [(&str, &str); 5] = [
@@ -30,6 +30,17 @@ impl Facets {
         for (buckets, (key, _)) in self.dimensions_mut().into_iter().zip(FACET_DIMENSIONS) {
             mark_active(buckets, query, key);
         }
+    }
+
+    /// The five dimensions in the order [`FACET_DIMENSIONS`] names them.
+    pub fn dimensions(&self) -> [&[FacetBucket]; 5] {
+        [
+            &self.role,
+            &self.base,
+            &self.format,
+            &self.precision,
+            &self.node,
+        ]
     }
 
     fn dimensions_mut(&mut self) -> [&mut Vec<FacetBucket>; 5] {
@@ -96,7 +107,8 @@ fn canonical_key(key: &str) -> String {
     }
 }
 
-fn quoted(value: &str) -> String {
+/// Quotes a grammar value that would otherwise tokenize as more than one word.
+pub fn quoted(value: &str) -> String {
     match value.contains(char::is_whitespace) || value.contains('"') {
         true => format!("\"{}\"", value.replace('"', "")),
         false => value.to_owned(),

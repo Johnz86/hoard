@@ -2,25 +2,63 @@
 //!
 //! Three layouts reach the same result: the HuggingFace cache, a directory of git clones
 //! and bare folders. Each yields repositories with revisions, refs and entries; nothing
-//! here reads a header, hashes bytes or touches SQLite beyond the noise list.
+//! here reads a header, hashes bytes or reads the catalog beyond the noise list.
 
 pub mod git_clone;
 pub mod hf_cache;
 pub mod loose;
 pub mod walker;
 
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use jiff::Timestamp;
+use serde::{Deserialize, Serialize};
 
 use hoard_core::{CommitSha, GitSha1, RepoId, Sha256};
 
 use crate::config::{SourceConfig, SourceKind};
-use crate::error::Result;
+use crate::error::{IndexError, Result};
 use crate::hash::FileStamp;
-use crate::store::revision::RefKind;
 
 pub use walker::{DiscoveredFile, NoiseFilter, WalkOptions, walk};
+
+/// Whether a name points at a moving branch or a fixed tag. Ordered so branches sort ahead
+/// of tags, which is the order the REFS tab presents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RefKind {
+    Branch,
+    Tag,
+}
+
+impl RefKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RefKind::Branch => "branch",
+            RefKind::Tag => "tag",
+        }
+    }
+}
+
+impl fmt::Display for RefKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for RefKind {
+    type Err = IndexError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "branch" => Ok(RefKind::Branch),
+            "tag" => Ok(RefKind::Tag),
+            other => Err(IndexError::Config(format!("unknown ref kind {other:?}"))),
+        }
+    }
+}
 
 /// One path inside a revision, with anything the layout already proves about its bytes.
 ///
@@ -220,6 +258,22 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn ref_kinds_round_trip_their_spelling() {
+        for kind in [RefKind::Branch, RefKind::Tag] {
+            assert_eq!(kind.as_str().parse::<RefKind>().expect("kind parses"), kind);
+            assert_eq!(kind.to_string(), kind.as_str());
+        }
+        assert!("note".parse::<RefKind>().is_err());
+    }
+
+    #[test]
+    fn branches_sort_ahead_of_tags() {
+        let mut kinds = vec![RefKind::Tag, RefKind::Branch, RefKind::Tag];
+        kinds.sort();
+        assert_eq!(kinds, [RefKind::Branch, RefKind::Tag, RefKind::Tag]);
+    }
 
     #[test]
     fn auto_recognizes_a_cache_a_clone_directory_and_a_bare_folder() {

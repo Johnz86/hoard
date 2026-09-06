@@ -1,8 +1,9 @@
 //! The background sweep: one eviction pass plus the index reconciliation it makes necessary.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use hoard_index::store::Store;
+use hoard_index::catalog::Catalog;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -73,15 +74,19 @@ impl EvictionHandle {
 
 /// One eviction pass followed by index reconciliation, which runs even when nothing was
 /// evicted.
-pub async fn sweep(store: &Store, cache: &BlockCache) -> Result<SweepReport> {
+pub async fn sweep(catalog: &Arc<Catalog>, cache: &BlockCache) -> Result<SweepReport> {
     let eviction = cache.run_eviction().await?;
-    let retired = reconcile_index(store, cache.layout()).await?;
+    let retired = reconcile_index(catalog, cache.layout()).await?;
     Ok(SweepReport { eviction, retired })
 }
 
 /// Runs the first sweep at once and then every interval; a failed sweep is logged and the
 /// loop continues.
-pub fn spawn_eviction(store: Store, cache: BlockCache, config: EvictionConfig) -> EvictionHandle {
+pub fn spawn_eviction(
+    catalog: Arc<Catalog>,
+    cache: BlockCache,
+    config: EvictionConfig,
+) -> EvictionHandle {
     let (stop, mut stopped) = watch::channel(false);
     let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(config.interval);
@@ -93,7 +98,7 @@ pub fn spawn_eviction(store: Store, cache: BlockCache, config: EvictionConfig) -
                         break;
                     }
                 }
-                _ = ticker.tick() => sweep_once(&store, &cache).await,
+                _ = ticker.tick() => sweep_once(&catalog, &cache).await,
             }
         }
         tracing::debug!("the cache sweep stopped");
@@ -101,8 +106,8 @@ pub fn spawn_eviction(store: Store, cache: BlockCache, config: EvictionConfig) -
     EvictionHandle { stop, task }
 }
 
-async fn sweep_once(store: &Store, cache: &BlockCache) {
-    match sweep(store, cache).await {
+async fn sweep_once(catalog: &Arc<Catalog>, cache: &BlockCache) {
+    match sweep(catalog, cache).await {
         Ok(report) if report.changed() => tracing::info!(
             units = report.eviction.units,
             pinned = report.eviction.pinned,
@@ -123,11 +128,11 @@ async fn sweep_once(store: &Store, cache: &BlockCache) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::path::Path;
 
-    use hoard_core::{NodeId, RepoId, RepoType, State};
-    use hoard_index::store::entry::{entry, served_cache_entries};
-    use hoard_index::store::node::{NewNode, local_node, upsert_node};
+    use hoard_core::{RepoId, RepoType, State};
+    use hoard_index::catalog::Catalog;
+    use hoard_index::config::IndexConfig;
     use tempfile::TempDir;
 
     use super::*;
@@ -137,30 +142,28 @@ mod tests {
 
     const SHA: &str = "9f1a2b3c4d5e6f708192a3b4c5d6e7f809a1b2c3";
 
-    fn store() -> Store {
-        let store = Store::open_in_memory().expect("store opens");
-        let conn = store.write().expect("writer");
-        upsert_node(
-            &conn,
-            &NewNode {
-                node_id: NodeId::new("node-a").expect("node id"),
-                name: "hoard".to_owned(),
-                url: None,
-                is_self: true,
-            },
+    fn catalog(directory: &Path) -> Arc<Catalog> {
+        Arc::new(
+            Catalog::open_or_scan(
+                &IndexConfig {
+                    data_dir: directory.to_path_buf(),
+                    sources: Vec::new(),
+                    ..IndexConfig::default()
+                },
+                "node-a",
+                |_, _| {},
+            )
+            .expect("catalog opens"),
         )
-        .expect("local node inserts");
-        drop(conn);
-        store
     }
 
-    fn cache(root: &TempDir, limit: u64) -> BlockCache {
+    fn cache(root: &Path, limit: u64) -> BlockCache {
         let config = MirrorConfig {
             cache_size_limit: Some(limit),
             geometry: Geometry::new(64, 16).expect("valid geometry"),
             ..MirrorConfig::default()
         };
-        BlockCache::at_root(Arc::new(config), root.path())
+        BlockCache::at_root(Arc::new(config), root.join("repos"))
     }
 
     fn repo() -> RepoId {
@@ -188,11 +191,11 @@ mod tests {
     #[tokio::test]
     async fn the_scheduler_sweeps_on_every_tick_until_it_is_shut_down() {
         let root = TempDir::new().expect("temp dir");
-        let cache = cache(&root, 1);
+        let cache = cache(root.path(), 1);
         let dir = filled(&cache).await.dir().to_path_buf();
 
         let handle = spawn_eviction(
-            store(),
+            catalog(&root.path().join("native")),
             cache,
             EvictionConfig::default().with_interval(Duration::from_millis(5)),
         );
@@ -214,10 +217,12 @@ mod tests {
     #[tokio::test]
     async fn a_sweep_reports_the_eviction_and_the_rows_it_reconciled() {
         let root = TempDir::new().expect("temp dir");
-        let cache = cache(&root, u64::MAX);
+        let cache = cache(root.path(), u64::MAX);
         let dir = filled(&cache).await.dir().to_path_buf();
 
-        let report = sweep(&store(), &cache).await.expect("the sweep runs");
+        let report = sweep(&catalog(&root.path().join("native")), &cache)
+            .await
+            .expect("the sweep runs");
 
         assert_eq!(report.eviction.units, 1);
         assert_eq!(report.eviction.removed, 0);
@@ -229,11 +234,11 @@ mod tests {
     #[tokio::test]
     async fn a_sweep_stops_the_index_advertising_bytes_it_evicted() {
         let root = TempDir::new().expect("temp dir");
-        let cache = cache(&root, 1);
-        let store = store();
+        let cache = cache(root.path(), 1);
+        let catalog = catalog(&root.path().join("native"));
         let mut cached = filled(&cache).await;
         let outcome = ingest_cached_file(
-            &store,
+            &catalog,
             &cache,
             &mut cached,
             CachedFile {
@@ -248,20 +253,22 @@ mod tests {
         .expect("the entry is complete");
         drop(cached);
 
-        let report = sweep(&store, &cache).await.expect("the sweep runs");
+        let report = sweep(&catalog, &cache).await.expect("the sweep runs");
 
         assert_eq!(report.eviction.removed, 1);
         assert_eq!(report.retired, 1);
         assert!(report.changed());
-        let conn = store.read().expect("reader");
-        let node = local_node(&conn).expect("local node");
-        let row = entry(&conn, outcome.entry)
-            .expect("entry reads")
+        let row = catalog
+            .entries_of(outcome.artifact.expect("the weight became an artifact"))
+            .expect("entries read")
+            .into_iter()
+            .find(|row| row.entry_id == outcome.entry)
             .expect("the row survives its bytes");
         assert!(!row.present, "nothing advertises bytes the cache dropped");
         assert_eq!(row.state, State::Remote);
         assert!(
-            served_cache_entries(&conn, node.id)
+            catalog
+                .served_cache_entries()
                 .expect("served rows read")
                 .is_empty()
         );

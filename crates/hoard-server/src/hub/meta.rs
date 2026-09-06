@@ -13,16 +13,13 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
 use hoard_core::{CommitSha, RepoId, RepoType};
-use hoard_index::store::node::local_node;
-use hoard_index::store::repo::repo_by_qualified;
-use hoard_index::store::revision::resolve_revision;
 use hoard_mirror::MirrorError;
-use hoard_mirror::local::index_repo::{self, MAX_COMMITS, RepoListQuery};
+use hoard_mirror::local::index_repo::{self, MAX_COMMITS, RepoListQuery, TreeListing};
 use hoard_mirror::upstream::{MetaKind, MetaRequest};
 
 use crate::error::{HubError, HubResult};
 use crate::hub::proxy::forward;
-use crate::hub::{PathParams, authorization, param, path_of, repo_of, revision_of};
+use crate::hub::{PathParams, authorization, on_catalog, param, path_of, repo_of, revision_of};
 use crate::state::AppState;
 
 /// The header every response that resolved a revision carries.
@@ -80,7 +77,7 @@ pub(crate) async fn repo_info(
     headers: HeaderMap,
 ) -> HubResult<Response> {
     let repo = repo_of(&params)?;
-    match index_repo::repo_info(state.store(), &repo, revision_of(&params)).await {
+    match index_repo::repo_info(state.catalog(), &repo, revision_of(&params)).await {
         Ok(info) => {
             let commit = info.sha.parse::<CommitSha>().ok();
             json(&info, commit)
@@ -113,12 +110,14 @@ pub(crate) async fn tree(
         return proxied(&state, &repo, kind, &headers).await;
     };
     let entries = index_repo::tree(
-        state.store(),
+        state.catalog(),
         &repo,
         &sha,
         path,
-        query.recursive(),
-        query.expand(),
+        TreeListing {
+            recursive: query.recursive(),
+            expand: query.expand(),
+        },
     )
     .await?;
     json(&entries, Some(sha))
@@ -150,7 +149,7 @@ pub(crate) async fn paths_info(
         };
         return proxied(&state, &repo, kind, &headers).await;
     };
-    let entries = index_repo::paths_info(state.store(), &repo, &sha, &paths).await?;
+    let entries = index_repo::paths_info(state.catalog(), &repo, &sha, &paths).await?;
     json(&entries, Some(sha))
 }
 
@@ -165,7 +164,7 @@ pub(crate) async fn commits(
     let Some(sha) = local_sha(&state, &repo, revision).await? else {
         return proxied(&state, &repo, MetaKind::Commits { revision }, &headers).await;
     };
-    let commits = index_repo::commits(state.store(), &repo, &sha, MAX_COMMITS).await?;
+    let commits = index_repo::commits(state.catalog(), &repo, &sha, MAX_COMMITS).await?;
     json(&commits, Some(sha))
 }
 
@@ -187,7 +186,7 @@ pub(crate) async fn list(
         author: text(query.author.as_deref()),
         ..RepoListQuery::new(repo_type, limit)
     };
-    let repos = index_repo::list_repos(state.store(), &listing).await?;
+    let repos = index_repo::list_repos(state.catalog(), &listing).await?;
     json(&repos, None)
 }
 
@@ -201,23 +200,19 @@ async fn local_sha(
     repo: &RepoId,
     revision: &str,
 ) -> HubResult<Option<CommitSha>> {
-    let qualified = repo.qualified();
-    let wanted = revision.to_owned();
-    let resolved = state
-        .store()
-        .call(move |conn| {
-            let node = local_node(conn)?;
-            let Some(row) = repo_by_qualified(conn, &qualified, node.id)? else {
-                return Ok(None);
-            };
-            Ok(Some(
-                resolve_revision(conn, row.id, &wanted).map(|revision| revision.sha),
-            ))
-        })
-        .await?;
+    let wanted = repo.clone();
+    let named = revision.to_owned();
+    let resolved = on_catalog(state.catalog(), move |catalog| {
+        Ok(catalog.repository(&wanted)?.map(|record| {
+            catalog
+                .resolve_revision(&record, &named)
+                .and_then(|revision| revision.sha)
+        }))
+    })
+    .await?;
     match resolved {
-        Some(Ok(sha)) => Ok(Some(sha)),
-        Some(Err(_)) => Err(HubError::revision_not_found(revision)),
+        Some(Some(sha)) => Ok(Some(sha)),
+        Some(None) => Err(HubError::revision_not_found(revision)),
         None => Ok(None),
     }
 }

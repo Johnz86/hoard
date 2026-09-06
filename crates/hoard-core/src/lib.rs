@@ -1,6 +1,7 @@
 //! Domain types shared by every hoard crate: repos, revisions, artifacts, roles and errors.
 //!
-//! Nothing here touches the filesystem, the network or SQLite. The rules that decide what a
+//! Nothing here touches the filesystem, the network or the catalog. The rules that decide
+//! what a
 //! blob is and what it plugs into live at this level so they can be tested against synthetic
 //! headers rather than real weights.
 

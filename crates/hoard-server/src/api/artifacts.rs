@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -6,12 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use hoard_core::{ArtifactId, Base, Evidence, Role, Sha256, SubRole, format_size};
 use hoard_index::IndexError;
-use hoard_index::store::entry::{entries_for_artifact, entries_for_blob};
-use hoard_index::store::{artifact, blob, overrides};
+use hoard_index::catalog::{Catalog, EntryDetail};
+use hoard_index::row::SearchRow;
 
 use crate::api::common::{
-    EntryView, Fact, PLUGS_INTO_LIMIT, PullCommands, RowView, authorize, clamp_limit, entry_views,
-    facts, pull_commands, require_row, row_by_artifact,
+    EntryView, Fact, PLUGS_INTO_LIMIT, PullCommands, RowView, authorize, blocking, clamp_limit,
+    entry_views, facts, pull_commands,
 };
 use crate::api::compat::{CompatRowView, CompatView, compat_for};
 use crate::error::{ApiError, ApiResult};
@@ -33,6 +35,8 @@ pub struct ArtifactView {
     pub facts: Vec<Fact>,
     pub evidence: Vec<Evidence>,
     pub entries: Vec<EntryView>,
+    /// Always empty: the catalog's artifact identity already merges every path holding the
+    /// same content into `entries`, so no second list of them exists to show.
     pub duplicates: Vec<EntryView>,
     pub plugs_into: Vec<CompatRowView>,
     pub usage: UsageSummary,
@@ -118,6 +122,16 @@ pub struct ClearedView {
     pub cleared: bool,
 }
 
+/// The catalog's half of the inspector, read on one blocking thread.
+struct Inspection {
+    row: SearchRow,
+    entries: Vec<EntryDetail>,
+    evidence: Vec<Evidence>,
+    plugs_into: Vec<CompatRowView>,
+    override_applied: bool,
+    usage: UsageSummary,
+}
+
 pub async fn detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -125,36 +139,39 @@ pub async fn detail(
     let id = artifact_id(&id)?;
     let host = state.node_name().to_owned();
     let now = Timestamp::now();
-    let view = state
-        .store()
-        .call(move |conn| {
-            let row = require_row(conn, id)?;
-            let record = artifact::artifact(conn, id)?;
-            let entries = entry_views(conn, &entries_for_artifact(conn, id)?, &host)?;
-            let mut duplicates = entry_views(conn, &entries_for_blob(conn, row.blob_id)?, &host)?;
-            duplicates.retain(|candidate| {
-                !entries
-                    .iter()
-                    .any(|entry| entry.path == candidate.path && entry.node == candidate.node)
-            });
-            let plugs = compat_for(conn, &row, PLUGS_INTO_LIMIT, now)?;
-            Ok(ArtifactView {
-                facts: facts(&row),
-                evidence: artifact::evidence(conn, id)?,
-                entries,
-                duplicates,
-                plugs_into: plugs.rows,
-                usage: UsageSummary {
-                    pulls: record.use_count,
-                    last_used: record.last_used,
-                    label: format!("{} {PULLS_LABEL}", record.use_count),
-                },
-                override_applied: overrides::artifact_override(conn, id)?.is_some(),
-                row: RowView::from(&row),
-            })
-        })
-        .await?;
-    Ok(Json(view))
+    let catalog = Arc::clone(state.catalog());
+    let inspected = blocking(move || inspect(&catalog, id, now)).await?;
+    Ok(Json(ArtifactView {
+        facts: facts(&inspected.row),
+        evidence: inspected.evidence,
+        entries: entry_views(&inspected.entries, &host),
+        duplicates: Vec::new(),
+        plugs_into: inspected.plugs_into,
+        usage: inspected.usage,
+        override_applied: inspected.override_applied,
+        row: RowView::from(&inspected.row),
+    }))
+}
+
+fn inspect(catalog: &Catalog, id: ArtifactId, now: Timestamp) -> Result<Inspection, IndexError> {
+    let row = require_row(catalog, id)?;
+    let plugs = compat_for(catalog, &row, PLUGS_INTO_LIMIT, now)?;
+    let usage = catalog.artifact_usage(id)?;
+    Ok(Inspection {
+        entries: catalog.entries_of(id)?,
+        evidence: catalog
+            .artifact_detail(id)?
+            .map(|detail| detail.evidence)
+            .unwrap_or_default(),
+        plugs_into: plugs.rows,
+        override_applied: catalog.artifact_override(id)?.is_some(),
+        usage: UsageSummary {
+            pulls: usage.pulls,
+            last_used: usage.last_used,
+            label: format!("{} {PULLS_LABEL}", usage.pulls),
+        },
+        row,
+    })
 }
 
 pub async fn compat(
@@ -165,13 +182,12 @@ pub async fn compat(
     let id = artifact_id(&id)?;
     let limit = clamp_limit(params.limit);
     let now = Timestamp::now();
-    let view = state
-        .store()
-        .call(move |conn| {
-            let row = require_row(conn, id)?;
-            compat_for(conn, &row, limit, now)
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        let row = require_row(&catalog, id)?;
+        compat_for(&catalog, &row, limit, now)
+    })
+    .await?;
     Ok(Json(view))
 }
 
@@ -180,10 +196,8 @@ pub async fn pull_command(
     Path(id): Path<String>,
 ) -> ApiResult<Json<PullCommands>> {
     let id = artifact_id(&id)?;
-    let row = state
-        .store()
-        .call(move |conn| require_row(conn, id))
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let row = blocking(move || require_row(&catalog, id)).await?;
     let repo = hoard_core::RepoId::parse_qualified(&row.repo).map_err(ApiError::from)?;
     let path = row.abs_path.clone().or(Some(row.path.clone()));
     Ok(Json(pull_commands(&state, &repo, path)))
@@ -198,22 +212,19 @@ pub async fn put_override(
     authorize(&state, &headers)?;
     let id = artifact_id(&id)?;
     let (role, sub_role, base) = body.parts()?;
-    let view = state
-        .store()
-        .call_mut(move |conn| {
-            overrides::put_override(conn, id, role, sub_role, base)?;
-            artifact::set_triage(conn, id, false)?;
-            let row = require_row(conn, id)?;
-            Ok(OverrideView {
-                artifact_id: id,
-                role: row.role,
-                sub_role: row.sub_role,
-                base: crate::api::common::base_label(&row.base, row.base_label.as_deref()),
-                facts: facts(&row),
-            })
-        })
-        .await?;
-    Ok(Json(view))
+    let catalog = Arc::clone(state.catalog());
+    let row = blocking(move || {
+        catalog.put_override(id, role, sub_role, base)?;
+        require_row(&catalog, id)
+    })
+    .await?;
+    Ok(Json(OverrideView {
+        artifact_id: id,
+        role: row.role,
+        sub_role: row.sub_role,
+        base: crate::api::common::base_label(&row.base, row.base_label.as_deref()),
+        facts: facts(&row),
+    }))
 }
 
 pub async fn delete_override(
@@ -223,15 +234,12 @@ pub async fn delete_override(
 ) -> ApiResult<Json<ClearedView>> {
     authorize(&state, &headers)?;
     let id = artifact_id(&id)?;
-    let cleared = state
-        .store()
-        .call_mut(move |conn| {
-            if row_by_artifact(conn, id)?.is_none() {
-                return Err(IndexError::not_found("artifact", id.to_string()));
-            }
-            overrides::clear_override(conn, id)
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let cleared = blocking(move || {
+        require_row(&catalog, id)?;
+        catalog.clear_override(id)
+    })
+    .await?;
     Ok(Json(ClearedView {
         artifact_id: id,
         cleared,
@@ -244,23 +252,37 @@ pub async fn blob_detail(
 ) -> ApiResult<Json<BlobView>> {
     let sha256: Sha256 = sha256.parse().map_err(ApiError::from)?;
     let host = state.node_name().to_owned();
-    let view = state
-        .store()
-        .call(move |conn| {
-            let record = blob::blob_by_sha256(conn, &sha256)?
-                .ok_or_else(|| IndexError::not_found("blob", sha256.to_hex()))?;
-            Ok(BlobView {
-                sha256,
-                size: record.size,
-                size_human: format_size(record.size),
-                path_count: record.path_count,
-                first_seen: record.first_seen,
-                hashed_at: record.hashed_at,
-                entries: entry_views(conn, &entries_for_blob(conn, record.id)?, &host)?,
-            })
+    let now = Timestamp::now();
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        let row = catalog
+            .artifact_by_sha256(&sha256)?
+            .ok_or_else(|| IndexError::not_found("blob", sha256.to_hex()))?;
+        let first_seen = catalog
+            .artifact_detail(row.artifact_id)?
+            .and_then(|detail| detail.first_seen)
+            .unwrap_or(now);
+        let entries = catalog.entries_of(row.artifact_id)?;
+        Ok::<_, IndexError>(BlobView {
+            sha256,
+            size: row.size,
+            size_human: format_size(row.size),
+            path_count: row.path_count,
+            first_seen,
+            hashed_at: None,
+            entries: entry_views(&entries, &host),
         })
-        .await?;
+    })
+    .await?;
     Ok(Json(view))
+}
+
+/// The artifact one identity names, or the 404 the routes answer with when the catalog
+/// holds no such row.
+fn require_row(catalog: &Catalog, id: ArtifactId) -> Result<SearchRow, IndexError> {
+    catalog
+        .artifact_row(id)?
+        .ok_or_else(|| IndexError::not_found("artifact", id.to_string()))
 }
 
 /// Reads `a_17` or a bare row id out of a path segment.

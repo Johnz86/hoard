@@ -37,6 +37,7 @@ percent-encoding.workspace = true
 jiff.workspace = true
 
 [dev-dependencies]
+hoard-index = { workspace = true, features = ["fixtures"] }
 tempfile.workspace = true
 wiremock.workspace = true
 

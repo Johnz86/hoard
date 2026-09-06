@@ -21,6 +21,7 @@ speak. Sources: `docs/use-case.md` (brief), `docs/design/ui-spec.md` and
 | 8 | Nodes: discovery, gossip, peer pulls | done | M3 |
 | 9 | Shelves, loadouts, projection, usage | done | M4 Make it usable |
 | 10 | Live index and polish | partial | M4 |
+| 11 | Native catalog (native_db + Tantivy) | partial | experimental |
 
 Tick a phase only when its acceptance check passes and `/hoard-verify` is clean.
 
@@ -39,6 +40,12 @@ on many networks.
 Phase 10 is partial: the `notify` watcher, PyTorch zip key extraction and dataset sniffing
 are in; the TREE and DISK views are not. `docs/design/ui-spec.md` records them as named in
 the proposal but absent from the prototype, so there is no design to build them from.
+
+Phase 11 is an experimental vertical slice behind `hoard catalog`; see
+`docs/native-catalog.md`. It is accepted for its own commands only when a scan of this
+workstation's HuggingFace cache yields the same artifact count, names and triage set as
+`hoard scan`, and when native search answers the exact-field queries the doc lists.
+Converting `serve` and the live store is not scheduled.
 
 ## Goals
 
@@ -112,8 +119,8 @@ the proposal but absent from the prototype, so there is no design to build them 
   action.
 - A10 Incremental rescans with `notify` and mtime/size short-circuit; missing files mark
   entries absent rather than deleting rows.
-- A11 Store: SQLite WAL, `user_version` migrations, FTS5 over names, keys, trigger words,
-  README; one writer, pooled readers, all through `spawn_blocking`.
+- A11 Store: a native_db (redb) catalog with a Tantivy search index; one process per
+  catalog, every write one transaction, all through `spawn_blocking`.
 - A12 Enrich (offline-safe): when a Hub cache or clone names the upstream repo, recover
   card, license and revisions from the local README and refs; never a network call
   during scan.
@@ -337,5 +344,5 @@ docs, Claude Code project configuration.
   Hub `resolve` for a loose file returns 404 until its sha256 exists, since clients verify
   ETags.
 - mDNS may be blocked on some networks; the manual `[peers]` list is the fallback.
-- SQLite is single-writer; scan batches commit every N rows, gossip and ingest writes are
-  small and queued.
+- The catalog takes an exclusive lock: one process at a time, which `hoard doctor` reports
+  when a second one tries.

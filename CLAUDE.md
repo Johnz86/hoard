@@ -16,8 +16,8 @@ datasets and repos, with a dense keyboard-first web UI. Read these before changi
 
 ## Crate boundaries
 
-`hoard-core` (types, no IO) <- `hoard-index` (discovery, sniffing, inference, SQLite,
-search) <- `hoard-mirror` (Hub protocol, git face, upstream proxy, block cache) <-
+`hoard-core` (types, no IO) <- `hoard-index` (discovery, sniffing, inference, the native
+catalog, search) <- `hoard-mirror` (Hub protocol, git face, upstream proxy, block cache) <-
 `hoard-server` (axum wiring, embedded `web/`) <- `hoard` binary (clap). Lower crates never
 depend on higher ones and never on axum. Put new code in the lowest crate that can hold it.
 
@@ -44,7 +44,7 @@ only thing that does; run it whenever `web/` gains or loses a file.
 - Dependencies are declared once in the root `[workspace.dependencies]` with a version and
   referenced with `.workspace = true`. Check crates.io for the current version before adding.
 - Errors: one `thiserror` enum per crate; `hoard-server` maps them to HTTP in `error.rs`.
-- SQLite access only through `hoard-index::store`, always inside `spawn_blocking`.
+- Catalog access only through `hoard_index::catalog::Catalog`, always inside `spawn_blocking`.
 - Everything the UI computes (query parsing, facets, Markdown, compat) is a Rust endpoint.
   `web/js` renders JSON and handles input; no logic that could be a unit test lives in JS.
 - Fixture files for tests are synthetic headers generated in the test, never real weights.

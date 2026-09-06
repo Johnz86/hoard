@@ -3,20 +3,21 @@ use serde::Serialize;
 
 use hoard_core::{ArtifactId, CompatRule, CompatSubject, Role, State, compatible, format_size};
 use hoard_index::IndexError;
-use hoard_index::search::{CompatTarget, CompileContext, SortKey, SortSpec, compile, parse};
-use hoard_index::store::row::SearchRow;
-use hoard_index::store::search_exec;
+use hoard_index::catalog::{Catalog, QueryRequest};
+use hoard_index::row::SearchRow;
+use hoard_index::search::{CompatTarget, CompileContext, SortKey, SortSpec};
 
-use crate::api::common::{Conn, MIDDOT, state_label};
+use crate::api::common::{MIDDOT, state_label};
 
 const COMPAT_QUERY: &str = "compat:subject";
 
 /// How many candidates the domain rule is asked about.
 ///
-/// The SQL narrows to one role and one base family, so this bounds a set that is already
+/// The query narrows to one role and one base family, so this bounds a set that is already
 /// small; `total` is the number of those candidates the rule accepted, never the number the
-/// SQL admitted, because the rows beside it are that same accepted set.
-const CANDIDATE_LIMIT: u32 = 4_096;
+/// catalog admitted, because the rows beside it are that same accepted set. It is the
+/// largest page the catalog will answer.
+const CANDIDATE_LIMIT: u32 = 1_000;
 
 /// One line of the COMPAT tab and of the inspector's PLUGS INTO list.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -70,7 +71,7 @@ const HEADING: &str = CompatRule::HostAcceptsAdapter.banner();
 /// Everything on this LAN that resolves against `subject`, under the domain rule rather
 /// than under a string comparison of `base` fields.
 pub fn compat_for(
-    conn: &Conn,
+    catalog: &Catalog,
     subject: &SearchRow,
     limit: u32,
     now: Timestamp,
@@ -86,19 +87,15 @@ pub fn compat_for(
     };
     let context =
         CompileContext::new(now).with_compat(CompatTarget::new(subject.role, subject.base.clone()));
-    let compiled = compile(
-        &parse(COMPAT_QUERY),
-        SortSpec::new(SortKey::Size, true),
-        &context,
-    )?;
-    let candidates = search_exec::query_rows(
-        conn,
-        &compiled.where_sql,
-        &compiled.params,
-        &compiled.order_sql,
-        CANDIDATE_LIMIT,
-        0,
-    )?;
+    let candidates = catalog
+        .query(QueryRequest {
+            raw: COMPAT_QUERY,
+            sort: SortSpec::new(SortKey::Size, true),
+            limit: CANDIDATE_LIMIT,
+            offset: 0,
+            context: &context,
+        })?
+        .rows;
     let held = CompatSubject::new(
         subject.artifact_id.to_string(),
         subject.role,

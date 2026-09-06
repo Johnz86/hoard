@@ -109,9 +109,9 @@ impl Default for IndexConfig {
 }
 
 impl IndexConfig {
-    /// The SQLite file, `<data-dir>/hoard.db`.
-    pub fn database_path(&self) -> PathBuf {
-        self.data_dir.join("hoard.db")
+    /// The catalog directory, `<data-dir>/native`.
+    pub fn native_path(&self) -> PathBuf {
+        self.data_dir.join("native")
     }
 
     /// Expands `~` in every configured path and rejects duplicate source names.
@@ -134,6 +134,30 @@ impl IndexConfig {
     pub fn source(&self, name: &str) -> Option<&SourceConfig> {
         self.sources.iter().find(|source| source.name == name)
     }
+
+    /// The same settings over only the named roots, which is what a scan narrowed to one
+    /// source and a rescan driven by the watcher both run.
+    pub fn over(&self, sources: Vec<SourceConfig>) -> Self {
+        Self {
+            sources,
+            ..self.clone()
+        }
+    }
+}
+
+/// The source a path belongs to, longest root first so nested roots resolve to the inner
+/// one. Used by the watcher to turn a filesystem event into a rescan.
+pub fn source_for_path<'a>(config: &'a IndexConfig, path: &Path) -> Option<&'a SourceConfig> {
+    config
+        .sources
+        .iter()
+        .filter(|source| path.starts_with(&source.path))
+        .max_by_key(|source| source.path.as_os_str().len())
+}
+
+/// The relative path of `path` inside `source`, or `None` when it lies outside.
+pub fn relative_to(source: &SourceConfig, path: &Path) -> Option<String> {
+    crate::discover::walker::relative(&source.path, path)
 }
 
 /// Replaces a leading `~` with the home directory. Paths without one are returned as is.
@@ -156,7 +180,7 @@ mod tests {
         let config = IndexConfig::default();
         assert_eq!(config.hash_policy, HashPolicy::Background);
         assert_eq!(config.lfs_threshold, 10_485_760);
-        assert_eq!(config.database_path(), PathBuf::from("./data/hoard.db"));
+        assert_eq!(config.native_path(), PathBuf::from("./data/native"));
     }
 
     #[test]
@@ -185,6 +209,33 @@ mod tests {
 
         config.sources.push(config.sources[0].clone());
         assert!(config.normalize(Some(Path::new("/home/u"))).is_err());
+    }
+
+    #[test]
+    fn a_path_resolves_to_the_innermost_source_that_holds_it() {
+        let root = Path::new("/models");
+        let inner = root.join("loras");
+        let named = |name: &str, path: &Path| SourceConfig {
+            name: name.to_owned(),
+            path: path.to_path_buf(),
+            kind: SourceKind::Loose,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            follow_symlinks: false,
+            repo_per_folder: false,
+        };
+        let config = IndexConfig {
+            sources: vec![named("outer", root), named("inner", &inner)],
+            ..IndexConfig::default()
+        };
+        let found = source_for_path(&config, &inner.join("style.safetensors"))
+            .expect("the path belongs to a source");
+        assert_eq!(found.name, "inner");
+        assert_eq!(
+            relative_to(found, &inner.join("style.safetensors")).as_deref(),
+            Some("style.safetensors")
+        );
+        assert!(source_for_path(&config, Path::new("/elsewhere/x.bin")).is_none());
     }
 
     #[test]

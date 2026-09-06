@@ -1,4 +1,5 @@
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
@@ -8,11 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use hoard_core::{ArtifactId, Role, ShelfId};
 use hoard_index::IndexError;
-use hoard_index::search::{SortKey, SortSpec, compile, parse};
-use hoard_index::store::projection::{NewProjection, record_projection};
-use hoard_index::store::{search_exec, shelf};
+use hoard_index::catalog::{NewProjection, QueryRequest};
+use hoard_index::search::{SortKey, SortSpec};
 
-use crate::api::common::{authorize, clamp_limit, compile_context};
+use crate::api::common::{authorize, blocking, clamp_limit};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -114,29 +114,36 @@ pub async fn link(
         .transpose()
         .map_err(ApiError::from)?;
     let raw = body.query.clone();
-    let node = state.node_name().to_owned();
     let now = Timestamp::now();
+    let catalog = Arc::clone(state.catalog());
 
-    let rows = state
-        .store()
-        .call(move |conn| {
-            let text = match shelf_id {
-                Some(id) => shelf::shelf(conn, id)?.query,
-                None => raw.unwrap_or_default(),
-            };
-            let query = parse(&text);
-            let context = compile_context(conn, &node, &query, now)?;
-            let compiled = compile(&query, SortSpec::new(SortKey::Size, true), &context)?;
-            search_exec::query_rows(
-                conn,
-                &compiled.where_sql,
-                &compiled.params,
-                &compiled.order_sql,
+    let rows = blocking(move || {
+        let text = match shelf_id {
+            Some(id) => {
+                catalog
+                    .shelf(id)?
+                    .ok_or_else(|| IndexError::not_found("shelf", id.to_string()))?
+                    .query
+            }
+            None => raw.unwrap_or_default(),
+        };
+        let shelves = catalog
+            .list_shelves()?
+            .into_iter()
+            .map(|shelf| (shelf.name, shelf.query))
+            .collect();
+        let context = catalog.compile_context(&text, now, shelves)?;
+        Ok(catalog
+            .query(QueryRequest {
+                raw: &text,
+                sort: SortSpec::new(SortKey::Size, true),
                 limit,
-                0,
-            )
-        })
-        .await?;
+                offset: 0,
+                context: &context,
+            })?
+            .rows)
+    })
+    .await?;
 
     let mut written = Vec::new();
     let mut skipped = Vec::new();
@@ -246,17 +253,8 @@ async fn record(state: &AppState, profile: Profile, written: &[LinkRow]) -> ApiR
             artifact_id: Some(row.artifact_id),
         })
         .collect();
-    state
-        .store()
-        .call_mut(move |conn| {
-            let transaction = conn.transaction()?;
-            for entry in &entries {
-                record_projection(&transaction, entry)?;
-            }
-            transaction.commit()?;
-            Ok(())
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    blocking(move || catalog.record_projections(&entries)).await?;
     Ok(())
 }
 
@@ -327,17 +325,20 @@ const fn a1111_directory(role: Role) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use hoard_index::store::Store;
 
     use super::*;
     use crate::config::HoardConfig;
 
-    fn state_at(data_dir: &Path, roots: Vec<PathBuf>) -> AppState {
-        let store = Store::open_in_memory().expect("store opens");
+    /// The projection rules are about paths the node never has to hold, so `data_dir` here
+    /// names a directory that does not exist; the catalog beside the state gets a real one.
+    fn state_at(data_dir: &Path, roots: Vec<PathBuf>) -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().expect("temp dir");
         let mut config = HoardConfig::default();
         config.server.data_dir = data_dir.to_path_buf();
         config.server.projection_roots = roots;
-        AppState::new(config, store).expect("state builds")
+        let catalog = crate::testing::empty_catalog(dir.path(), "test");
+        let state = AppState::new(config, catalog).expect("state builds");
+        (dir, state)
     }
 
     #[test]
@@ -375,7 +376,7 @@ mod tests {
 
     #[test]
     fn a_projection_never_escapes_the_directories_this_node_offers() {
-        let state = state_at(Path::new("/srv/hoard"), Vec::new());
+        let (_dir, state) = state_at(Path::new("/srv/hoard"), Vec::new());
         assert_eq!(
             projection_dir(&state, Profile::ComfyUi, None).expect("the default is the root"),
             PathBuf::from("/srv/hoard/profiles/comfyui")
@@ -401,7 +402,7 @@ mod tests {
 
     #[test]
     fn a_configured_root_is_the_only_way_out_of_the_data_directory() {
-        let state = state_at(
+        let (_dir, state) = state_at(
             Path::new("/srv/hoard"),
             vec![PathBuf::from("/home/hoarder/ComfyUI/models")],
         );

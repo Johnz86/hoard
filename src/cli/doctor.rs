@@ -2,9 +2,9 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use std::sync::Arc;
+
 use hoard_core::format_size;
-use hoard_index::store::node::list_nodes;
-use hoard_index::store::source::list_sources;
 
 use super::node::Context;
 
@@ -33,13 +33,19 @@ impl Check {
 }
 
 pub async fn run(context: Context) -> Result<()> {
-    let Context { config, store } = context;
+    let Context {
+        config, catalog, ..
+    } = context;
     let mut checks = Vec::new();
 
     checks.push(git_binary());
     checks.push(data_dir(&config.server.data_dir));
+    if let Some(legacy) = legacy_database(&config.index.data_dir) {
+        checks.push(legacy);
+    }
 
-    let nodes = store.call(list_nodes).await?;
+    let listing = Arc::clone(&catalog);
+    let nodes = tokio::task::spawn_blocking(move || listing.list_nodes()).await??;
     let this = nodes.iter().find(|node| node.is_self);
     checks.push(match this {
         Some(node) => Check::pass("node", format!("{} ({})", node.name, node.node_id)),
@@ -50,7 +56,7 @@ pub async fn run(context: Context) -> Result<()> {
         format!("{} known", nodes.len().saturating_sub(1)),
     ));
 
-    let sources = store.call(list_sources).await?;
+    let sources = tokio::task::spawn_blocking(move || catalog.sources()).await??;
     if config.index.sources.is_empty() {
         checks.push(Check::fail(
             "sources",
@@ -58,7 +64,7 @@ pub async fn run(context: Context) -> Result<()> {
         ));
     }
     for source in &config.index.sources {
-        let indexed = sources.iter().find(|row| row.name == source.name);
+        let indexed = sources.iter().find(|record| record.name == source.name);
         checks.push(if !source.path.exists() {
             Check::fail(
                 "source",
@@ -70,16 +76,16 @@ pub async fn run(context: Context) -> Result<()> {
             )
         } else {
             match indexed {
-                Some(row) => Check::pass(
+                Some(record) if record.last_scan.is_some() => Check::pass(
                     "source",
                     format!(
                         "{} {} files, {}",
                         source.name,
-                        row.file_count,
-                        format_size(row.byte_count)
+                        record.file_count,
+                        format_size(record.byte_count)
                     ),
                 ),
-                None => Check::pass("source", format!("{} not scanned yet", source.name)),
+                Some(_) | None => Check::pass("source", format!("{} not scanned yet", source.name)),
             }
         });
     }
@@ -120,6 +126,21 @@ fn data_dir(path: &Path) -> Check {
         Ok(()) => Check::pass("data", path.display().to_string()),
         Err(error) => Check::fail("data", format!("{}: {error}", path.display())),
     }
+}
+
+/// A `hoard.db` left by a version that kept a SQLite index. Nothing reads it any more, so
+/// it is reported once as reclaimable rather than silently occupying the data directory.
+fn legacy_database(data_dir: &Path) -> Option<Check> {
+    let database = data_dir.join("hoard.db");
+    database.is_file().then(|| {
+        Check::pass(
+            "legacy",
+            format!(
+                "hoard.db at {} is no longer read and can be deleted",
+                database.display()
+            ),
+        )
+    })
 }
 
 fn cache_dir(path: &Path) -> Check {

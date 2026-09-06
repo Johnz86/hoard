@@ -7,10 +7,10 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use hoard_core::NodeId;
-use hoard_index::store::Store;
-use hoard_index::store::node::{NewNode, list_nodes, node_by_name, set_node_online, upsert_node};
+use hoard_index::catalog::Catalog;
 use jiff::Timestamp;
 use mdns_sd::{ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio::sync::mpsc::error::TrySendError;
@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 
 use crate::error::{NetError, Result};
 use crate::identity::{NodeIdentity, SERVICE_TYPE};
+use crate::peer::on_catalog;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DiscoveryMode {
@@ -259,88 +260,80 @@ fn peer_of(resolved: &mdns_sd::ResolvedService, local: &NodeIdentity) -> Result<
     NodeIdentity::from_txt(&records, address.as_deref())?.disambiguated_from(local.id())
 }
 
-/// Records a peer in the index and marks it online, which is what the NODES tab reads.
+/// Records a peer in the catalog and marks it online, which is what the NODES tab reads.
 ///
 /// Returns the node row every later gossip and pull is filed against.
-pub async fn record_peer(store: &Store, peer: &NodeIdentity) -> Result<i64> {
+pub async fn record_peer(catalog: &Arc<Catalog>, peer: &NodeIdentity) -> Result<i64> {
     let id = peer.id().clone();
-    let name = unique_name(store, peer).await?;
+    let name = unique_name(catalog, peer).await?;
     let url = peer.url().to_string();
-    let row = store
-        .call_mut(move |conn| {
-            let row = upsert_node(conn, &NewNode::peer(id, name, url))?;
-            set_node_online(conn, row, true)?;
-            Ok(row)
-        })
-        .await?;
-    Ok(row)
+    on_catalog(catalog, move |catalog| {
+        let row = catalog.upsert_peer(&id, &name, Some(&url))?;
+        catalog.set_node_online(row.id, true)?;
+        Ok(row.id)
+    })
+    .await
 }
 
 /// Marks a peer offline without forgetting what it holds: its REMOTE entries stay, so the
-/// index still knows where the bytes are when it comes back.
-pub async fn forget_peer(store: &Store, id: &NodeId) -> Result<()> {
+/// catalog still knows where the bytes are when it comes back.
+pub async fn forget_peer(catalog: &Arc<Catalog>, id: &NodeId) -> Result<()> {
     let id = id.clone();
-    store
-        .call_mut(move |conn| {
-            let peer = list_nodes(conn)?
-                .into_iter()
-                .find(|node| !node.is_self && node.node_id == id);
-            match peer {
-                Some(node) => set_node_online(conn, node.id, false),
-                None => Ok(()),
-            }
-        })
-        .await?;
-    Ok(())
+    on_catalog(catalog, move |catalog| {
+        match catalog.node_by_id(&id)?.filter(|node| !node.is_self) {
+            Some(node) => catalog.set_node_online(node.id, false),
+            None => Ok(()),
+        }
+    })
+    .await
 }
 
 /// Records that a peer answered, with the bytes its index covers.
-pub async fn touch_peer(store: &Store, row: i64, indexed_bytes: u64) -> Result<()> {
+pub async fn touch_peer(catalog: &Arc<Catalog>, row: i64, indexed_bytes: u64) -> Result<()> {
     let at = Timestamp::now();
-    store
-        .call_mut(move |conn| hoard_index::store::node::touch_node(conn, row, at, indexed_bytes))
-        .await?;
-    Ok(())
+    on_catalog(catalog, move |catalog| {
+        catalog.touch_node(row, at, indexed_bytes)
+    })
+    .await
 }
 
 /// A display name no other node has already taken.
 ///
-/// Two machines can be called `workstation`; the index is keyed by node id, but the NODES
+/// Two machines can be called `workstation`; the catalog is keyed by node id, but the NODES
 /// tab and the `node:` facet are keyed by name, so a collision would merge them on screen.
-async fn unique_name(store: &Store, peer: &NodeIdentity) -> Result<String> {
+async fn unique_name(catalog: &Arc<Catalog>, peer: &NodeIdentity) -> Result<String> {
     let wanted = peer.name().to_owned();
     let id = peer.id().clone();
     let host = peer.host().to_owned();
-    let name = store
-        .call(move |conn| {
-            let taken = |candidate: &str| -> hoard_index::Result<bool> {
-                Ok(match node_by_name(conn, candidate)? {
-                    Some(row) => row.node_id != id,
-                    None => false,
-                })
-            };
-            if !taken(&wanted)? {
-                return Ok(wanted);
+    on_catalog(catalog, move |catalog| {
+        let taken = |candidate: &str| -> hoard_index::Result<bool> {
+            Ok(match catalog.node_by_name(candidate)? {
+                Some(row) => row.node_id != id,
+                None => false,
+            })
+        };
+        if !taken(&wanted)? {
+            return Ok(wanted);
+        }
+        let qualified = format!("{wanted} ({host})");
+        if !taken(&qualified)? {
+            return Ok(qualified);
+        }
+        for ordinal in 2..=NAME_ATTEMPTS {
+            let candidate = format!("{qualified} {ordinal}");
+            if !taken(&candidate)? {
+                return Ok(candidate);
             }
-            let qualified = format!("{wanted} ({host})");
-            if !taken(&qualified)? {
-                return Ok(qualified);
-            }
-            for ordinal in 2..=NAME_ATTEMPTS {
-                let candidate = format!("{qualified} {ordinal}");
-                if !taken(&candidate)? {
-                    return Ok(candidate);
-                }
-            }
-            Ok(format!("{wanted} ({})", id.as_str()))
-        })
-        .await?;
-    Ok(name)
+        }
+        Ok(format!("{wanted} ({})", id.as_str()))
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
-    use hoard_index::store::node::list_nodes;
+    use hoard_index::catalog::NodeRecord;
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -353,19 +346,23 @@ mod tests {
         .expect("identity builds")
     }
 
-    async fn store_with_local() -> Store {
-        let store = Store::open_in_memory().expect("store opens");
-        store
-            .call_mut(|conn| {
-                upsert_node(
-                    conn,
-                    &NewNode::local(NodeId::new("workstation-1").expect("id"), "workstation"),
-                )?;
-                Ok(())
-            })
-            .await
+    /// A catalog with no configured sources, holding only this node's own row.
+    fn catalog_with_local(root: &TempDir) -> Arc<Catalog> {
+        let config = hoard_index::config::IndexConfig {
+            data_dir: root.path().join("native-data"),
+            sources: Vec::new(),
+            ..hoard_index::config::IndexConfig::default()
+        };
+        let catalog =
+            Catalog::open_or_scan(&config, "workstation", |_, _| {}).expect("catalog opens");
+        catalog
+            .ensure_local_node(&NodeId::new("workstation-1").expect("id"), "workstation")
             .expect("local node records");
-        store
+        Arc::new(catalog)
+    }
+
+    fn nodes_of(catalog: &Catalog) -> Vec<NodeRecord> {
+        catalog.list_nodes().expect("nodes read")
     }
 
     #[test]
@@ -408,44 +405,49 @@ mod tests {
 
     #[tokio::test]
     async fn a_discovered_peer_becomes_an_online_node_row() {
-        let store = store_with_local().await;
+        let root = TempDir::new().expect("temp dir");
+        let catalog = catalog_with_local(&root);
         let peer = NodeIdentity::from_address("laptop.lan:7099").expect("peer identity");
-        let row = record_peer(&store, &peer).await.expect("peer records");
-        let again = record_peer(&store, &peer).await.expect("peer re-records");
+        let row = record_peer(&catalog, &peer).await.expect("peer records");
+        let again = record_peer(&catalog, &peer).await.expect("peer re-records");
         assert_eq!(row, again);
 
-        let nodes = store.call(list_nodes).await.expect("nodes read");
+        let nodes = nodes_of(&catalog);
         assert_eq!(nodes.len(), 2);
         let recorded = &nodes[1];
         assert!(!recorded.is_self);
         assert!(recorded.online);
         assert_eq!(recorded.url.as_deref(), Some("http://laptop.lan:7099/"));
 
-        touch_peer(&store, row, 4096).await.expect("peer answers");
-        forget_peer(&store, peer.id()).await.expect("peer departs");
-        let nodes = store.call(list_nodes).await.expect("nodes read");
+        touch_peer(&catalog, row, 4096).await.expect("peer answers");
+        forget_peer(&catalog, peer.id())
+            .await
+            .expect("peer departs");
+        let nodes = nodes_of(&catalog);
         assert!(!nodes[1].online);
         assert_eq!(nodes[1].indexed_bytes, 4096);
     }
 
     #[tokio::test]
     async fn a_peer_never_takes_a_name_another_node_already_answers_to() {
-        let store = store_with_local().await;
+        let root = TempDir::new().expect("temp dir");
+        let catalog = catalog_with_local(&root);
         let twin = NodeIdentity::new(
             NodeId::new("laptop-1").expect("id"),
             "workstation",
             "http://laptop.lan:7099",
         )
         .expect("identity builds");
-        record_peer(&store, &twin).await.expect("peer records");
-        let nodes = store.call(list_nodes).await.expect("nodes read");
+        record_peer(&catalog, &twin).await.expect("peer records");
+        let nodes = nodes_of(&catalog);
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[1].name, "workstation (laptop.lan)");
     }
 
     #[tokio::test]
     async fn peers_colliding_on_name_and_host_are_still_told_apart() {
-        let store = store_with_local().await;
+        let root = TempDir::new().expect("temp dir");
+        let catalog = catalog_with_local(&root);
         for (id, port) in [("laptop-1", 7099), ("laptop-2", 7100), ("laptop-3", 7101)] {
             let twin = NodeIdentity::new(
                 NodeId::new(id).expect("id"),
@@ -453,12 +455,9 @@ mod tests {
                 &format!("http://laptop.lan:{port}"),
             )
             .expect("identity builds");
-            record_peer(&store, &twin).await.expect("peer records");
+            record_peer(&catalog, &twin).await.expect("peer records");
         }
-        let mut names: Vec<String> = store
-            .call(list_nodes)
-            .await
-            .expect("nodes read")
+        let mut names: Vec<String> = nodes_of(&catalog)
             .into_iter()
             .map(|node| node.name)
             .collect();
@@ -469,8 +468,9 @@ mod tests {
 
     #[tokio::test]
     async fn forgetting_an_unknown_peer_is_not_an_error() {
-        let store = store_with_local().await;
-        forget_peer(&store, &NodeId::new("nobody").expect("id"))
+        let root = TempDir::new().expect("temp dir");
+        let catalog = catalog_with_local(&root);
+        forget_peer(&catalog, &NodeId::new("nobody").expect("id"))
             .await
             .expect("an unknown peer is ignored");
     }

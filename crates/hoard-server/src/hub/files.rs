@@ -17,12 +17,7 @@ use axum::response::{IntoResponse, Response};
 use futures::TryStreamExt;
 
 use hoard_core::{ArtifactId, CommitSha, RepoId, RepoRowId, Sha256};
-use hoard_index::store::Store;
-use hoard_index::store::blob::blob_by_sha256;
-use hoard_index::store::entry::{entries_for_blob, entries_for_revision};
-use hoard_index::store::node::local_node;
-use hoard_index::store::repo::repo_by_qualified;
-use hoard_index::store::revision::{resolve_revision, revision_by_sha};
+use hoard_index::catalog::Catalog;
 use hoard_mirror::MirrorError;
 use hoard_mirror::git::LfsLocation;
 use hoard_mirror::resolve::{FileAnswer, FileRequest, IngestTrigger, read_range, served_response};
@@ -31,7 +26,8 @@ use hoard_mirror::usage::{ServedRequest, log_served};
 use crate::error::{HubError, HubResult};
 use crate::hub::meta::REPO_COMMIT;
 use crate::hub::{
-    Client, PathParams, authorization, is_object_name, param, path_of, repo_of, revision_of,
+    Client, PathParams, authorization, is_object_name, on_catalog, param, path_of, repo_of,
+    revision_of,
 };
 use crate::state::AppState;
 
@@ -86,19 +82,15 @@ async fn refine(state: &AppState, repo: &RepoId, revision: &str, error: MirrorEr
 }
 
 async fn holds(state: &AppState, repo: &RepoId, revision: &str) -> bool {
-    let qualified = repo.qualified();
-    let wanted = revision.to_owned();
-    state
-        .store()
-        .call(move |conn| {
-            let node = local_node(conn)?;
-            let Some(row) = repo_by_qualified(conn, &qualified, node.id)? else {
-                return Ok(false);
-            };
-            Ok(resolve_revision(conn, row.id, &wanted).is_ok())
-        })
-        .await
-        .unwrap_or(false)
+    let wanted = repo.clone();
+    let named = revision.to_owned();
+    on_catalog(state.catalog(), move |catalog| {
+        Ok(catalog
+            .repository(&wanted)?
+            .is_some_and(|record| catalog.resolve_revision(&record, &named).is_some()))
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// `HEAD`, `GET /repos/{d1}/{d2}/{hash_repo}/{hash_file}`, the CDN URL shape a client is
@@ -146,7 +138,7 @@ async fn by_content_hash(
     let hash = hash
         .parse::<Sha256>()
         .map_err(|_| HubError::entry_not_found())?;
-    let location = locate_content(state.store(), &hash)
+    let location = locate_content(state.catalog(), &hash)
         .await?
         .ok_or_else(HubError::entry_not_found)?;
     let auth = authorization(headers);
@@ -168,41 +160,30 @@ async fn by_content_hash(
 
 /// Where in Hub terms the bytes of one content hash live, which is what both the CDN
 /// routes and the git LFS batch answer with.
-pub(crate) async fn locate_content(store: &Store, hash: &Sha256) -> HubResult<Option<LfsLocation>> {
-    Ok(locate_contents(store, vec![*hash]).await?.remove(hash))
+pub(crate) async fn locate_content(
+    catalog: &Arc<Catalog>,
+    hash: &Sha256,
+) -> HubResult<Option<LfsLocation>> {
+    Ok(locate_contents(catalog, vec![*hash]).await?.remove(hash))
 }
 
-/// Where the bytes of every named content hash live, resolved in one pass over the index.
+/// Where the bytes of every named content hash live, resolved in one pass over the catalog.
 ///
-/// An LFS batch names many objects at once, and one round trip to the store per object is
-/// one blocking task per object for a request that reads a single connection anyway.
+/// An LFS batch names many objects at once, and one round trip to the catalog per object is
+/// one blocking task per object for a request that reads a single snapshot anyway.
 pub(crate) async fn locate_contents(
-    store: &Store,
+    catalog: &Arc<Catalog>,
     hashes: Vec<Sha256>,
 ) -> HubResult<HashMap<Sha256, LfsLocation>> {
-    let located = store
-        .call(move |conn| {
-            let node = local_node(conn)?;
-            let mut found = Vec::with_capacity(hashes.len());
-            for hash in hashes {
-                let Some(blob) = blob_by_sha256(conn, &hash)? else {
-                    continue;
-                };
-                let held = entries_for_blob(conn, blob.id)?
-                    .into_iter()
-                    .find(|entry| entry.present && entry.node_row == node.id);
-                if let Some(entry) = held {
-                    found.push((hash, entry.repo_qualified, entry.revision_sha, entry.path));
-                }
-            }
-            Ok(found)
-        })
-        .await?;
+    let located = on_catalog(catalog, move |catalog| catalog.entries_by_sha256(&hashes)).await?;
     let mut out = HashMap::with_capacity(located.len());
-    for (hash, qualified, revision, path) in located {
+    for (hash, entry) in located {
+        let Some(revision) = entry.revision_sha else {
+            continue;
+        };
         let repo =
-            RepoId::parse_qualified(&qualified).map_err(|_| HubError::proxy_invalid_data())?;
-        out.insert(hash, LfsLocation::new(repo, revision, path));
+            RepoId::parse_qualified(&entry.repo).map_err(|_| HubError::proxy_invalid_data())?;
+        out.insert(hash, LfsLocation::new(repo, revision, entry.rel_path));
     }
     Ok(out)
 }
@@ -291,7 +272,7 @@ impl Meter {
     fn new(state: &AppState, served: &Served, answer: &FileAnswer, status: u16) -> Self {
         Self {
             inner: Some(Record {
-                store: state.store().clone(),
+                catalog: Arc::clone(state.catalog()),
                 repo: served.repo.clone(),
                 commit: answer.commit,
                 path: served.path.clone(),
@@ -325,7 +306,7 @@ impl Drop for Meter {
 }
 
 struct Record {
-    store: Store,
+    catalog: Arc<Catalog>,
     repo: RepoId,
     commit: CommitSha,
     path: String,
@@ -343,13 +324,13 @@ impl Record {
         {
             tracing::warn!(repo = %self.repo, %error, "a cached file was not ingested");
         }
-        let (repo, artifact) = attribute(&self.store, &self.repo, &self.commit, &self.path).await;
+        let (repo, artifact) = attribute(&self.catalog, &self.repo, &self.commit, &self.path).await;
         let request = ServedRequest::new(self.path.clone(), self.status)
             .from_client(self.client.clone())
             .for_repo(repo)
             .for_artifact(artifact)
             .served(self.bytes, self.elapsed);
-        if let Err(error) = log_served(&self.store, &request).await {
+        if let Err(error) = log_served(&self.catalog, &request).await {
             tracing::warn!(repo = %self.repo, %error, "a served response was not logged");
         }
     }
@@ -358,35 +339,39 @@ impl Record {
 /// Which repository row and artifact a served path belongs to, so the USAGE tab and the
 /// `used:` key see the pull.
 async fn attribute(
-    store: &Store,
+    catalog: &Arc<Catalog>,
     repo: &RepoId,
     commit: &CommitSha,
     path: &str,
 ) -> (Option<RepoRowId>, Option<ArtifactId>) {
-    let qualified = repo.qualified();
-    let commit = *commit;
-    let wanted = path.to_owned();
-    let found = store
-        .call(move |conn| {
-            let node = local_node(conn)?;
-            let Some(row) = repo_by_qualified(conn, &qualified, node.id)? else {
-                return Ok(None);
-            };
-            let artifact = match revision_by_sha(conn, row.id, &commit)? {
-                Some(revision) => entries_for_revision(conn, revision.id)?
-                    .into_iter()
-                    .find(|entry| entry.path == wanted)
-                    .and_then(|entry| entry.artifact),
-                None => None,
-            };
-            Ok(Some((row.id, artifact)))
-        })
-        .await;
+    let catalog = Arc::clone(catalog);
+    let wanted = repo.clone();
+    let commit = commit.to_hex();
+    let path = path.to_owned();
+    let found = tokio::task::spawn_blocking(move || {
+        let Some(record) = catalog.repository(&wanted)? else {
+            return Ok(None);
+        };
+        let artifact = match catalog.resolve_revision(&record, &commit) {
+            Some(revision) => catalog
+                .revision_entries(record.id, revision.ordinal)?
+                .into_iter()
+                .find(|entry| entry.rel_path == path)
+                .and_then(|entry| entry.artifact_id),
+            None => None,
+        };
+        Ok::<_, hoard_index::IndexError>(Some((record.id, artifact)))
+    })
+    .await;
     match found {
-        Ok(Some((repo, artifact))) => (Some(repo), artifact),
-        Ok(None) => (None, None),
-        Err(error) => {
+        Ok(Ok(Some((repo, artifact)))) => (Some(repo), artifact),
+        Ok(Ok(None)) => (None, None),
+        Ok(Err(error)) => {
             tracing::warn!(%error, "a served response could not be attributed");
+            (None, None)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "attributing a served response was cancelled");
             (None, None)
         }
     }

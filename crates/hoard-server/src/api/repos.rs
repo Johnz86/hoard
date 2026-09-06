@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path as RoutePath, Query, State};
@@ -10,16 +11,17 @@ use hoard_core::{
     State as ArtifactState, format_size,
 };
 use hoard_index::IndexError;
+use hoard_index::catalog::{
+    Catalog, EntryDetail, RepositoryDetail, RepositoryFilter, RevisionDetail,
+};
+use hoard_index::catalog::{PullRow, UsageDay};
+use hoard_index::discover::RefKind;
+use hoard_index::row::SearchRow;
 use hoard_index::shard::parse_shard_name;
 use hoard_index::sniff::parse_readme;
-use hoard_index::store::entry::entries_for_revision;
-use hoard_index::store::revision::{RefKind, RevisionRow};
-use hoard_index::store::row::SearchRow;
-use hoard_index::store::usage::{PullRow, UsageDay};
-use hoard_index::store::{artifact, blob, entry, node, repo, revision, usage};
 
 use crate::api::common::{
-    Conn, DEFAULT_LIMIT, EntryView, Fact, MIDDOT, PullCommands, RowView, clamp_limit,
+    DEFAULT_LIMIT, EntryView, Fact, MIDDOT, PullCommands, RowView, blocking, clamp_limit,
     decode_row_cursor, encode_row_cursor, entry_views, facts, pull_commands, relative_time,
     repo_id, state_label,
 };
@@ -31,6 +33,7 @@ const USAGE_DAYS: u32 = 7;
 const RECENT_PULLS: u32 = 20;
 const REPO_ARTIFACTS: u32 = 64;
 const README_PATH: &str = "README.md";
+const PULLS_LABEL: &str = "pulls on lan";
 const README_LIMIT: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -87,7 +90,7 @@ pub struct RepoListView {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RefView {
     pub name: String,
-    pub sha: CommitSha,
+    pub sha: Option<CommitSha>,
     pub short: String,
     pub when: String,
     pub kind: RefKind,
@@ -112,7 +115,7 @@ pub struct RepoView {
     pub pull_progress: Option<f32>,
     pub meta: String,
     pub revision: String,
-    pub revision_sha: CommitSha,
+    pub revision_sha: Option<CommitSha>,
     pub revision_summary: String,
     pub refs: Vec<RefView>,
     pub facts: Vec<Fact>,
@@ -196,43 +199,40 @@ pub async fn list(
     );
     let after = decode_row_cursor(params.cursor.as_deref(), &key)?.map(RepoRowId::new);
     let text = params.q.clone();
-    let view = state
-        .store()
-        .call(move |conn| {
-            let filter = repo::RepoFilter {
-                text,
-                repo_type,
-                node_row: None,
-                present_only: true,
-            };
-            let mut page = repo::list_repos(conn, &filter, after, limit.saturating_add(1))?;
-            let more = page.len() > limit as usize;
-            page.truncate(limit as usize);
-            let next_cursor = match more {
-                true => page
-                    .last()
-                    .map(|record| encode_row_cursor(record.id.get(), &key)),
-                false => None,
-            };
-            let mut rows = Vec::with_capacity(page.len());
-            for record in &page {
-                rows.push(list_row(conn, record)?);
-            }
-            Ok(RepoListView {
-                next_cursor,
-                rows,
-                total: repo::list_repos(conn, &filter, None, u32::MAX)?.len() as u64,
-            })
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        let filter = RepositoryFilter {
+            text,
+            repo_type,
+            present_only: true,
+        };
+        let page = catalog.repositories(&filter, after, limit.saturating_add(1))?;
+        let mut listed = page.rows;
+        let more = listed.len() > limit as usize;
+        listed.truncate(limit as usize);
+        let next_cursor = match more {
+            true => listed
+                .last()
+                .map(|record| encode_row_cursor(record.id.get(), &key)),
+            false => None,
+        };
+        let mut rows = Vec::with_capacity(listed.len());
+        for record in &listed {
+            rows.push(list_row(&catalog, record)?);
+        }
+        Ok(RepoListView {
+            next_cursor,
+            rows,
+            total: page.total,
         })
-        .await?;
+    })
+    .await?;
     Ok(Json(view))
 }
 
-fn list_row(conn: &Conn, record: &repo::RepoRow) -> Result<RepoListRow, IndexError> {
-    let node = node::node(conn, record.node_row)?;
-    let revision = revision::resolve_revision(conn, record.id, &record.default_ref).ok();
-    let entries = match &revision {
-        Some(revision) => entries_for_revision(conn, revision.id)?,
+fn list_row(catalog: &Catalog, record: &RepositoryDetail) -> Result<RepoListRow, IndexError> {
+    let entries = match catalog.resolve_revision(record, &record.default_ref) {
+        Some(revision) => catalog.revision_entries(record.id, revision.ordinal)?,
         None => Vec::new(),
     };
     let size = entries.iter().map(|entry| entry.size).sum();
@@ -242,13 +242,13 @@ fn list_row(conn: &Conn, record: &repo::RepoRow) -> Result<RepoListRow, IndexErr
         repo_type: record.repo.repo_type(),
         org: record.repo.org().map(str::to_owned),
         name: record.repo.name().to_owned(),
-        node: node.name,
+        node: record.node.clone(),
         kind: record.kind.as_str().to_owned(),
         default_ref: record.default_ref.clone(),
         files: entries.len() as u64,
         size,
         size_human: format_size(size),
-        last_modified: record.last_modified,
+        last_modified: None,
     })
 }
 
@@ -263,56 +263,77 @@ pub async fn detail(
     let public = public_host(state.public_url());
     let now = Timestamp::now();
     let commands = pull_commands(&state, &repo, None);
-    let view = state
-        .store()
-        .call(move |conn| {
-            let record = repo_row(conn, &repo)?;
-            let revision = revision::resolve_revision(conn, record.id, &wanted)?;
-            let rows = crate::api::common::rows_for_repo(conn, record.id, REPO_ARTIFACTS)?;
-            let primary = pick_primary(&rows);
-            let entries = entries_for_revision(conn, revision.id)?;
-            let refs = ref_views(conn, record.id, &revision, now)?;
-            let paths = match primary {
-                Some(row) => entry_views(
-                    conn,
-                    &entry::entries_for_artifact(conn, row.artifact_id)?,
-                    &host,
-                )?,
-                None => entry_views(conn, &entries, &host)?,
-            };
-            let node_name = node::node(conn, record.node_row)?.name;
-            let path = primary.and_then(|row| row.abs_path.clone());
-            let view = RepoView {
-                repo: record.repo.qualified(),
-                repo_type: record.repo.repo_type(),
-                org: record.repo.org().map(str::to_owned),
-                name: record.repo.name().to_owned(),
-                node: node_name,
-                artifact_id: primary.map(|row| row.artifact_id),
-                role: primary.map_or(Role::Unk, |row| row.role),
-                role_code: primary.map_or(Role::Unk, |row| row.role).code().to_owned(),
-                role_full: primary.map_or(Role::Unk, |row| row.role).label(),
-                state: primary.map_or(ArtifactState::Remote, |row| row.state),
-                state_full: state_label(
-                    primary.map_or(ArtifactState::Remote, |row| row.state),
-                    primary.and_then(|row| row.pull_progress),
-                    Some(&public),
-                ),
-                pull_progress: primary.and_then(|row| row.pull_progress),
-                meta: meta_line(primary, &entries, now),
-                revision: revision_name(&refs, &revision),
-                revision_sha: revision.sha,
-                revision_summary: revision_summary(&revision, entries.len(), &refs),
-                facts: repo_facts(conn, primary, now)?,
-                refs,
-                paths,
-                pull: PullCommands { path, ..commands },
-                rows: rows.iter().map(RowView::from).collect(),
-            };
-            Ok(view)
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        describe(
+            &catalog,
+            &Header {
+                repo,
+                wanted,
+                host,
+                public,
+            },
+            commands,
+            now,
+        )
+    })
+    .await?;
     Ok(Json(view))
+}
+
+/// What the header needs that the catalog does not hold: which repository and revision the
+/// route named, this node's name and the host a served badge prints.
+struct Header {
+    repo: RepoId,
+    wanted: String,
+    host: String,
+    public: String,
+}
+
+fn describe(
+    catalog: &Catalog,
+    header: &Header,
+    commands: PullCommands,
+    now: Timestamp,
+) -> Result<RepoView, IndexError> {
+    let record = require_repository(catalog, &header.repo)?;
+    let revision = require_revision(catalog, &record, &header.wanted)?;
+    let rows = catalog.repository_rows(record.id, REPO_ARTIFACTS)?;
+    let primary = pick_primary(&rows);
+    let entries = catalog.revision_entries(record.id, revision.ordinal)?;
+    let refs = ref_views(&record, &revision, now);
+    let paths = match primary {
+        Some(row) => entry_views(&catalog.entries_of(row.artifact_id)?, &header.host),
+        None => entry_views(&entries, &header.host),
+    };
+    let path = primary.and_then(|row| row.abs_path.clone());
+    Ok(RepoView {
+        repo: record.repo.qualified(),
+        repo_type: record.repo.repo_type(),
+        org: record.repo.org().map(str::to_owned),
+        name: record.repo.name().to_owned(),
+        node: record.node.clone(),
+        artifact_id: primary.map(|row| row.artifact_id),
+        role: primary.map_or(Role::Unk, |row| row.role),
+        role_code: primary.map_or(Role::Unk, |row| row.role).code().to_owned(),
+        role_full: primary.map_or(Role::Unk, |row| row.role).label(),
+        state: primary.map_or(ArtifactState::Remote, |row| row.state),
+        state_full: state_label(
+            primary.map_or(ArtifactState::Remote, |row| row.state),
+            primary.and_then(|row| row.pull_progress),
+            Some(&header.public),
+        ),
+        pull_progress: primary.and_then(|row| row.pull_progress),
+        meta: meta_line(primary, &entries, now),
+        revision: revision_name(&refs, &revision),
+        revision_sha: revision.sha,
+        revision_summary: revision_summary(&revision, entries.len(), &refs),
+        facts: repo_facts(catalog, primary, now)?,
+        refs,
+        paths,
+        pull: PullCommands { path, ..commands },
+        rows: rows.iter().map(RowView::from).collect(),
+    })
 }
 
 pub async fn files(
@@ -322,41 +343,38 @@ pub async fn files(
 ) -> ApiResult<Json<FilesView>> {
     let repo = repo_id(&repo_type, &org, &name)?;
     let wanted = params.wanted();
-    let view = state
-        .store()
-        .call(move |conn| {
-            let record = repo_row(conn, &repo)?;
-            let revision = revision::resolve_revision(conn, record.id, &wanted)?;
-            let entries = entries_for_revision(conn, revision.id)?;
-            let single = entries
-                .iter()
-                .filter(|entry| entry.artifact.is_some())
-                .count()
-                == 1;
-            let mut rows = Vec::with_capacity(entries.len());
-            for item in &entries {
-                let deduped = match item.blob {
-                    Some(id) => blob::blob(conn, id)?.path_count > 1,
-                    None => false,
-                };
-                rows.push(FileRow {
-                    kind: file_kind(&item.path, item.artifact.is_some(), single),
-                    size: item.size,
-                    size_human: format_size(item.size),
-                    state: file_state(item.present, item.lfs_pointer, deduped),
-                    state_label: file_state(item.present, item.lfs_pointer, deduped).label(),
-                    artifact_id: item.artifact,
-                    path: item.path.clone(),
-                });
-            }
-            rows.sort_by(|left, right| left.path.cmp(&right.path));
-            Ok(FilesView {
-                revision: wanted,
-                rows,
-            })
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        let record = require_repository(&catalog, &repo)?;
+        let revision = require_revision(&catalog, &record, &wanted)?;
+        let entries = catalog.revision_entries(record.id, revision.ordinal)?;
+        let single = entries
+            .iter()
+            .filter(|entry| entry.artifact_id.is_some())
+            .count()
+            == 1;
+        let mut rows: Vec<FileRow> = entries.iter().map(|item| file_row(item, single)).collect();
+        rows.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(FilesView {
+            revision: wanted,
+            rows,
         })
-        .await?;
+    })
+    .await?;
     Ok(Json(view))
+}
+
+fn file_row(item: &EntryDetail, single: bool) -> FileRow {
+    let state = file_state(item.present, item.lfs_pointer, item.deduped);
+    FileRow {
+        kind: file_kind(&item.rel_path, item.artifact_id.is_some(), single),
+        size: item.size,
+        size_human: format_size(item.size),
+        state,
+        state_label: state.label(),
+        artifact_id: item.artifact_id,
+        path: item.rel_path.clone(),
+    }
 }
 
 pub async fn readme(
@@ -368,22 +386,20 @@ pub async fn readme(
     let wanted = params.wanted();
     let probe = repo.clone();
     let revision = wanted.clone();
-    let (path, fallback) = state
-        .store()
-        .call(move |conn| {
-            let record = repo_row(conn, &probe)?;
-            let resolved = revision::resolve_revision(conn, record.id, &revision)?;
-            let entries = entries_for_revision(conn, resolved.id)?;
-            let path = entries
-                .iter()
-                .find(|entry| entry.path.eq_ignore_ascii_case(README_PATH))
-                .and_then(|entry| entry.abs_path.clone())
-                .map(PathBuf::from);
-            let rows = crate::api::common::rows_for_repo(conn, record.id, REPO_ARTIFACTS)?;
-            let primary = pick_primary(&rows).cloned();
-            Ok((path, primary))
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let (path, fallback) = blocking(move || {
+        let record = require_repository(&catalog, &probe)?;
+        let resolved = require_revision(&catalog, &record, &revision)?;
+        let entries = catalog.revision_entries(record.id, resolved.ordinal)?;
+        let path = entries
+            .iter()
+            .find(|entry| entry.rel_path.eq_ignore_ascii_case(README_PATH))
+            .and_then(|entry| entry.abs_path.clone())
+            .map(PathBuf::from);
+        let rows = catalog.repository_rows(record.id, REPO_ARTIFACTS)?;
+        Ok((path, pick_primary(&rows).cloned()))
+    })
+    .await?;
 
     let source = match path {
         Some(path) => read_card(&path).await,
@@ -421,18 +437,16 @@ pub async fn compat(
     let repo = repo_id(&repo_type, &org, &name)?;
     let wanted = params.wanted();
     let now = Timestamp::now();
-    let view = state
-        .store()
-        .call(move |conn| {
-            let record = repo_row(conn, &repo)?;
-            let resolved = revision::resolve_revision(conn, record.id, &wanted)?;
-            let rows = rows_in_revision(conn, record.id, resolved.id)?;
-            match pick_primary(&rows) {
-                Some(row) => compat_for(conn, row, DEFAULT_LIMIT, now),
-                None => Err(IndexError::not_found("artifact", record.repo.qualified())),
-            }
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        let record = require_repository(&catalog, &repo)?;
+        let resolved = require_revision(&catalog, &record, &wanted)?;
+        let rows = rows_in_revision(&catalog, &record, resolved.ordinal)?;
+        let row = pick_primary(&rows)
+            .ok_or_else(|| IndexError::not_found("artifact", record.repo.qualified()))?;
+        compat_for(&catalog, row, DEFAULT_LIMIT, now)
+    })
+    .await?;
     Ok(Json(view))
 }
 
@@ -442,23 +456,23 @@ pub async fn repo_usage(
 ) -> ApiResult<Json<UsageView>> {
     let repo = repo_id(&repo_type, &org, &name)?;
     let now = Timestamp::now();
-    let view = state
-        .store()
-        .call(move |conn| {
-            let record = repo_row(conn, &repo)?;
-            let days = usage::usage_days(conn, record.id, USAGE_DAYS)?;
-            let pulls: Vec<PullView> = usage::recent_pulls(conn, record.id, RECENT_PULLS)?
-                .into_iter()
-                .map(|pull| pull_view(pull, now))
-                .collect();
-            Ok(UsageView {
-                total: days.iter().map(|day| day.pulls).sum(),
-                days,
-                pulls,
-                clients: usage::distinct_clients(conn, record.id)?,
-            })
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        let record = require_repository(&catalog, &repo)?;
+        let days = catalog.usage_days(record.id, USAGE_DAYS)?;
+        let pulls: Vec<PullView> = catalog
+            .recent_pulls(record.id, RECENT_PULLS)?
+            .into_iter()
+            .map(|pull| pull_view(pull, now))
+            .collect();
+        Ok(UsageView {
+            total: days.iter().map(|day| day.pulls).sum(),
+            days,
+            pulls,
+            clients: catalog.distinct_clients(record.id)?,
         })
-        .await?;
+    })
+    .await?;
     Ok(Json(view))
 }
 
@@ -473,19 +487,6 @@ fn pull_view(pull: PullRow, now: Timestamp) -> PullView {
     }
 }
 
-/// The repository as this node holds it, falling back to a peer's copy so a REMOTE repo
-/// still opens.
-fn repo_row(conn: &Conn, wanted: &RepoId) -> Result<repo::RepoRow, IndexError> {
-    let qualified = wanted.qualified();
-    let rows = repo::repos_by_qualified(conn, &qualified)?;
-    let local = node::local_node(conn).ok().map(|node| node.id);
-    rows.iter()
-        .find(|row| Some(row.node_row) == local)
-        .or_else(|| rows.first())
-        .cloned()
-        .ok_or_else(|| IndexError::not_found("repo", qualified))
-}
-
 /// The artifact the header describes: the largest weights file, else the largest artifact.
 fn pick_primary(rows: &[SearchRow]) -> Option<&SearchRow> {
     rows.iter()
@@ -494,39 +495,61 @@ fn pick_primary(rows: &[SearchRow]) -> Option<&SearchRow> {
         .or_else(|| rows.iter().max_by_key(|row| row.size))
 }
 
-fn ref_views(
-    conn: &Conn,
-    repo: RepoRowId,
-    current: &RevisionRow,
-    now: Timestamp,
-) -> Result<Vec<RefView>, IndexError> {
-    let mut views = Vec::new();
-    for reference in revision::refs_for_repo(conn, repo)? {
-        let record = revision::revision(conn, reference.revision)?;
-        views.push(RefView {
-            when: record
-                .committed
-                .map(|at| relative_time(now, at))
-                .unwrap_or_else(|| "-".to_owned()),
-            short: reference.sha.short(),
-            current: reference.revision == current.id,
-            name: reference.name,
-            sha: reference.sha,
-            kind: reference.kind,
-        });
-    }
-    Ok(views)
+fn require_repository(catalog: &Catalog, repo: &RepoId) -> Result<RepositoryDetail, IndexError> {
+    catalog
+        .repository(repo)?
+        .ok_or_else(|| IndexError::not_found("repo", repo.qualified()))
 }
 
-fn revision_name(refs: &[RefView], revision: &RevisionRow) -> String {
+fn require_revision(
+    catalog: &Catalog,
+    record: &RepositoryDetail,
+    wanted: &str,
+) -> Result<RevisionDetail, IndexError> {
+    catalog
+        .resolve_revision(record, wanted)
+        .ok_or_else(|| IndexError::not_found("revision", format!("{}@{wanted}", record.id)))
+}
+
+/// The REFS tab. `when` is how long ago the ref's revision was committed, and the
+/// placeholder the design prints for an unknown time when the revision carries no date.
+fn ref_views(record: &RepositoryDetail, current: &RevisionDetail, now: Timestamp) -> Vec<RefView> {
+    record
+        .refs
+        .iter()
+        .map(|reference| {
+            let sha = reference.sha.or(current.sha);
+            let committed = record
+                .revisions
+                .iter()
+                .find(|revision| revision.ordinal == reference.revision)
+                .and_then(|revision| revision.committed);
+            RefView {
+                when: committed
+                    .map_or_else(|| "-".to_owned(), |committed| relative_time(now, committed)),
+                short: short_sha(sha),
+                current: reference.revision == current.ordinal,
+                name: reference.name.clone(),
+                kind: reference.kind,
+                sha,
+            }
+        })
+        .collect()
+}
+
+fn short_sha(sha: Option<CommitSha>) -> String {
+    sha.map_or_else(|| "-".to_owned(), |sha| sha.short())
+}
+
+fn revision_name(refs: &[RefView], revision: &RevisionDetail) -> String {
     refs.iter()
         .find(|reference| reference.current)
         .map(|reference| reference.name.clone())
-        .unwrap_or_else(|| revision.sha.short())
+        .unwrap_or_else(|| short_sha(revision.sha))
 }
 
-/// `462c3cb · 14 files · 3 branches · 2 tags`, the line under the revision chip.
-fn revision_summary(revision: &RevisionRow, files: usize, refs: &[RefView]) -> String {
+/// `462c3cb \u{b7} 14 files \u{b7} 3 branches \u{b7} 2 tags`, the line under the revision chip.
+fn revision_summary(revision: &RevisionDetail, files: usize, refs: &[RefView]) -> String {
     let branches = refs
         .iter()
         .filter(|reference| reference.kind == RefKind::Branch)
@@ -534,12 +557,12 @@ fn revision_summary(revision: &RevisionRow, files: usize, refs: &[RefView]) -> S
     let tags = refs.len() - branches;
     format!(
         "{} {MIDDOT} {files} files {MIDDOT} {branches} branches {MIDDOT} {tags} tags",
-        revision.sha.short()
+        short_sha(revision.sha)
     )
 }
 
-/// `path · size · last used 2h ago`, the header's third line.
-fn meta_line(primary: Option<&SearchRow>, entries: &[entry::EntryRow], now: Timestamp) -> String {
+/// `path \u{b7} size \u{b7} last used 2h ago`, the header's third line.
+fn meta_line(primary: Option<&SearchRow>, entries: &[EntryDetail], now: Timestamp) -> String {
     let size: u64 = entries.iter().map(|entry| entry.size).sum();
     let mut parts = Vec::with_capacity(3);
     if let Some(path) = primary.and_then(|row| row.abs_path.clone()) {
@@ -552,9 +575,10 @@ fn meta_line(primary: Option<&SearchRow>, entries: &[entry::EntryRow], now: Time
     parts.join(&format!(" {MIDDOT} "))
 }
 
-/// DERIVED FACTS: the inspector's facts plus what only a repository knows.
+/// DERIVED FACTS: the inspector's facts plus what only a repository knows, which is when
+/// the catalog first saw the artifact and how often this node has served it.
 fn repo_facts(
-    conn: &Conn,
+    catalog: &Catalog,
     primary: Option<&SearchRow>,
     now: Timestamp,
 ) -> Result<Vec<Fact>, IndexError> {
@@ -562,13 +586,13 @@ fn repo_facts(
         return Ok(Vec::new());
     };
     let mut list = facts(row);
-    let record = blob::blob(conn, row.blob_id)?;
-    list.push(Fact::new(
-        "first seen",
-        relative_time(now, record.first_seen),
-    ));
-    let uses = artifact::artifact(conn, row.artifact_id)?.use_count;
-    list.push(Fact::new("pulls on lan", uses.to_string()));
+    let first_seen = catalog
+        .artifact_detail(row.artifact_id)?
+        .and_then(|detail| detail.first_seen)
+        .map_or_else(|| "-".to_owned(), |seen| relative_time(now, seen));
+    list.push(Fact::new("first seen", first_seen));
+    let pulls = catalog.artifact_usage(row.artifact_id)?.pulls;
+    list.push(Fact::new(PULLS_LABEL, pulls.to_string()));
     Ok(list)
 }
 
@@ -577,16 +601,16 @@ fn repo_facts(
 /// A repository's artifacts are shared across its revisions, so the revision a request
 /// names is what decides which of them answer for it.
 fn rows_in_revision(
-    conn: &Conn,
-    repo: RepoRowId,
-    revision: hoard_core::RevisionId,
+    catalog: &Catalog,
+    record: &RepositoryDetail,
+    revision: u32,
 ) -> Result<Vec<SearchRow>, IndexError> {
-    let entries = entries_for_revision(conn, revision)?;
-    let mut rows = crate::api::common::rows_for_repo(conn, repo, REPO_ARTIFACTS)?;
+    let entries = catalog.revision_entries(record.id, revision)?;
+    let mut rows = catalog.repository_rows(record.id, REPO_ARTIFACTS)?;
     rows.retain(|row| {
         entries
             .iter()
-            .any(|entry| entry.artifact == Some(row.artifact_id))
+            .any(|entry| entry.artifact_id == Some(row.artifact_id))
     });
     Ok(rows)
 }

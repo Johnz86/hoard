@@ -1,6 +1,8 @@
 //! The triage queue's pure half: what an unclassified artifact looks like, and how a user
 //! override replaces what inference guessed. Persistence lives in `store`.
 
+use serde::Serialize;
+
 use hoard_core::{Base, Evidence, EvidenceSource, Role, SubRole, TensorSummary};
 
 use crate::error::{IndexError, Result};
@@ -9,7 +11,7 @@ use crate::infer::Inference;
 const MAX_TRIAGE_PREFIXES: usize = 8;
 
 /// The header facts the design's CARD tab shows for an unclassified item.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct TriageHeader {
     pub tensor_count: u32,
     pub key_prefixes: Vec<(String, u32)>,

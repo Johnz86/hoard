@@ -1,24 +1,20 @@
-//! Hub metadata and byte locations answered from the SQLite index.
+//! Hub metadata and byte locations answered from the native catalog.
 //!
-//! Every route backed here reads the files of one revision with a single entry query and
-//! derives the Hub shapes from them, so a repository this node already holds is served
-//! without opening git and without touching the network.
+//! Every route backed here reads the files of one revision once and derives the Hub shapes
+//! from them, so a repository this node already holds is served without opening git and
+//! without touching the network.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use hoard_core::{ArtifactId, CommitSha, RepoId, RepoRowId, RepoType, Sha256, clean_repo_path};
 use hoard_index::IndexError;
+use hoard_index::catalog::{
+    Catalog, EntryDetail, RepositoryDetail, RepositoryFilter, RevisionDetail,
+};
 use hoard_index::hash::git_blob_sha1_bytes;
 use hoard_index::sniff::parse_readme;
-use hoard_index::store::blob::blob;
-use hoard_index::store::entry::{entries_for_revision, entry_by_path};
-use hoard_index::store::node::local_node;
-use hoard_index::store::repo::{
-    RepoFilter, RepoRow, list_repos as list_repo_rows, repo_by_qualified,
-};
-use hoard_index::store::revision::{RevisionRow, resolve_revision, revision_by_sha};
-use hoard_index::store::{Reader, Store, Writer};
 use jiff::Timestamp;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256 as Sha256Hasher};
@@ -81,7 +77,7 @@ impl RepoListQuery {
     }
 }
 
-/// One file of a revision with everything the Hub shapes need, read in one entry query.
+/// One file of a revision with everything the Hub shapes need.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RevisionFile {
     pub(crate) path: String,
@@ -94,6 +90,18 @@ pub(crate) struct RevisionFile {
 }
 
 impl RevisionFile {
+    fn of(entry: EntryDetail) -> Self {
+        Self {
+            path: entry.rel_path,
+            size: entry.size,
+            abs_path: entry.abs_path.map(PathBuf::from),
+            sha256: entry.sha256,
+            git_sha1: entry.git_sha1,
+            artifact: entry.artifact_id,
+            lfs_pointer: entry.lfs_pointer,
+        }
+    }
+
     fn is_lfs(&self) -> bool {
         self.lfs_pointer || self.size >= LFS_THRESHOLD
     }
@@ -138,137 +146,89 @@ pub fn lfs_pointer_text(oid: &Sha256, size: u64) -> String {
     )
 }
 
-/// Runs an index read on a blocking thread with one pooled connection.
-pub(crate) async fn read_index<T, F>(store: &Store, f: F) -> Result<T>
+/// Runs catalog work off the reactor: the catalog is a file, so every read and write of it
+/// belongs on a blocking thread.
+pub(crate) async fn on_catalog<T, F>(catalog: &Arc<Catalog>, f: F) -> Result<T>
 where
-    F: FnOnce(&Reader) -> Result<T> + Send + 'static,
+    F: FnOnce(&Catalog) -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let store = store.clone();
-    tokio::task::spawn_blocking(move || {
-        let connection = store.read().map_err(MirrorError::from)?;
-        f(&connection)
-    })
-    .await
-    .map_err(|_| MirrorError::Index(IndexError::TaskJoin))?
-}
-
-/// Runs an index write on a blocking thread, serialized against every other writer.
-pub(crate) async fn write_index<T, F>(store: &Store, f: F) -> Result<T>
-where
-    F: FnOnce(&mut Writer<'_>) -> Result<T> + Send + 'static,
-    T: Send + 'static,
-{
-    let store = store.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut connection = store.write().map_err(MirrorError::from)?;
-        f(&mut connection)
-    })
-    .await
-    .map_err(|_| MirrorError::Index(IndexError::TaskJoin))?
+    let catalog = Arc::clone(catalog);
+    tokio::task::spawn_blocking(move || f(&catalog))
+        .await
+        .map_err(|_| MirrorError::Index(IndexError::TaskJoin))?
 }
 
 /// The repository as this node holds it. A repo only a peer holds is not servable here.
-pub(crate) fn repo_row(conn: &Reader, repo: &RepoId) -> Result<RepoRow> {
-    let node = local_node(conn)?;
-    repo_by_qualified(conn, &repo.qualified(), node.id)?
+pub(crate) fn repository(catalog: &Catalog, repo: &RepoId) -> Result<RepositoryDetail> {
+    catalog
+        .repository(repo)?
         .ok_or_else(|| MirrorError::RepoNotFound(repo.qualified()))
 }
 
-pub(crate) fn revision_row(conn: &Reader, repo: &RepoRow, rev: &str) -> Result<RevisionRow> {
-    resolve_revision(conn, repo.id, rev).map_err(|_| MirrorError::RevisionNotFound(rev.to_owned()))
+pub(crate) fn revision(
+    catalog: &Catalog,
+    repository: &RepositoryDetail,
+    rev: &str,
+) -> Result<RevisionDetail> {
+    catalog
+        .resolve_revision(repository, rev)
+        .ok_or_else(|| MirrorError::RevisionNotFound(rev.to_owned()))
 }
 
-pub(crate) fn revision_row_by_sha(
-    conn: &Reader,
-    repo: &RepoRow,
+pub(crate) fn revision_by_sha(
+    repository: &RepositoryDetail,
     sha: &CommitSha,
-) -> Result<RevisionRow> {
-    revision_by_sha(conn, repo.id, sha)?.ok_or_else(|| MirrorError::RevisionNotFound(sha.to_hex()))
+) -> Result<RevisionDetail> {
+    repository
+        .revisions
+        .iter()
+        .find(|revision| revision.sha.as_ref() == Some(sha))
+        .cloned()
+        .ok_or_else(|| MirrorError::RevisionNotFound(sha.to_hex()))
 }
 
-/// Every present file of a revision, sorted by path.
-///
-/// The entry rows come back in one query; the content hashes are then read once per
-/// distinct blob, so the cost is bound by the revision rather than by how many paths a
-/// request asked about.
-pub(crate) fn revision_files(conn: &Reader, revision: &RevisionRow) -> Result<Vec<RevisionFile>> {
-    let rows = entries_for_revision(conn, revision.id)?;
-    let mut hashes: BTreeMap<i64, (Option<Sha256>, Option<CommitSha>)> = BTreeMap::new();
-    let mut files = Vec::with_capacity(rows.len());
-    for row in rows {
-        if !row.present {
-            continue;
-        }
-        let (sha256, git_sha1) = match row.blob {
-            Some(id) => match hashes.get(&id.get()) {
-                Some(found) => *found,
-                None => {
-                    let record = blob(conn, id)?;
-                    let pair = (record.sha256, record.git_sha1);
-                    hashes.insert(id.get(), pair);
-                    pair
-                }
-            },
-            None => (None, None),
-        };
-        files.push(RevisionFile {
-            path: row.path,
-            size: row.size,
-            abs_path: row.abs_path.map(PathBuf::from),
-            sha256,
-            git_sha1,
-            artifact: row.artifact,
-            lfs_pointer: row.lfs_pointer,
-        });
-    }
+/// Every present file of a revision, sorted by path, read in one pass so the cost is bound
+/// by the revision rather than by how many paths a request asked about.
+pub(crate) fn revision_files(
+    catalog: &Catalog,
+    repository: &RepositoryDetail,
+    revision: &RevisionDetail,
+) -> Result<Vec<RevisionFile>> {
+    let mut files: Vec<RevisionFile> = catalog
+        .revision_entries(repository.id, revision.ordinal)?
+        .into_iter()
+        .filter(|entry| entry.present)
+        .map(RevisionFile::of)
+        .collect();
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
 }
 
-/// One present file of a revision, named by path.
-///
-/// Only the matching row's blob is read, so resolving one path of a large revision does not
-/// pay for the content hashes of every other file in it.
+/// One file of a revision, named by path, without reading the rest of the revision.
 pub(crate) fn revision_file(
-    conn: &Reader,
-    revision: &RevisionRow,
+    catalog: &Catalog,
+    repository: &RepositoryDetail,
+    revision: &RevisionDetail,
     path: &str,
 ) -> Result<Option<RevisionFile>> {
-    let Some(row) = entry_by_path(conn, revision.id, path)? else {
-        return Ok(None);
-    };
-    let (sha256, git_sha1) = match row.blob {
-        Some(id) => {
-            let record = blob(conn, id)?;
-            (record.sha256, record.git_sha1)
-        }
-        None => (None, None),
-    };
-    Ok(Some(RevisionFile {
-        path: row.path,
-        size: row.size,
-        abs_path: row.abs_path.map(PathBuf::from),
-        sha256,
-        git_sha1,
-        artifact: row.artifact,
-        lfs_pointer: row.lfs_pointer,
-    }))
+    Ok(catalog
+        .revision_entry(repository.id, revision.ordinal, path)?
+        .map(RevisionFile::of))
 }
 
 /// `/api/{repo_type}/{ref}` and `/api/{repo_type}/{ref}/revision/{revision}`.
-pub async fn repo_info(store: &Store, repo: &RepoId, revision: &str) -> Result<RepoInfo> {
+pub async fn repo_info(catalog: &Arc<Catalog>, repo: &RepoId, revision: &str) -> Result<RepoInfo> {
     let wanted = repo.clone();
     let rev = revision.to_owned();
-    read_index(store, move |conn| {
-        let row = repo_row(conn, &wanted)?;
-        let revision = revision_row(conn, &row, &rev)?;
-        let files = revision_files(conn, &revision)?;
-        let card = read_card(&row, &files);
+    on_catalog(catalog, move |catalog| {
+        let record = repository(catalog, &wanted)?;
+        let found = self::revision(catalog, &record, &rev)?;
+        let files = revision_files(catalog, &record, &found)?;
+        let card = read_card(&files);
         Ok(build_repo_info(
             &wanted,
-            &row,
-            &revision,
+            &found,
             files.iter().map(|file| Sibling::new(&file.path)).collect(),
             card,
         ))
@@ -278,22 +238,21 @@ pub async fn repo_info(store: &Store, repo: &RepoId, revision: &str) -> Result<R
 
 /// `/api/{repo_type}/{ref}/tree/{revision}/{path}`.
 pub async fn tree(
-    store: &Store,
+    catalog: &Arc<Catalog>,
     repo: &RepoId,
     sha: &CommitSha,
     path: &str,
-    recursive: bool,
-    expand: bool,
+    listing: TreeListing,
 ) -> Result<Vec<TreeEntry>> {
     let wanted = repo.clone();
     let sha = *sha;
     let prefix =
         clean_repo_path(path).ok_or_else(|| MirrorError::EntryNotFound(path.to_owned()))?;
-    read_index(store, move |conn| {
-        let row = repo_row(conn, &wanted)?;
-        let revision = revision_row_by_sha(conn, &row, &sha)?;
-        let files = revision_files(conn, &revision)?;
-        Ok(build_tree(&files, &prefix, recursive, expand, &revision))
+    on_catalog(catalog, move |catalog| {
+        let record = repository(catalog, &wanted)?;
+        let found = revision_by_sha(&record, &sha)?;
+        let files = revision_files(catalog, &record, &found)?;
+        Ok(build_tree(&files, &prefix, listing, &found))
     })
     .await
 }
@@ -301,7 +260,7 @@ pub async fn tree(
 /// `/api/{repo_type}/{ref}/paths-info/{revision}`, answered for every requested path from
 /// one pass over the revision rather than one upstream call per path.
 pub async fn paths_info(
-    store: &Store,
+    catalog: &Arc<Catalog>,
     repo: &RepoId,
     sha: &CommitSha,
     paths: &[String],
@@ -309,10 +268,10 @@ pub async fn paths_info(
     let wanted = repo.clone();
     let sha = *sha;
     let paths = paths.to_vec();
-    read_index(store, move |conn| {
-        let row = repo_row(conn, &wanted)?;
-        let revision = revision_row_by_sha(conn, &row, &sha)?;
-        let files = revision_files(conn, &revision)?;
+    on_catalog(catalog, move |catalog| {
+        let record = repository(catalog, &wanted)?;
+        let found = revision_by_sha(&record, &sha)?;
+        let files = revision_files(catalog, &record, &found)?;
         Ok(build_paths_info(&files, &paths))
     })
     .await
@@ -323,20 +282,20 @@ pub async fn paths_info(
 /// A repository the index synthesized from an HF cache snapshot or a loose folder has one
 /// commit per revision and no ancestry, so the listing is that single commit.
 pub async fn commits(
-    store: &Store,
+    catalog: &Arc<Catalog>,
     repo: &RepoId,
     sha: &CommitSha,
     limit: u32,
 ) -> Result<Vec<CommitEntry>> {
     let wanted = repo.clone();
     let sha = *sha;
-    read_index(store, move |conn| {
-        let row = repo_row(conn, &wanted)?;
-        let revision = revision_row_by_sha(conn, &row, &sha)?;
+    on_catalog(catalog, move |catalog| {
+        let record = repository(catalog, &wanted)?;
+        let found = revision_by_sha(&record, &sha)?;
         if limit.min(MAX_COMMITS) == 0 {
             return Ok(Vec::new());
         }
-        Ok(vec![build_commit(&row, &revision)])
+        Ok(vec![build_commit(&record.repo, &found)])
     })
     .await
 }
@@ -346,7 +305,7 @@ pub async fn commits(
 /// A file whose content hash this node has not computed yet is reported as missing: a
 /// client verifies the `etag` it is given, so an unverifiable answer is worse than a 404.
 pub async fn locate(
-    store: &Store,
+    catalog: &Arc<Catalog>,
     repo: &RepoId,
     sha: &CommitSha,
     path: &str,
@@ -355,10 +314,10 @@ pub async fn locate(
     let sha = *sha;
     let cleaned =
         clean_repo_path(path).ok_or_else(|| MirrorError::EntryNotFound(path.to_owned()))?;
-    read_index(store, move |conn| {
-        let row = repo_row(conn, &wanted)?;
-        let revision = revision_row_by_sha(conn, &row, &sha)?;
-        let file = revision_file(conn, &revision, &cleaned)?
+    on_catalog(catalog, move |catalog| {
+        let record = repository(catalog, &wanted)?;
+        let found = revision_by_sha(&record, &sha)?;
+        let file = revision_file(catalog, &record, &found, &cleaned)?
             .ok_or_else(|| MirrorError::EntryNotFound(cleaned.clone()))?;
         let abs_path = file
             .abs_path
@@ -381,8 +340,8 @@ pub async fn locate(
             is_lfs,
             lfs_pointer_only: file.lfs_pointer,
             artifact_id: file.artifact,
-            repo_id: row.id,
-            commit: revision.sha,
+            repo_id: record.id,
+            commit: sha,
         })
     })
     .await
@@ -391,24 +350,22 @@ pub async fn locate(
 /// `GET /api/models`, `/api/datasets` and `/api/spaces`.
 ///
 /// The Hub omits `siblings` from a listing and so does hoard; a client that wants the file
-/// list asks for the repo itself.
-pub async fn list_repos(store: &Store, query: &RepoListQuery) -> Result<Vec<RepoInfo>> {
+/// list asks for the repo itself, which is also where the card is read from.
+pub async fn list_repos(catalog: &Arc<Catalog>, query: &RepoListQuery) -> Result<Vec<RepoInfo>> {
     let query = query.clone();
-    read_index(store, move |conn| {
-        let node = local_node(conn)?;
-        let filter = RepoFilter {
+    on_catalog(catalog, move |catalog| {
+        let filter = RepositoryFilter {
             text: query.search.clone(),
             repo_type: Some(query.repo_type),
-            node_row: Some(node.id),
             present_only: true,
         };
         let page = query.limit.max(1).saturating_mul(2).min(512);
         let mut cursor = None;
         let mut out = Vec::new();
         while out.len() < query.limit as usize {
-            let rows = list_repo_rows(conn, &filter, cursor, page)?;
-            let exhausted = rows.len() < page as usize;
-            for row in rows {
+            let listing = catalog.repositories(&filter, cursor, page)?;
+            let exhausted = listing.rows.len() < page as usize;
+            for row in &listing.rows {
                 cursor = Some(row.id);
                 if query
                     .author
@@ -417,12 +374,15 @@ pub async fn list_repos(store: &Store, query: &RepoListQuery) -> Result<Vec<Repo
                 {
                     continue;
                 }
-                let Ok(revision) = revision_row(conn, &row, "main") else {
+                let Some(found) = catalog.resolve_revision(row, &row.default_ref) else {
                     continue;
                 };
-                let card = stored_card(&row);
-                let repo = row.repo.clone();
-                out.push(build_repo_info(&repo, &row, &revision, Vec::new(), card));
+                out.push(build_repo_info(
+                    &row.repo,
+                    &found,
+                    Vec::new(),
+                    RepoCard::default(),
+                ));
                 if out.len() == query.limit as usize {
                     return Ok(out);
                 }
@@ -436,6 +396,13 @@ pub async fn list_repos(store: &Store, query: &RepoListQuery) -> Result<Vec<Repo
     .await
 }
 
+/// How much of a tree one request asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeListing {
+    pub recursive: bool,
+    pub expand: bool,
+}
+
 /// The README body and the parsed frontmatter behind `description` and `cardData`.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct RepoCard {
@@ -443,23 +410,9 @@ struct RepoCard {
     data: Option<Value>,
 }
 
-fn stored_card(row: &RepoRow) -> RepoCard {
-    RepoCard {
-        description: row.description.clone().unwrap_or_default(),
-        data: row
-            .card_data
-            .as_deref()
-            .and_then(|raw| serde_json::from_str(raw).ok()),
-    }
-}
-
-/// The card as the Hub reports it: the stored columns when discovery filled them, and the
-/// README of the revision otherwise.
-fn read_card(row: &RepoRow, files: &[RevisionFile]) -> RepoCard {
-    let stored = stored_card(row);
-    if !stored.description.is_empty() && stored.data.is_some() {
-        return stored;
-    }
+/// The card as the Hub reports it: the README of the revision, when this node holds one
+/// small enough to read.
+fn read_card(files: &[RevisionFile]) -> RepoCard {
     let Some(readme) = files
         .iter()
         .find(|file| file.path == README_PATH)
@@ -469,13 +422,11 @@ fn read_card(row: &RepoRow, files: &[RevisionFile]) -> RepoCard {
         })
         .and_then(|path| std::fs::read_to_string(path).ok())
     else {
-        return stored;
+        return RepoCard::default();
     };
     let document = parse_readme(&readme);
-    let data = if document.frontmatter.is_empty() {
-        stored.data
-    } else {
-        Some(Value::Object(
+    let data = (!document.frontmatter.is_empty()).then(|| {
+        Value::Object(
             document
                 .frontmatter
                 .iter()
@@ -487,49 +438,47 @@ fn read_card(row: &RepoRow, files: &[RevisionFile]) -> RepoCard {
                     )
                 })
                 .collect::<Map<String, Value>>(),
-        ))
-    };
+        )
+    });
     RepoCard {
-        description: if stored.description.is_empty() {
-            document.body.trim().to_owned()
-        } else {
-            stored.description
-        },
+        description: document.body.trim().to_owned(),
         data,
     }
 }
 
+/// The commit a revision names, or git's own spelling for no object when the layout the
+/// revision came from never carried one.
+fn revision_sha(revision: &RevisionDetail) -> String {
+    revision
+        .sha
+        .map_or_else(|| UNKNOWN_OID.to_owned(), |sha| sha.to_hex())
+}
+
 fn build_repo_info(
     repo: &RepoId,
-    row: &RepoRow,
-    revision: &RevisionRow,
+    revision: &RevisionDetail,
     siblings: Vec<Sibling>,
     card: RepoCard,
 ) -> RepoInfo {
-    let sha = revision.sha.to_hex();
-    let last_modified = revision
-        .committed
-        .or(row.last_modified)
-        .or(row.created_at)
-        .unwrap_or(Timestamp::UNIX_EPOCH);
-    let created_at = row.created_at.unwrap_or(last_modified);
+    let sha = revision_sha(revision);
+    let last_modified = revision.committed.unwrap_or(Timestamp::UNIX_EPOCH);
     RepoInfo {
         internal_id: internal_id(repo, &sha),
         id: repo.reference(),
         author: repo.org().map(str::to_owned),
         sha,
         last_modified: HubTimestamp::new(last_modified),
-        private: row.private,
-        gated: row.gated,
+        private: false,
+        gated: false,
         disabled: false,
-        tags: tags(row, card.data.as_ref()),
+        tags: tags(card.data.as_ref()),
         description: card.description,
         paperswithcode_id: None,
-        downloads: row.downloads,
-        likes: row.likes,
+        downloads: 0,
+        likes: 0,
         card_data: card.data,
         siblings,
-        created_at: HubTimestamp::new(created_at),
+        created_at: HubTimestamp::new(last_modified),
     }
 }
 
@@ -542,7 +491,7 @@ fn internal_id(repo: &RepoId, sha: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn tags(row: &RepoRow, card: Option<&Value>) -> Vec<String> {
+fn tags(card: Option<&Value>) -> Vec<String> {
     let mut tags: Vec<String> = card
         .and_then(|data| data.get("tags"))
         .and_then(Value::as_array)
@@ -554,7 +503,10 @@ fn tags(row: &RepoRow, card: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default();
-    if let Some(license) = row.license.as_deref() {
+    if let Some(license) = card
+        .and_then(|data| data.get("license"))
+        .and_then(Value::as_str)
+    {
         let tag = format!("license:{license}");
         if !tags.contains(&tag) {
             tags.push(tag);
@@ -563,31 +515,26 @@ fn tags(row: &RepoRow, card: Option<&Value>) -> Vec<String> {
     tags
 }
 
-fn build_commit(row: &RepoRow, revision: &RevisionRow) -> CommitEntry {
+fn build_commit(repo: &RepoId, revision: &RevisionDetail) -> CommitEntry {
     let author = revision
         .author
         .clone()
-        .or_else(|| row.repo.org().map(str::to_owned));
+        .or_else(|| repo.org().map(str::to_owned));
     CommitEntry {
-        id: revision.sha.to_hex(),
+        id: revision_sha(revision),
         title: revision
             .title
             .clone()
             .unwrap_or_else(|| DEFAULT_COMMIT_TITLE.to_owned()),
         message: String::new(),
         authors: author.into_iter().map(CommitAuthor::new).collect(),
-        date: HubTimestamp::new(
-            revision
-                .committed
-                .or(row.last_modified)
-                .unwrap_or(Timestamp::UNIX_EPOCH),
-        ),
+        date: HubTimestamp::new(revision.committed.unwrap_or(Timestamp::UNIX_EPOCH)),
     }
 }
 
-fn last_commit(revision: &RevisionRow) -> LastCommit {
+fn last_commit(revision: &RevisionDetail) -> LastCommit {
     LastCommit {
-        id: revision.sha.to_hex(),
+        id: revision_sha(revision),
         title: revision
             .title
             .clone()
@@ -606,9 +553,8 @@ fn under<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
 fn build_tree(
     files: &[RevisionFile],
     prefix: &str,
-    recursive: bool,
-    expand: bool,
-    revision: &RevisionRow,
+    listing: TreeListing,
+    revision: &RevisionDetail,
 ) -> Vec<TreeEntry> {
     let mut entries: BTreeMap<String, TreeEntry> = BTreeMap::new();
     for file in files {
@@ -618,7 +564,7 @@ fn build_tree(
         if rest.is_empty() {
             continue;
         }
-        match (rest.split_once('/'), recursive) {
+        match (rest.split_once('/'), listing.recursive) {
             (Some((head, _)), false) => {
                 let path = join_path(prefix, head);
                 entries
@@ -640,7 +586,7 @@ fn build_tree(
         }
     }
     let mut out: Vec<TreeEntry> = entries.into_values().collect();
-    if expand {
+    if listing.expand {
         let commit = last_commit(revision);
         for entry in &mut out {
             entry.last_commit = Some(commit.clone());
@@ -690,26 +636,22 @@ fn build_paths_info(files: &[RevisionFile], paths: &[String]) -> Vec<PathsInfoEn
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::path::Path;
 
-    use rusqlite::trace::{TraceEvent, TraceEventCodes};
-
-    use hoard_core::NodeId;
-    use hoard_core::{RepoType, State};
-    use hoard_index::config::SourceKind;
-    use hoard_index::store::artifact::{NewArtifact, upsert_artifact};
-    use hoard_index::store::blob::{set_sha256, upsert_blob};
-    use hoard_index::store::entry::{NewEntry, upsert_entry};
-    use hoard_index::store::node::{NewNode, upsert_node};
-    use hoard_index::store::repo::{NewRepo, upsert_repo};
-    use hoard_index::store::revision::{NewRevision, RefKind, upsert_ref, upsert_revision};
+    use hoard_core::{Artifact, ArtifactFormat, Base, BlobId, RepoType, Role, State};
+    use hoard_index::catalog::{LOCAL_NODE, SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
+    use hoard_index::config::{IndexConfig, SourceKind};
+    use hoard_index::discover::RefKind;
+    use tempfile::TempDir;
 
     use super::*;
 
     const WEIGHTS: &str = "unet/model.safetensors";
     const WEIGHTS_SHA256: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const CONFIG_SHA256: &str = "3333333333333333333333333333333333333333333333333333333333333333";
     const CONFIG_SHA1: &str = "2222222222222222222222222222222222222222";
     const COMMIT: [u8; 20] = [0x46; 20];
+    const CARD: &str = "---\nlicense: apache-2.0\n---\n\nWhisper.\n";
 
     pub(crate) fn commit_sha() -> CommitSha {
         CommitSha::from_bytes(COMMIT)
@@ -719,108 +661,115 @@ mod tests {
         "2026-01-17T10:22:31Z".parse().expect("timestamp parses")
     }
 
-    pub(crate) fn seed(store: &Store) -> RepoId {
-        let conn = store.write().expect("writer");
-        let node = upsert_node(
-            &conn,
-            &NewNode::local(NodeId::new("node-1").expect("node id"), "workstation"),
-        )
-        .expect("node inserts");
-        let repo = RepoId::new(RepoType::Models, Some("openai".to_owned()), "whisper");
-        let repo_row = upsert_repo(
-            &conn,
-            &NewRepo {
-                license: Some("apache-2.0".to_owned()),
-                last_modified: Some(at()),
-                created_at: Some(at()),
-                ..NewRepo::new(repo.clone(), node, SourceKind::HfCache)
-            },
-        )
-        .expect("repo inserts");
-        let revision = upsert_revision(
-            &conn,
-            &NewRevision {
-                title: Some("Upload weights".to_owned()),
-                author: Some("openai".to_owned()),
-                committed: Some(at()),
-                ..NewRevision::new(repo_row, commit_sha())
-            },
-        )
-        .expect("revision inserts");
-        upsert_ref(&conn, repo_row, "main", RefKind::Branch, revision).expect("ref inserts");
-
-        let big = upsert_blob(&conn, "xxh3:weights", 4_265_146_304, at()).expect("blob inserts");
-        set_sha256(
-            &conn,
-            big,
-            WEIGHTS_SHA256.parse().expect("sha256 parses"),
-            None,
-            at(),
-        )
-        .expect("hash records");
-        let small = upsert_blob(&conn, "xxh3:config", 12, at()).expect("blob inserts");
-        set_sha256(
-            &conn,
-            small,
-            "3333333333333333333333333333333333333333333333333333333333333333"
-                .parse()
-                .expect("sha256 parses"),
-            Some(CONFIG_SHA1.parse().expect("sha1 parses")),
-            at(),
-        )
-        .expect("hash records");
-        let readme = upsert_blob(&conn, "xxh3:readme", 64, at()).expect("blob inserts");
-
-        let artifact = upsert_artifact(&conn, &NewArtifact::new(big, "whisper"), at())
-            .expect("artifact inserts");
-        upsert_entry(
-            &conn,
-            &NewEntry {
-                blob: Some(big),
-                artifact: Some(artifact),
-                abs_path: Some("/data/hub/blobs/weights".to_owned()),
-                size: 4_265_146_304,
-                state: State::Served,
-                ..NewEntry::new(revision, WEIGHTS, node)
-            },
-            at(),
-        )
-        .expect("entry inserts");
-        upsert_entry(
-            &conn,
-            &NewEntry {
-                blob: Some(small),
-                abs_path: Some("/data/hub/blobs/config".to_owned()),
-                size: 12,
-                ..NewEntry::new(revision, "config.json", node)
-            },
-            at(),
-        )
-        .expect("entry inserts");
-        upsert_entry(
-            &conn,
-            &NewEntry {
-                blob: Some(readme),
-                abs_path: Some("/data/hub/blobs/readme".to_owned()),
-                size: 64,
-                ..NewEntry::new(revision, README_PATH, node)
-            },
-            at(),
-        )
-        .expect("entry inserts");
-        drop(conn);
-        repo
+    fn listing(recursive: bool, expand: bool) -> TreeListing {
+        TreeListing { recursive, expand }
     }
 
-    fn store() -> Store {
-        Store::open_in_memory().expect("store opens")
+    fn weights_artifact() -> SeedArtifact {
+        SeedArtifact {
+            identity: 0x77,
+            artifact: Artifact {
+                id: ArtifactId::new(0),
+                blob: BlobId::new(0),
+                sha256: Some(WEIGHTS_SHA256.parse().expect("sha256 parses")),
+                size: 4_265_146_304,
+                format: ArtifactFormat::Safetensors,
+                role: Role::Ckpt,
+                sub_role: None,
+                role_confidence: 0.9,
+                base: Base::any(),
+                base_label: None,
+                base_confidence: 0.5,
+                precision: None,
+                quant: None,
+                rank: None,
+                alpha: None,
+                params: None,
+                context: None,
+                trigger: None,
+                sniff_version: 1,
+            },
+            name: "model.safetensors".to_owned(),
+            org: Some("openai".to_owned()),
+            tensors: None,
+            evidence: Vec::new(),
+            card: None,
+            group_bytes: None,
+            shard_count: None,
+        }
+    }
+
+    fn present(rel_path: &str, abs_path: &str, size: u64) -> SeedEntry {
+        SeedEntry {
+            node: LOCAL_NODE,
+            rel_path: rel_path.to_owned(),
+            abs_path: Some(abs_path.to_owned()),
+            size,
+            state: State::Served,
+            is_symlink: false,
+            sha256: None,
+            git_sha1: None,
+            artifact: None,
+        }
+    }
+
+    /// One repository as the catalog holds it: a README this node can read, a small file
+    /// with both hashes, and an LFS-sized weight file that is an artifact.
+    pub(crate) fn seeded(dir: &Path) -> (Arc<Catalog>, RepoId) {
+        std::fs::write(dir.join(README_PATH), CARD).expect("card writes");
+        let catalog = Catalog::open_or_scan(
+            &IndexConfig {
+                data_dir: dir.join("native"),
+                sources: Vec::new(),
+                ..IndexConfig::default()
+            },
+            "node-1",
+            |_, _| {},
+        )
+        .expect("catalog opens");
+        let repo = RepoId::new(RepoType::Models, Some("openai".to_owned()), "whisper");
+        catalog
+            .seed(&[SeedRepository {
+                repo: repo.clone(),
+                source: "cache".to_owned(),
+                kind: SourceKind::HfCache,
+                root_path: dir.to_path_buf(),
+                git_dir: None,
+                revisions: vec![SeedRevision {
+                    name: "main".to_owned(),
+                    sha: Some(commit_sha()),
+                    refs: vec![("main".to_owned(), RefKind::Branch)],
+                    title: Some("Upload weights".to_owned()),
+                    author: Some("openai".to_owned()),
+                    committed: Some(at()),
+                    entries: vec![
+                        present(README_PATH, &dir.join(README_PATH).to_string_lossy(), 64),
+                        SeedEntry {
+                            node: LOCAL_NODE,
+                            sha256: Some(CONFIG_SHA256.parse().expect("sha256 parses")),
+                            git_sha1: Some(CONFIG_SHA1.parse().expect("sha1 parses")),
+                            ..present("config.json", "/data/hub/blobs/config", 12)
+                        },
+                        SeedEntry {
+                            node: LOCAL_NODE,
+                            sha256: Some(WEIGHTS_SHA256.parse().expect("sha256 parses")),
+                            artifact: Some(weights_artifact()),
+                            ..present(WEIGHTS, "/data/hub/blobs/weights", 4_265_146_304)
+                        },
+                    ],
+                }],
+            }])
+            .expect("the catalog seeds");
+        (Arc::new(catalog), repo)
     }
 
     #[tokio::test]
     async fn repo_metadata_matches_the_documented_body() {
-        let store = store();
-        let repo = seed(&store);
-        let info = repo_info(&store, &repo, "main").await.expect("info reads");
+        let dir = TempDir::new().expect("temp dir");
+        let (catalog, repo) = seeded(dir.path());
+        let info = repo_info(&catalog, &repo, "main")
+            .await
+            .expect("info reads");
 
         assert_eq!(info.id, "openai/whisper");
         assert_eq!(info.author.as_deref(), Some("openai"));
@@ -845,9 +794,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_tree_listing_names_lfs_files_by_their_content_hash() {
-        let store = store();
-        let repo = seed(&store);
-        let entries = tree(&store, &repo, &commit_sha(), "", false, false)
+        let dir = TempDir::new().expect("temp dir");
+        let (catalog, repo) = seeded(dir.path());
+        let entries = tree(&catalog, &repo, &commit_sha(), "", listing(false, false))
             .await
             .expect("tree reads");
 
@@ -868,9 +817,15 @@ mod tests {
             .expect("array")
         );
 
-        let deep = tree(&store, &repo, &commit_sha(), "unet", false, false)
-            .await
-            .expect("tree reads");
+        let deep = tree(
+            &catalog,
+            &repo,
+            &commit_sha(),
+            "unet",
+            listing(false, false),
+        )
+        .await
+        .expect("tree reads");
         assert_eq!(deep.len(), 1);
         let lfs = deep[0].lfs.as_ref().expect("the weight file is lfs");
         assert_eq!(lfs.oid, WEIGHTS_SHA256);
@@ -882,9 +837,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_expanded_tree_carries_the_last_commit_and_the_scan_report() {
-        let store = store();
-        let repo = seed(&store);
-        let entries = tree(&store, &repo, &commit_sha(), "unet", true, true)
+        let dir = TempDir::new().expect("temp dir");
+        let (catalog, repo) = seeded(dir.path());
+        let entries = tree(&catalog, &repo, &commit_sha(), "unet", listing(true, true))
             .await
             .expect("tree reads");
         let commit = entries[0].last_commit.as_ref().expect("last commit");
@@ -895,8 +850,8 @@ mod tests {
 
     #[tokio::test]
     async fn paths_info_answers_every_path_from_one_revision_read() {
-        let store = store();
-        let repo = seed(&store);
+        let dir = TempDir::new().expect("temp dir");
+        let (catalog, repo) = seeded(dir.path());
         let paths = vec![
             WEIGHTS.to_owned(),
             "config.json".to_owned(),
@@ -904,7 +859,7 @@ mod tests {
             "missing.bin".to_owned(),
             "config.json".to_owned(),
         ];
-        let entries = paths_info(&store, &repo, &commit_sha(), &paths)
+        let entries = paths_info(&catalog, &repo, &commit_sha(), &paths)
             .await
             .expect("paths info reads");
         let json = serde_json::to_value(&entries).expect("serializes");
@@ -934,55 +889,39 @@ mod tests {
     const WEIGHTS_POINTER_OID: &str = "e5ac5c26df05b49b81220fd5128d05097e959822";
     const LFS_POINTER_SIZE: u64 = 135;
 
-    static STATEMENTS: AtomicUsize = AtomicUsize::new(0);
-    static ENTRY_STATEMENTS: AtomicUsize = AtomicUsize::new(0);
-
-    fn count(event: TraceEvent<'_>) {
-        if let TraceEvent::Stmt(_, sql) = event {
-            STATEMENTS.fetch_add(1, Ordering::Relaxed);
-            if sql.contains("FROM entry") {
-                ENTRY_STATEMENTS.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
     #[test]
-    fn paths_info_reads_the_entry_table_once_however_many_paths_are_asked_about() {
-        let store = store();
-        let repo = seed(&store);
-        let conn = store.read().expect("reader");
-        conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(count));
+    fn paths_info_reads_the_revision_once() {
+        let dir = TempDir::new().expect("temp dir");
+        let (catalog, repo) = seeded(dir.path());
+        let record = repository(&catalog, &repo).expect("repo reads");
+        let found = revision_by_sha(&record, &commit_sha()).expect("revision reads");
+        let files = revision_files(&catalog, &record, &found).expect("files read");
 
-        let one = vec![WEIGHTS.to_owned()];
-        let five: Vec<String> = ["a", "b", "c", "d", "e"]
-            .iter()
-            .map(|name| format!("{name}.bin"))
-            .collect();
-
-        let row = repo_row(&conn, &repo).expect("repo reads");
-        let revision = revision_row_by_sha(&conn, &row, &commit_sha()).expect("revision reads");
-
-        STATEMENTS.store(0, Ordering::Relaxed);
-        ENTRY_STATEMENTS.store(0, Ordering::Relaxed);
-        let files = revision_files(&conn, &revision).expect("files read");
-        build_paths_info(&files, &one);
-        let single = STATEMENTS.load(Ordering::Relaxed);
-        assert_eq!(ENTRY_STATEMENTS.load(Ordering::Relaxed), 1);
-
-        STATEMENTS.store(0, Ordering::Relaxed);
-        ENTRY_STATEMENTS.store(0, Ordering::Relaxed);
-        let files = revision_files(&conn, &revision).expect("files read");
-        build_paths_info(&files, &five);
-        assert_eq!(STATEMENTS.load(Ordering::Relaxed), single);
-        assert_eq!(ENTRY_STATEMENTS.load(Ordering::Relaxed), 1);
-        conn.trace_v2(TraceEventCodes::empty(), None);
+        let one = build_paths_info(&files, &[WEIGHTS.to_owned()]);
+        let five = build_paths_info(
+            &files,
+            &[
+                WEIGHTS.to_owned(),
+                "config.json".to_owned(),
+                "unet".to_owned(),
+                "missing.bin".to_owned(),
+                "config.json".to_owned(),
+            ],
+        );
+        assert_eq!(one.len(), 1);
+        assert_eq!(
+            five.len(),
+            3,
+            "five paths are answered from the same revision read as one"
+        );
+        assert_eq!(one[0], five[0], "and answered identically");
     }
 
     #[tokio::test]
     async fn commits_lists_the_one_commit_of_a_synthesized_revision() {
-        let store = store();
-        let repo = seed(&store);
-        let listed = commits(&store, &repo, &commit_sha(), 50)
+        let dir = TempDir::new().expect("temp dir");
+        let (catalog, repo) = seeded(dir.path());
+        let listed = commits(&catalog, &repo, &commit_sha(), 50)
             .await
             .expect("commits read");
         assert_eq!(
@@ -996,7 +935,7 @@ mod tests {
             }])
         );
         assert!(
-            commits(&store, &repo, &commit_sha(), 0)
+            commits(&catalog, &repo, &commit_sha(), 0)
                 .await
                 .expect("commits read")
                 .is_empty()
@@ -1005,9 +944,9 @@ mod tests {
 
     #[tokio::test]
     async fn locate_reports_the_bytes_and_refuses_a_path_outside_the_revision() {
-        let store = store();
-        let repo = seed(&store);
-        let found = locate(&store, &repo, &commit_sha(), WEIGHTS)
+        let dir = TempDir::new().expect("temp dir");
+        let (catalog, repo) = seeded(dir.path());
+        let found = locate(&catalog, &repo, &commit_sha(), WEIGHTS)
             .await
             .expect("weights locate");
         assert_eq!(found.abs_path, PathBuf::from("/data/hub/blobs/weights"));
@@ -1017,7 +956,7 @@ mod tests {
         assert_eq!(found.commit, commit_sha());
         assert!(found.artifact_id.is_some());
 
-        let small = locate(&store, &repo, &commit_sha(), "config.json")
+        let small = locate(&catalog, &repo, &commit_sha(), "config.json")
             .await
             .expect("config locates");
         assert!(!small.is_lfs);
@@ -1027,48 +966,46 @@ mod tests {
         );
 
         assert!(matches!(
-            locate(&store, &repo, &commit_sha(), "nope.bin").await,
+            locate(&catalog, &repo, &commit_sha(), "nope.bin").await,
             Err(MirrorError::EntryNotFound(_))
         ));
         assert!(matches!(
-            locate(&store, &repo, &commit_sha(), "../etc/passwd").await,
+            locate(&catalog, &repo, &commit_sha(), "../etc/passwd").await,
             Err(MirrorError::EntryNotFound(_))
         ));
     }
 
     #[tokio::test]
     async fn a_file_with_no_content_hash_is_not_served() {
-        let store = store();
-        let repo = seed(&store);
+        let dir = TempDir::new().expect("temp dir");
+        let (catalog, repo) = seeded(dir.path());
         assert!(matches!(
-            locate(&store, &repo, &commit_sha(), README_PATH).await,
+            locate(&catalog, &repo, &commit_sha(), README_PATH).await,
             Err(MirrorError::EntryNotFound(_))
         ));
     }
 
     #[tokio::test]
     async fn an_unknown_repo_or_revision_is_reported_as_such() {
-        let store = store();
-        seed(&store);
+        let dir = TempDir::new().expect("temp dir");
+        let (catalog, repo) = seeded(dir.path());
         let missing = RepoId::new(RepoType::Models, Some("nobody".to_owned()), "nothing");
         assert!(matches!(
-            repo_info(&store, &missing, "main").await,
+            repo_info(&catalog, &missing, "main").await,
             Err(MirrorError::RepoNotFound(_))
         ));
 
-        let repo = RepoId::new(RepoType::Models, Some("openai".to_owned()), "whisper");
         assert!(matches!(
-            repo_info(&store, &repo, "v9").await,
+            repo_info(&catalog, &repo, "v9").await,
             Err(MirrorError::RevisionNotFound(_))
         ));
         assert!(matches!(
             tree(
-                &store,
+                &catalog,
                 &repo,
                 &CommitSha::from_bytes([0x99; 20]),
                 "",
-                false,
-                false
+                listing(false, false)
             )
             .await,
             Err(MirrorError::RevisionNotFound(_))
@@ -1077,16 +1014,16 @@ mod tests {
 
     #[tokio::test]
     async fn the_listing_endpoints_filter_by_search_and_author() {
-        let store = store();
-        seed(&store);
-        let all = list_repos(&store, &RepoListQuery::new(RepoType::Models, 10))
+        let dir = TempDir::new().expect("temp dir");
+        let (catalog, _repo) = seeded(dir.path());
+        let all = list_repos(&catalog, &RepoListQuery::new(RepoType::Models, 10))
             .await
             .expect("list reads");
         assert_eq!(all.len(), 1);
         assert!(all[0].siblings.is_empty());
 
         let by_author = list_repos(
-            &store,
+            &catalog,
             &RepoListQuery {
                 author: Some("openai".to_owned()),
                 ..RepoListQuery::new(RepoType::Models, 10)
@@ -1097,7 +1034,7 @@ mod tests {
         assert_eq!(by_author.len(), 1);
 
         let other_author = list_repos(
-            &store,
+            &catalog,
             &RepoListQuery {
                 author: Some("meta".to_owned()),
                 ..RepoListQuery::new(RepoType::Models, 10)
@@ -1108,7 +1045,7 @@ mod tests {
         assert!(other_author.is_empty());
 
         let by_search = list_repos(
-            &store,
+            &catalog,
             &RepoListQuery {
                 search: Some("whisper".to_owned()),
                 ..RepoListQuery::new(RepoType::Models, 10)
@@ -1118,7 +1055,7 @@ mod tests {
         .expect("list reads");
         assert_eq!(by_search.len(), 1);
 
-        let datasets = list_repos(&store, &RepoListQuery::new(RepoType::Datasets, 10))
+        let datasets = list_repos(&catalog, &RepoListQuery::new(RepoType::Datasets, 10))
             .await
             .expect("list reads");
         assert!(datasets.is_empty());

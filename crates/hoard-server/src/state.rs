@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use secrecy::{ExposeSecret, SecretString};
 
-use hoard_index::store::Store;
+use hoard_index::catalog::Catalog;
 use hoard_mirror::MirrorError;
 use hoard_mirror::access::AccessPolicy;
 use hoard_mirror::cache::BlockCache;
@@ -56,8 +56,8 @@ impl UpstreamHealth {
     }
 }
 
-/// Everything a handler needs, cloned per request. Cheap to clone: the store is a pooled
-/// handle and the rest is behind `Arc`.
+/// Everything a handler needs, cloned per request. Cheap to clone: everything in it is
+/// behind an `Arc`.
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Inner>,
@@ -69,12 +69,11 @@ pub struct AppState {
 struct Inner {
     config: HoardConfig,
     mirror_config: Arc<MirrorConfig>,
-    store: Store,
+    catalog: Arc<Catalog>,
     cache: Arc<BlockCache>,
     access: Arc<AccessPolicy>,
     mirror: Arc<Mirror>,
     upstream_health: AtomicU8,
-    scan_handoff: tokio::sync::Mutex<()>,
     local_node_name: String,
     public_url: String,
 }
@@ -91,8 +90,10 @@ impl std::fmt::Debug for AppState {
 
 impl AppState {
     /// Builds the shared state. The node write token is read from the environment only,
-    /// never from `hoard.toml`, so a config file can be committed without leaking it.
-    pub fn new(config: HoardConfig, store: Store) -> Result<Self, ApiError> {
+    /// never from `hoard.toml`, so a config file can be committed without leaking it. The
+    /// native catalog is opened by the caller, which is the only place that knows whether a
+    /// fresh scan is acceptable there.
+    pub fn new(config: HoardConfig, catalog: Arc<Catalog>) -> Result<Self, ApiError> {
         let mirror_config = Arc::new(config.mirror.clone());
         let access = Arc::new(
             AccessPolicy::compile(&mirror_config)
@@ -107,7 +108,7 @@ impl AppState {
         let upstream = Hub::new(upstream_client, &mirror_config.upstream)
             .map_err(|error| ApiError::bad_request(format!("upstream url: {error}")))?;
         let mirror = Arc::new(Mirror::new(
-            store.clone(),
+            Arc::clone(&catalog),
             Arc::clone(&cache),
             Arc::clone(&access),
             upstream,
@@ -126,12 +127,11 @@ impl AppState {
             inner: Arc::new(Inner {
                 config,
                 mirror_config,
-                store,
+                catalog,
                 cache,
                 access,
                 mirror,
                 upstream_health: AtomicU8::new(health.code()),
-                scan_handoff: tokio::sync::Mutex::new(()),
                 local_node_name,
                 public_url,
             }),
@@ -146,8 +146,9 @@ impl AppState {
         self
     }
 
-    pub fn store(&self) -> &Store {
-        &self.inner.store
+    /// The catalog every route reads and `hoard scan` writes.
+    pub fn catalog(&self) -> &Arc<Catalog> {
+        &self.inner.catalog
     }
 
     pub fn config(&self) -> &HoardConfig {
@@ -183,12 +184,6 @@ impl AppState {
 
     pub fn offline(&self) -> bool {
         self.inner.mirror_config.offline
-    }
-
-    /// Held across the window in which a scan request watches for the job row the scanner
-    /// opens, so two requests cannot each be handed the other's job.
-    pub fn scan_handoff(&self) -> &tokio::sync::Mutex<()> {
-        &self.inner.scan_handoff
     }
 
     /// The root every projection is written under: `data_dir/profiles`.
@@ -252,20 +247,23 @@ impl AppState {
 mod tests {
     use super::*;
 
-    fn state() -> AppState {
-        let store = Store::open_in_memory().expect("in-memory store opens");
-        AppState::new(HoardConfig::default(), store).expect("state builds")
+    fn state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let catalog = crate::testing::empty_catalog(dir.path(), "test");
+        let state = AppState::new(HoardConfig::default(), catalog).expect("state builds");
+        (dir, state)
     }
 
     #[test]
     fn writes_are_open_when_no_token_is_configured() {
-        let state = state();
+        let (_dir, state) = state();
         assert!(state.authorize_write(None).is_ok());
     }
 
     #[test]
     fn a_configured_token_is_required_and_compared_in_full() {
-        let state = state().with_node_token("swordfish");
+        let (_dir, state) = state();
+        let state = state.with_node_token("swordfish");
 
         assert!(state.authorize_write(None).is_err());
         assert!(state.authorize_write(Some("swordfish")).is_err());
@@ -276,10 +274,11 @@ mod tests {
 
     #[test]
     fn an_offline_node_never_reports_an_unreachable_upstream() {
-        let store = Store::open_in_memory().expect("in-memory store opens");
+        let dir = tempfile::tempdir().expect("temp dir");
         let mut config = HoardConfig::default();
         config.mirror.offline = true;
-        let state = AppState::new(config, store).expect("state builds");
+        let catalog = crate::testing::empty_catalog(dir.path(), "test");
+        let state = AppState::new(config, catalog).expect("state builds");
         let refused: Result<(), MirrorError> = Err(MirrorError::ProxyTimeout);
         assert!(state.note_upstream(refused).is_err());
         assert_eq!(state.upstream_health(), UpstreamHealth::Offline);
@@ -287,7 +286,7 @@ mod tests {
 
     #[test]
     fn a_timed_out_upstream_call_is_remembered_until_the_next_answer() {
-        let state = state();
+        let (_dir, state) = state();
         assert_eq!(state.upstream_health(), UpstreamHealth::Reachable);
         let refused: Result<(), MirrorError> = Err(MirrorError::ProxyTimeout);
         assert!(state.note_upstream(refused).is_err());
@@ -307,10 +306,11 @@ mod tests {
 
     #[test]
     fn every_projection_lands_under_the_data_directory() {
-        let store = Store::open_in_memory().expect("in-memory store opens");
+        let dir = tempfile::tempdir().expect("temp dir");
         let mut config = HoardConfig::default();
         config.server.data_dir = std::path::PathBuf::from("/srv/hoard");
-        let state = AppState::new(config, store).expect("state builds");
+        let catalog = crate::testing::empty_catalog(dir.path(), "test");
+        let state = AppState::new(config, catalog).expect("state builds");
         assert_eq!(
             state.projection_root(),
             std::path::PathBuf::from("/srv/hoard/profiles")
@@ -319,6 +319,7 @@ mod tests {
 
     #[test]
     fn the_public_url_is_what_pull_commands_print() {
-        assert_eq!(state().public_url(), "http://0.0.0.0:7099");
+        let (_dir, state) = state();
+        assert_eq!(state.public_url(), "http://0.0.0.0:7099");
     }
 }

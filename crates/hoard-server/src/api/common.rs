@@ -6,23 +6,16 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use hoard_core::{
-    ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, Precision, RepoId, RepoRowId, RepoType,
-    Role, Sha256, State, SubRole, format_size,
+    ArtifactFormat, ArtifactId, Base, CommitSha, Precision, RepoId, RepoType, Role, Sha256, State,
+    SubRole, format_size,
 };
 use hoard_index::IndexError;
-use hoard_index::search::{
-    CompatTarget, CompileContext, ParsedQuery, SortKey, SortSpec, TokenKind, compile,
-};
-use hoard_index::store::entry::EntryRow;
-use hoard_index::store::row::{SearchRow, SqlValue};
-use hoard_index::store::{revision, search_exec, shelf};
+use hoard_index::catalog::EntryDetail;
+use hoard_index::row::SearchRow;
+use hoard_index::search::{SortKey, SortSpec};
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-
-/// The SQLite connection the store hands to a blocking closure, named through the store
-/// rather than by depending on rusqlite from the HTTP layer.
-pub type Conn = <hoard_index::store::Reader as std::ops::Deref>::Target;
 
 /// Rows returned when a request names no limit.
 pub const DEFAULT_LIMIT: u32 = 100;
@@ -37,6 +30,19 @@ const SECONDS_PER_HOUR: i64 = 60 * SECONDS_PER_MINUTE;
 const SECONDS_PER_DAY: i64 = 24 * SECONDS_PER_HOUR;
 const SECONDS_PER_MONTH: i64 = 30 * SECONDS_PER_DAY;
 const SECONDS_PER_YEAR: i64 = 365 * SECONDS_PER_DAY;
+
+/// Runs catalog work off the reactor. The catalog and its search index are file work, so
+/// every route that reads them hands the closure to a blocking thread.
+pub async fn blocking<T, F>(work: F) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, IndexError> + Send + 'static,
+{
+    let done = tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(done?)
+}
 
 /// Rejects a mutating request that carries no valid node token.
 pub fn authorize(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
@@ -161,107 +167,6 @@ pub fn sort_key(sort: Option<&str>, dir: Option<&str>) -> String {
     format!("{}:{}", sort.unwrap_or_default(), dir.unwrap_or_default())
 }
 
-/// Everything compilation needs that the query text does not carry: the shelves a
-/// `shelf:` token expands to, this node's name and the resolved `compat:` target.
-pub fn compile_context(
-    conn: &Conn,
-    node: &str,
-    query: &ParsedQuery,
-    now: Timestamp,
-) -> Result<CompileContext, IndexError> {
-    let shelves = shelf::list_shelves(conn)?
-        .into_iter()
-        .map(|row| (row.name, row.query))
-        .collect();
-    let mut context = CompileContext::new(now)
-        .with_local_node(node.to_owned())
-        .with_shelves(shelves);
-    if let Some(token) = query
-        .tokens
-        .iter()
-        .find(|token| token.kind == TokenKind::Compat)
-        && let Some(target) = resolve_compat_target(conn, &token.normalized, now)?
-    {
-        context = context.with_compat(target);
-    }
-    Ok(context)
-}
-
-/// Resolves what a `compat:` value names, because the rule reads a role and a base rather
-/// than a string. A repository reference wins over free text.
-pub fn resolve_compat_target(
-    conn: &Conn,
-    value: &str,
-    now: Timestamp,
-) -> Result<Option<CompatTarget>, IndexError> {
-    for probe in [format!("repo:{}", quoted(value)), quoted(value)] {
-        let query = hoard_index::search::parse(&probe);
-        let context = CompileContext::new(now);
-        let compiled = compile(&query, SortSpec::new(SortKey::Size, true), &context)?;
-        let rows = search_exec::query_rows(
-            conn,
-            &compiled.where_sql,
-            &compiled.params,
-            &compiled.order_sql,
-            32,
-            0,
-        )?;
-        if let Some(row) = rows
-            .iter()
-            .find(|row| row.role.is_host())
-            .or_else(|| rows.first())
-        {
-            return Ok(Some(CompatTarget::new(row.role, row.base.clone())));
-        }
-    }
-    Ok(None)
-}
-
-/// One artifact of the `search_row` view, read by its identity rather than by a query.
-pub fn row_by_artifact(conn: &Conn, id: ArtifactId) -> Result<Option<SearchRow>, IndexError> {
-    let rows = search_exec::query_rows(
-        conn,
-        "artifact_id = ?",
-        &[SqlValue::Int(id.get())],
-        "",
-        1,
-        0,
-    )?;
-    Ok(rows.into_iter().next())
-}
-
-pub fn require_row(conn: &Conn, id: ArtifactId) -> Result<SearchRow, IndexError> {
-    row_by_artifact(conn, id)?.ok_or_else(|| IndexError::not_found("artifact", id.to_string()))
-}
-
-/// Every artifact reachable through one repository, most bytes first.
-pub fn rows_for_repo(
-    conn: &Conn,
-    repo: RepoRowId,
-    limit: u32,
-) -> Result<Vec<SearchRow>, IndexError> {
-    search_exec::query_rows(
-        conn,
-        "repo_id = ?",
-        &[SqlValue::Int(repo.get())],
-        "size DESC, artifact_id ASC",
-        limit,
-        0,
-    )
-}
-
-/// Every artifact sharing one blob, which is what a duplicate is.
-pub fn rows_for_blob(conn: &Conn, blob: BlobId) -> Result<Vec<SearchRow>, IndexError> {
-    search_exec::query_rows(
-        conn,
-        "blob_id = ?",
-        &[SqlValue::Int(blob.get())],
-        "",
-        MAX_LIMIT,
-        0,
-    )
-}
-
 /// One row of the results table, the cards view and `hoard ls --json`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RowView {
@@ -362,47 +267,27 @@ pub struct EntryView {
     pub symlink: bool,
 }
 
-/// Renders entries with the ref name each revision answers to, falling back to the short
-/// sha exactly as the `search_row` view does.
-pub fn entry_views(
-    conn: &Conn,
-    entries: &[EntryRow],
-    host: &str,
-) -> Result<Vec<EntryView>, IndexError> {
-    let mut labels: Vec<(RepoRowId, Vec<(hoard_core::RevisionId, String)>)> = Vec::new();
-    let mut views = Vec::with_capacity(entries.len());
-    for entry in entries {
-        if !labels.iter().any(|(repo, _)| *repo == entry.repo) {
-            let refs = revision::refs_for_repo(conn, entry.repo)?
-                .into_iter()
-                .map(|reference| (reference.revision, reference.name))
-                .collect();
-            labels.push((entry.repo, refs));
-        }
-        let revision = labels
-            .iter()
-            .find(|(repo, _)| *repo == entry.repo)
-            .and_then(|(_, refs)| {
-                refs.iter()
-                    .find(|(id, _)| *id == entry.revision)
-                    .map(|(_, name)| name.clone())
-            })
-            .unwrap_or_else(|| entry.revision_sha.short());
-        views.push(EntryView {
-            repo: entry.repo_qualified.clone(),
-            revision,
-            path: entry.abs_path.clone().unwrap_or_else(|| entry.path.clone()),
-            node: entry.node.clone(),
+/// One path of an artifact as the catalog resolved it.
+pub fn entry_views(entries: &[EntryDetail], host: &str) -> Vec<EntryView> {
+    entries
+        .iter()
+        .map(|entry| EntryView {
+            repo: entry.repo.clone(),
+            revision: entry.revision.clone(),
+            path: entry
+                .abs_path
+                .clone()
+                .unwrap_or_else(|| entry.rel_path.clone()),
             label: match entry.is_symlink {
                 true => format!("{} {MIDDOT} symlink", entry.node),
                 false => entry.node.clone(),
             },
+            node: entry.node.clone(),
             state: entry.state,
-            state_label: state_label(entry.state, entry.pull_progress, Some(host)),
+            state_label: state_label(entry.state, None, Some(host)),
             symlink: entry.is_symlink,
-        });
-    }
-    Ok(views)
+        })
+        .collect()
 }
 
 /// The display spelling of a base family, `sdxl 1.0` rather than the `sdxl10` key.
@@ -596,14 +481,6 @@ pub fn repo_id(repo_type: &str, org: &str, name: &str) -> ApiResult<RepoId> {
         org => format!("{org}/{name}"),
     };
     RepoId::parse_ref(repo_type, &reference).map_err(ApiError::from)
-}
-
-/// Quotes a grammar value that would otherwise tokenize as more than one word.
-pub fn quoted(value: &str) -> String {
-    match value.contains(char::is_whitespace) || value.contains('"') {
-        true => format!("\"{}\"", value.replace('"', "")),
-        false => value.to_owned(),
-    }
 }
 
 #[cfg(test)]

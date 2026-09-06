@@ -1,15 +1,19 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
 use axum::http::HeaderMap;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use hoard_core::format_size;
-use hoard_index::store::row::FacetBucket;
-use hoard_index::store::{artifact, blob, node, repo, search_exec, setting};
+use hoard_index::IndexError;
+use hoard_index::catalog::{QueryPage, QueryRequest, Totals};
+use hoard_index::row::FacetBucket;
+use hoard_index::search::SortSpec;
 
-use crate::api::common::authorize;
+use crate::api::common::{authorize, blocking};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -137,15 +141,16 @@ impl SettingsView {
 /// degraded, because a health route that returns an error tells a watchdog nothing about
 /// which half of the node is down.
 pub async fn healthz(State(state): State<AppState>) -> ApiResult<Json<HealthView>> {
-    let probe = state
-        .store()
-        .call(|conn| {
-            Ok(node::list_nodes(conn)?
-                .into_iter()
-                .filter(|row| !row.is_self)
-                .count() as u64)
-        })
-        .await;
+    let catalog = Arc::clone(state.catalog());
+    let probe = tokio::task::spawn_blocking(move || {
+        Ok(catalog
+            .list_nodes()?
+            .into_iter()
+            .filter(|row| !row.is_self)
+            .count() as u64)
+    })
+    .await
+    .unwrap_or_else(|error| Err(IndexError::Catalog(error.to_string())));
     let (status, index, peers) = match probe {
         Ok(peers) => ("ok", "ok", peers),
         Err(error) => {
@@ -171,38 +176,49 @@ pub async fn stats(State(state): State<AppState>) -> ApiResult<Json<StatsView>> 
     })
     .await
     .unwrap_or_default();
-    let counts = state
-        .store()
-        .call(move |conn| {
-            let (local_blobs, indexed_bytes) = blob::local_totals(conn)?;
-            let repos = repo::list_repos(conn, &repo::RepoFilter::default(), None, u32::MAX)?;
-            Ok(StatsView {
-                artifacts: search_exec::count_rows(conn, "", &[])?,
-                blobs: local_blobs,
-                repos: repos.len() as u64,
-                triage: artifact::triage_count(conn)?,
-                indexed_bytes,
-                indexed_bytes_human: format_size(indexed_bytes),
-                roles: search_exec::facet_counts(conn, "role", "", &[])?,
-                formats: search_exec::facet_counts(conn, "format", "", &[])?,
-                nodes: search_exec::facet_counts(conn, "node", "", &[])?,
-                cache: CacheView {
-                    bytes,
-                    bytes_human: format_size(bytes),
-                    limit,
-                    limit_human: limit.map(format_size),
-                },
-            })
-        })
-        .await?;
-    Ok(Json(counts))
+    let (totals, page) = catalog_totals(&state).await?;
+    Ok(Json(StatsView {
+        artifacts: totals.artifacts,
+        blobs: totals.present_artifacts,
+        repos: totals.repositories,
+        triage: totals.triage_artifacts,
+        indexed_bytes: totals.indexed_bytes,
+        indexed_bytes_human: format_size(totals.indexed_bytes),
+        roles: page.facets.role,
+        formats: page.facets.format,
+        nodes: page.facets.node,
+        cache: CacheView {
+            bytes,
+            bytes_human: format_size(bytes),
+            limit,
+            limit_human: limit.map(format_size),
+        },
+    }))
+}
+
+/// The counts the sweep measured and the unnarrowed facets beside them, both read from the
+/// native catalog on a blocking thread.
+async fn catalog_totals(state: &AppState) -> Result<(Totals, QueryPage), IndexError> {
+    let catalog = Arc::clone(state.catalog());
+    let now = Timestamp::now();
+    tokio::task::spawn_blocking(move || {
+        let totals = catalog.totals()?;
+        let context = catalog.compile_context("", now, Vec::new())?;
+        let page = catalog.query(QueryRequest {
+            raw: "",
+            sort: SortSpec::default(),
+            limit: 1,
+            offset: 0,
+            context: &context,
+        })?;
+        Ok((totals, page))
+    })
+    .await?
 }
 
 pub async fn settings(State(state): State<AppState>) -> ApiResult<Json<SettingsView>> {
-    let view = state
-        .store()
-        .call(|conn| Ok(SettingsView::from_stored(&setting::all_settings(conn)?)))
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || Ok(SettingsView::from_stored(&catalog.all_settings()?))).await?;
     Ok(Json(view))
 }
 
@@ -213,15 +229,14 @@ pub async fn put_settings(
 ) -> ApiResult<Json<SettingsView>> {
     authorize(&state, &headers)?;
     let body = body.validated()?;
-    let view = state
-        .store()
-        .call_mut(move |conn| {
-            for (key, value) in body.pairs() {
-                setting::put_setting(conn, key, &value)?;
-            }
-            Ok(SettingsView::from_stored(&setting::all_settings(conn)?))
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        for (key, value) in body.pairs() {
+            catalog.put_setting(key, &value)?;
+        }
+        Ok(SettingsView::from_stored(&catalog.all_settings()?))
+    })
+    .await?;
     Ok(Json(view))
 }
 
