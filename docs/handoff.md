@@ -20,9 +20,11 @@ first; this document assumes it.
   dependency research; they stay. The wave plan files under `docs/superpowers/plans/` are
   deleted - git keeps them, and a stale plan in the tree is a trap for the next agent.
 - Phases 0 to 9 are done, 10 and 11 are partial. `docs/feature-plan.md` holds the table.
-- `cargo fmt --check` and `cargo test --workspace` pass: 745 tests, 0 failed, 3 ignored (the
-  scale harness and two others). `cargo doc --workspace --no-deps` emits two warnings, listed
-  below.
+- At `3b27564` all four checks pass: `cargo fmt --check`, clippy with `-D warnings`,
+  `cargo test --workspace` at 745 passed, 0 failed, 3 ignored, and `cargo build --workspace`.
+  The three ignored are the scale harness, the mDNS test that needs a multicast route and the
+  sniffer test that reads the local model caches. `cargo doc --workspace --no-deps` emits two
+  warnings, listed below.
 
 ## Running the loop
 
@@ -31,21 +33,40 @@ pass, and a review. The skills carry the contracts so no prompt has to repeat th
 
 1. **Write the plan.** Follow `.claude/skills/hoard-write-plan/SKILL.md`. It goes to
    `docs/superpowers/plans/YYYY-MM-DD-<name>.md`, is committed with the wave's first task,
-   and is deleted when the wave lands. Anchor its Verified facts to a named commit and grep
-   every symbol it mentions before you hand it over.
+   and is deleted by you when the wave lands - not by the implementer. Anchor its Verified
+   facts to a named commit and grep every symbol it mentions before you hand it over.
 2. **Dispatch the implementer.** The `wave-implementer` agent, given the plan path and the
    two commit trailer lines, and nothing else. It follows
    `.claude/skills/hoard-implement-plan/SKILL.md`: preflight, the AGENTS.md rules, the
    checks, foreground-only process hygiene, a record of every deviation from the plan, one
-   commit per task, and a report of the commits, the deviations, the check output, the
-   measurements and what is left for a human.
+   commit per task, and a report.
+
+   The report is written so you can verify without reading the transcript, and section 7 of
+   that skill fixes what it contains: the commit hashes and subjects in order, every
+   deviation with what the plan said and what the code said, the final output line of each
+   check quoted rather than "all checks pass", the measurement tables with a commit per
+   column, the tests whose assertions changed and why, what was left for a human, and a
+   clean `git status --short` with the `pgrep` result. A report missing a section is a
+   report to send back.
+
+   An implementer that stops early - a deviation that makes a task's outcome wrong, a check
+   it cannot get green, a decision that is not its to take - stops after a commit that
+   builds and says so in its first line. Read its reasoning, take the decision yourself, and
+   resume it with a message naming the next task; a fresh agent would re-derive the whole
+   plan. An implementer that appears to be waiting on a long command is waiting on a
+   foreground command, which is what the skill requires: let it finish, or raise the
+   timeout and resume it. Never ask it to poll, and never start a background process on its
+   behalf.
 3. **Verify.** `/hoard-verify`: `cargo fmt --check`, clippy with `-D warnings`,
    `cargo test --workspace`, `cargo build --workspace`, plus
    `cargo test --release -p hoard-server --lib assets::` after any change under
    `crates/hoard-server/` or `web/`, and `cargo doc --workspace --no-deps` once at the end.
 4. **Review.** `perf-reviewer` for a performance wave, following
    `.claude/skills/hoard-perf-review/SKILL.md`; `rust-reviewer` otherwise. Both are
-   read-only.
+   read-only. Give the reviewer the commit the plan gated on: the wave's work is already
+   committed, so `git diff` on its own is empty and the change set is `<base>..HEAD`. Do not
+   run a build while a reviewer is measuring, or dispatch a measuring reviewer beside
+   anything else that uses the disk.
 
 For anything touching `crates/hoard-index/src/catalog/`, read
 `.claude/skills/hoard-catalog/SKILL.md` first: the module map, the write path, and the
@@ -80,9 +101,10 @@ Decisions someone has to take:
 
 - **May `hoard doctor` write?** Its `summary` check calls `Catalog::recount_summary`, which
   counts every artifact record again *and upserts the result*, so the check repairs the drift
-  it is meant to detect. A second run therefore always passes. Either doctor becomes
-  read-only and reports drift without fixing it, or the repair is deliberate and should be
-  named as such in the check's output.
+  it is meant to detect. The repair is already named as such - `src/cli/doctor.rs::summary`
+  documents it and the failing check says "totals had drifted and were recounted" - so what
+  is open is only that a second run always passes and the drift leaves no trace. Either that
+  is accepted, or doctor becomes read-only and something else repairs.
 - **Should a rescan ever compact?** `Catalog::compact` runs on a fresh `scan_sources` and
   again at the end of `hoard catalog scan`, and nowhere else; there is no compact subcommand.
   A rescan deliberately does not compact, so a catalog the server holds can be walked again
@@ -104,6 +126,11 @@ Smaller things, each verified:
 - Two rustdoc warnings: `public documentation for retract_digest links to private item CHUNK`
   and the same for `reset_stale_pulls`, both in `crates/hoard-index/src/catalog/digest.rs`.
   Either stop linking `CHUNK` or make it public.
+- **`[index] hash_policy` is read by `Catalog::open_or_scan` alone**, the first open of a
+  catalog that does not exist yet. `hoard scan` takes its policy from `--hash`, which
+  defaults to `later`, so a configured `hash_policy = "never"` does not survive a rescan and
+  a measurement run has to pass `--hash never` as well. Either the flag should default to
+  the configured policy or the config key should say it applies to the first scan only.
 - `crates/hoard-net/Cargo.toml` declares `hex.workspace = true` and no code in the crate uses
   the `hex` crate (the only match is a local variable of that name in `digest.rs`).
 - `mockall` and `criterion` are declared in the root `[workspace.dependencies]` and no crate

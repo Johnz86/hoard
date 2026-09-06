@@ -260,8 +260,8 @@ docs, Claude Code project configuration.
 - `hoard-index::catalog`: the `native_model` records for node, source, artifact, tensor
   summary, repository, revision, entry, override, noise, shelf, loadout, job and usage, the
   secondary indexes over them, and typed request and response types so no caller names a
-  native_db or Tantivy type. One shape per record and no migrations; see the
-  "Compatibility" section of `CLAUDE.md`.
+  native_db or Tantivy type. The record-shape policy is the "Compatibility" section of
+  `CLAUDE.md`.
 - Accept: unit tests round-trip a synthetic repo with two revisions and a duplicate blob and
   survive a process reopen; role alias table parses every alias from the design.
 

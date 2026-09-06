@@ -21,8 +21,7 @@ rebuilt from the native records alone, without re-reading a single source file.
 ## Compatibility
 
 Read the "Compatibility" section of `CLAUDE.md`. It is the only statement of the policy;
-nothing here restates it. In short: one shape per record, no migrations, and a catalog of
-another format is rebuilt rather than converted.
+nothing here restates it.
 
 ## Layout
 

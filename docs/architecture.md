@@ -23,7 +23,7 @@ Toolchain: Rust 1.95 stable, edition 2024, workspace resolver 3.
 | Concern | Crate | Version | Why |
 | --- | --- | --- | --- |
 | Async runtime | `tokio` | 1.53 | Required by AGENTS.md; multi-thread runtime, `fs`, `signal`, `sync`, `process` for upload-pack. |
-| HTTP server | `axum` | 0.8 | Required by AGENTS.md; handlers return `Result<Response, AppError>`. |
+| HTTP server | `axum` | 0.8 | Required by AGENTS.md; handlers return `ApiResult<T>`, the crate's `Result<T, ApiError>`. |
 | Middleware | `tower`, `tower-http` | 0.5, 0.7 | Trace, timeout, request-id, compression (text only), CORS, catch-panic, body limit. |
 | Typed headers, Range | `axum-extra`, `headers`, `http-range-header` | 0.12, 0.4, 0.4 | `Range` and `ETag` on `resolve` without hand parsing. |
 | Upstream and peer client | `reqwest` | 0.13 | rustls, streaming bodies, HTTP/2 to `huggingface.co`, the LFS CDN and peer nodes. |
