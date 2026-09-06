@@ -66,7 +66,9 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Nodes => cli::node::list(cli::node::open(config_path).await?).await,
-        Command::Doctor => cli::doctor::run(cli::node::open(config_path).await?).await,
+        Command::Doctor { repair } => {
+            cli::doctor::run(cli::node::inspect(config_path).await?, repair).await
+        }
     }
 }
 

@@ -9,6 +9,9 @@ first; this document assumes it.
   second clone. **Nothing has been pushed.** There is no remote work to reconcile with, and
   no release and no user - see the "Compatibility" section of `CLAUDE.md` for what that
   buys.
+- `docs/superpowers/specs/2026-09-06-remaining-work-goal.md` is the brief every wave now
+  follows: what "remaining work" means, the finish condition that ends the run, and the rule
+  that performance is measured once, in the last wave, rather than in each one.
 - The native_db (redb) plus Tantivy catalog replaced the SQLite index and is merged. Every
   command, every route, both faces and gossip read and write it, and no SQLite code remains.
   `docs/native-catalog.md` is the current-state document;
@@ -19,9 +22,10 @@ first; this document assumes it.
   `docs/superpowers/research/2026-09-05-native-db-tantivy.md` are the decision and the
   dependency research; they stay. The wave plan files under `docs/superpowers/plans/` are
   deleted - git keeps them, and a stale plan in the tree is a trap for the next agent.
-- Phases 0 to 9 are done, 10 and 11 are partial. `docs/feature-plan.md` holds the table.
-- At the head of `master` after the tally wave all four checks pass:
-  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 782 passed,
+- Phases 0 to 9 and 11 are done; 10 is partial, waiting on the watcher through `serve` and on
+  a design for TREE and DISK. `docs/feature-plan.md` holds the table.
+- At the head of `master` after the doctor-and-sources wave all four checks pass:
+  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 790 passed,
   0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness
   and its supplemental fixture, the mDNS test that needs a multicast route and the sniffer
   test that reads the local model caches. `cargo doc --workspace --no-deps` emits no warning.
@@ -112,8 +116,8 @@ Performance, with the numbers from `docs/native-catalog.md`:
   its own page against 58.56 MiB; the same page after a refresh, over four segments, is
   189.6 ms against 1.544 s. Two rows this wave did not put on a new path, `role:lora` and the
   filtered query, are 4.7 and 7.4 ms slower at 1M and outside their own spread; they are back
-  on their before numbers at 100k, so it does not scale, and it is codegen around the
-  collector's inner loop rather than any extra work.
+  on their before numbers at 100k, so it does not scale. Codegen around the collector's inner
+  loop is the hypothesis for what is left, and profiling has not established it.
 - **A tallying pass now costs about what a counting pass costs.** Each facet dimension is a
   vector indexed by term ordinal per segment rather than a `HashMap` keyed by
   `(segment, dimension, ordinal)` per document, and every collector reads its columns once
@@ -139,57 +143,69 @@ Performance, with the numbers from `docs/native-catalog.md`:
   `node:self` is 352 to 439 ms at 1M; any query naming `node:`, `state:`, `source:`,
   `repo:`, `rev:` or `hash:`, or sorting on revision, node or state, takes the same path and
   still keeps one row per matching artifact rather than one per page. The primary path is
-  bounded and is the model to follow.
+  bounded above the window caps and is the model to follow; below them the sampled selection
+  falls back to the heap on purpose, so "paging is bounded" is a claim about the deep pages
+  the caps cover, not about every page.
 - **The usage views are O(rows of the repository).** The client count the USAGE tab shows is
   a claim about every pull the repository ever served, so bounding the chart alone would not
   bound the route: 20,000 rows cost 9.1 ms. It needs a maintained count, not a bound.
 
-Decisions someone has to take:
+Decisions taken on 2026-09-06, by the project owner:
 
-- **How should the base facet be counted?** `Catalog::facets` runs one `Count` search per
-  distinct base value in the answer, uncapped, because the prefix rule that groups base
-  labels means the exact-term count the tally already holds is not what a click on that
-  bucket produces. `Base` is open ended, so the bucket count is bounded by what the catalog
-  holds rather than by its size: at 200 distinct bases that is 200 extra searches per
-  request. Either the rail is truncated to the top N buckets by tally before the per-bucket
-  count is run, which changes what the UI shows, or the prefix rule is answered from ordinals,
-  which changes what a base bucket means. Neither is an implementer's call.
-- **May `hoard doctor` write?** Its `summary` check calls `Catalog::recount_summary`, which
-  counts every artifact record again *and upserts the result*, so the check repairs the drift
-  it is meant to detect. The repair is already named as such - `src/cli/doctor.rs::summary`
-  documents it and the failing check says "totals had drifted and were recounted" - so what
-  is open is only that a second run always passes and the drift leaves no trace. Either that
-  is accepted, or doctor becomes read-only and something else repairs.
-- **Should a rescan ever compact?** `Catalog::compact` runs on a fresh `scan_sources` and
-  again at the end of `hoard catalog scan`, and nowhere else; there is no compact subcommand.
-  A rescan deliberately does not compact, so a catalog the server holds can be walked again
-  without an exclusive borrow - but a long-lived server catalog therefore never reclaims a
-  fragmented page. The storage table shows fragmentation running at roughly the stored size.
-- **The watcher is not started by `serve`.** `crates/hoard-index/src/watch.rs` exists, is
-  tested, and nothing in `src/cli/serve.rs` or `hoard-server` calls it. Phase 10 is partial
-  and this is why; decide whether live rescanning ships or the module goes.
+- **`hoard doctor` is diagnostic by default.** It reports drift and exits non-zero without
+  correcting it; `hoard doctor --repair` recounts the derived totals, reports before and
+  after and verifies the result. Counting is separated from storing: `Catalog::count_summary`
+  reads one snapshot and writes nothing, `Catalog::repair_summary` is exclusive by signature.
+  Doctor opens through `node::inspect`, which creates no directory, scans nothing, refreshes
+  nothing and records nothing; a missing or foreign catalog is a finding it reports, not
+  something it fixes on the way in. Read-only means no catalog row is written: native_db
+  opens every table in a committed write transaction as it opens the file, so the file's
+  transaction id advances whatever a caller does. **Done in this wave.**
+- **Automatic rescans never compact.** `hoard catalog compact --directory <dir>` compacts on
+  demand, takes the catalog to itself through the redb lock and reports allocated bytes
+  before and after. A fresh scan still compacts at the end of building one, which is bulk
+  construction. There is no scheduled server compaction until sustained churn is measured,
+  and intra-page slack is not a promise of what a compaction returns: dense packing is a
+  separate investigation. **The command is done in this wave; the rest is standing policy.**
+- **Live rescanning ships, on by default for configured filesystem sources with an opt-out.**
+  Its preconditions: manual and watched scans share coordination so neither runs over a
+  source the other holds, the configured hash policy is preserved, an overflowed watch marks
+  its source dirty rather than losing the change, Hoard's own writes under the data directory
+  are excluded, shutdown joins the watcher, and the rebuild-versus-write boundary is
+  enforced. **Scheduled as its own wave; no code in this one.**
+- **Managed sources stay visible.** `GET /api/v1/sources` lists every source the catalog
+  holds, including a peer's namespace, and each row carries `can_scan`, true exactly when the
+  configuration names it, and `managed_by`, one of `"downloads"`, `"pulls"`, `"peer"` or
+  `"nobody"` for a stored source the configuration no longer names. The UI offers SCAN on
+  `can_scan` alone and labels the rest; no source name appears in JavaScript, and the backend
+  still answers 404 for a scan of a source it does not walk.
+  **Done in this wave.**
+- **The triage queue stays local and actionable.** A peer-only artifact stays searchable as a
+  remote artifact and does not enter this node's queue: local evidence decides local triage.
+  **Already the behaviour; recorded, no code.**
+- **Phase 1 stays complete and Phase 11 is done.** Phase 1's SQLite implementation is
+  history, not an unfinished phase. Phase 10 stays partial until the watcher starts,
+  reconciles and shuts down through `serve`, and TREE and DISK need a design decision before
+  either can be implemented. Phase 11's storage replacement is complete; the optimisation
+  that continues is a list of follow-ups with their own acceptance criteria under `### Phase
+  11`. **Done in this wave.**
+- **How should the base facet be counted?** Still open, and still not an implementer's call.
+  `Catalog::facets` runs one `Count` search per distinct base value in the answer, uncapped,
+  because the prefix rule that groups base labels means the exact-term count the tally already
+  holds is not what a click on that bucket produces. `Base` is open ended, so the bucket count
+  is bounded by what the catalog holds rather than by its size: at 200 distinct bases that is
+  200 extra searches per request. Either the rail is truncated to the top N buckets by tally
+  before the per-bucket count is run, which changes what the UI shows, or the prefix rule is
+  answered from ordinals, which changes what a base bucket means.
 
 Smaller things, each verified:
 
-- The SOURCES tab offers a SCAN button on every row the route lists, including the `mirror`
-  and `pulls` rows the ingest and pull paths write. Neither is named by the configuration, so
-  `resolve_source` answers 404 and the panel toasts `scan failed`. The button is honest for a
-  configured source and dead for those two; whether they should carry one, or appear at all,
-  is a UI decision nobody has taken.
-- Peer-only artifacts no longer appear in the triage queue. `Catalog::triage_queue` pages
-  `state:triage` from the search index, and a peer-advertised artifact is filed as remote
-  entries, which never carry that state. Whether a peer's triage should be visible at all is
-  an open question, not obviously a bug.
 - The hourly cache eviction sweep is O(the whole mirror). `hoard-mirror`'s
   `cache/reconcile.rs` calls `Catalog::served_cache_entries`, which calls
   `read.rs::repositories_of_source_in` to walk **every** `Repository` row looking for the
   mirror source, then scans every entry of each and collects one `Vec<EntryDetail>` before
   anything is stat-ed. It is off the request path and the mirror source is small today;
   chunking it the way `scan.rs` chunks its passes is the fix if it ever is not.
-- `docs/feature-plan.md` Phase 1 is named "Core types and index store" and its acceptance
-  history was written against the SQLite schema. The bullets now describe the catalog; the
-  phase name and the accepted-in-the-past framing are history rather than a description of
-  the code.
 
 `docs/native-catalog.md` under "Remaining work" holds the rest: a truncated record panicking
 inside `native_model` before any hoard codec runs, `sweep_artifact` decompressing a cold row
@@ -199,4 +215,5 @@ path identities,
 re-read when every stamp is unchanged, revision ordinals recomputed on every rescan, counting
 a revision's artifact units for content another revision already claimed, complete repository
 git metadata with stable cross-scan identities, a read-only redb open once one exists, and
-power-loss recovery tests.
+power-loss recovery tests. `docs/feature-plan.md` under `### Phase 11` names which of them
+carry acceptance criteria as follow-ups of that phase.

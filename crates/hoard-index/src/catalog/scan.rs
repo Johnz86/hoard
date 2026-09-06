@@ -117,7 +117,7 @@ impl Catalog {
     }
 
     fn fill(
-        &self,
+        &mut self,
         node: &str,
         sources: &[&SourceConfig],
         settings: ScanSettings,
@@ -147,7 +147,7 @@ impl Catalog {
             search_seq: 0,
         })?;
         transaction.commit()?;
-        self.recount_summary()?;
+        self.repair_summary()?;
         Ok(())
     }
 
@@ -432,11 +432,28 @@ impl Catalog {
         Ok(())
     }
 
-    /// Counts every artifact record again and writes what they add up to, which is what a
-    /// fresh scan and `hoard doctor` use to prove the incremental totals.
+    /// The totals a fresh count of every artifact record gives, from one read snapshot,
+    /// without writing anything.
+    ///
     /// An artifact reached by more than one path wastes every copy but the first; an
     /// artifact no path reaches at all is not indexed bytes on this node.
-    pub fn recount_summary(&self) -> Result<super::Totals> {
+    pub fn count_summary(&self) -> Result<super::Totals> {
+        Ok(super::totals_of(&self.counted_summary()?))
+    }
+
+    /// Recounts and stores the totals, returning what was stored before and what is stored
+    /// now. Exclusive by signature: nothing else holds the catalog while it runs.
+    pub fn repair_summary(&mut self) -> Result<(super::Totals, super::Totals)> {
+        let before = self.totals()?;
+        let counted = self.counted_summary()?;
+        let after = super::totals_of(&counted);
+        let transaction = self.database.rw_transaction()?;
+        transaction.upsert(counted)?;
+        transaction.commit()?;
+        Ok((before, after))
+    }
+
+    fn counted_summary(&self) -> Result<Summary> {
         let triage = IndexConfig::default().triage_confidence;
         let read = self.database.r_transaction()?;
         let mut summary = Summary {
@@ -451,19 +468,7 @@ impl Catalog {
                 SummaryPart::of(Some(&record), triage),
             );
         }
-        drop(read);
-        let totals = super::Totals {
-            artifacts: summary.artifacts,
-            present_artifacts: summary.present_artifacts,
-            triage_artifacts: summary.triage_artifacts,
-            indexed_bytes: summary.indexed_bytes,
-            repositories: summary.repositories,
-            advertised_artifacts: summary.advertised_artifacts,
-        };
-        let transaction = self.database.rw_transaction()?;
-        transaction.upsert(summary)?;
-        transaction.commit()?;
-        Ok(totals)
+        Ok(summary)
     }
 }
 

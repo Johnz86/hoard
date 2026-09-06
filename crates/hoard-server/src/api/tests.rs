@@ -10,12 +10,13 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 use hoard_core::{
-    Artifact, ArtifactFormat, ArtifactId, Base, BlobId, Evidence, EvidenceSource, NodeId,
-    Precision, RepoId, RepoType, Role, Sha256, State as ArtifactState, TensorSample, TensorSummary,
+    Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, Evidence, EvidenceSource,
+    NodeId, Precision, RepoId, RepoType, Role, Sha256, State as ArtifactState, TensorSample,
+    TensorSummary,
 };
 use hoard_index::catalog::{
-    Catalog, LOCAL_NODE, RemoteEntry, SeedArtifact, SeedEntry, SeedRepository, SeedRevision,
-    UsageEvent, content_key,
+    Catalog, LOCAL_NODE, MIRROR_SOURCE, RemoteEntry, SeedArtifact, SeedEntry, SeedRepository,
+    SeedRevision, ServedFile, UsageEvent, content_key,
 };
 use hoard_index::config::{SourceConfig, SourceKind};
 use hoard_index::discover::RefKind;
@@ -1585,8 +1586,8 @@ async fn sources_scans_and_jobs_are_listed() {
     let sources = get(&world.state, "/api/v1/sources").await;
     assert_eq!(
         sources.as_array().expect("sources").len(),
-        1,
-        "a peer's namespace is not a root of files on this node"
+        2,
+        "every source the catalog holds is listed, scannable or not"
     );
     assert_eq!(sources[0]["kind"], "hf-cache");
     assert_eq!(sources[0]["path"], "/data/hub");
@@ -1594,6 +1595,21 @@ async fn sources_scans_and_jobs_are_listed() {
         sources[0]["pending_hashes"], 9,
         "every seeded path is still waiting for a content hash"
     );
+    assert_eq!(
+        sources[0]["can_scan"], true,
+        "the configuration names this root, so a scan will take it"
+    );
+    assert_eq!(
+        sources[0]["managed_by"],
+        Value::Null,
+        "and nothing else writes it"
+    );
+    assert_eq!(sources[1]["name"], "peer:laptop-1");
+    assert_eq!(
+        sources[1]["can_scan"], false,
+        "a peer's namespace is not a root of files on this node"
+    );
+    assert_eq!(sources[1]["managed_by"], "peer");
 
     let started = post(
         &world.state,
@@ -1635,6 +1651,92 @@ async fn sources_scans_and_jobs_are_listed() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(bad["error"]["code"], "BadRequest");
+}
+
+#[tokio::test]
+async fn a_managed_source_is_listed_without_a_scan_action() {
+    let world = seeded();
+    world
+        .state
+        .catalog()
+        .ingest_served(&ServedFile {
+            repo: RepoId::parse_ref(RepoType::Models, "openai/whisper").expect("a repo"),
+            commit: CommitSha::from_bytes([0x11; 20]),
+            rel_path: "model.safetensors".to_owned(),
+            size: 4096,
+            sha256: Sha256::from_bytes([0x42; 32]),
+            git_sha1: None,
+            cache_root: world.state.config().cache_root(),
+        })
+        .expect("a served file is filed");
+
+    let sources = get(&world.state, "/api/v1/sources").await;
+    let downloads = sources
+        .as_array()
+        .expect("sources")
+        .iter()
+        .find(|row| row["name"] == MIRROR_SOURCE)
+        .expect("the mirror's own source is listed");
+    assert_eq!(
+        downloads["can_scan"], false,
+        "the scanner never walks what the mirror wrote"
+    );
+    assert_eq!(downloads["managed_by"], "downloads");
+
+    let (status, refused) = call(
+        &world.state,
+        Method::POST,
+        "/api/v1/scan",
+        Some(json!({ "source": MIRROR_SOURCE })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "and the backend still refuses to scan it: {refused}"
+    );
+}
+
+#[tokio::test]
+async fn a_source_the_configuration_dropped_is_listed_as_managed_by_nobody() {
+    let world = seeded();
+    world
+        .state
+        .catalog()
+        .seed(&[SeedRepository {
+            source: "retired".to_owned(),
+            kind: SourceKind::Loose,
+            root_path: std::path::PathBuf::from("/data/retired"),
+            ..seed_repo(
+                "org/left-behind",
+                RepoType::Models,
+                0x77,
+                vec![seed_entry(
+                    "w.safetensors",
+                    "/data/retired/w.safetensors",
+                    4096,
+                    None,
+                )],
+            )
+        }])
+        .expect("a repository under a source the configuration does not name");
+
+    let sources = get(&world.state, "/api/v1/sources").await;
+    let dropped = sources
+        .as_array()
+        .expect("sources")
+        .iter()
+        .find(|row| row["name"] == "retired")
+        .expect("a source the configuration dropped is still listed");
+    assert_eq!(
+        dropped["can_scan"], false,
+        "the scanner walks what the configuration names, and this is not it"
+    );
+    assert_eq!(
+        dropped["managed_by"], "nobody",
+        "nothing removes a Source row, so a dropped [[index.sources]] leaves one behind \
+         that no writer owns"
+    );
 }
 
 #[tokio::test]

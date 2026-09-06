@@ -29,6 +29,9 @@ pub enum IndexError {
     #[error("invalid catalog: {0}")]
     Catalog(String),
 
+    #[error("the catalog is open in another process; wait for it to finish")]
+    CatalogBusy,
+
     #[error(
         "catalog at {directory} has format {found}, this build writes {expected}: \
          delete the directory and scan again"
@@ -95,9 +98,7 @@ impl From<native_db::db_type::Error> for IndexError {
         match error {
             native_db::db_type::Error::RedbDatabaseError(
                 redb::DatabaseError::DatabaseAlreadyOpen,
-            ) => IndexError::Catalog(
-                "the catalog is open in another process; wait for it to finish".into(),
-            ),
+            ) => IndexError::CatalogBusy,
             other => IndexError::Native(Box::new(other)),
         }
     }

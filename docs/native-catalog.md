@@ -272,11 +272,18 @@ cargo run -- catalog search --directory /existing/path/native-catalog 'format:gg
 cargo run -- catalog search --directory /existing/path/native-catalog --sort size --desc 'base:sdxl'
 cargo run -- catalog status --directory /existing/path/native-catalog
 cargo run -- catalog rebuild --directory /existing/path/native-catalog
+cargo run -- catalog compact --directory /existing/path/native-catalog
 ```
 
-Run `search`, `status` and `rebuild` one after another; the lock is exclusive. A
+Run `search`, `status`, `rebuild` and `compact` one after another; the lock is exclusive. A
 scan that fails removes the directory it started, and a source whose root is missing is
 skipped with a warning.
+
+`compact` is the only thing that compacts a catalog on demand. A scan compacts at the end of
+building one, because that is bulk construction; a rescan never does, so a shared catalog
+stays readable. `compact` reports the bytes `catalog.redb` was allocated before and after,
+and what that difference reclaimed. It needs the catalog to itself: a catalog another process
+holds is refused rather than waited for.
 
 ## The query grammar
 
@@ -542,8 +549,9 @@ stand at +1.7, +1.3, +4.7 and +7.4 ms. The first two are inside the spread of th
 the last two are not, and are a 3.2 per cent regression on two rows this wave did not put on
 a new path. All four are shallow windows that still take the heap. At 100k the same four rows
 are back on their before numbers to within 0.7 ms, so whatever is left does not scale with
-the change; the reviewer refuted the three mechanical explanations and what remains is
-codegen around the collector's inner loop.
+the change; the reviewer refuted the three mechanical explanations. Codegen around the
+collector's inner loop is the hypothesis that remains, and it is only that: no profile has
+been taken that establishes it.
 
 `node:self` is the collapse path, which this wave did not touch; it read 411.839, 381.425 and
 322.365 ms across the three columns, a spread wider than any difference between them. The
@@ -723,7 +731,9 @@ Past that point the numeric heap is not monotone - it reads 175.330 ms at 131,17
 141.718 ms at 500,050 - so at the midpoint a numeric heap is about 33 ms faster than the
 sample on a single warm sample. It is not chosen there: that heap holds 500,050 rows in every
 segment it reads, which is the 58.56 MiB the wave removed, against about a thousand rows for
-the bucket. Where the two are level in time the bounded one is taken.
+the bucket. Where the two are level in time the bounded one is taken - except below the caps,
+where the sampled selection falls back to the heap on purpose, so paging is bounded
+everywhere above them and not below.
 
 The first two rows are the catalog at rest. The third is not: `publish` writes the new
 `search-v1-<nanos>` directory in full and keeps the old one until the new one is committed

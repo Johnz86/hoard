@@ -39,7 +39,7 @@ pub use self::ingest::{IngestRecord, MIRROR_SOURCE, ServedFile};
 pub use self::jobs::{JobProgress, JobRecord, JobState};
 pub use self::loadouts::LoadoutRecord;
 pub use self::models::LOCAL_NODE;
-pub use self::nodes::NodeRecord;
+pub use self::nodes::{NodeRecord, PEER_SOURCE};
 pub use self::pulls::{PULL_SOURCE, PullMark, PullSlot, PulledFile};
 pub use self::read::{
     ArtifactDetailView, EntryDetail, RefDetail, RepositoryDetail, RepositoryFilter, RepositoryPage,
@@ -149,6 +149,20 @@ impl Catalog {
     /// Opens a completed scan; an incomplete scan and a catalog of another format are
     /// rejected.
     pub fn open(directory: &Path) -> Result<Self> {
+        let (catalog, manifest) = Self::open_checked(directory)?;
+        catalog.seed_builtin_shelves()?;
+        catalog.ensure_self_row(&manifest.node)?;
+        Ok(catalog)
+    }
+
+    /// Opens an existing catalog for inspection: the format is checked and no catalog row is
+    /// written. native_db opens every table in a committed write transaction as it opens the
+    /// file, so the file's transaction id advances; nothing this catalog stores changes.
+    pub fn inspect(directory: &Path) -> Result<Self> {
+        Ok(Self::open_checked(directory)?.0)
+    }
+
+    fn open_checked(directory: &Path) -> Result<(Self, Manifest)> {
         let database = builder().open(models()?, directory.join("catalog.redb"))?;
         let catalog = Self {
             database,
@@ -163,9 +177,7 @@ impl Catalog {
                 expected: FORMAT_VERSION,
             });
         }
-        catalog.seed_builtin_shelves()?;
-        catalog.ensure_self_row(&manifest.node)?;
-        Ok(catalog)
+        Ok((catalog, manifest))
     }
 
     /// Opens the catalog at `config.native_path()`, scanning the configured sources into a
@@ -303,14 +315,7 @@ impl Catalog {
     /// catalog whose sweep predates this record reports zeroes rather than rescanning.
     pub fn totals(&self) -> Result<Totals> {
         let summary: Option<Summary> = self.database.r_transaction()?.get().primary(0_u8)?;
-        Ok(summary.map_or_else(Totals::default, |summary| Totals {
-            artifacts: summary.artifacts,
-            present_artifacts: summary.present_artifacts,
-            triage_artifacts: summary.triage_artifacts,
-            indexed_bytes: summary.indexed_bytes,
-            repositories: summary.repositories,
-            advertised_artifacts: summary.advertised_artifacts,
-        }))
+        Ok(summary.map_or_else(Totals::default, |summary| totals_of(&summary)))
     }
 
     fn manifest(&self) -> Result<Manifest> {
@@ -321,6 +326,17 @@ impl Catalog {
             .ok_or_else(|| {
                 IndexError::Catalog("scan is incomplete; scan again into a new directory".into())
             })
+    }
+}
+
+fn totals_of(summary: &Summary) -> Totals {
+    Totals {
+        artifacts: summary.artifacts,
+        present_artifacts: summary.present_artifacts,
+        triage_artifacts: summary.triage_artifacts,
+        indexed_bytes: summary.indexed_bytes,
+        repositories: summary.repositories,
+        advertised_artifacts: summary.advertised_artifacts,
     }
 }
 

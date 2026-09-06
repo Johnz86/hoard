@@ -14,7 +14,7 @@ use super::userdata::next_id;
 
 /// The prefix a source of a peer's rows carries, so the repositories filed under it read
 /// back as that peer's rather than this node's.
-pub(super) const PEER_SOURCE: &str = "peer:";
+pub const PEER_SOURCE: &str = "peer:";
 
 /// The identity a node with no configured one falls back to.
 const FALLBACK_ID: &str = "hoard";

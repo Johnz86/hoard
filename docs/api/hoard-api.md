@@ -131,7 +131,14 @@ no `dir` at all and always uses the configured root.
 
 - `GET /api/v1/sources`: kind, files, bytes, last scan, pending hashes; `blobs` is kept for
   the shape and always reads zero, the catalog counts content by artifact rather than by
-  blob.
+  blob. The list holds every source the catalog knows, including the ones this node does not
+  scan: the mirror's downloads, the puller's landings and a peer's namespace. `can_scan` says
+  whether `POST /api/v1/scan` will accept the row, which is true exactly when the
+  configuration names it; `managed_by` says who writes it instead, one of `"downloads"`,
+  `"pulls"`, `"peer"` or `"nobody"`, and is absent when `can_scan` is true. `"nobody"` is a
+  source the catalog still holds that the configuration no longer names, which is what a
+  dropped or renamed `[[index.sources]]` leaves behind: nothing removes a `Source` row. A
+  client offers the scan action on `can_scan` alone and never on a name it recognises.
 - `POST /api/v1/scan { "source" | null, "hash": "now" | "later" | "never" }` returns
   `{ "job_id" }`. `"background"` is accepted as an alias for `"later"`; omitting `hash`
   also means `"later"`.

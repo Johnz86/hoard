@@ -53,27 +53,34 @@ export function renderScansView(app) {
                 el("span", { class: "align-right", text: fmtBytes(source.bytes) }),
                 el("span", { class: "align-right", text: String(source.pending_hashes ?? 0) }),
                 el("span", { class: "align-right mono-dim", text: fmtAge(source.last_scan) }),
-                el(
-                    "span",
-                    { class: "align-right" },
-                    el("button", {
-                        class: "btn btn-tiny",
-                        type: "button",
-                        text: "SCAN",
-                        onClick: async () => {
-                            try {
-                                await api.startScan(source.id ?? source.path);
-                                toast(`scan queued · ${source.path || source.id}`);
-                                loadJobs(app);
-                            } catch (error) {
-                                toast(`scan failed · ${error.message}`);
-                            }
-                        }
-                    })
-                )
+                el("span", { class: "align-right" }, scanAction(app, source))
             )
         )
     );
+}
+
+function scanAction(app, source) {
+    if (!source.can_scan) {
+        const label =
+            source.managed_by === "nobody"
+                ? "not configured"
+                : `managed by ${source.managed_by}`;
+        return el("span", { class: "mono-dim", text: label });
+    }
+    return el("button", {
+        class: "btn btn-tiny",
+        type: "button",
+        text: "SCAN",
+        onClick: async () => {
+            try {
+                await api.startScan(source.id ?? source.path);
+                toast(`scan queued · ${source.path || source.id}`);
+                loadJobs(app);
+            } catch (error) {
+                toast(`scan failed · ${error.message}`);
+            }
+        }
+    });
 }
 
 export function renderJobsView(app) {

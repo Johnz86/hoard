@@ -101,8 +101,13 @@ pub enum Command {
     },
     /// List this node and its peers.
     Nodes,
-    /// Check that this installation can do everything it claims.
-    Doctor,
+    /// Check that this installation can do everything it claims. Diagnostic by default:
+    /// nothing is created, scanned or corrected unless `--repair` is given.
+    Doctor {
+        /// Recompute the derived totals and store them, reporting before and after.
+        #[arg(long)]
+        repair: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -157,6 +162,19 @@ mod tests {
         for case in cases {
             Cli::try_parse_from(case).unwrap_or_else(|error| panic!("{case:?}: {error}"));
         }
+    }
+
+    #[test]
+    fn doctor_parses_with_and_without_repair() {
+        let bare = Cli::try_parse_from(["hoard", "doctor"]).expect("a bare doctor parses");
+        assert!(matches!(bare.command, Command::Doctor { repair: false }));
+
+        let repairing =
+            Cli::try_parse_from(["hoard", "doctor", "--repair"]).expect("--repair parses");
+        assert!(matches!(
+            repairing.command,
+            Command::Doctor { repair: true }
+        ));
     }
 
     #[test]

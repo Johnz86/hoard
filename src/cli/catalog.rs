@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use clap::Subcommand;
+use serde::Serialize;
 use serde_json::json;
 
-use hoard_index::catalog::{Catalog, QueryRequest};
+use hoard_index::catalog::{Catalog, QueryRequest, StorageReport};
 use hoard_index::config::HashPolicy;
 use hoard_index::search::{SortKey, SortSpec};
 
@@ -54,6 +55,39 @@ pub enum CatalogCommand {
         #[arg(long)]
         directory: PathBuf,
     },
+    /// Rewrite the catalog file without its free pages and report allocated bytes before
+    /// and after. Needs the catalog to itself; a catalog another process holds is refused,
+    /// not waited for.
+    Compact {
+        #[arg(long)]
+        directory: PathBuf,
+    },
+}
+
+/// What one compaction returned: the bytes `catalog.redb` was allocated before and after
+/// being rewritten without its free pages, and the storage report of the rewritten file.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct Compaction {
+    before: u64,
+    after: u64,
+    reclaimed: u64,
+    storage: StorageReport,
+}
+
+fn compact(directory: &Path) -> Result<Compaction> {
+    let before = Catalog::storage(directory)
+        .context("measuring the catalog before compaction")?
+        .allocated_bytes;
+    let mut catalog = Catalog::open(directory).context("opening native catalog")?;
+    catalog.compact().context("compacting native catalog")?;
+    drop(catalog);
+    let storage = Catalog::storage(directory).context("measuring the catalog after compaction")?;
+    Ok(Compaction {
+        before,
+        after: storage.allocated_bytes,
+        reclaimed: before.saturating_sub(storage.allocated_bytes),
+        storage,
+    })
 }
 
 pub async fn run(config_path: Option<&Path>, command: CatalogCommand) -> Result<()> {
@@ -176,6 +210,9 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
             progress.finish_and_clear();
             report(&catalog.status()?)?;
         }
+        CatalogCommand::Compact { directory } => {
+            report(&compact(&directory)?)?;
+        }
         CatalogCommand::Status { directory } => {
             let mut catalog = Catalog::open(&directory)?;
             anyhow::ensure!(
@@ -202,6 +239,73 @@ mod tests {
 
     use super::*;
     use crate::cli::{Cli, Command};
+
+    #[test]
+    fn compact_parses_its_directory() -> Result<()> {
+        let parsed =
+            Cli::try_parse_from(["hoard", "catalog", "compact", "--directory", "/tmp/catalog"])?;
+        assert!(matches!(parsed.command, Command::Catalog {
+            command: CatalogCommand::Compact { directory }
+        } if directory == Path::new("/tmp/catalog")));
+        Ok(())
+    }
+
+    #[test]
+    fn compacting_reports_before_and_after_and_keeps_the_data() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let input = root.path().join("files");
+        std::fs::create_dir_all(&input)?;
+        for index in 0..128 {
+            std::fs::write(
+                input.join(format!("d{index}.jsonl")),
+                format!("{{\"text\":\"row {index}\"}}\n"),
+            )?;
+        }
+        let config = hoard_index::config::IndexConfig {
+            sources: vec![hoard_index::config::SourceConfig {
+                name: "files".to_owned(),
+                path: input.clone(),
+                kind: hoard_index::config::SourceKind::Loose,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                follow_symlinks: false,
+                repo_per_folder: false,
+            }],
+            ..hoard_index::config::IndexConfig::default()
+        };
+        let directory = root.path().join("native");
+        let catalog =
+            Catalog::scan_sources(&directory, "n", &config, HashPolicy::Never, |_, _| {})?;
+        for index in 0..96 {
+            std::fs::remove_file(input.join(format!("d{index}.jsonl")))?;
+        }
+        catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+        let expected = catalog.count_summary()?;
+        drop(catalog);
+
+        let compaction = compact(&directory)?;
+        assert!(
+            compaction.after <= compaction.before,
+            "a compaction never grows the file: {compaction:?}"
+        );
+        assert_eq!(
+            compaction.reclaimed,
+            compaction.before - compaction.after,
+            "what it reclaimed is the difference it reported"
+        );
+        assert_eq!(
+            compaction.storage.allocated_bytes, compaction.after,
+            "the report describes the file the compaction left"
+        );
+
+        let reopened = Catalog::inspect(&directory)?;
+        assert_eq!(
+            reopened.count_summary()?,
+            expected,
+            "a compaction moves pages, not records"
+        );
+        Ok(())
+    }
 
     #[test]
     fn native_search_command_keeps_the_query_and_pagination() -> Result<()> {

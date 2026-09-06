@@ -19,7 +19,7 @@ use crate::search::{CompileContext, SortKey, SortSpec, parse};
 
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, LocationKey,
-    Manifest, Placement, Repository, RepositoryKey, SearchChange, Source,
+    Manifest, Node, Placement, Repository, RepositoryKey, SearchChange, Shelf, Source,
 };
 use super::search::{Paging, QueryPath};
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
@@ -564,10 +564,15 @@ fn a_catalog_open_elsewhere_reports_the_lock_plainly() -> Result<()> {
     let (directory, catalog) = fixture()?;
     let second = Catalog::open(&directory.path().join("native"));
     let message = match second {
-        Err(IndexError::Catalog(message)) => message,
-        other => panic!("expected a catalog error, got {other:?}"),
+        Err(error @ IndexError::CatalogBusy) => error.to_string(),
+        other => panic!("expected the catalog to report its lock, got {other:?}"),
     };
     assert!(message.contains("another process"), "{message}");
+    let inspected = Catalog::inspect(&directory.path().join("native"));
+    assert!(
+        matches!(inspected, Err(IndexError::CatalogBusy)),
+        "inspecting a locked catalog reports the lock rather than waiting: {inspected:?}"
+    );
     drop(catalog);
     Ok(())
 }
@@ -2445,6 +2450,125 @@ fn repository_counts_follow_every_writer() -> Result<()> {
 }
 
 #[test]
+fn inspect_opens_without_seeding_shelves_or_a_self_row() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("models");
+    fs::create_dir_all(&input)?;
+    fs::write(input.join("w.safetensors"), lora_header_named("t"))?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let native = directory.path().join("native");
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
+    assert!(
+        !catalog.list_shelves()?.is_empty(),
+        "a scan seeds the shelves"
+    );
+    assert_eq!(catalog.list_nodes()?.len(), 1, "and records this machine");
+
+    let read = catalog.database.r_transaction()?;
+    let shelves: Vec<Shelf> = read
+        .scan()
+        .primary::<Shelf>()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    drop(read);
+    let transaction = catalog.database.rw_transaction()?;
+    for shelf in shelves {
+        transaction.remove(shelf)?;
+    }
+    let this: Option<Node> = transaction.get().primary(LOCAL_NODE)?;
+    transaction.remove(this.ok_or_else(|| IndexError::Catalog("the self row".into()))?)?;
+    transaction.commit()?;
+    drop(catalog);
+
+    let inspected = Catalog::inspect(&native)?;
+    assert!(
+        inspected.list_shelves()?.is_empty(),
+        "inspecting seeds no shelf"
+    );
+    assert!(
+        inspected.list_nodes()?.is_empty(),
+        "and records no node either"
+    );
+    drop(inspected);
+
+    let opened = Catalog::open(&native)?;
+    assert!(
+        !opened.list_shelves()?.is_empty(),
+        "opening restores the shelves"
+    );
+    assert_eq!(
+        opened.list_nodes()?.len(),
+        1,
+        "and records this machine again"
+    );
+    Ok(())
+}
+
+#[test]
+fn counting_the_summary_writes_nothing() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("models");
+    fs::create_dir_all(&input)?;
+    for index in 0..3 {
+        fs::write(
+            input.join(format!("w{index}.safetensors")),
+            lora_header_named(&format!("t{index}")),
+        )?;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let mut catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+
+    let truth = catalog.count_summary()?;
+    assert_eq!(truth.artifacts, 3, "the scan filed one artifact per file");
+    let wrong = crate::catalog::Totals {
+        artifacts: truth.artifacts + 7,
+        indexed_bytes: truth.indexed_bytes + 4096,
+        ..truth.clone()
+    };
+    catalog.drift_summary(&wrong)?;
+
+    assert_eq!(
+        catalog.count_summary()?,
+        truth,
+        "a count reads the records, not the stored totals"
+    );
+    assert_eq!(
+        catalog.totals()?,
+        wrong,
+        "and it leaves the drifted totals where they were"
+    );
+
+    assert_eq!(
+        catalog.repair_summary()?,
+        (wrong, truth.clone()),
+        "a repair reports what was stored and what it stored"
+    );
+    assert_eq!(
+        catalog.totals()?,
+        truth,
+        "the stored totals are the counted"
+    );
+    assert_eq!(
+        catalog.repair_summary()?,
+        (truth.clone(), truth),
+        "a second repair finds nothing to move"
+    );
+    Ok(())
+}
+
+#[test]
 fn the_summary_is_exact_after_incremental_passes() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("models");
@@ -2469,8 +2593,8 @@ fn the_summary_is_exact_after_incremental_passes() -> Result<()> {
     )?;
     let exact = |stage: &str| -> Result<()> {
         let stored = catalog.totals()?;
-        let recounted = catalog.recount_summary()?;
-        assert_eq!(stored, recounted, "the summary drifted after {stage}");
+        let counted = catalog.count_summary()?;
+        assert_eq!(stored, counted, "the summary drifted after {stage}");
         Ok(())
     };
     exact("a scan")?;
@@ -3803,7 +3927,7 @@ fn new_and_existing_artifacts_keep_counts_and_search_changes() -> Result<()> {
         3,
         "a, c and b survive; the copy of b was removed"
     );
-    let totals = catalog.recount_summary()?;
+    let totals = catalog.count_summary()?;
     assert_eq!(
         totals.artifacts,
         search(&catalog, "")?.total,

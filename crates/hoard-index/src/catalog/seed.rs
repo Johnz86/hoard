@@ -15,9 +15,9 @@ use super::Catalog;
 use super::hashing::content_key;
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, Manifest, Ref, Repository,
-    RepositoryKey, Revision, SearchText, Source, placement_in, repository_key,
+    RepositoryKey, Revision, SearchText, Source, Summary, placement_in, repository_key,
 };
-use super::scan::{Counters, counts, log_changes, next_id, preference, tensor_keys};
+use super::scan::{Counters, blank_summary, counts, log_changes, next_id, preference, tensor_keys};
 
 /// The instant every seeded artifact reports as first seen, so a test that renders it reads
 /// one fixed value rather than the wall clock.
@@ -74,6 +74,25 @@ pub struct SeedArtifact {
 }
 
 impl Catalog {
+    /// Stores totals no count of the records would produce, so a test can prove that a
+    /// reader leaves drift alone and that a repair corrects it.
+    pub fn drift_summary(&self, totals: &super::Totals) -> Result<()> {
+        let transaction = self.database.rw_transaction()?;
+        let stored: Option<Summary> = transaction.get().primary(0_u8)?;
+        let summary = Summary {
+            artifacts: totals.artifacts,
+            present_artifacts: totals.present_artifacts,
+            triage_artifacts: totals.triage_artifacts,
+            indexed_bytes: totals.indexed_bytes,
+            repositories: totals.repositories,
+            advertised_artifacts: totals.advertised_artifacts,
+            ..stored.unwrap_or_else(blank_summary)
+        };
+        transaction.upsert(summary)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Writes records the way a scan would, for tests that need known rows without
     /// inference: ids come from the allocator, every artifact is logged for the search
     /// index, path counts and the summary are swept, and the generation increments.

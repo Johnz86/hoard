@@ -22,7 +22,7 @@ use super::models::{
     ArtifactDetail, ArtifactRecord, Entry, EntryKey, LocationKey, Repository, RepositoryKey,
     Revision, Source, repository_key,
 };
-use super::nodes::{NodeNames, PEER_SOURCE};
+use super::nodes::NodeNames;
 use super::search::{EntryFacts, assemble_row, revision_of};
 use super::usage::last_used_in;
 use super::{Catalog, QueryRequest};
@@ -168,8 +168,9 @@ pub struct TriageItem {
 }
 
 impl Catalog {
-    /// Every nominated root this catalog holds, ordered by name, with the files each still
-    /// owes a content hash. A peer's namespace is not a root on this node, so it is left out.
+    /// Every source this catalog holds, ordered by name, with the files each still owes a
+    /// content hash. A peer's namespace is one of them: it is not a root of files on this
+    /// node, and what may be done to it is the caller's to decide from its name.
     pub fn sources(&self) -> Result<Vec<SourceRecord>> {
         let read = self.database.r_transaction()?;
         let rows: Vec<Source> = read
@@ -177,10 +178,7 @@ impl Catalog {
             .primary()?
             .all()?
             .collect::<native_db::db_type::Result<_>>()?;
-        rows.into_iter()
-            .filter(|row| !row.name.starts_with(PEER_SOURCE))
-            .map(SourceRecord::of)
-            .collect()
+        rows.into_iter().map(SourceRecord::of).collect()
     }
 
     /// The repositories filed under one source, by id.

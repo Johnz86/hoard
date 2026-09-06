@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 
 use hoard_core::NodeId;
+use hoard_index::IndexError;
 use hoard_index::catalog::Catalog;
 use hoard_server::HoardConfig;
 
@@ -13,6 +14,86 @@ const DEFAULT_CONFIG: &str = "hoard.toml";
 pub struct Context {
     pub config: HoardConfig,
     pub catalog: Arc<Catalog>,
+}
+
+/// Why a catalog could not be opened for inspection, in the terms `hoard doctor` reports.
+#[derive(Debug)]
+pub enum Finding {
+    Missing(PathBuf),
+    Format {
+        directory: PathBuf,
+        found: u32,
+        expected: u32,
+    },
+    Locked(String),
+    Unreadable(String),
+}
+
+impl std::fmt::Display for Finding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Finding::Missing(directory) => write!(
+                formatter,
+                "no catalog at {}; run `hoard scan`",
+                directory.display()
+            ),
+            Finding::Format {
+                directory,
+                found,
+                expected,
+            } => write!(
+                formatter,
+                "catalog at {} is format {found}, this build reads {expected}; \
+                 `hoard scan` rebuilds it",
+                directory.display()
+            ),
+            Finding::Locked(message) | Finding::Unreadable(message) => formatter.write_str(message),
+        }
+    }
+}
+
+/// The configuration and, when one exists in this build's format, the catalog, opened
+/// without creating, scanning, refreshing or writing anything.
+#[derive(Debug)]
+pub struct Inspection {
+    pub config: HoardConfig,
+    pub catalog: Result<Catalog, Finding>,
+}
+
+/// Loads `hoard.toml` and opens the catalog it names for reading only: no directory is
+/// created, no source is scanned, no search index is built and no catalog row is written.
+/// Every reason a catalog cannot be opened comes back as a [`Finding`] rather than an error,
+/// so a diagnosis can report it beside the checks that did run.
+pub async fn inspect(config_path: Option<&Path>) -> Result<Inspection> {
+    let config = load_config(config_path)?;
+    let directory = config.index.native_path();
+    if !directory.join("catalog.redb").exists() {
+        let catalog = Err(Finding::Missing(directory));
+        return Ok(Inspection { config, catalog });
+    }
+    let opening = directory.clone();
+    let catalog = tokio::task::spawn_blocking(move || Catalog::inspect(&opening))
+        .await
+        .with_context(|| format!("inspecting the native catalog at {}", directory.display()))?
+        .map_err(finding_of);
+    Ok(Inspection { config, catalog })
+}
+
+fn finding_of(error: IndexError) -> Finding {
+    let message = error.to_string();
+    match error {
+        IndexError::CatalogFormat {
+            directory,
+            found,
+            expected,
+        } => Finding::Format {
+            directory,
+            found,
+            expected,
+        },
+        IndexError::CatalogBusy => Finding::Locked(message),
+        _ => Finding::Unreadable(message),
+    }
 }
 
 /// Loads `hoard.toml`, opens the catalog and makes sure this node exists in it under the

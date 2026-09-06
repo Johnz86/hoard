@@ -21,7 +21,7 @@ speak. Sources: `docs/use-case.md` (brief), `docs/design/ui-spec.md` and
 | 8 | Nodes: discovery, gossip, peer pulls | done | M3 |
 | 9 | Shelves, loadouts, projection, usage | done | M4 Make it usable |
 | 10 | Live index and polish | partial | M4 |
-| 11 | Native catalog (native_db + Tantivy) | partial | M1 |
+| 11 | Native catalog (native_db + Tantivy) | done | M1 |
 
 Tick a phase only when its acceptance check passes and `/hoard-verify` is clean.
 
@@ -37,14 +37,17 @@ apply pulled one whose sha256 matched the origin byte for byte before it became 
 searchable. The static `[peers]` path was verified independently, because mDNS is blocked
 on many networks.
 
-Phase 10 is partial: the `notify` watcher, PyTorch zip key extraction and dataset sniffing
-are in; the TREE and DISK views are not. `docs/design/ui-spec.md` records them as named in
-the proposal but absent from the prototype, so there is no design to build them from.
+Phase 10 is partial: PyTorch zip key extraction, dataset sniffing, the `?` sheet and the
+doctor command are in. The `notify` watcher exists and is tested but nothing starts it, so
+live rescanning does not ship until `serve` starts, reconciles and shuts it down. The TREE
+and DISK views need a design decision before they can be built: `docs/design/ui-spec.md`
+records them as named in the proposal but absent from the prototype, so there is no design to
+build them from.
 
-Phase 11 replaced the SQLite index with the native catalog and is merged: every command,
-every route, both faces and gossip read and write it, and no SQLite code remains. It stays
-partial because of the items under "Remaining work" in `docs/native-catalog.md`, chiefly the
-per-entry record size at a million artifacts and the unbounded collapse path.
+Phase 11 is done. It replaced the SQLite index with the native catalog: every command, every
+route, both faces and gossip read and write it, and no SQLite code remains, which is what the
+phase was for. Making the catalog faster and smaller is ongoing work rather than an unfinished
+phase, and the follow-ups under `### Phase 11` carry their own acceptance criteria.
 
 ## Goals
 
@@ -254,6 +257,9 @@ docs, Claude Code project configuration.
 
 ### Phase 1: Core types and index store
 
+Its first implementation was SQLite with an FTS5 index; Phase 11 replaced that store with the
+native catalog, and the bullets below describe what the catalog holds.
+
 - `hoard-core`: `RepoId`, `RepoType`, `CommitSha`, `Sha256`, `BlobId`, `ArtifactId`,
   `NodeId`, `Role` with sub-roles and aliases, `Base`, `ArtifactFormat`, `Precision`,
   `State`, `Evidence`, `HoardError`.
@@ -331,8 +337,17 @@ docs, Claude Code project configuration.
 
 ### Phase 10: Live index and polish
 
-- `notify` watcher, PyTorch zip key extraction, ONNX and dataset sniffing, TREE and DISK
-  views, `?` key sheet, doctor command.
+- Done: PyTorch zip key extraction, ONNX and dataset sniffing, the `?` key sheet, and the
+  doctor command, which diagnoses by default and repairs the derived totals on `--repair`.
+- The `notify` watcher through `serve`: started with the server, reconciling what changed
+  while it was down, and joined on shutdown. Accept: a file added under a configured source
+  while `serve` runs is searchable without a manual scan, a manual scan and a watched scan
+  never run over the same source at once, the configured hash policy is preserved, an
+  overflowed watch marks its source dirty rather than losing the change, and shutdown leaves
+  no running watcher.
+- TREE and DISK views: blocked on a design decision, not on implementation. There is no
+  layout for them in `docs/design/handoff/`, so what they show has to be decided before
+  either can be built.
 
 ### Phase 11: Native catalog
 
@@ -341,9 +356,21 @@ docs, Claude Code project configuration.
   SQLite store and its FTS5 index are gone.
 - Accept: a scan of this workstation's disks yields the same artifact count, names and triage
   set the SQLite index gave; `hoard doctor` passes every check; the scale harness meets its
-  thresholds at 1M entries.
-- Remaining: `docs/native-catalog.md` under "Remaining work" holds the open items with their
-  numbers.
+  thresholds at 1M entries. All three hold, and the phase is done.
+
+Follow-ups, each with its own acceptance criterion. They are optimisation and hardening of a
+store that already works, not the remainder of the phase.
+
+- Bounded collapse. Accept: every query that takes the collapse path answers under 500 ms at
+  1M with memory bounded by the page and the sample, as the primary path already is.
+- Power-loss and process-kill recovery tests. Accept: a catalog killed mid-scan reopens and
+  rescans to the same counts a clean run gives.
+- Byte-exact path identities, so an identity is the path's bytes rather than its lossy string.
+- Revision ordinals stored rather than recomputed on every rescan.
+- Counting a revision's artifact units without counting content another revision claimed.
+- Complete repository git metadata with identities that are stable across scans.
+
+`docs/native-catalog.md` under "Remaining work" holds each of these with its measured numbers.
 
 ## Risks and open decisions
 

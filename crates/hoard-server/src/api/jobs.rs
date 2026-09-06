@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use hoard_core::{JobId, SourceId, format_size};
 use hoard_index::IndexError;
 use hoard_index::catalog::{
-    Catalog, HashReport, JobProgress, JobRecord, JobState, RescanReport, SourceRecord,
+    Catalog, HashReport, JobProgress, JobRecord, JobState, MIRROR_SOURCE, PEER_SOURCE, PULL_SOURCE,
+    RescanReport, SourceRecord,
 };
 use hoard_index::config::{HashPolicy, IndexConfig};
 
@@ -20,11 +21,12 @@ use crate::state::AppState;
 /// The `job.kind` a scan records.
 const SCAN_KIND: &str = "scan";
 
-/// One nominated root and what the last scan of it counted.
+/// One source the catalog holds and what the last scan of it counted.
 ///
 /// Sources carry no identity of their own in the catalog yet, so `id` is the source's
 /// one-based position in this listing, which is also how a scan request naming an id is
-/// read back. `blobs` reads zero because the catalog counts paths, not blobs.
+/// read back. `blobs` reads zero because the catalog counts paths, not blobs. Sources this
+/// node does not scan are listed too, saying who does write them.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SourceView {
     pub id: SourceId,
@@ -38,6 +40,14 @@ pub struct SourceView {
     pub bytes_human: String,
     pub last_scan: Option<Timestamp>,
     pub pending_hashes: u64,
+    /// Whether `POST /api/v1/scan` will accept this source: it is named in the
+    /// configuration.
+    pub can_scan: bool,
+    /// Who writes this source when it is not the scanner: "downloads", "pulls", "peer", or
+    /// "nobody" for a stored source the configuration no longer names. Absent when
+    /// `can_scan` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -79,14 +89,25 @@ async fn source_views(state: &AppState) -> ApiResult<Vec<SourceView>> {
     let catalog = Arc::clone(state.catalog());
     let records = blocking(move || catalog.sources()).await?;
     let node = state.node_name();
+    let index = &state.config().index;
     Ok(records
         .into_iter()
         .enumerate()
-        .map(|(position, record)| source_view(position, record, node))
+        .map(|(position, record)| source_view(position, record, node, index))
         .collect())
 }
 
-fn source_view(position: usize, record: SourceRecord, node: &str) -> SourceView {
+fn source_view(
+    position: usize,
+    record: SourceRecord,
+    node: &str,
+    index: &IndexConfig,
+) -> SourceView {
+    let can_scan = index.source(&record.name).is_some();
+    let managed_by = match can_scan {
+        true => None,
+        false => Some(manager_of(&record.name)),
+    };
     SourceView {
         id: SourceId::new(position as i64 + 1),
         name: record.name,
@@ -99,7 +120,22 @@ fn source_view(position: usize, record: SourceRecord, node: &str) -> SourceView 
         bytes_human: format_size(record.byte_count),
         last_scan: record.last_scan,
         pending_hashes: record.pending_hashes,
+        can_scan,
+        managed_by,
     }
+}
+
+fn manager_of(name: &str) -> &'static str {
+    if name == MIRROR_SOURCE {
+        return "downloads";
+    }
+    if name == PULL_SOURCE {
+        return "pulls";
+    }
+    if name.starts_with(PEER_SOURCE) {
+        return "peer";
+    }
+    "nobody"
 }
 
 /// Starts a scan and answers with the job it runs under.
