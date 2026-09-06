@@ -96,8 +96,8 @@ pub struct CatalogStatus {
     pub pending_changes: u64,
 }
 
-/// An independent native filesystem catalog. The `catalog` commands use this store;
-/// the existing HTTP server and legacy `scan` command are not yet routed through it.
+/// The native filesystem catalog: everything Hoard knows about a file, and the only store
+/// the server, the mirror and every command read and write.
 pub struct Catalog {
     database: Database<'static>,
     directory: PathBuf,

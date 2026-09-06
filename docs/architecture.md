@@ -288,8 +288,8 @@ mDNS _hoard._tcp -> node records -> periodic GET /api/v1/peers/digest?since=curs
   the loadout documents the drawer edits, and the job rows a scan, apply or pull writes.
   Every command that opens the index opens or creates it there, and `hoard scan` and the
   `/api/v1/scan` job rescan and refresh it; the server holds it as shared state. `hoard
-  catalog` still takes any directory with `--directory`. A `hoard.db` left by an earlier
-  version is not read; `hoard doctor` reports it as removable.
+  catalog` still takes any directory with `--directory`. A catalog has one format,
+  `catalog::FORMAT_VERSION`; a directory written in another is removed and scanned again.
 - Mirror cache: `<data-dir>/repos/` in the olah layout (`docs/api/hub-compat.md`).
 - Projections: symlinks written by `hoard link` and `hoard apply`, tracked in the native
   catalog so PATHS ON DISK can show `laptop · symlink`.

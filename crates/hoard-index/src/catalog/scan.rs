@@ -429,7 +429,7 @@ impl Catalog {
     }
 
     /// Counts every artifact record again and writes what they add up to, which is what a
-    /// fresh scan, a migration and `hoard doctor` use to prove the incremental totals.
+    /// fresh scan and `hoard doctor` use to prove the incremental totals.
     /// An artifact reached by more than one path wastes every copy but the first; an
     /// artifact no path reaches at all is not indexed bytes on this node.
     pub fn recount_summary(&self) -> Result<super::Totals> {

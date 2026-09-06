@@ -172,8 +172,7 @@ of the shallowest README in each revision.
 - Loadouts, jobs and sources are catalog records: pins resolve through the catalog, every job
   writer records natively, and a source carries the counts of its last scan and the files it
   still owes a content hash.
-- The artifact sweep keeps the totals the stats route prints in its summary record, which is
-  at model version 2; version 1 rows are migrated on open.
+- The artifact sweep keeps the totals the stats route prints in its summary record.
 - A `fixtures` feature exposes `Catalog::seed`, which writes repositories, entries,
   artifacts, details and search text through the same allocator, change log and sweep a scan
   uses, so a test can hold known rows without inference. It is compiled only under `cfg(test)`
@@ -195,8 +194,10 @@ of the shallowest README in each revision.
   under a source named after it; a resync pass stamps what the peer still names and drops
   the rest. A pull is marked while it moves and filed with its hashes and classification
   when it verifies, so `hoard-net` and the nodes, peers and apply routes hold the catalog.
-- The manifest is at model version 2, a source at version 2 and the summary at version 3;
-  earlier rows of each are migrated on open.
+- Every record has one shape. The manifest carries `catalog::FORMAT_VERSION`, which is the
+  one format this build reads and writes; `Catalog::open` refuses a catalog that names
+  another, and `open_or_scan` removes that directory and scans the sources again. There is
+  no conversion path, so every table is named `<model id>_1_<key>`.
 - CLI operations run on blocking threads and report scan/index progress with indicatif.
 
 ## Search document shape
@@ -250,8 +251,7 @@ and the naming convention takes the remaining eight.
 
 Commit `8757c76`, release build, every source `./hoard.toml` nominates: the HuggingFace
 cache, the ComfyUI tree, the LM Studio tree and one git source whose root no longer exists
-and is skipped with a warning. `./data/hoard.db` is the old SQLite file and is no longer
-read; `doctor` says so and offers to have it deleted.
+and is skipped with a warning.
 
 ```sh
 cargo build --release
@@ -339,8 +339,7 @@ are kept.
 The w11 column is the same run with `HashPolicy::Never`, so it hashes nothing and measures
 only what the wider entry record costs. Queries, disk and refresh are where they were; the
 scan is 1.0 s slower at 100k, which is the price of the second secondary index the entry
-gained, `node`, writing one more row per file. The entry's own table is `7_2_id` after the
-migration; the storage measurements below predate it and name it `7_1_id`.
+gained, `node`, writing one more row per file. The entry's own table is `7_1_id`.
 
 The merged column is commit `8757c76`, the merge of this branch into `master`, run with the
 harness as it stands, which is the w11 condition: `HashPolicy::Never` throughout. The 1M
@@ -507,8 +506,7 @@ The three listings and `sources` are the wave: each of them used to read every e
 every repository to decide presence, count files or count owed hashes, and now reads a
 number off the record it already had. `resolve` is one location-key lookup rather than a
 scan of its repository. `triage` moved by less than the spread between its own three runs
-and is unchanged. The first scan of an existing catalog with the new binary runs the four
-migrations and recounts once, at 6.4 s against 0.7 s for the scan after it.
+and is unchanged.
 
 The scale harness at 1M, against the merged column above:
 
@@ -537,14 +535,11 @@ settled, and a facet pass keeps no candidates at all. `node:self` at 511 ms is u
 
 Allocated disk grew 2242 to 2564 MB at 1M and 229 to 260 MB at 100k. That is the unique
 `location` secondary key on every entry, which is what buys the lookup, and it moves the
-1.5 GB disk threshold further away rather than closer. The entry's own table is `7_3_id`
-after this wave's migration; the storage measurements above predate it.
+1.5 GB disk threshold further away rather than closer.
 
-The four record versions this wave added, each with a frozen encoding test on the version it
-supersedes: `Repository` v4 carries `present_files` and `present_bytes`, `Source` v3 carries
-`pending_hashes`, `Node` v2 carries `filed`, and `Entry` v3 carries `location`. `Catalog::open`
-counts them again once, and only when a row of the previous version was migrated. Every
-writer that moves an entry into or out of presence moves the counts above it, and
+Four records grew in this wave: `Repository` carries `present_files` and `present_bytes`,
+`Source` carries `pending_hashes`, `Node` carries `filed`, and `Entry` carries `location`.
+Every writer that moves an entry into or out of presence moves the counts above it, and
 `hoard doctor` gained a `summary` check that counts every artifact record again and reports
 any drift.
 
@@ -615,21 +610,11 @@ At 100k the same shape: the scan is 6.88 s against wave 1's 7.42 s, allocated di
 against 260 MB, peak RSS 271 MB against 285 MB, and `node:self` 32.6 ms against 32.9 ms.
 
 Allocated disk at 1M falls 2564 to 2276 MB. That is the `node` secondary key on every entry
-and the absolute path every row used to carry: `Entry` reaches version 4, drops the index,
-and stores a path only when the bytes do not sit at the repository's root joined with the
-relative path. The 1.5 GB threshold is still missed. The rescan's memory falls 528 to
-359 MB: the stamp map is keyed by the xxh3 of the path rather than by the path, and a
-repository's rows are read one at a time rather than collected first.
-
-The entry table is `7_4_id` after this wave's migration. Migrating in place inflates the
-file: the 100,000 file catalog is 297 MB after a fresh scan and 1,705 MB after the same
-catalog is migrated by a rescan, of which `catalog status` reports 128 MB actually stored.
-redb does not return freed pages and no command compacts a catalog in place, so a large
-catalog is better rescanned fresh than migrated until one does.
-
-`Entry` v4 is the only record version this wave added, with `entry_v3_encoding_is_frozen`
-holding v3's encoding byte for byte. `Catalog::open` folds every migrated path that sits
-under its repository's root, which is the only place a root is in reach, and does it once.
+and the absolute path every row used to carry: `Entry` drops the index and stores a path
+only when the bytes do not sit at the repository's root joined with the relative path. The
+1.5 GB threshold is still missed. The rescan's memory falls 528 to 359 MB: the stamp map is
+keyed by the xxh3 of the path rather than by the path, and a repository's rows are read one
+at a time rather than collected first.
 
 Three writers that used to leave the totals behind no longer do. Retiring a path recounts
 what its artifact still holds, from that artifact's own paths; a verdict measures the record
@@ -650,10 +635,6 @@ total. `hoard doctor`'s summary check is what proves it.
   still written out per entry, which is what the 1M catalog is mostly made of. Intern them
   per revision and reference them by id. Allocated disk at 1M is 2276 MB against a 1.5 GB
   threshold.
-- Compact a catalog in place. A migrating rescan of a 100,000 file catalog leaves a 1,705 MB
-  file holding 128 MB of rows, because redb does not return freed pages and `Catalog::compact`
-  is not reachable from any command. Until it is, a migrated catalog of any size is better
-  rescanned fresh.
 - The USAGE tab still reads a repository's whole log, because the client count it shows is a
   claim about every pull the repository ever served. Bounding the chart alone would not
   bound the route: 20,000 rows cost 9.1 ms.
