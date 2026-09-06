@@ -10,7 +10,7 @@ use hoard_core::{
     TensorSummary,
 };
 
-use crate::config::{IndexConfig, SourceConfig, SourceKind};
+use crate::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
 
 use crate::error::{IndexError, Result};
 use crate::search::{CompileContext, SortKey, SortSpec, parse};
@@ -60,6 +60,7 @@ fn fixture() -> Result<(TempDir, Catalog)> {
         &directory.path().join("native"),
         "test-node",
         &config,
+        HashPolicy::Never,
         |_, _| {},
     )?;
     Ok((directory, catalog))
@@ -279,7 +280,13 @@ fn an_identity_is_a_hash_of_its_text_and_two_copies_share_it() -> Result<()> {
         }],
         ..IndexConfig::default()
     };
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     let read = catalog.database.r_transaction()?;
     assert_eq!(read.len().primary::<ArtifactRecord>()?, 1);
     let canonical = input.join("a/one.csv").canonicalize()?;
@@ -310,7 +317,13 @@ fn exactly_one_document_per_artifact_is_primary_and_it_is_the_preferred_entry() 
         }],
         ..IndexConfig::default()
     };
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     catalog.rebuild_search(|_| {})?;
     let primaries = catalog.count_documents("primary", 1)?;
     let all = catalog.count_documents("primary", 0)? + primaries;
@@ -329,7 +342,7 @@ fn exactly_one_document_per_artifact_is_primary_and_it_is_the_preferred_entry() 
         .write(true)
         .open(&solo)?
         .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))?;
-    catalog.rescan(&config, |_, _| {})?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
     assert!(catalog.pending_changes()? > 0, "the rewrite is logged");
     catalog.refresh_search(|_| {})?;
     assert_eq!(
@@ -394,7 +407,13 @@ fn version_one_records_are_migrated_on_open() -> Result<()> {
 fn an_override_rewrites_the_artifact_reaches_search_and_survives_a_rescan() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     catalog.rebuild_search(|_| {})?;
     let before = search(&catalog, "role:lora")?;
     let id = before.rows[0].artifact_id;
@@ -414,7 +433,7 @@ fn an_override_rewrites_the_artifact_reaches_search_and_survives_a_rescan() -> R
         .write(true)
         .open(&touched)?
         .set_modified(later)?;
-    catalog.rescan(&config, |_, _| {})?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
     catalog.refresh_search(|_| {})?;
     let after = search(&catalog, "role:ctrl")?;
     assert!(
@@ -542,12 +561,22 @@ fn invalid_output_and_sources_do_not_overwrite_existing_data() -> Result<()> {
         sources: vec![source(&directory.path().join("files"), "datasets")],
         ..IndexConfig::default()
     };
-    assert!(Catalog::scan_sources(&catalog.directory, "node", &config, |_, _| {}).is_err());
+    assert!(
+        Catalog::scan_sources(
+            &catalog.directory,
+            "node",
+            &config,
+            HashPolicy::Never,
+            |_, _| {}
+        )
+        .is_err()
+    );
     assert!(
         Catalog::scan_sources(
             &directory.path().join("files/nested"),
             "node",
             &config,
+            HashPolicy::Never,
             |_, _| {}
         )
         .is_err()
@@ -561,6 +590,7 @@ fn invalid_output_and_sources_do_not_overwrite_existing_data() -> Result<()> {
         &directory.path().join("empty"),
         "node",
         &IndexConfig::default(),
+        HashPolicy::Never,
         |_, _| {},
     )?;
     assert_eq!(
@@ -666,6 +696,7 @@ fn a_missing_source_root_is_skipped_not_fatal() -> Result<()> {
         &directory.path().join("native"),
         "test-node",
         &config,
+        HashPolicy::Never,
         |_, _| {},
     )?;
     let status = catalog.status()?;
@@ -684,7 +715,7 @@ fn a_failed_scan_leaves_no_directory_behind() -> Result<()> {
         ..IndexConfig::default()
     };
     let output = directory.path().join("native");
-    let result = Catalog::scan_sources(&output, "test-node", &config, |_, _| {});
+    let result = Catalog::scan_sources(&output, "test-node", &config, HashPolicy::Never, |_, _| {});
     assert!(result.is_err());
     assert!(!output.exists());
     Ok(())
@@ -711,6 +742,7 @@ fn an_unreadable_file_is_recorded_as_absent_instead_of_aborting() -> Result<()> 
         &directory.path().join("native"),
         "test-node",
         &config,
+        HashPolicy::Never,
         |_, _| {},
     )?;
     catalog.rebuild_search(|_| {})?;
@@ -757,6 +789,7 @@ fn an_lfs_pointer_is_an_absent_entry_without_an_artifact() -> Result<()> {
         &directory.path().join("native"),
         "test-node",
         &config,
+        HashPolicy::Never,
         |_, _| {},
     )?;
     catalog.rebuild_search(|_| {})?;
@@ -909,7 +942,13 @@ fn hf_cache_rows_match_the_legacy_shape() -> Result<()> {
         }],
         ..IndexConfig::default()
     };
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     catalog.rebuild_search(|_| {})?;
     let rows = search(&catalog, "")?;
     assert_eq!(
@@ -949,7 +988,13 @@ fn a_revisions_own_readme_and_config_reach_inference() -> Result<()> {
         sources: vec![source(&input, "files")],
         ..IndexConfig::default()
     };
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     catalog.rebuild_search(|_| {})?;
     let rows = search(&catalog, "")?;
     assert_eq!(
@@ -1017,7 +1062,13 @@ fn path_counts_are_final_on_the_artifact() -> Result<()> {
         }],
         ..IndexConfig::default()
     };
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     {
         let read = catalog.database.r_transaction()?;
         let entries: Vec<Entry> = read
@@ -1140,7 +1191,13 @@ fn a_second_path_does_not_rename_the_artifact() -> Result<()> {
         }],
         ..IndexConfig::default()
     };
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     catalog.rebuild_search(|_| {})?;
     let rows = search(&catalog, "")?;
     assert_eq!(rows.total, 1);
@@ -1200,7 +1257,13 @@ fn the_grammar_sorts_facets_and_counts_like_the_index_screen() -> Result<()> {
         sources: vec![source(&input, "files")],
         ..IndexConfig::default()
     };
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     catalog.rebuild_search(|_| {})?;
     let by_name = catalog.query(QueryRequest {
         raw: "",
@@ -1282,7 +1345,13 @@ fn a_shelf_and_a_compat_target_resolve_against_the_catalog() -> Result<()> {
         sources: vec![source(&input, "files")],
         ..IndexConfig::default()
     };
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     catalog.rebuild_search(|_| {})?;
     let shelves = vec![("adapters".to_owned(), "role:lora".to_owned())];
     let context = catalog.compile_context("shelf:adapters", jiff::Timestamp::now(), shelves)?;
@@ -1318,7 +1387,13 @@ fn disk_pressure_is_summarised_after_every_sweep() -> Result<()> {
         }],
         ..IndexConfig::default()
     };
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     let pressure = catalog.disk_pressure()?;
     assert_eq!(pressure.duplicate_blobs, 1);
     assert_eq!(
@@ -1326,7 +1401,7 @@ fn disk_pressure_is_summarised_after_every_sweep() -> Result<()> {
         fs::metadata(input.join("a/one.csv"))?.len()
     );
     fs::remove_file(input.join("b/two.csv"))?;
-    catalog.rescan(&config, |_, _| {})?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
     let after = catalog.disk_pressure()?;
     assert_eq!(after.reclaimable_bytes, 0);
     assert_eq!(after.duplicate_blobs, 0);
@@ -1960,7 +2035,13 @@ fn loose_fixture(directory: &Path) -> Result<(PathBuf, IndexConfig)> {
 fn totals_follow_the_sweep() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     let totals = catalog.totals()?;
     assert_eq!(totals.artifacts, 2);
     assert_eq!(totals.present_artifacts, 2);
@@ -1971,7 +2052,7 @@ fn totals_follow_the_sweep() -> Result<()> {
             + fs::metadata(input.join("loras/gone.safetensors"))?.len()
     );
     fs::remove_file(input.join("loras/gone.safetensors"))?;
-    catalog.rescan(&config, |_, _| {})?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
     let after = catalog.totals()?;
     assert_eq!(after.artifacts, 1, "the orphan was removed");
     assert_eq!(after.present_artifacts, 1);
@@ -1982,7 +2063,13 @@ fn totals_follow_the_sweep() -> Result<()> {
 fn a_source_remembers_what_its_last_scan_found() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     let sources = catalog.sources()?;
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0].file_count, 2);
@@ -1993,7 +2080,7 @@ fn a_source_remembers_what_its_last_scan_found() -> Result<()> {
     );
     assert!(sources[0].last_scan.is_some());
     fs::remove_file(input.join("loras/gone.safetensors"))?;
-    catalog.rescan(&config, |_, _| {})?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
     assert_eq!(
         catalog.sources()?[0].file_count,
         1,
@@ -2007,11 +2094,11 @@ fn an_unchanged_rescan_reads_no_headers_and_a_deleted_file_is_marked_absent() ->
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
     let native = directory.path().join("native");
-    let catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
     let first = catalog.status()?;
     assert_eq!(first.generation, 1);
 
-    let unchanged = catalog.rescan(&config, |_, _| {})?;
+    let unchanged = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
     assert_eq!(
         unchanged,
         RescanReport {
@@ -2025,7 +2112,7 @@ fn an_unchanged_rescan_reads_no_headers_and_a_deleted_file_is_marked_absent() ->
     assert!(!catalog.status()?.search_ready, "a rescan needs a rebuild");
 
     fs::remove_file(input.join("loras/gone.safetensors"))?;
-    let retracted = catalog.rescan(&config, |_, _| {})?;
+    let retracted = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
     assert_eq!(
         retracted,
         RescanReport {
@@ -2065,7 +2152,7 @@ fn a_changed_file_is_reread_and_a_new_file_continues_the_ids() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
     let native = directory.path().join("native");
-    let catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
     let before: Vec<Entry> = {
         let read = catalog.database.r_transaction()?;
         read.scan()
@@ -2084,7 +2171,7 @@ fn a_changed_file_is_reread_and_a_new_file_continues_the_ids() -> Result<()> {
         .set_modified(later)?;
     fs::write(input.join("loras/new.safetensors"), lora_header())?;
 
-    let report = catalog.rescan(&config, |_, _| {})?;
+    let report = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
     assert_eq!(
         report,
         RescanReport {
@@ -2473,7 +2560,13 @@ fn scan_hub(directory: &Path, hub: &Path) -> Result<Catalog> {
         }],
         ..IndexConfig::default()
     };
-    let catalog = Catalog::scan_sources(&directory.join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     catalog.rebuild_search(|_| {})?;
     Ok(catalog)
 }
@@ -2483,14 +2576,14 @@ fn a_rescan_refreshes_the_index_without_a_rebuild() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
     let native = directory.path().join("native");
-    let catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
     catalog.rebuild_search(|_| {})?;
     assert_eq!(catalog.pending_changes()?, 0);
     assert!(catalog.status()?.search_ready);
 
     fs::remove_file(input.join("loras/gone.safetensors"))?;
     fs::write(input.join("loras/new.safetensors"), lora_header())?;
-    let report = catalog.rescan(&config, |_, _| {})?;
+    let report = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
     assert_eq!(report.added, 1);
     assert_eq!(report.absent, 1);
     assert!(
@@ -2529,10 +2622,10 @@ fn a_refresh_is_idempotent_and_resumes_from_the_cursor() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
     let native = directory.path().join("native");
-    let catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
     catalog.rebuild_search(|_| {})?;
     fs::write(input.join("loras/new.safetensors"), lora_header())?;
-    catalog.rescan(&config, |_, _| {})?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
     let before = search_total_after_refresh(&catalog)?;
     let again = catalog.refresh_search(|_| {})?;
     assert_eq!(again, 0, "nothing after the cursor");
@@ -2799,7 +2892,13 @@ fn every_sort_key_orders_the_page_and_paging_is_stable() -> Result<()> {
         sources: vec![source(&input, "files")],
         ..IndexConfig::default()
     };
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     catalog.rebuild_search(|_| {})?;
     let context = catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?;
     let keys = [
@@ -2878,14 +2977,14 @@ fn facets_and_nodes_survive_a_multi_segment_index() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
     let native = directory.path().join("native");
-    let catalog = Catalog::scan_sources(&native, "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
     catalog.rebuild_search(|_| {})?;
     for round in 0..3 {
         fs::write(
             input.join(format!("loras/extra-{round}.safetensors")),
             lora_header(),
         )?;
-        catalog.rescan(&config, |_, _| {})?;
+        catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
         catalog.refresh_search(|_| {})?;
     }
     let page = search(&catalog, "")?;
@@ -3084,10 +3183,16 @@ fn a_catalog_can_be_shared_across_threads() {
 fn a_query_serves_the_published_index_while_changes_are_pending() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     catalog.rebuild_search(|_| {})?;
     fs::write(input.join("loras/new.safetensors"), lora_header())?;
-    catalog.rescan(&config, |_, _| {})?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
     let page = search(&catalog, "")?;
     assert!(page.stale, "the index has not seen the rescan yet");
     assert_eq!(page.total, 2, "the published index still answers");
@@ -3127,7 +3232,13 @@ fn open_or_scan_creates_then_reopens_and_tolerates_no_sources() -> Result<()> {
 fn shelves_settings_and_noise_live_in_the_catalog_and_noise_reaches_the_scan() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     let shelves = catalog.list_shelves()?;
     assert_eq!(shelves.len(), 6, "the builtin shelves are seeded");
     assert!(shelves.iter().all(|shelf| shelf.builtin));
@@ -3166,7 +3277,7 @@ fn shelves_settings_and_noise_live_in_the_catalog_and_noise_reaches_the_scan() -
     );
     assert!(catalog.is_noise(&gone)?);
     assert_eq!(catalog.list_noise()?.len(), 1);
-    let report = catalog.rescan(&config, |_, _| {})?;
+    let report = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
     assert_eq!(
         report.absent, 1,
         "a noisy path is walked past, so its row goes absent"
@@ -3217,7 +3328,13 @@ fn projections_are_recorded_by_link_path_and_cleared_by_profile() -> Result<()> 
 fn usage_is_logged_summarised_and_reaches_the_used_token() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (_input, config) = loose_fixture(directory.path())?;
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     catalog.rebuild_search(|_| {})?;
     let row = search(&catalog, "role:lora")?.rows[0].clone();
     let repo = row.repo_id;
@@ -3280,7 +3397,13 @@ fn hashing_gives_every_file_a_sha256_and_merges_two_copies_into_one_artifact() -
         sources: vec![source(&input, "files")],
         ..IndexConfig::default()
     };
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     assert_eq!(catalog.pending_hashes()?, 3);
     assert_eq!(
         catalog.totals()?.artifacts,
@@ -3346,9 +3469,15 @@ fn a_rescan_after_hashing_keeps_the_merged_artifact() -> Result<()> {
         sources: vec![source(&input, "files")],
         ..IndexConfig::default()
     };
-    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
     catalog.hash_pending(&config, |_| {})?;
-    let report = catalog.rescan(&config, |_, _| {})?;
+    let report = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
     assert_eq!(report.unchanged, 2, "hashed files are unchanged files");
     assert_eq!(catalog.totals()?.artifacts, 1);
     fs::write(input.join("a/style.safetensors"), plain_header())?;
@@ -3357,7 +3486,7 @@ fn a_rescan_after_hashing_keeps_the_merged_artifact() -> Result<()> {
         .write(true)
         .open(input.join("a/style.safetensors"))?
         .set_modified(later)?;
-    catalog.rescan(&config, |_, _| {})?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
     assert_eq!(
         catalog.pending_hashes()?,
         1,
@@ -3369,5 +3498,42 @@ fn a_rescan_after_hashing_keeps_the_merged_artifact() -> Result<()> {
         2,
         "different content, two artifacts again"
     );
+    Ok(())
+}
+
+#[test]
+fn hashing_now_gives_content_identities_from_the_first_scan() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("a"))?;
+    fs::create_dir_all(input.join("b"))?;
+    fs::write(input.join("a/style.safetensors"), lora_header())?;
+    fs::write(input.join("b/style-copy.safetensors"), lora_header())?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Now,
+        |_, _| {},
+    )?;
+    assert_eq!(catalog.pending_hashes()?, 0);
+    assert_eq!(
+        catalog.totals()?.artifacts,
+        1,
+        "one artifact from the start"
+    );
+    let never = Catalog::scan_sources(
+        &directory.path().join("never"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    assert_eq!(never.pending_hashes()?, 2);
+    assert_eq!(never.totals()?.artifacts, 2);
     Ok(())
 }

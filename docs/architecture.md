@@ -139,6 +139,7 @@ hoard/
           mod.rs             Catalog open/status/integrity, format version
           models.rs          native_model records: Source, Repository, ArtifactRecord, Entry, SearchEntry, SearchText, Manifest
           scan.rs            discovery -> sniff -> infer -> one transaction per source
+          hashing.rs         sha256 and git blob sha1 per file, content identities, merges
           search.rs          Tantivy schema, rebuild, per-entry documents collapsed per artifact
           read.rs            inspector, repository screens, triage queue, sources
           query.rs           the grammar compiled against the Tantivy index
@@ -253,9 +254,10 @@ compat, the triage queue with its confirm and reject, the shelves and settings r
 noise list a rejection writes, the projections `hoard link` and `hoard apply` record, and
 the usage the Hub logs and the USAGE tab reads, the loadouts every loadout route and
 `hoard loadout` store and resolve, every job a scan, apply or pull runs under, and the
-sources listing with the counts its last scan wrote. The SQLite scan and its hashing, nodes
-and peers, the Hub and git faces' own lookups, the mirror's ingest and gossip still read
-SQLite.
+sources listing with the counts its last scan wrote and the files it still owes a hash. The
+catalog hashes its own files, inline when the scan asks for it and by a background pass
+otherwise. The SQLite scan and its hashing, nodes and peers, the Hub and git faces' own
+lookups, the mirror's ingest and gossip still read SQLite.
 
 Nodes:
 

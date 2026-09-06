@@ -190,7 +190,7 @@ fn native_catalog_at_scale() {
     let config = config(&root, &tree);
     let rss_before = peak_rss_kb();
     let (catalog, scan_time) =
-        timed(|| Catalog::scan_sources(&output, "scale", &config, |_, _| {}));
+        timed(|| Catalog::scan_sources(&output, "scale", &config, HashPolicy::Never, |_, _| {}));
     let catalog = catalog.expect("native scan succeeds");
     let rss_after_scan = peak_rss_kb();
     let ((), rebuild_time) = timed(|| catalog.rebuild_search(|_| {}).expect("rebuild succeeds"));
@@ -219,8 +219,11 @@ fn native_catalog_at_scale() {
     let disk_allocated = directory_size(&output, allocated);
 
     touch(&tree, TOUCHED);
-    let (rescanned, rescan_time) =
-        timed(|| catalog.rescan(&config, |_, _| {}).expect("rescan succeeds"));
+    let (rescanned, rescan_time) = timed(|| {
+        catalog
+            .rescan(&config, HashPolicy::Never, |_, _| {})
+            .expect("rescan succeeds")
+    });
     let (applied, refresh_time) =
         timed(|| catalog.refresh_search(|_| {}).expect("refresh succeeds"));
     let rss_after_refresh = peak_rss_kb();

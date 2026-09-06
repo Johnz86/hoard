@@ -103,9 +103,11 @@ of the shallowest README in each revision.
   summaries, evidence, entries and searchable text. Library types stay inside
   `hoard-index::catalog`; callers use Hoard-owned request and response types.
 - Automatic unique artifact identity and entry-to-artifact/repository indexes.
-- Known content hashes or canonical paths establish identity. No full model hashing
-  occurs in this initial native scan path. Two unrelated paths with unknown hashes
-  remain separate artifacts, even if their bytes match.
+- Known content hashes or canonical paths establish identity.
+- Every present file is hashed, inline when the scan is asked to hash now and by a background
+  job otherwise; a file's sha256 and, below the LFS threshold, its git blob sha1 live on its
+  entry, and an artifact identified by its path becomes identified by its content once
+  hashed, merging copies.
 - The artifact inspector, compat, pull command, override and blob views, the repository
   list, detail, files, card and compat, and the triage queue with its confirm and reject
   read and write the native catalog. A user's verdict is a native record applied to the
@@ -161,8 +163,8 @@ of the shallowest README in each revision.
   and the usage log are catalog records; the scan honours noise; the Hub logs every served
   response and the `used:` token and the last-used column read the log.
 - Loadouts, jobs and sources are catalog records: pins resolve through the catalog, every job
-  writer records natively, and a source carries the counts of its last scan. Hashing is not
-  native yet, so pending hashes read zero.
+  writer records natively, and a source carries the counts of its last scan and the files it
+  still owes a content hash.
 - The artifact sweep keeps the totals the stats route prints in its summary record, which is
   at model version 2; version 1 rows are migrated on open.
 - A `fixtures` feature exposes `Catalog::seed`, which writes repositories, entries,
@@ -271,26 +273,32 @@ total. Wave 4 removed it; the rows below it measure `query`, which also counts f
 dimensions and the distinct nodes, so the two sets of timings are not comparable and both
 are kept.
 
-| measure | 100k w1 | 100k w2 | 100k w3 | 100k w4 | 100k w5 | 100k w6 | 1M w1 | 1M w2 | 1M w3 | 1M w4 | 1M w5 | 1M w6 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| scan wall | 5.226065725s | 5.900763157s | 5.476153652s | 5.657892353s | 5.672653469s | 5.623549612s | 57.77687964s | 75.282972971s | 85.709219721s | 85.449911878s | 84.603774091s | 85.078043138s |
-| peak rss growth during scan | 198 MB | 292 MB | 253 MB | 254 MB | 254 MB | 254 MB | 1560 MB | 842 MB | 731 MB | 741 MB | 732 MB | 732 MB |
-| rebuild wall | 596.949484ms | 440.388181ms | 802.170108ms | 943.869337ms | 883.471396ms | 1.076870421s | 4.40112116s | 5.294884595s | 8.497179982s | 10.39137641s | 10.551732892s | 11.886669682s |
-| peak rss growth during rebuild | 34 MB | 54 MB | 52 MB | 47 MB | 48 MB | 46 MB | 0 MB | 0 MB | 0 MB | 0 MB | 0 MB | 0 MB |
-| on disk, apparent | 518 MB | 261 MB | 261 MB | 265 MB | 265 MB | 265 MB | 4138 MB | 4138 MB | 4138 MB | 4173 MB | 4173 MB | 4174 MB |
-| on disk, allocated | 288 MB | 243 MB | 213 MB | 216 MB | 216 MB | 216 MB | 2983 MB | 2476 MB | 2112 MB | 2148 MB | 2148 MB | 2149 MB |
-| search offset 0 | 10.577049ms | 12.251924ms | 9.756606ms | removed | removed | removed | 189.855663ms | 174.943704ms | 216.076995ms | removed | removed | removed |
-| search deep offset | 9.144823ms | 9.106715ms | 8.649164ms | removed | removed | removed | 197.536743ms | 190.89815ms | 217.117028ms | removed | removed | removed |
-| search filtered | 7.200678ms | 7.238805ms | 6.967226ms | removed | removed | removed | 177.39202ms | 168.239764ms | 188.590775ms | removed | removed | removed |
-| query empty by name | not measured | not measured | not measured | 221.111746ms | 33.894331ms | 13.27674ms | not measured | not measured | not measured | 3.011389042s | 577.455193ms | 125.506335ms |
-| query deep offset | not measured | not measured | not measured | 212.094065ms | 34.319659ms | 13.447428ms | not measured | not measured | not measured | 2.982565132s | 534.299433ms | 125.852064ms |
-| query role:lora with facets | not measured | not measured | not measured | 135.635441ms | 28.611903ms | 16.175599ms | not measured | not measured | not measured | 2.016078812s | 493.170639ms | 159.062959ms |
-| query filtered | not measured | not measured | not measured | 300.337912ms | 41.425115ms | 25.132866ms | not measured | not measured | not measured | 4.384522112s | 873.916709ms | 251.142862ms |
-| query node:self with facets | not measured | not measured | not measured | not measured | not measured | 58.87439ms | not measured | not measured | not measured | not measured | not measured | 1.082111424s |
-| peak rss growth during queries | not measured | not measured | not measured | 113 MB | 41 MB | 1 MB | not measured | not measured | not measured | 1190 MB | 409 MB | 0 MB |
-| peak rss growth during the collapse query | not measured | not measured | not measured | not measured | not measured | 42 MB | not measured | not measured | not measured | not measured | not measured | 300 MB |
-| rescan wall (1,000 changed) | not measured | not measured | 812.140523ms | 816.293704ms | 898.947574ms | 517.541105ms | not measured | not measured | 28.5581122s | 29.606316494s | 31.851403311s | 6.241905939s |
-| refresh wall | not measured | not measured | 28.341576ms | 31.047147ms | 31.89983ms | 27.67862ms | not measured | not measured | 28.598925ms | 35.828931ms | 33.576794ms | 29.871137ms |
+The w11 column is the same run with `HashPolicy::Never`, so it hashes nothing and measures
+only what the wider entry record costs. Queries, disk and refresh are where they were; the
+scan is 1.0 s slower at 100k, which is the price of the second secondary index the entry
+gained, `node`, writing one more row per file. The entry's own table is `7_2_id` after the
+migration; the storage measurements below predate it and name it `7_1_id`.
+
+| measure | 100k w1 | 100k w2 | 100k w3 | 100k w4 | 100k w5 | 100k w6 | 100k w11 | 1M w1 | 1M w2 | 1M w3 | 1M w4 | 1M w5 | 1M w6 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| scan wall | 5.226065725s | 5.900763157s | 5.476153652s | 5.657892353s | 5.672653469s | 5.623549612s | 6.618210648s | 57.77687964s | 75.282972971s | 85.709219721s | 85.449911878s | 84.603774091s | 85.078043138s |
+| peak rss growth during scan | 198 MB | 292 MB | 253 MB | 254 MB | 254 MB | 254 MB | 275 MB | 1560 MB | 842 MB | 731 MB | 741 MB | 732 MB | 732 MB |
+| rebuild wall | 596.949484ms | 440.388181ms | 802.170108ms | 943.869337ms | 883.471396ms | 1.076870421s | 1.135933202s | 4.40112116s | 5.294884595s | 8.497179982s | 10.39137641s | 10.551732892s | 11.886669682s |
+| peak rss growth during rebuild | 34 MB | 54 MB | 52 MB | 47 MB | 48 MB | 46 MB | 46 MB | 0 MB | 0 MB | 0 MB | 0 MB | 0 MB | 0 MB |
+| on disk, apparent | 518 MB | 261 MB | 261 MB | 265 MB | 265 MB | 265 MB | 265 MB | 4138 MB | 4138 MB | 4138 MB | 4173 MB | 4173 MB | 4174 MB |
+| on disk, allocated | 288 MB | 243 MB | 213 MB | 216 MB | 216 MB | 216 MB | 229 MB | 2983 MB | 2476 MB | 2112 MB | 2148 MB | 2148 MB | 2149 MB |
+| search offset 0 | 10.577049ms | 12.251924ms | 9.756606ms | removed | removed | removed | removed | 189.855663ms | 174.943704ms | 216.076995ms | removed | removed | removed |
+| search deep offset | 9.144823ms | 9.106715ms | 8.649164ms | removed | removed | removed | removed | 197.536743ms | 190.89815ms | 217.117028ms | removed | removed | removed |
+| search filtered | 7.200678ms | 7.238805ms | 6.967226ms | removed | removed | removed | removed | 177.39202ms | 168.239764ms | 188.590775ms | removed | removed | removed |
+| query empty by name | not measured | not measured | not measured | 221.111746ms | 33.894331ms | 13.27674ms | 13.43545ms | not measured | not measured | not measured | 3.011389042s | 577.455193ms | 125.506335ms |
+| query deep offset | not measured | not measured | not measured | 212.094065ms | 34.319659ms | 13.447428ms | 13.634569ms | not measured | not measured | not measured | 2.982565132s | 534.299433ms | 125.852064ms |
+| query role:lora with facets | not measured | not measured | not measured | 135.635441ms | 28.611903ms | 16.175599ms | 15.641774ms | not measured | not measured | not measured | 2.016078812s | 493.170639ms | 159.062959ms |
+| query filtered | not measured | not measured | not measured | 300.337912ms | 41.425115ms | 25.132866ms | 24.692991ms | not measured | not measured | not measured | 4.384522112s | 873.916709ms | 251.142862ms |
+| query node:self with facets | not measured | not measured | not measured | not measured | not measured | 58.87439ms | 64.457049ms | not measured | not measured | not measured | not measured | not measured | 1.082111424s |
+| peak rss growth during queries | not measured | not measured | not measured | 113 MB | 41 MB | 1 MB | 1 MB | not measured | not measured | not measured | 1190 MB | 409 MB | 0 MB |
+| peak rss growth during the collapse query | not measured | not measured | not measured | not measured | not measured | 42 MB | 34 MB | not measured | not measured | not measured | not measured | not measured | 300 MB |
+| rescan wall (1,000 changed) | not measured | not measured | 812.140523ms | 816.293704ms | 898.947574ms | 517.541105ms | 631.498106ms | not measured | not measured | 28.5581122s | 29.606316494s | 31.851403311s | 6.241905939s |
+| refresh wall | not measured | not measured | 28.341576ms | 31.047147ms | 31.89983ms | 27.67862ms | 31.797068ms | not measured | not measured | 28.598925ms | 35.828931ms | 33.576794ms | 29.871137ms |
 
 `query role:lora with facets` matches a quarter of the catalog and is the one query here
 whose facet rail costs a second collection: the ROLE dimension is counted with its own key
@@ -394,12 +402,10 @@ than a correctness one.
 - Shrink the per-entry record further: revision, repository, source and absolute path are
   written out per entry, which is what the 1M catalog is mostly made of. Intern them per
   revision and reference them by id.
-- Implement peer cursors and the associated graph constraints/cascades.
+- Implement peer cursors and the associated graph constraints/cascades. An entry carries a
+  node, a resync pass and a pull fraction, but every row names this node until peers land.
 - Preserve complete repository Git metadata and add stable cross-scan identities.
-- Add full hash scheduling, progressive identities and content deduplication.
 - Port the missing-file policies from the existing scan pipeline.
-- Entries carry no node: the manifest's node is the only one, so peer-gossiped entries need
-  a node id per entry when peers land.
 - A rescan re-reads every revision's documents (README, configs, index files) before
   deciding units; measure this on the workstation cache and skip when every document's
   stamp is unchanged.

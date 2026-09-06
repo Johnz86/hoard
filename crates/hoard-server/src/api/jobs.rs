@@ -172,7 +172,7 @@ async fn run_scan(
     phase(state, job, "scanning the sources").await?;
     hoard_index::scan::scan(state.store(), &config, options, &|_| {}).await?;
     phase(state, job, "rescanning the native catalog").await?;
-    let report = rescan_catalog(state, config.clone()).await?;
+    let report = rescan_catalog(state, config.clone(), hash).await?;
     match hash {
         HashPolicy::Now | HashPolicy::Background => {
             phase(state, job, "hashing").await?;
@@ -211,9 +211,10 @@ async fn settle_scan(
 async fn rescan_catalog(
     state: &AppState,
     config: hoard_index::config::IndexConfig,
+    policy: HashPolicy,
 ) -> Result<RescanReport, IndexError> {
     let catalog = Arc::clone(state.catalog());
-    tokio::task::spawn_blocking(move || catalog.rescan(&config, |_, _| {})).await?
+    tokio::task::spawn_blocking(move || catalog.rescan(&config, policy, |_, _| {})).await?
 }
 
 /// Hashes what the walk left unhashed, which is what gives copies of one file one artifact.

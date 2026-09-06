@@ -153,7 +153,7 @@ impl Catalog {
                 if let Some(parent) = directory.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                Self::scan_sources(&directory, node, config, &mut progress)?
+                Self::scan_sources(&directory, node, config, config.hash_policy, &mut progress)?
             }
         };
         let status = catalog.status()?;

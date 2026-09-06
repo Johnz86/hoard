@@ -85,6 +85,7 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
             if config.index.sources.is_empty() {
                 anyhow::bail!("no sources are configured; add [[index.sources]] to hoard.toml");
             }
+            let policy = HashPolicy::from(hash);
             let progress = progress_bar();
             progress.set_message("Scanning native catalog");
             let rescanned = directory.join("catalog.redb").exists();
@@ -94,6 +95,7 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
                     &directory,
                     &config.node.name,
                     &config.index,
+                    policy,
                     |phase, count| {
                         progress.set_message(format!("{phase}: {count} entries"));
                     },
@@ -103,14 +105,14 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
             let rescan = match rescanned {
                 true => Some(
                     catalog
-                        .rescan(&config.index, |phase, count| {
+                        .rescan(&config.index, policy, |phase, count| {
                             progress.set_message(format!("{phase}: {count} entries"));
                         })
                         .context("rescanning native catalog")?,
                 ),
                 false => None,
             };
-            let hashing = match HashPolicy::from(hash) {
+            let hashing = match policy {
                 HashPolicy::Now | HashPolicy::Background => Some(
                     catalog
                         .hash_pending(&config.index, |hashed| {

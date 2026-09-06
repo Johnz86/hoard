@@ -8,15 +8,17 @@ use rayon::prelude::{
 };
 use serde::Serialize;
 
-use hoard_core::{Artifact, ArtifactFormat, ArtifactId, BlobId, Sha256, State, TensorSummary};
+use hoard_core::{
+    Artifact, ArtifactFormat, ArtifactId, BlobId, GitSha1, Sha256, State, TensorSummary,
+};
 
-use crate::config::{IndexConfig, SourceConfig, SourceKind};
+use crate::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
 use crate::discover::{self, DiscoveredEntry, DiscoveredRepo, DiscoveredRevision, RevisionName};
 use crate::hash::FileStamp;
 use crate::infer::{self, InferInput, Inference};
 use crate::scan::{
-    InferenceContext, Naming, artifact_name, disambiguate_labels, index_document, inference_path,
-    shard_label,
+    InferenceContext, Naming, artifact_name, content_hashes, disambiguate_labels, index_document,
+    inference_path, shard_label,
 };
 use crate::shard::{self, ShardCandidate, ShardSet, file_name};
 use crate::sniff::{self, SniffResult};
@@ -40,12 +42,13 @@ impl Catalog {
         directory: &Path,
         node: &str,
         config: &IndexConfig,
+        policy: HashPolicy,
         progress: impl FnMut(&str, u64),
     ) -> Result<Self> {
         let (directory, sources) = validate_output(directory, config)?;
         let mut catalog = Self::create(directory)?;
         match catalog
-            .fill(node, &sources, config.triage_confidence, progress)
+            .fill(node, &sources, ScanSettings::new(config, policy), progress)
             .and_then(|()| catalog.compact())
         {
             Ok(()) => Ok(catalog),
@@ -66,12 +69,13 @@ impl Catalog {
     pub fn rescan(
         &self,
         config: &IndexConfig,
+        policy: HashPolicy,
         progress: impl FnMut(&str, u64),
     ) -> Result<RescanReport> {
         let sources = available_sources(config)?;
         let mut counters = Counters::load(&self.database)?;
         let mut walk = Walk {
-            triage: config.triage_confidence,
+            settings: ScanSettings::new(config, policy),
             known: self.known_stamps(&sources)?,
             seen: HashSet::new(),
             report: RescanReport::default(),
@@ -116,18 +120,18 @@ impl Catalog {
         &self,
         node: &str,
         sources: &[&SourceConfig],
-        triage: f32,
+        settings: ScanSettings,
         progress: impl FnMut(&str, u64),
     ) -> Result<()> {
         let mut counters = Counters::load(&self.database)?;
         let mut walk = Walk {
-            triage,
+            settings,
             known: HashMap::new(),
             seen: HashSet::new(),
             report: RescanReport::default(),
         };
         self.walk(sources, &mut walk, &mut counters, progress)?;
-        self.sweep_artifacts(&mut counters, triage)?;
+        self.sweep_artifacts(&mut counters, settings.triage)?;
         let transaction = self.database.rw_transaction()?;
         counters.save(&transaction)?;
         transaction.insert(Manifest {
@@ -166,7 +170,7 @@ impl Catalog {
                         repo,
                         repo_id,
                         revision,
-                        triage: walk.triage,
+                        settings: walk.settings,
                         kind,
                         ordinal: u32::try_from(ordinal)
                             .map_err(|_| IndexError::Catalog("revision ordinal overflow".into()))?,
@@ -591,7 +595,7 @@ fn available_sources(config: &IndexConfig) -> Result<Vec<&SourceConfig>> {
 /// What one pass over the sources has settled so far: which stored rows it recognised, and
 /// how many files it left alone, read again, added or retracted.
 struct Walk {
-    triage: f32,
+    settings: ScanSettings,
     known: HashMap<PathBuf, Known>,
     seen: HashSet<i64>,
     report: RescanReport,
@@ -847,6 +851,7 @@ pub(super) struct Presence {
     pub(super) readable: bool,
     pub(super) size: u64,
     pub(super) sha256: Option<Sha256>,
+    pub(super) git_sha1: Option<GitSha1>,
     pub(super) lfs_pointer: bool,
     pub(super) pointer_bytes: bool,
 }
@@ -862,6 +867,7 @@ impl Presence {
                 readable: false,
                 size: pointer.size,
                 sha256: Some(pointer.sha256),
+                git_sha1: entry.git_sha1,
                 lfs_pointer: true,
                 pointer_bytes: true,
             },
@@ -870,6 +876,7 @@ impl Presence {
                 readable: sniffed.is_some(),
                 size: entry.size,
                 sha256: entry.sha256,
+                git_sha1: entry.git_sha1,
                 lfs_pointer: entry.lfs_pointer,
                 pointer_bytes: false,
             },
@@ -1174,11 +1181,15 @@ fn prepare_unit<'a>(
         .par_iter()
         .map(|position| sniff_entry(&entries[*position]))
         .collect();
-    let presences: Vec<Presence> = positions
+    let mut presences: Vec<Presence> = positions
         .iter()
         .zip(&sniffed)
         .map(|(position, result)| Presence::of(&entries[*position], result.as_ref()))
         .collect();
+    match context.settings.policy {
+        HashPolicy::Now => hash_presences(&mut presences, context.settings.threshold),
+        HashPolicy::Background | HashPolicy::Never => {}
+    }
     let roles = unit_roles(unit, &sniffed, &presences, label);
     positions
         .par_iter()
@@ -1189,6 +1200,34 @@ fn prepare_unit<'a>(
             prepare_entry(&entries[*position], sniffed, presence, role, plan)
         })
         .collect()
+}
+
+/// Reads the content hashes of every file of one unit that does not already carry them, so
+/// the identity the unit's artifacts take is a content identity from this scan onwards.
+fn hash_presences(presences: &mut [Presence], threshold: u64) {
+    let digests: Vec<Option<(Sha256, Option<GitSha1>)>> = presences
+        .par_iter()
+        .map(|presence| {
+            let path = presence
+                .abs_path
+                .as_deref()
+                .filter(|_| presence.sha256.is_none())?;
+            match content_hashes(path, presence.size, threshold) {
+                Ok(hashes) => Some(hashes),
+                Err(error) => {
+                    tracing::debug!(path = %path.display(), %error, "file is unhashable");
+                    None
+                }
+            }
+        })
+        .collect();
+    for (presence, digest) in presences.iter_mut().zip(digests) {
+        let Some((sha256, git_sha1)) = digest else {
+            continue;
+        };
+        presence.sha256 = Some(sha256);
+        presence.git_sha1 = presence.git_sha1.or(git_sha1);
+    }
 }
 
 fn sniff_entry(entry: &DiscoveredEntry) -> Option<SniffResult> {
@@ -1285,9 +1324,28 @@ struct EntryContext<'a> {
     repo: &'a DiscoveredRepo,
     repo_id: i64,
     revision: &'a DiscoveredRevision,
-    triage: f32,
+    settings: ScanSettings,
     kind: SourceKind,
     ordinal: u32,
+}
+
+/// What one walk was asked for beyond the roots themselves: where inference stops being
+/// trusted, and whether the files it reads are hashed as it goes.
+#[derive(Debug, Clone, Copy)]
+struct ScanSettings {
+    triage: f32,
+    policy: HashPolicy,
+    threshold: u64,
+}
+
+impl ScanSettings {
+    fn new(config: &IndexConfig, policy: HashPolicy) -> Self {
+        Self {
+            triage: config.triage_confidence,
+            policy,
+            threshold: config.lfs_threshold,
+        }
+    }
 }
 
 /// Writes one unit. A shard member carries no artifact of its own, so it is stored after
@@ -1334,7 +1392,7 @@ fn store_entry(
     let stored = match &record {
         Some(record) => Some((
             record.id,
-            artifact_triage(&prepared, record, context.triage),
+            artifact_triage(&prepared, record, context.settings.triage),
         )),
         None => anchor,
     };
@@ -1360,7 +1418,7 @@ fn store_entry(
         is_symlink: prepared.discovered.is_symlink,
         sha256: prepared.presence.sha256,
         content: prepared.presence.sha256.as_ref().map(content_key),
-        git_sha1: prepared.discovered.git_sha1,
+        git_sha1: prepared.presence.git_sha1,
         mtime: prepared.discovered.stamp.map(|stamp| stamp.mtime),
         inode: prepared.discovered.stamp.map(|stamp| stamp.inode),
         node: LOCAL_NODE,

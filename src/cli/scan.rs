@@ -85,7 +85,7 @@ async fn rescan_catalog(
     let hashing = Arc::clone(bar);
     let indexing = Arc::clone(bar);
     tokio::task::spawn_blocking(move || -> Result<RescanReport, IndexError> {
-        let report = catalog.rescan(&config, |phase, count| {
+        let report = catalog.rescan(&config, hash, |phase, count| {
             walking.set_message(format!("{phase}: {count} entries"));
             walking.tick();
         })?;
