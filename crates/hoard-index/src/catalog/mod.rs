@@ -31,8 +31,9 @@ pub use self::scan::RescanReport;
 pub use self::search::{QueryPage, QueryRequest};
 #[cfg(any(test, feature = "fixtures"))]
 pub use self::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
-pub use self::userdata::{NoiseRecord, ShelfRecord};
+pub use self::userdata::{NoiseRecord, ProjectionRecord, ShelfRecord};
 pub use self::verdict::OverrideRecord;
+pub use crate::store::projection::NewProjection;
 
 /// One redb table's share of the catalog file: the rows it holds, the bytes those rows
 /// occupy, and the bytes a compaction would reclaim.

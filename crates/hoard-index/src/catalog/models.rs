@@ -429,6 +429,22 @@ pub(super) struct Noise {
     pub(super) added_at: String,
 }
 
+/// One symlink `hoard link` or `hoard apply` wrote into a tool's layout.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 16, version = 1)]
+#[native_db]
+pub(super) struct Projection {
+    #[primary_key]
+    pub(super) id: i64,
+    #[secondary_key(unique)]
+    pub(super) link_path: String,
+    #[secondary_key]
+    pub(super) profile: String,
+    pub(super) target_path: String,
+    pub(super) artifact_id: Option<i64>,
+    pub(super) written_at: String,
+}
+
 /// Registers every record type. `native_db` compares each definition against every model
 /// already registered rather than only against the other versions of the same model, so a
 /// version 1 model must be defined last: it is what leaves each migrated model marked
@@ -453,5 +469,6 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<Setting>()?;
     models.define::<Shelf>()?;
     models.define::<Noise>()?;
+    models.define::<Projection>()?;
     Ok(models)
 }

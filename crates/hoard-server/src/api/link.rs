@@ -1,4 +1,5 @@
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
@@ -8,11 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use hoard_core::{ArtifactId, Role, ShelfId};
 use hoard_index::IndexError;
+use hoard_index::catalog::NewProjection;
 use hoard_index::search::{SortKey, SortSpec, compile, parse};
-use hoard_index::store::projection::{NewProjection, record_projection};
 use hoard_index::store::{search_exec, shelf};
 
-use crate::api::common::{authorize, clamp_limit, compile_context};
+use crate::api::common::{authorize, blocking, clamp_limit, compile_context};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -246,17 +247,8 @@ async fn record(state: &AppState, profile: Profile, written: &[LinkRow]) -> ApiR
             artifact_id: Some(row.artifact_id),
         })
         .collect();
-    state
-        .store()
-        .call_mut(move |conn| {
-            let transaction = conn.transaction()?;
-            for entry in &entries {
-                record_projection(&transaction, entry)?;
-            }
-            transaction.commit()?;
-            Ok(())
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    blocking(move || catalog.record_projections(&entries)).await?;
     Ok(())
 }
 

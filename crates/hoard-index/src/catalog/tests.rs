@@ -24,7 +24,8 @@ use super::models::{
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::{
-    Catalog, QueryPage, QueryRequest, RepositoryFilter, RescanReport, builder, models, query,
+    Catalog, NewProjection, QueryPage, QueryRequest, RepositoryFilter, RescanReport, builder,
+    models, query,
 };
 
 fn running_as_root() -> bool {
@@ -2988,5 +2989,42 @@ fn shelves_settings_and_noise_live_in_the_catalog_and_noise_reaches_the_scan() -
     );
     assert!(catalog.remove_noise(id)?);
     assert!(!catalog.is_noise(&gone)?);
+    Ok(())
+}
+
+#[test]
+fn projections_are_recorded_by_link_path_and_cleared_by_profile() -> Result<()> {
+    let (_directory, catalog) = fixture()?;
+    let first = catalog.record_projections(&[NewProjection {
+        link_path: "/p/comfyui/loras/a".into(),
+        target_path: "/data/a".into(),
+        profile: "comfyui".into(),
+        artifact_id: Some(ArtifactId::new(1)),
+    }])?;
+    let again = catalog.record_projections(&[NewProjection {
+        link_path: "/p/comfyui/loras/a".into(),
+        target_path: "/data/a2".into(),
+        profile: "comfyui".into(),
+        artifact_id: Some(ArtifactId::new(1)),
+    }])?;
+    assert_eq!(first, again, "the same link keeps its id");
+    catalog.record_projections(&[NewProjection {
+        link_path: "/p/a1111/lora/b".into(),
+        target_path: "/data/b".into(),
+        profile: "a1111".into(),
+        artifact_id: None,
+    }])?;
+    assert_eq!(catalog.list_projections(None)?.len(), 2);
+    assert_eq!(
+        catalog.list_projections(Some("comfyui"))?[0].target_path,
+        "/data/a2"
+    );
+    assert_eq!(
+        catalog.projections_for_artifact(ArtifactId::new(1))?.len(),
+        1
+    );
+    assert_eq!(catalog.clear_profile("comfyui")?, 1);
+    assert!(catalog.remove_projection(catalog.list_projections(None)?[0].id)?);
+    assert!(catalog.list_projections(None)?.is_empty());
     Ok(())
 }

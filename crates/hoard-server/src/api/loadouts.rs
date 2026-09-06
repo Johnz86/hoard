@@ -12,14 +12,14 @@ use hoard_core::{
     PinResolution, RepoId, Role, State as ArtifactState, format_size,
 };
 use hoard_index::IndexError;
-use hoard_index::store::projection::{NewProjection, record_projection};
+use hoard_index::catalog::NewProjection;
 use hoard_index::store::row::{SearchRow, SqlValue};
 use hoard_index::store::{blob, job, loadout, node, search_exec};
 use hoard_net::identity::NodeIdentity;
 use hoard_net::{PullRequest, Puller};
 
 use crate::api::artifacts::artifact_id;
-use crate::api::common::{Conn, authorize, require_row};
+use crate::api::common::{Conn, authorize, blocking, require_row};
 use crate::api::link::{self, Profile};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -594,17 +594,8 @@ async fn write_links(
     }
     let count = written.len();
     if count > 0 {
-        state
-            .store()
-            .call_mut(move |conn| {
-                let transaction = conn.transaction()?;
-                for projection in &written {
-                    record_projection(&transaction, projection)?;
-                }
-                transaction.commit()?;
-                Ok(())
-            })
-            .await?;
+        let catalog = Arc::clone(state.catalog());
+        blocking(move || catalog.record_projections(&written)).await?;
     }
     Ok(count)
 }

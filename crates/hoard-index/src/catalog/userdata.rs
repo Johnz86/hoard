@@ -5,13 +5,14 @@ use native_db::ToInput;
 use native_db::transaction::RwTransaction;
 use serde::Serialize;
 
-use hoard_core::ShelfId;
+use hoard_core::{ArtifactId, ShelfId};
 
 use crate::discover::NoiseFilter;
 use crate::error::{IndexError, Result};
+use crate::store::projection::NewProjection;
 
 use super::Catalog;
-use super::models::{Noise, NoiseKey, Setting, Shelf, ShelfKey};
+use super::models::{Noise, NoiseKey, Projection, ProjectionKey, Setting, Shelf, ShelfKey};
 
 /// The shelves hoard ships with, in the order the rail lists them.
 const BUILTIN_SHELVES: [(&str, &str); 6] = [
@@ -271,6 +272,113 @@ impl Catalog {
     }
 }
 
+/// One symlink hoard wrote, as PATHS ON DISK and a later reprojection read it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProjectionRecord {
+    pub id: i64,
+    pub link_path: String,
+    pub target_path: String,
+    pub profile: String,
+    pub artifact_id: Option<ArtifactId>,
+    pub written_at: String,
+}
+
+impl From<Projection> for ProjectionRecord {
+    fn from(projection: Projection) -> Self {
+        Self {
+            id: projection.id,
+            link_path: projection.link_path,
+            target_path: projection.target_path,
+            profile: projection.profile,
+            artifact_id: projection.artifact_id.map(ArtifactId::new),
+            written_at: projection.written_at,
+        }
+    }
+}
+
+impl Catalog {
+    /// Records every written symlink in one transaction, upserting by link path because a
+    /// link that was written again replaced the one on disk. Returns the ids in order.
+    pub fn record_projections(&self, projections: &[NewProjection]) -> Result<Vec<i64>> {
+        let written_at = jiff::Timestamp::now().to_string();
+        let transaction = self.database.rw_transaction()?;
+        let mut ids = Vec::with_capacity(projections.len());
+        for projection in projections {
+            let stored: Option<Projection> = transaction
+                .get()
+                .secondary(ProjectionKey::link_path, projection.link_path.as_str())?;
+            let id = match stored {
+                Some(stored) => stored.id,
+                None => next_id::<Projection>(&transaction)?,
+            };
+            transaction.upsert(Projection {
+                id,
+                link_path: projection.link_path.clone(),
+                profile: projection.profile.clone(),
+                target_path: projection.target_path.clone(),
+                artifact_id: projection.artifact_id.map(ArtifactId::get),
+                written_at: written_at.clone(),
+            })?;
+            ids.push(id);
+        }
+        transaction.commit()?;
+        Ok(ids)
+    }
+
+    /// Every projection, or every projection of one profile, ordered by link path.
+    pub fn list_projections(&self, profile: Option<&str>) -> Result<Vec<ProjectionRecord>> {
+        let read = self.database.r_transaction()?;
+        let mut rows: Vec<Projection> = read
+            .scan()
+            .secondary(ProjectionKey::link_path)?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
+        if let Some(profile) = profile {
+            rows.retain(|row| row.profile == profile);
+        }
+        Ok(rows.into_iter().map(ProjectionRecord::from).collect())
+    }
+
+    pub fn projections_for_artifact(&self, id: ArtifactId) -> Result<Vec<ProjectionRecord>> {
+        let mut rows = self.list_projections(None)?;
+        rows.retain(|row| row.artifact_id == Some(id));
+        Ok(rows)
+    }
+
+    pub fn remove_projection(&self, id: i64) -> Result<bool> {
+        let transaction = self.database.rw_transaction()?;
+        let stored: Option<Projection> = transaction.get().primary(id)?;
+        let removed = match stored {
+            Some(projection) => {
+                transaction.remove(projection)?;
+                true
+            }
+            None => false,
+        };
+        transaction.commit()?;
+        Ok(removed)
+    }
+
+    /// Drops every record of a profile, for when a projection directory is rewritten.
+    pub fn clear_profile(&self, profile: &str) -> Result<u64> {
+        let transaction = self.database.rw_transaction()?;
+        let rows: Vec<Projection> = transaction
+            .scan()
+            .secondary(ProjectionKey::profile)?
+            .start_with(profile)?
+            .collect::<native_db::db_type::Result<_>>()?;
+        let mut removed = 0;
+        for row in rows {
+            if row.profile == profile {
+                transaction.remove(row)?;
+                removed += 1;
+            }
+        }
+        transaction.commit()?;
+        Ok(removed)
+    }
+}
+
 /// The primary key a record was given, so a fresh one can continue the sequence.
 pub(super) trait Sequenced {
     fn sequence(&self) -> u64;
@@ -283,6 +391,12 @@ impl Sequenced for Shelf {
 }
 
 impl Sequenced for Noise {
+    fn sequence(&self) -> u64 {
+        u64::try_from(self.id).unwrap_or_default()
+    }
+}
+
+impl Sequenced for Projection {
     fn sequence(&self) -> u64 {
         u64::try_from(self.id).unwrap_or_default()
     }
