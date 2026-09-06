@@ -336,6 +336,7 @@ impl Ingesting<'_, '_> {
             tensors: None,
             group_bytes: None,
             shard_count: None,
+            first_seen: None,
         });
         let triage = record.artifact.needs_triage(self.triage);
         self.transaction.upsert(SearchText {

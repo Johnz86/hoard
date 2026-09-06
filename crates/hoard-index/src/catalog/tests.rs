@@ -1237,6 +1237,56 @@ fn a_second_path_does_not_rename_the_artifact() -> Result<()> {
 }
 
 #[test]
+fn two_copies_in_one_unit_share_one_record_without_a_cache() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(&input)?;
+    fs::write(input.join("a-copy.safetensors"), lora_header())?;
+    fs::write(input.join("b-copy.safetensors"), lora_header())?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Now,
+        |_, _| {},
+    )?;
+    catalog.rebuild_search(|_| {})?;
+
+    let read = catalog.database.r_transaction()?;
+    let records: Vec<ArtifactRecord> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(
+        records.len(),
+        1,
+        "the identity key sees the row this transaction wrote a moment ago"
+    );
+    assert_eq!(records[0].path_count, 2, "both copies are its paths");
+    assert_eq!(
+        records[0].name, "a-copy.safetensors",
+        "the first path names it"
+    );
+    let entries: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.artifact_id == Some(records[0].id))
+    );
+    Ok(())
+}
+
+#[test]
 fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
     let (directory, mut catalog) = fixture()?;
     catalog.rebuild_search(|_| {})?;

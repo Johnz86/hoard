@@ -423,7 +423,10 @@ impl Catalog {
 
     /// Every path the catalog already holds for the selected sources, with the stamp that
     /// proves it unchanged and the facts a decision needs before any file is opened.
-    fn known_stamps(&self, sources: &[&SourceConfig]) -> Result<HashMap<PathBuf, Known>> {
+    ///
+    /// Keyed by [`path_hash`] rather than by the path: a million paths held as text is the
+    /// largest thing a rescan keeps in memory, and nothing here reads the path back.
+    fn known_stamps(&self, sources: &[&SourceConfig]) -> Result<HashMap<u128, Known>> {
         let names: HashSet<&str> = sources.iter().map(|source| source.name.as_str()).collect();
         let read = self.database.r_transaction()?;
         let repositories: Vec<Repository> = read
@@ -437,12 +440,12 @@ impl Catalog {
             .iter()
             .filter(|repository| names.contains(repository.source.as_str()))
         {
-            let entries: Vec<Entry> = read
+            for entry in read
                 .scan()
                 .secondary::<Entry>(EntryKey::repo_id)?
                 .start_with(repository.id)?
-                .collect::<native_db::db_type::Result<_>>()?;
-            for entry in entries {
+            {
+                let entry: Entry = entry?;
                 let (Some(abs_path), Some(mtime), Some(inode)) = (
                     entry.placed.resolve(&repository.root_path, &entry.rel_path),
                     entry.mtime,
@@ -455,7 +458,7 @@ impl Catalog {
                     None => None,
                 };
                 known.insert(
-                    PathBuf::from(abs_path),
+                    path_hash(Path::new(&abs_path)),
                     Known {
                         entry_id: entry.id,
                         stamp: FileStamp {
@@ -736,7 +739,7 @@ fn available_sources(config: &IndexConfig) -> Result<Vec<&SourceConfig>> {
 /// how many files it left alone, read again, added or retracted.
 struct Walk {
     settings: ScanSettings,
-    known: HashMap<PathBuf, Known>,
+    known: HashMap<u128, Known>,
     seen: HashSet<i64>,
     report: RescanReport,
 }
@@ -770,8 +773,14 @@ fn known_of(walk: &Walk, entry: &DiscoveredEntry) -> Option<Known> {
     entry
         .abs_path
         .as_ref()
-        .and_then(|path| walk.known.get(path))
+        .and_then(|path| walk.known.get(&path_hash(path)))
         .copied()
+}
+
+/// A path as the key a rescan looks it up by. Two distinct paths colliding on 128 bits is
+/// not a case this workspace budgets for.
+fn path_hash(path: &Path) -> u128 {
+    xxhash_rust::xxh3::xxh3_128(path.as_os_str().as_encoded_bytes())
 }
 
 fn unchanged_entry(walk: &Walk, entry: &DiscoveredEntry) -> bool {
@@ -859,7 +868,6 @@ pub(super) struct Counters {
     repos: u64,
     pub(super) artifacts: u64,
     pub(super) entries: u64,
-    artifacts_by_identity: HashMap<u128, i64>,
     pub(super) touched: HashSet<i64>,
     pub(super) pending: Vec<i64>,
     pub(super) derived: DerivedShift,
@@ -1069,7 +1077,6 @@ impl Counters {
             repos: allocator.repos,
             artifacts: allocator.artifacts,
             entries: allocator.entries,
-            artifacts_by_identity: HashMap::new(),
             touched: HashSet::new(),
             pending: Vec::new(),
             derived: DerivedShift::default(),
@@ -1811,23 +1818,19 @@ fn artifact_triage(prepared: &PreparedEntry<'_>, record: &ArtifactRecord, confid
     record.artifact.needs_triage(confidence) || incomplete
 }
 
-/// The record this entry contributes a path to. A first path writes the record; an identity
-/// the catalog already holds keeps its id and takes what this file's header just proved,
-/// because only a file that was read again reaches this point twice.
+/// The record this entry contributes a path to.
+///
+/// A first path writes the record and names it; an identity the catalog already holds keeps
+/// its id, its name and when it was first seen, and takes what this file's header just
+/// proved. The identity is a unique secondary key, and a read inside the writing
+/// transaction sees the rows that transaction has already written, so two copies of one
+/// file in one unit reach the same record without a cache of what this pass has written.
 fn store_artifact(
     transaction: &RwTransaction<'_>,
     prepared: &PreparedEntry<'_>,
     draft: &ArtifactDraft,
     counters: &mut Counters,
 ) -> Result<ArtifactRecord> {
-    if let Some(id) = counters.artifacts_by_identity.get(&draft.identity).copied() {
-        counters.touch(transaction, id)?;
-        counters.pending.push(id);
-        return transaction
-            .get()
-            .primary(id)?
-            .ok_or_else(|| IndexError::Catalog(format!("artifact {id} vanished mid-scan")));
-    }
     let stored: Option<ArtifactRecord> = transaction
         .get()
         .secondary(ArtifactRecordKey::identity, draft.identity)?;
@@ -1836,10 +1839,16 @@ fn store_artifact(
         None => next_id(&mut counters.artifacts)?,
     };
     counters.touch(transaction, id)?;
-    let (mut record, detail) = artifact_record(id, prepared, draft);
-    if let Some(stored) = stored {
-        record.first_seen = stored.first_seen;
+    let (mut record, detail) = artifact_record(
+        id,
+        prepared,
+        draft,
+        stored.as_ref().map(|stored| stored.first_seen.clone()),
+    );
+    if let Some(stored) = &stored {
         record.triage_cleared = stored.triage_cleared;
+        record.name = stored.name.clone();
+        record.org = stored.org.clone();
     }
     let verdict: Option<Override> = transaction.get().primary(id)?;
     if let Some(verdict) = &verdict {
@@ -1851,8 +1860,12 @@ fn store_artifact(
         card: draft.card.clone().unwrap_or_default(),
     })?;
     transaction.upsert(detail)?;
-    transaction.upsert(record.clone())?;
-    counters.artifacts_by_identity.insert(draft.identity, id);
+    match stored {
+        Some(_) => {
+            transaction.upsert(record.clone())?;
+        }
+        None => transaction.insert(record.clone())?,
+    }
     counters.pending.push(id);
     Ok(record)
 }
@@ -1902,12 +1915,16 @@ pub(super) struct RecordFacts<'a> {
     pub(super) tensors: Option<TensorSummary>,
     pub(super) group_bytes: Option<u64>,
     pub(super) shard_count: Option<u32>,
+    /// When the catalog first recorded this artifact. A record being rewritten passes what
+    /// it already carries, so nothing reads the clock for a row that has been seen before.
+    pub(super) first_seen: Option<String>,
 }
 
 fn artifact_record(
     id: i64,
     prepared: &PreparedEntry<'_>,
     draft: &ArtifactDraft,
+    first_seen: Option<String>,
 ) -> (ArtifactRecord, ArtifactDetail) {
     let (tensors, group_bytes, shard_count) = match &prepared.role {
         EntryRole::Anchor(facts) => (
@@ -1939,6 +1956,7 @@ fn artifact_record(
         tensors,
         group_bytes,
         shard_count,
+        first_seen,
     })
 }
 
@@ -1955,6 +1973,7 @@ pub(super) fn record_of(facts: RecordFacts<'_>) -> (ArtifactRecord, ArtifactDeta
         tensors,
         group_bytes,
         shard_count,
+        first_seen,
     } = facts;
     let record = ArtifactRecord {
         id,
@@ -1986,7 +2005,7 @@ pub(super) fn record_of(facts: RecordFacts<'_>) -> (ArtifactRecord, ArtifactDeta
         group_bytes,
         shard_count,
         triage_cleared: false,
-        first_seen: jiff::Timestamp::now().to_string(),
+        first_seen: first_seen.unwrap_or_else(|| jiff::Timestamp::now().to_string()),
     };
     let detail = ArtifactDetail {
         artifact_id: id,

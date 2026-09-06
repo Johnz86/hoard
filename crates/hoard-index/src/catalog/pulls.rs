@@ -345,6 +345,7 @@ fn filed_artifact(
         tensors: file.sniff.tensors.clone(),
         group_bytes: None,
         shard_count: None,
+        first_seen: None,
     });
     transaction.upsert(SearchText {
         artifact_id: id,
