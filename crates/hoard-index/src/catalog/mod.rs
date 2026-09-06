@@ -184,7 +184,7 @@ impl Catalog {
 
     pub fn status(&self) -> Result<CatalogStatus> {
         let manifest = self.manifest()?;
-        let pending_changes = self.pending_after(manifest.search_seq)?;
+        let pending_changes = self.pending_changes()?;
         Ok(CatalogStatus {
             format_version: manifest.format_version,
             generation: manifest.generation,

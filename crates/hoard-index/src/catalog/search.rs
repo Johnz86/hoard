@@ -238,22 +238,30 @@ impl Catalog {
     }
 
     /// Changes logged after the cursor, which is what makes `search_ready` false.
+    ///
+    /// Every logged change is numbered above the cursor and a refresh prunes what it
+    /// applied, so the log holds nothing at or below the cursor and its length is the
+    /// count.
     pub fn pending_changes(&self) -> Result<u64> {
-        self.pending_after(self.manifest()?.search_seq)
+        Ok(self
+            .database
+            .r_transaction()?
+            .len()
+            .primary::<SearchChange>()?)
     }
 
-    pub(super) fn pending_after(&self, cursor: u64) -> Result<u64> {
-        let read = self.database.r_transaction()?;
-        let mut pending = 0;
-        for change in read
+    /// Whether the log holds anything the published index has not applied, which costs one
+    /// row rather than the whole log.
+    fn first_change_after(&self, cursor: u64) -> Result<bool> {
+        Ok(self
+            .database
+            .r_transaction()?
             .scan()
             .primary::<SearchChange>()?
             .range(cursor.saturating_add(1)..)?
-        {
-            change?;
-            pending += 1;
-        }
-        Ok(pending)
+            .next()
+            .transpose()?
+            .is_some())
     }
 
     fn changes_up_to(&self, cursor: u64, bound: u64) -> Result<Vec<SearchChange>> {
@@ -470,7 +478,7 @@ impl Catalog {
             .search_directory
             .as_deref()
             .ok_or_else(|| IndexError::Catalog("search index needs rebuilding".into()))?;
-        let stale = self.pending_after(manifest.search_seq)? > 0;
+        let stale = self.first_change_after(manifest.search_seq)?;
         if !directory.starts_with("search-v1-") || directory.contains(['/', '\\']) {
             return Err(IndexError::Catalog(
                 "invalid search directory in manifest".into(),

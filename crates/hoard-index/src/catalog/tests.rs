@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 use hoard_core::{
-    Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, Evidence, EvidenceSource, JobId,
-    Loadout, LoadoutPin, NodeId, Precision, RepoId, RepoType, Role, Sha256, State, SubRole,
-    TensorSample, TensorSummary,
+    Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, EntryId, Evidence,
+    EvidenceSource, JobId, Loadout, LoadoutPin, NodeId, Precision, RepoId, RepoType, Role, Sha256,
+    State, SubRole, TensorSample, TensorSummary,
 };
 
 use crate::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
@@ -2447,6 +2447,68 @@ fn legacy_entry(id: i64, repo_id: i64, size: u64, state: State) -> Entry {
         pass: 0,
         pull_progress: None,
     }
+}
+
+/// How many artifacts the stale check must never read to answer.
+const LOGGED_CHANGES: usize = 500;
+
+#[test]
+fn a_stale_check_reads_one_change() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("models");
+    fs::create_dir_all(&input)?;
+    for index in 0..LOGGED_CHANGES {
+        fs::write(
+            input.join(format!("w{index}.safetensors")),
+            lora_header_named(&format!("t{index}")),
+        )?;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    catalog.rebuild_search(|_| {})?;
+    assert_eq!(catalog.pending_changes()?, 0);
+    assert!(!search(&catalog, "")?.stale);
+
+    let read = catalog.database.r_transaction()?;
+    let entries: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    drop(read);
+    let ids: Vec<EntryId> = entries.iter().map(|entry| EntryId::new(entry.id)).collect();
+    assert_eq!(ids.len(), LOGGED_CHANGES);
+    assert_eq!(catalog.retire_entries(&ids)?, LOGGED_CHANGES);
+    let logged = catalog.pending_changes()?;
+    assert!(
+        logged >= LOGGED_CHANGES as u64,
+        "a retired path is a logged change, got {logged}"
+    );
+    assert!(search(&catalog, "")?.stale, "the index is behind the log");
+
+    catalog.refresh_search(|_| {})?;
+    assert!(
+        !search(&catalog, "")?.stale,
+        "the refresh caught the index up"
+    );
+    let read = catalog.database.r_transaction()?;
+    assert_eq!(
+        read.len().primary::<SearchChange>()?,
+        0,
+        "a refresh prunes everything at or below its cursor"
+    );
+    drop(read);
+    assert_eq!(catalog.pending_changes()?, 0);
+    Ok(())
 }
 
 #[test]
