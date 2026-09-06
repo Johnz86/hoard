@@ -18,15 +18,15 @@ use crate::row::SearchRow;
 use crate::search::{CompileContext, SortKey, SortSpec, parse};
 
 use super::models::{
-    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, Placement,
-    Repository, RepositoryKey, SearchChange, Source,
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, Manifest,
+    Placement, Repository, RepositoryKey, SearchChange, Source,
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::{
     Catalog, DigestApplied, JobProgress, JobState, MIRROR_SOURCE, NewProjection, PullMark,
     PulledFile, QueryPage, QueryRequest, RemoteEntry, RepositoryDetail, RepositoryFilter,
-    RescanReport, ServedFile, UsageEvent, models, query,
+    RescanReport, ServedFile, UsageEvent, builder, models, query,
 };
 
 fn running_as_root() -> bool {
@@ -3978,6 +3978,72 @@ fn open_or_scan_creates_then_reopens_and_tolerates_no_sources() -> Result<()> {
     };
     let none = Catalog::open_or_scan(&empty, "n", |_, _| {})?;
     assert_eq!(search(&none, "")?.total, 0);
+    Ok(())
+}
+
+#[test]
+fn a_catalog_of_another_format_is_rebuilt_on_open() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (_input, config) = loose_fixture(directory.path())?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        ..config
+    };
+    let expected = Catalog::scan_sources(
+        &directory.path().join("reference"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?
+    .totals()?;
+    drop(Catalog::open_or_scan(&config, "n", |_, _| {})?);
+    let native = config.native_path();
+    stamp_format(&native, super::FORMAT_VERSION + 1)?;
+
+    let rebuilt = Catalog::open_or_scan(&config, "n", |_, _| {})?;
+
+    let status = rebuilt.status()?;
+    assert_eq!(status.format_version, super::FORMAT_VERSION);
+    assert_eq!(status.generation, 1, "the rebuild is a fresh scan");
+    assert_eq!(rebuilt.totals()?, expected);
+    assert_eq!(search(&rebuilt, "")?.total, 2);
+    Ok(())
+}
+
+#[test]
+fn open_refuses_another_format() -> Result<()> {
+    let (directory, catalog) = fixture()?;
+    let native = directory.path().join("native");
+    drop(catalog);
+    stamp_format(&native, super::FORMAT_VERSION + 1)?;
+    match Catalog::open(&native) {
+        Err(IndexError::CatalogFormat {
+            directory: named,
+            found,
+            expected,
+        }) => {
+            assert_eq!(named, native);
+            assert_eq!(found, super::FORMAT_VERSION + 1);
+            assert_eq!(expected, super::FORMAT_VERSION);
+        }
+        other => panic!("a catalog of another format is refused: {other:?}"),
+    }
+    Ok(())
+}
+
+fn stamp_format(directory: &Path, format_version: u32) -> Result<()> {
+    let database = builder().open(models()?, directory.join("catalog.redb"))?;
+    let transaction = database.rw_transaction()?;
+    let manifest: Manifest = transaction
+        .get()
+        .primary(0_u8)?
+        .ok_or_else(|| IndexError::Catalog("the manifest".into()))?;
+    transaction.upsert(Manifest {
+        format_version,
+        ..manifest
+    })?;
+    transaction.commit()?;
     Ok(())
 }
 

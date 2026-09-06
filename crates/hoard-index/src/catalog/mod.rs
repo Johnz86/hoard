@@ -146,7 +146,8 @@ impl Catalog {
 
     /// Opens the catalog at `config.native_path()`, scanning the configured sources into a
     /// new one when there is none, and always returns one a query can use: an index is built
-    /// when there is none and refreshed when a rescan left changes behind. A configuration
+    /// when there is none and refreshed when a rescan left changes behind. A catalog written
+    /// in another format is removed and scanned again rather than converted. A configuration
     /// naming no walkable source yields an empty catalog rather than an error.
     pub fn open_or_scan(
         config: &IndexConfig,
@@ -154,14 +155,28 @@ impl Catalog {
         mut progress: impl FnMut(&str, u64),
     ) -> Result<Self> {
         let directory = config.native_path();
-        let catalog = match directory.join("catalog.redb").exists() {
-            true => Self::open(&directory)?,
-            false => {
-                if let Some(parent) = directory.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                Self::scan_sources(&directory, node, config, config.hash_policy, &mut progress)?
+        let opened = match directory.join("catalog.redb").exists() {
+            true => Some(Self::open(&directory)),
+            false => None,
+        };
+        let catalog = match opened {
+            Some(Ok(catalog)) => catalog,
+            Some(Err(IndexError::CatalogFormat {
+                directory: named,
+                found,
+                expected,
+            })) => {
+                tracing::warn!(
+                    directory = %named.display(),
+                    found,
+                    expected,
+                    "the catalog was written in another format; scanning a fresh one"
+                );
+                std::fs::remove_dir_all(&directory)?;
+                Self::scan_fresh(&directory, node, config, &mut progress)?
             }
+            Some(Err(error)) => return Err(error),
+            None => Self::scan_fresh(&directory, node, config, &mut progress)?,
         };
         let status = catalog.status()?;
         if !status.search_built {
@@ -170,6 +185,18 @@ impl Catalog {
             catalog.refresh_search(|count| progress("refreshing the search index", count))?;
         }
         Ok(catalog)
+    }
+
+    fn scan_fresh(
+        directory: &Path,
+        node: &str,
+        config: &IndexConfig,
+        progress: impl FnMut(&str, u64),
+    ) -> Result<Self> {
+        if let Some(parent) = directory.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Self::scan_sources(directory, node, config, config.hash_policy, progress)
     }
 
     pub fn status(&self) -> Result<CatalogStatus> {
