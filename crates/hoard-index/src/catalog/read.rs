@@ -11,11 +11,11 @@ use hoard_core::{
 };
 
 use crate::config::{IndexConfig, SourceKind};
+use crate::discover::RefKind;
 use crate::error::{IndexError, Result};
+use crate::row::SearchRow;
 use crate::search::{SortKey, SortSpec};
-use crate::store::SearchRow;
-use crate::store::convert::parse_opt_timestamp;
-use crate::store::revision::RefKind;
+use crate::time::parse_opt_timestamp;
 use crate::triage::{TriageHeader, header_facts};
 
 use super::models::{

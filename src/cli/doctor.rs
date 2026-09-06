@@ -40,6 +40,9 @@ pub async fn run(context: Context) -> Result<()> {
 
     checks.push(git_binary());
     checks.push(data_dir(&config.server.data_dir));
+    if let Some(legacy) = legacy_database(&config.index.data_dir) {
+        checks.push(legacy);
+    }
 
     let listing = Arc::clone(&catalog);
     let nodes = tokio::task::spawn_blocking(move || listing.list_nodes()).await??;
@@ -123,6 +126,21 @@ fn data_dir(path: &Path) -> Check {
         Ok(()) => Check::pass("data", path.display().to_string()),
         Err(error) => Check::fail("data", format!("{}: {error}", path.display())),
     }
+}
+
+/// A `hoard.db` left by a version that kept a SQLite index. Nothing reads it any more, so
+/// it is reported once as reclaimable rather than silently occupying the data directory.
+fn legacy_database(data_dir: &Path) -> Option<Check> {
+    let database = data_dir.join("hoard.db");
+    database.is_file().then(|| {
+        Check::pass(
+            "legacy",
+            format!(
+                "hoard.db at {} is no longer read and can be deleted",
+                database.display()
+            ),
+        )
+    })
 }
 
 fn cache_dir(path: &Path) -> Check {

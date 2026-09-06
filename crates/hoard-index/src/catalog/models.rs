@@ -8,8 +8,9 @@ use hoard_core::{
 };
 
 use crate::config::{SourceConfig, SourceKind};
-use crate::store::job::JobState;
-use crate::store::revision::RefKind;
+use crate::discover::RefKind;
+
+use super::jobs::JobState;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 1, version = 1)]

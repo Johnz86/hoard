@@ -28,14 +28,14 @@ use serde::Serialize;
 
 use crate::config::IndexConfig;
 use crate::error::{IndexError, Result};
-use crate::store::DiskPressure;
+use crate::row::DiskPressure;
 
 use self::models::{ArtifactRecord, Entry, Manifest, Repository, Source, Summary, define_models};
 
 pub use self::digest::{DigestApplied, DigestEntry, DigestPage, RemoteEntry};
 pub use self::hashing::{HashReport, content_key};
 pub use self::ingest::{IngestRecord, MIRROR_SOURCE, ServedFile};
-pub use self::jobs::JobRecord;
+pub use self::jobs::{JobProgress, JobRecord, JobState};
 pub use self::loadouts::LoadoutRecord;
 pub use self::models::LOCAL_NODE;
 pub use self::nodes::NodeRecord;
@@ -48,12 +48,9 @@ pub use self::scan::RescanReport;
 pub use self::search::{QueryPage, QueryRequest};
 #[cfg(any(test, feature = "fixtures"))]
 pub use self::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
-pub use self::usage::ArtifactUsage;
-pub use self::userdata::{NoiseRecord, ProjectionRecord, ShelfRecord};
+pub use self::usage::{ArtifactUsage, PullRow, UsageDay, UsageEvent};
+pub use self::userdata::{NewProjection, NoiseRecord, ProjectionRecord, ShelfRecord};
 pub use self::verdict::OverrideRecord;
-pub use crate::store::job::{JobProgress, JobState};
-pub use crate::store::projection::NewProjection;
-pub use crate::store::usage::{PullRow, UsageDay, UsageEvent};
 
 /// One redb table's share of the catalog file: the rows it holds, the bytes those rows
 /// occupy, and the bytes a compaction would reclaim.

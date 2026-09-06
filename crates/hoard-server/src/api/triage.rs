@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use hoard_core::{ArtifactId, Base, Role};
 use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, NoiseRecord, TriageItem};
-use hoard_index::store::row::SearchRow;
+use hoard_index::row::SearchRow;
 
 use crate::api::artifacts::artifact_id;
 use crate::api::common::{Fact, PageParams, RowView, authorize, blocking, facts};

@@ -13,7 +13,7 @@ use hoard_core::{
 };
 use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, JobProgress, LoadoutRecord, NewProjection};
-use hoard_index::store::row::SearchRow;
+use hoard_index::row::SearchRow;
 use hoard_net::identity::NodeIdentity;
 use hoard_net::{PullRequest, Puller, PullerConfig};
 

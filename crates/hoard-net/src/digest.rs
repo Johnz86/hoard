@@ -243,8 +243,8 @@ mod tests {
 
     use hoard_core::{NodeId, RepoType};
     use hoard_index::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
+    use hoard_index::row::SearchRow;
     use hoard_index::search::{SortKey, SortSpec};
-    use hoard_index::store::SearchRow;
     use tempfile::TempDir;
 
     use super::*;

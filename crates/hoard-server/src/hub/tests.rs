@@ -17,8 +17,7 @@ use hoard_index::catalog::{
     Catalog, LOCAL_NODE, SeedArtifact, SeedEntry, SeedRepository, SeedRevision, UsageDay,
 };
 use hoard_index::config::SourceKind;
-use hoard_index::store::Store;
-use hoard_index::store::revision::RefKind;
+use hoard_index::discover::RefKind;
 use hoard_mirror::access::AccessRule;
 
 use crate::config::HoardConfig;
@@ -58,7 +57,6 @@ fn seeded() -> World {
     std::fs::write(root.join(SMALL_PATH), World::small_bytes()).expect("small file");
     std::fs::write(root.join("unet/model.json"), World::small_bytes()).expect("nested file");
     std::fs::write(root.join(LFS_PATH), vec![7u8; LFS_SIZE]).expect("lfs file");
-    let store = Store::open_in_memory().expect("store opens");
     let mut config = HoardConfig::default();
     config.server.data_dir = root.to_path_buf();
     config.index.data_dir = root.to_path_buf();
@@ -69,7 +67,7 @@ fn seeded() -> World {
     let catalog = crate::testing::empty_catalog(root, "test");
     seed_catalog(&catalog, root);
     World {
-        state: AppState::new(config, store, catalog).expect("state builds"),
+        state: AppState::new(config, catalog).expect("state builds"),
         _dir: dir,
     }
 }
@@ -218,9 +216,8 @@ fn mirrored(upstream: &str) -> World {
     config.mirror.upstream = upstream.to_owned();
     config.mirror.proxy = vec![AccessRule::glob("*", true), AccessRule::glob("*/*", true)];
     config.mirror.cache = vec![AccessRule::glob("*", true), AccessRule::glob("*/*", true)];
-    let store = world.state.store().clone();
     let catalog = std::sync::Arc::clone(world.state.catalog());
-    world.state = AppState::new(config, store, catalog).expect("state builds");
+    world.state = AppState::new(config, catalog).expect("state builds");
     world
 }
 

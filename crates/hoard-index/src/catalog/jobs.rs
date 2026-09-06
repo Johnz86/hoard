@@ -1,18 +1,75 @@
+use std::fmt;
+use std::str::FromStr;
+
 use jiff::Timestamp;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use hoard_core::JobId;
 
 use crate::error::{IndexError, Result};
-use crate::store::convert::{now, parse_opt_timestamp, parse_timestamp, timestamp_text};
-use crate::store::job::{JobProgress, JobState};
+use crate::time::{now, parse_opt_timestamp, parse_timestamp, timestamp_text};
 
 use super::Catalog;
 use super::models::Job;
 use super::userdata::{Sequenced, next_id};
 
-/// A scan, hash run, pull or apply as the JOBS tab shows it. This is the shape the jobs
-/// routes answer with, so it serialises exactly like the row the SQLite index kept.
+/// Where a job has got to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JobState {
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+impl JobState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            JobState::Running => "running",
+            JobState::Done => "done",
+            JobState::Failed => "failed",
+            JobState::Cancelled => "cancelled",
+        }
+    }
+
+    /// True once the job has stopped, whatever the outcome.
+    pub const fn is_final(self) -> bool {
+        !matches!(self, JobState::Running)
+    }
+}
+
+impl fmt::Display for JobState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for JobState {
+    type Err = IndexError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "running" => Ok(JobState::Running),
+            "done" => Ok(JobState::Done),
+            "failed" => Ok(JobState::Failed),
+            "cancelled" => Ok(JobState::Cancelled),
+            other => Err(IndexError::Config(format!("unknown job state {other:?}"))),
+        }
+    }
+}
+
+/// What a running job reports on each tick.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct JobProgress {
+    pub phase: Option<String>,
+    pub progress: f32,
+    pub bytes: u64,
+    pub total: Option<u64>,
+    pub rate_bps: Option<u64>,
+}
+
+/// A scan, hash run, pull or apply as the JOBS tab shows it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct JobRecord {
     pub id: JobId,
@@ -168,5 +225,29 @@ fn settled(job: Job, state: JobState, error: Option<&str>) -> Job {
         },
         finished: Some(timestamp_text(now())),
         ..job
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn job_states_round_trip_their_spelling() {
+        for state in [
+            JobState::Running,
+            JobState::Done,
+            JobState::Failed,
+            JobState::Cancelled,
+        ] {
+            assert_eq!(
+                state.as_str().parse::<JobState>().expect("state parses"),
+                state
+            );
+            assert_eq!(state.to_string(), state.as_str());
+        }
+        assert!("paused".parse::<JobState>().is_err());
+        assert!(!JobState::Running.is_final());
+        assert!(JobState::Cancelled.is_final());
     }
 }

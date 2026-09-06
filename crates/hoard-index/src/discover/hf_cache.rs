@@ -12,12 +12,12 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use hoard_core::{CommitSha, GitSha1, RepoId, RepoType, Sha256};
 
+use super::RefKind;
 use crate::discover::walker::{self, NoiseFilter, WalkOptions};
 use crate::discover::{
     DEFAULT_REF, DiscoveredEntry, DiscoveredRef, DiscoveredRepo, DiscoveredRevision, RevisionName,
 };
 use crate::error::{IndexError, Result};
-use crate::store::revision::RefKind;
 
 const REFS_DIR: &str = "refs";
 const SNAPSHOTS_DIR: &str = "snapshots";

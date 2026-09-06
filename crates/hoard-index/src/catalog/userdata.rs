@@ -9,7 +9,6 @@ use hoard_core::{ArtifactId, ShelfId};
 
 use crate::discover::NoiseFilter;
 use crate::error::{IndexError, Result};
-use crate::store::projection::NewProjection;
 
 use super::Catalog;
 use super::models::{Node, Noise, NoiseKey, Projection, ProjectionKey, Setting, Shelf, ShelfKey};
@@ -270,6 +269,15 @@ impl Catalog {
             rows.into_iter().map(|noise| PathBuf::from(noise.path)),
         ))
     }
+}
+
+/// A symlink about to be recorded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewProjection {
+    pub link_path: String,
+    pub target_path: String,
+    pub profile: String,
+    pub artifact_id: Option<ArtifactId>,
 }
 
 /// One symlink hoard wrote, as PATHS ON DISK and a later reprojection read it.

@@ -204,13 +204,13 @@ mod tests {
     }
 
     #[test]
-    fn data_dir_becomes_the_root_for_the_index_and_the_cache() {
+    fn data_dir_becomes_the_root_for_the_catalog_and_the_cache() {
         let mut config =
             HoardConfig::parse("[server]\ndata_dir = \"/srv/hoard\"\n").expect("config parses");
         config.normalize(None);
         assert_eq!(
-            config.index.database_path(),
-            PathBuf::from("/srv/hoard/hoard.db")
+            config.index.native_path(),
+            PathBuf::from("/srv/hoard/native")
         );
         assert_eq!(config.cache_root(), PathBuf::from("/srv/hoard/repos"));
     }

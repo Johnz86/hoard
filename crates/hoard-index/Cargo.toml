@@ -12,10 +12,6 @@ fixtures = []
 
 [dependencies]
 hoard-core.workspace = true
-rusqlite.workspace = true
-r2d2.workspace = true
-r2d2_sqlite.workspace = true
-rusqlite_migration.workspace = true
 ignore.workspace = true
 notify.workspace = true
 globset.workspace = true

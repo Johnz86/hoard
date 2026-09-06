@@ -13,13 +13,13 @@ use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use hoard_core::{CommitSha, RepoId, RepoType};
 
+use super::RefKind;
 use crate::discover::walker::{self, NoiseFilter, WalkOptions};
 use crate::discover::{
     DEFAULT_REF, DiscoveredEntry, DiscoveredRef, DiscoveredRepo, DiscoveredRevision, RevisionName,
 };
 use crate::error::{IndexError, Result};
 use crate::sniff::{MAX_LFS_POINTER_BYTES, parse_lfs_pointer};
-use crate::store::revision::RefKind;
 
 const BRANCH_PREFIX: &str = "refs/heads/";
 const TAG_PREFIX: &str = "refs/tags/";

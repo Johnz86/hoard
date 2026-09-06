@@ -641,7 +641,7 @@ mod tests {
     use hoard_core::{Artifact, ArtifactFormat, Base, BlobId, RepoType, Role, State};
     use hoard_index::catalog::{LOCAL_NODE, SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
     use hoard_index::config::{IndexConfig, SourceKind};
-    use hoard_index::store::revision::RefKind;
+    use hoard_index::discover::RefKind;
     use tempfile::TempDir;
 
     use super::*;

@@ -12,8 +12,7 @@ use tower::ServiceExt;
 use hoard_core::{CommitSha, RepoId, RepoType, Sha256, State as ArtifactState};
 use hoard_index::catalog::{Catalog, LOCAL_NODE, SeedEntry, SeedRepository, SeedRevision};
 use hoard_index::config::SourceKind;
-use hoard_index::store::Store;
-use hoard_index::store::revision::RefKind;
+use hoard_index::discover::RefKind;
 
 use crate::config::HoardConfig;
 use crate::state::AppState;
@@ -65,7 +64,6 @@ fn seeded() -> World {
     git(&clone, &["tag", "v1.0"]);
     let head = git(&clone, &["rev-parse", "HEAD"]).trim().to_owned();
 
-    let store = Store::open_in_memory().expect("store opens");
     let mut config = HoardConfig::default();
     config.server.data_dir = dir.path().to_path_buf();
     config.index.data_dir = dir.path().to_path_buf();
@@ -75,7 +73,7 @@ fn seeded() -> World {
     let catalog = crate::testing::empty_catalog(dir.path(), "test");
     seed_catalog(&catalog, &clone.join(".git"));
     World {
-        state: AppState::new(config, store, catalog).expect("state builds"),
+        state: AppState::new(config, catalog).expect("state builds"),
         head,
         _dir: dir,
     }

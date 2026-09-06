@@ -18,8 +18,7 @@ use hoard_index::catalog::{
     UsageEvent, content_key,
 };
 use hoard_index::config::{SourceConfig, SourceKind};
-use hoard_index::store::Store;
-use hoard_index::store::revision::RefKind;
+use hoard_index::discover::RefKind;
 
 use crate::api;
 use crate::config::HoardConfig;
@@ -56,7 +55,6 @@ struct World {
 fn seeded() -> World {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(dir.path().join("README.md"), CARD).expect("card writes");
-    let store = Store::open_in_memory().expect("store opens");
     let hub = dir.path().join("hub");
     std::fs::create_dir_all(&hub).expect("hub dir");
     let mut config = HoardConfig::default();
@@ -78,7 +76,7 @@ fn seeded() -> World {
     let native = seed_catalog(&catalog, dir.path());
     seed_catalog_usage(&catalog, native[0]);
     World {
-        state: AppState::new(config, store, catalog).expect("state builds"),
+        state: AppState::new(config, catalog).expect("state builds"),
         _dir: dir,
         lora: native[0],
         ckpt: native[1],

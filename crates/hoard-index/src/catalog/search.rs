@@ -15,12 +15,12 @@ use tantivy::{DocId, Index, Score, Searcher, SegmentOrdinal, SegmentReader, Term
 
 use hoard_core::{EntryId, RepoRowId};
 
+use crate::row::{FacetBucket, SearchRow};
 use crate::search::facets::quoted;
 use crate::search::{
     CompatTarget, CompileContext, FACET_DIMENSIONS, Facets, ParsedQuery, SortKey, SortSpec,
     TokenKind, parse,
 };
-use crate::store::{FacetBucket, SearchRow};
 
 use super::models::{
     ArtifactRecord, Entry, EntryKey, Manifest, Repository, Revision, SearchChange, SearchText,

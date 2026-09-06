@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use hoard_core::{ArtifactId, Base, Evidence, Role, Sha256, SubRole, format_size};
 use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, EntryDetail};
-use hoard_index::store::row::SearchRow;
+use hoard_index::row::SearchRow;
 
 use crate::api::common::{
     EntryView, Fact, PLUGS_INTO_LIMIT, PullCommands, RowView, authorize, blocking, clamp_limit,

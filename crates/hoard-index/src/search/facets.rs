@@ -1,9 +1,9 @@
 use hoard_core::Base;
 use serde::{Deserialize, Serialize};
 
+use crate::row::{DiskPressure, FacetBucket};
 use crate::search::grammar::scan;
 use crate::search::token::{ParsedQuery, Token, TokenKind};
-use crate::store::{DiskPressure, FacetBucket};
 
 /// The facet rail, in the order it renders: the query key and the header the UI shows.
 pub const FACET_DIMENSIONS: [(&str, &str); 5] = [

@@ -325,7 +325,6 @@ const fn a1111_directory(role: Role) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use hoard_index::store::Store;
 
     use super::*;
     use crate::config::HoardConfig;
@@ -334,12 +333,11 @@ mod tests {
     /// names a directory that does not exist; the catalog beside the state gets a real one.
     fn state_at(data_dir: &Path, roots: Vec<PathBuf>) -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().expect("temp dir");
-        let store = Store::open_in_memory().expect("store opens");
         let mut config = HoardConfig::default();
         config.server.data_dir = data_dir.to_path_buf();
         config.server.projection_roots = roots;
         let catalog = crate::testing::empty_catalog(dir.path(), "test");
-        let state = AppState::new(config, store, catalog).expect("state builds");
+        let state = AppState::new(config, catalog).expect("state builds");
         (dir, state)
     }
 

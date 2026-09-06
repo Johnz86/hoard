@@ -2,7 +2,9 @@ use std::cmp::Reverse;
 
 use native_db::transaction::RwTransaction;
 
-use hoard_core::{Artifact, ArtifactFormat, ArtifactId, BlobId, State};
+use hoard_core::{
+    Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, RepoId, Role, Sha256, State,
+};
 
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
 use crate::error::{IndexError, Result};
@@ -18,7 +20,47 @@ use super::nodes::PEER_SOURCE;
 use super::read::Reader;
 use super::scan::{Counters, log_changes, next_id, preference, sweep_artifact};
 
-pub use crate::store::digest::{DigestApplied, DigestEntry, DigestPage, RemoteEntry};
+/// One artifact of this node, flattened to what a peer needs to find and fetch it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DigestEntry {
+    pub sha256: Sha256,
+    pub size: u64,
+    pub role: Role,
+    pub base: Base,
+    pub repo: String,
+    pub revision_sha: Option<CommitSha>,
+    pub path: String,
+    pub state: State,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DigestPage {
+    pub rows: Vec<DigestEntry>,
+    /// The highest artifact row this page reached, which is where the next one starts.
+    /// A page that returned nothing has nowhere new to point, so a reader that asks again
+    /// from the same place is asking for what has been added since.
+    pub next: Option<i64>,
+    pub total: u64,
+}
+
+/// A peer's row, parsed and validated, ready to be filed against that peer's node row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteEntry {
+    pub sha256: Sha256,
+    pub size: u64,
+    pub role: Role,
+    pub base: Base,
+    pub repo: RepoId,
+    pub revision_sha: CommitSha,
+    pub path: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DigestApplied {
+    pub entries: u64,
+    pub artifacts: u64,
+}
 
 impl Catalog {
     /// This node's hashed artifacts with an id above `since`, in id order, each as its

@@ -54,7 +54,7 @@ pub async fn run(
     Ok(())
 }
 
-fn render(rows: &[hoard_index::store::SearchRow]) {
+fn render(rows: &[hoard_index::row::SearchRow]) {
     let mut out = String::new();
     out.push_str(&format!(
         "{:<5} {:<38} {:<10} {:<13} {:<7} {:>10} {:<10} {:<12} {}\n",

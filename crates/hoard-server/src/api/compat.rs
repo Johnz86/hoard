@@ -4,8 +4,8 @@ use serde::Serialize;
 use hoard_core::{ArtifactId, CompatRule, CompatSubject, Role, State, compatible, format_size};
 use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, QueryRequest};
+use hoard_index::row::SearchRow;
 use hoard_index::search::{CompatTarget, CompileContext, SortKey, SortSpec};
-use hoard_index::store::row::SearchRow;
 
 use crate::api::common::{MIDDOT, state_label};
 

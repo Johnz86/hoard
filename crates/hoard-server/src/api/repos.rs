@@ -15,10 +15,10 @@ use hoard_index::catalog::{
     Catalog, EntryDetail, RepositoryDetail, RepositoryFilter, RevisionDetail,
 };
 use hoard_index::catalog::{PullRow, UsageDay};
+use hoard_index::discover::RefKind;
+use hoard_index::row::SearchRow;
 use hoard_index::shard::parse_shard_name;
 use hoard_index::sniff::parse_readme;
-use hoard_index::store::revision::RefKind;
-use hoard_index::store::row::SearchRow;
 
 use crate::api::common::{
     DEFAULT_LIMIT, EntryView, Fact, MIDDOT, PullCommands, RowView, blocking, clamp_limit,

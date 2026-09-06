@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use secrecy::{ExposeSecret, SecretString};
 
 use hoard_index::catalog::Catalog;
-use hoard_index::store::Store;
 use hoard_mirror::MirrorError;
 use hoard_mirror::access::AccessPolicy;
 use hoard_mirror::cache::BlockCache;
@@ -57,8 +56,8 @@ impl UpstreamHealth {
     }
 }
 
-/// Everything a handler needs, cloned per request. Cheap to clone: the store is a pooled
-/// handle and the rest is behind `Arc`.
+/// Everything a handler needs, cloned per request. Cheap to clone: everything in it is
+/// behind an `Arc`.
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Inner>,
@@ -70,7 +69,6 @@ pub struct AppState {
 struct Inner {
     config: HoardConfig,
     mirror_config: Arc<MirrorConfig>,
-    store: Store,
     catalog: Arc<Catalog>,
     cache: Arc<BlockCache>,
     access: Arc<AccessPolicy>,
@@ -95,7 +93,7 @@ impl AppState {
     /// never from `hoard.toml`, so a config file can be committed without leaking it. The
     /// native catalog is opened by the caller, which is the only place that knows whether a
     /// fresh scan is acceptable there.
-    pub fn new(config: HoardConfig, store: Store, catalog: Arc<Catalog>) -> Result<Self, ApiError> {
+    pub fn new(config: HoardConfig, catalog: Arc<Catalog>) -> Result<Self, ApiError> {
         let mirror_config = Arc::new(config.mirror.clone());
         let access = Arc::new(
             AccessPolicy::compile(&mirror_config)
@@ -129,7 +127,6 @@ impl AppState {
             inner: Arc::new(Inner {
                 config,
                 mirror_config,
-                store,
                 catalog,
                 cache,
                 access,
@@ -149,12 +146,7 @@ impl AppState {
         self
     }
 
-    pub fn store(&self) -> &Store {
-        &self.inner.store
-    }
-
-    /// The native catalog kept beside the index. No route reads it yet; `hoard scan` and the
-    /// scan job rescan and refresh it so it stays current.
+    /// The catalog every route reads and `hoard scan` writes.
     pub fn catalog(&self) -> &Arc<Catalog> {
         &self.inner.catalog
     }
@@ -257,9 +249,8 @@ mod tests {
 
     fn state() -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().expect("temp dir");
-        let store = Store::open_in_memory().expect("in-memory store opens");
         let catalog = crate::testing::empty_catalog(dir.path(), "test");
-        let state = AppState::new(HoardConfig::default(), store, catalog).expect("state builds");
+        let state = AppState::new(HoardConfig::default(), catalog).expect("state builds");
         (dir, state)
     }
 
@@ -284,11 +275,10 @@ mod tests {
     #[test]
     fn an_offline_node_never_reports_an_unreachable_upstream() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let store = Store::open_in_memory().expect("in-memory store opens");
         let mut config = HoardConfig::default();
         config.mirror.offline = true;
         let catalog = crate::testing::empty_catalog(dir.path(), "test");
-        let state = AppState::new(config, store, catalog).expect("state builds");
+        let state = AppState::new(config, catalog).expect("state builds");
         let refused: Result<(), MirrorError> = Err(MirrorError::ProxyTimeout);
         assert!(state.note_upstream(refused).is_err());
         assert_eq!(state.upstream_health(), UpstreamHealth::Offline);
@@ -317,11 +307,10 @@ mod tests {
     #[test]
     fn every_projection_lands_under_the_data_directory() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let store = Store::open_in_memory().expect("in-memory store opens");
         let mut config = HoardConfig::default();
         config.server.data_dir = std::path::PathBuf::from("/srv/hoard");
         let catalog = crate::testing::empty_catalog(dir.path(), "test");
-        let state = AppState::new(config, store, catalog).expect("state builds");
+        let state = AppState::new(config, catalog).expect("state builds");
         assert_eq!(
             state.projection_root(),
             std::path::PathBuf::from("/srv/hoard/profiles")

@@ -11,8 +11,8 @@ use hoard_core::{
 };
 use hoard_index::IndexError;
 use hoard_index::catalog::EntryDetail;
+use hoard_index::row::SearchRow;
 use hoard_index::search::{SortKey, SortSpec};
-use hoard_index::store::row::SearchRow;
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;

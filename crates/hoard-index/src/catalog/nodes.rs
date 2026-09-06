@@ -6,7 +6,7 @@ use serde::Serialize;
 use hoard_core::NodeId;
 
 use crate::error::{IndexError, Result};
-use crate::store::convert::parse_opt_timestamp;
+use crate::time::parse_opt_timestamp;
 
 use super::Catalog;
 use super::models::{LOCAL_NODE, Manifest, Node, NodeKey};

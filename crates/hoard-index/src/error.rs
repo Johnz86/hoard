@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use hoard_core::HoardError;
 
-/// Everything that can go wrong while discovering, sniffing or storing artifacts.
+/// Everything that can go wrong while discovering, sniffing or cataloguing artifacts.
 #[derive(Debug, Error)]
 pub enum IndexError {
     #[error("domain error: {0}")]
@@ -19,15 +19,6 @@ pub enum IndexError {
 
     #[error(transparent)]
     BareIo(#[from] std::io::Error),
-
-    #[error("database error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
-
-    #[error("database pool error: {0}")]
-    Pool(#[from] r2d2::Error),
-
-    #[error("migration error: {0}")]
-    Migration(#[from] rusqlite_migration::Error),
 
     #[error("native catalog error: {0}")]
     Native(#[source] Box<native_db::db_type::Error>),

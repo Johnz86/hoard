@@ -8,8 +8,8 @@ use hoard_core::{
 };
 
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
+use crate::discover::RefKind;
 use crate::error::{IndexError, Result};
-use crate::store::revision::RefKind;
 
 use super::Catalog;
 use super::hashing::content_key;

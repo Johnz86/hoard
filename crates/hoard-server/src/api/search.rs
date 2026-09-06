@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use hoard_core::format_size;
 use hoard_index::IndexError;
 use hoard_index::catalog::{QueryPage, QueryRequest};
+use hoard_index::row::DiskPressure;
 use hoard_index::search::{FACET_DIMENSIONS, Facets, ParsedQuery, SortSpec, parse, quoted};
-use hoard_index::store::row::DiskPressure;
 
 use crate::api::common::{
     MIDDOT, RowView, clamp_limit, decode_cursor, next_cursor, sort_key, sort_spec,

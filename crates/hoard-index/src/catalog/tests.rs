@@ -12,10 +12,10 @@ use hoard_core::{
 
 use crate::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
 
+use crate::discover::RefKind;
 use crate::error::{IndexError, Result};
+use crate::row::SearchRow;
 use crate::search::{CompileContext, SortKey, SortSpec, parse};
-use crate::store::SearchRow;
-use crate::store::revision::RefKind;
 
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, ArtifactRecordV1, Entry, EntryKey, EntryV1,

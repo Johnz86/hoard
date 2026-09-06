@@ -109,12 +109,7 @@ impl Default for IndexConfig {
 }
 
 impl IndexConfig {
-    /// The SQLite file, `<data-dir>/hoard.db`.
-    pub fn database_path(&self) -> PathBuf {
-        self.data_dir.join("hoard.db")
-    }
-
-    /// The native catalog directory, `<data-dir>/native`.
+    /// The catalog directory, `<data-dir>/native`.
     pub fn native_path(&self) -> PathBuf {
         self.data_dir.join("native")
     }
@@ -185,7 +180,7 @@ mod tests {
         let config = IndexConfig::default();
         assert_eq!(config.hash_policy, HashPolicy::Background);
         assert_eq!(config.lfs_threshold, 10_485_760);
-        assert_eq!(config.database_path(), PathBuf::from("./data/hoard.db"));
+        assert_eq!(config.native_path(), PathBuf::from("./data/native"));
     }
 
     #[test]

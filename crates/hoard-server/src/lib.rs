@@ -174,16 +174,14 @@ mod tests {
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};
     use hoard_core::{CommitSha, RepoId, RepoType, State};
     use hoard_index::catalog::{JobState, PullMark};
-    use hoard_index::store::Store;
     use tower::ServiceExt;
 
     use super::*;
 
     fn state() -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().expect("temp dir");
-        let store = Store::open_in_memory().expect("in-memory store opens");
         let catalog = crate::testing::empty_catalog(dir.path(), "test");
-        let state = AppState::new(HoardConfig::default(), store, catalog).expect("state builds");
+        let state = AppState::new(HoardConfig::default(), catalog).expect("state builds");
         (dir, state)
     }
 

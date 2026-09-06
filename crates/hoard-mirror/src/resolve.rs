@@ -1211,7 +1211,7 @@ mod tests {
     use hoard_core::{RepoType, State};
     use hoard_index::catalog::{LOCAL_NODE, SeedEntry, SeedRepository, SeedRevision};
     use hoard_index::config::{IndexConfig, SourceKind};
-    use hoard_index::store::revision::RefKind;
+    use hoard_index::discover::RefKind;
     use sha2::{Digest, Sha256 as Sha256Hasher};
     use tempfile::TempDir;
     use wiremock::matchers::{body_json, method, path as path_matcher, query_param};

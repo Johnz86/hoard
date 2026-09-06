@@ -5,38 +5,30 @@ use anyhow::{Context as _, Result};
 
 use hoard_core::NodeId;
 use hoard_index::catalog::Catalog;
-use hoard_index::store::Store;
 use hoard_server::HoardConfig;
 
 const DEFAULT_CONFIG: &str = "hoard.toml";
 
-/// The configuration, the open index and the native catalog beside it, which every
-/// subcommand needs.
+/// The configuration and the catalog it points at, which every subcommand needs.
 pub struct Context {
     pub config: HoardConfig,
-    pub store: Store,
     pub catalog: Arc<Catalog>,
 }
 
-/// Loads `hoard.toml`, opens the index and the native catalog beside it, and makes sure this
-/// node exists in the index under the name the configuration chose. A data directory without
-/// a native catalog gets one scanned into it, which is why this reports its progress.
+/// Loads `hoard.toml`, opens the catalog and makes sure this node exists in it under the
+/// name the configuration chose. A data directory without a catalog gets one scanned into
+/// it, which is why this reports its progress.
 pub async fn open(config_path: Option<&Path>) -> Result<Context> {
     let config = load_config(config_path)?;
-    let database = config.index.database_path();
-    if let Some(parent) = database.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating the data directory {}", parent.display()))?;
-    }
-    let store = Store::open(&database)
-        .with_context(|| format!("opening the index at {}", database.display()))?;
+    std::fs::create_dir_all(&config.index.data_dir).with_context(|| {
+        format!(
+            "creating the data directory {}",
+            config.index.data_dir.display()
+        )
+    })?;
     let catalog = open_catalog(&config).await?;
     ensure_local_node(&catalog, &config.node.name)?;
-    Ok(Context {
-        config,
-        store,
-        catalog,
-    })
+    Ok(Context { config, catalog })
 }
 
 async fn open_catalog(config: &HoardConfig) -> Result<Arc<Catalog>> {

@@ -6,12 +6,56 @@ use serde::Serialize;
 use hoard_core::{ArtifactId, RepoRowId};
 
 use crate::error::{IndexError, Result};
-use crate::store::usage::{PullRow, UsageDay, UsageEvent};
 
 use super::Catalog;
 use super::models::{ArtifactUse, Usage, UsageKey};
 use super::scan::{Counters, log_changes};
 use super::userdata::{Sequenced, next_key};
+
+/// One served request, which is what the USAGE tab and `used:` queries read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageEvent {
+    pub at: Timestamp,
+    pub client: Option<String>,
+    pub repo: Option<RepoRowId>,
+    pub artifact: Option<ArtifactId>,
+    pub path: String,
+    pub bytes: u64,
+    pub rate_bps: Option<u64>,
+    pub status: u16,
+}
+
+impl UsageEvent {
+    pub fn new(path: impl Into<String>, at: Timestamp) -> Self {
+        Self {
+            at,
+            client: None,
+            repo: None,
+            artifact: None,
+            path: path.into(),
+            bytes: 0,
+            rate_bps: None,
+            status: 200,
+        }
+    }
+}
+
+/// One bar of the seven day usage chart.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsageDay {
+    pub date: String,
+    pub pulls: u64,
+}
+
+/// One line of the RECENT PULLS list.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PullRow {
+    pub when: Timestamp,
+    pub who: Option<String>,
+    pub what: String,
+    pub bytes: u64,
+    pub rate_bps: Option<u64>,
+}
 
 /// How often this node has served one artifact, and when it last did.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]

@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use hoard_core::format_size;
 use hoard_index::IndexError;
 use hoard_index::catalog::{QueryPage, QueryRequest, Totals};
+use hoard_index::row::FacetBucket;
 use hoard_index::search::SortSpec;
-use hoard_index::store::row::FacetBucket;
 
 use crate::api::common::{authorize, blocking};
 use crate::error::{ApiError, ApiResult};

@@ -844,7 +844,7 @@ fn revision_name(repo: &DiscoveredRepo, ordinal: usize) -> String {
         .filter(|reference| reference.revision == ordinal)
         .min_by_key(|reference| {
             (
-                reference.kind != crate::store::revision::RefKind::Branch,
+                reference.kind != crate::discover::RefKind::Branch,
                 &reference.name,
             )
         })

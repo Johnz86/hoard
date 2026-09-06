@@ -11,13 +11,13 @@ use std::path::Path;
 
 use hoard_core::{CommitSha, RepoId, RepoType};
 
+use super::RefKind;
 use crate::discover::walker::{self, NoiseFilter, WalkOptions};
 use crate::discover::{
     DEFAULT_REF, DiscoveredEntry, DiscoveredRef, DiscoveredRepo, DiscoveredRevision, RevisionName,
 };
 use crate::error::Result;
 use crate::hash::sha256_bytes;
-use crate::store::revision::RefKind;
 
 /// A tool's models directory, recognized by the folders it keeps beside each other. A
 /// recognized layout always yields one repository per category folder.

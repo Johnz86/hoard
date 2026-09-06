@@ -1909,7 +1909,7 @@ mod tests {
     }
 
     /// The rows one query answers, with the search index caught up to what was just filed.
-    async fn rows_of(catalog: &Arc<Catalog>, raw: &str) -> Vec<hoard_index::store::SearchRow> {
+    async fn rows_of(catalog: &Arc<Catalog>, raw: &str) -> Vec<hoard_index::row::SearchRow> {
         let raw = raw.to_owned();
         on_catalog(catalog, move |catalog| {
             catalog.refresh_search(|_| {})?;

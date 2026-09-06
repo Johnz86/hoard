@@ -9,7 +9,7 @@ use tantivy::query::{
 use tantivy::schema::{Field, IndexRecordOption};
 
 use crate::error::{IndexError, Result};
-use crate::search::sql::{HOURS_PER_DAY, MAX_SHELF_DEPTH};
+use crate::search::context::{HOURS_PER_DAY, MAX_SHELF_DEPTH};
 use crate::search::{CompareOp, CompileContext, SortKey, Token, TokenKind, parse};
 
 use super::search::{
@@ -443,8 +443,10 @@ fn all_of(mut queries: Vec<Box<dyn Query>>) -> Box<dyn Query> {
 
 #[cfg(test)]
 mod tests {
+    use hoard_core::Base;
+
     use super::*;
-    use crate::search::{CompileContext, parse};
+    use crate::search::{CompatTarget, CompileContext, parse};
 
     fn compiled(raw: &str) -> String {
         let (_, fields) = Fields::build();
@@ -501,7 +503,115 @@ mod tests {
     }
 
     #[test]
-    fn a_shelf_expands_and_a_loop_is_refused() {
+    fn a_node_alias_resolves_to_the_local_node() {
+        let (_, fields) = Fields::build();
+        let context = CompileContext::new("2026-09-04T00:00:00Z".parse().expect("clock"))
+            .with_local_node("workstation");
+        let rendered = format!(
+            "{:?}",
+            compile(
+                &parse("node:self").tokens,
+                None,
+                &QueryFields {
+                    fields: &fields,
+                    context: &context,
+                },
+            )
+            .expect("compiles")
+        );
+        assert!(rendered.contains("workstation"));
+        assert!(!rendered.contains("self"));
+    }
+
+    #[test]
+    fn a_compat_target_names_its_roles_and_accepts_an_agnostic_base() {
+        let (_, fields) = Fields::build();
+        let context = CompileContext::new("2026-09-04T00:00:00Z".parse().expect("clock"))
+            .with_compat(CompatTarget::new(Role::Ckpt, Base::new("sdxl 1.0")));
+        let rendered = format!(
+            "{:?}",
+            compile(
+                &parse("compat:sdxl-base-1.0").tokens,
+                None,
+                &QueryFields {
+                    fields: &fields,
+                    context: &context,
+                },
+            )
+            .expect("compiles")
+        );
+        for adapter in ["lora", "ctrl", "upsc", "vae", "emb"] {
+            assert!(rendered.contains(adapter), "compat selects {adapter}");
+        }
+        assert!(
+            rendered.contains(ANY_BASE),
+            "an artifact that plugs into anything is compatible with this host"
+        );
+    }
+
+    #[test]
+    fn a_base_filter_does_not_collect_architecture_agnostic_artifacts() {
+        let (_, fields) = Fields::build();
+        let rendered = format!("{:?}", base_filter(&fields, "lfm2"));
+        assert!(
+            rendered.contains("\"lfm2\""),
+            "the family asked for is matched"
+        );
+        assert!(
+            !rendered.contains(&format!("\"{ANY_BASE}\"")),
+            "an upscaler that plugs into anything is not an lfm2 model, and counting it \
+             under every family inflates every bucket in the facet rail"
+        );
+        assert!(
+            !rendered.contains("Str, \"\""),
+            "an artifact whose base could not be inferred must not match every base query"
+        );
+    }
+
+    #[test]
+    fn every_seeded_shelf_parses_and_compiles() {
+        let (_, fields) = Fields::build();
+        let shelves = seeded_shelves();
+        let context = CompileContext::new("2026-09-04T00:00:00Z".parse().expect("clock"))
+            .with_shelves(shelves.clone());
+        let bound = QueryFields {
+            fields: &fields,
+            context: &context,
+        };
+        for (name, _) in &shelves {
+            let raw = format!("shelf:{}", crate::search::quoted(name));
+            compile(&parse(&raw).tokens, None, &bound)
+                .unwrap_or_else(|error| panic!("shelf {name} compiles: {error}"));
+        }
+        let spelled = format!(
+            "{:?}",
+            compile(&parse("shelf:\"flux workhorse\"").tokens, None, &bound).expect("compiles")
+        );
+        let slugged = format!(
+            "{:?}",
+            compile(&parse("shelf:flux-workhorse").tokens, None, &bound)
+                .expect("slug names resolve")
+        );
+        assert_eq!(spelled, slugged);
+        assert!(spelled.contains("flux"));
+    }
+
+    fn seeded_shelves() -> Vec<(String, String)> {
+        [
+            ("sdxl lora small", "role:lora base:sdxl size:<400mb"),
+            ("flux workhorse", "base:flux"),
+            ("quantised llm", "role:llm fmt:gguf"),
+            ("cold + duplicate", "dupe:true"),
+            ("triage queue", "role:?"),
+            ("everything on laptop", "node:laptop"),
+        ]
+        .into_iter()
+        .map(|(name, query)| (name.to_owned(), query.to_owned()))
+        .collect()
+    }
+
+    #[test]
+    fn a_shelf_expands_and_an_unknown_one_or_a_loop_is_refused() {
         let (_, schema) = Fields::build();
         let context = CompileContext::new("2026-09-04T00:00:00Z".parse().expect("clock"))
             .with_shelves(vec![
@@ -521,6 +631,10 @@ mod tests {
         );
         assert!(matches!(
             compile(&parse("shelf:loop").tokens, None, &fields),
+            Err(IndexError::Query(_))
+        ));
+        assert!(matches!(
+            compile(&parse("shelf:missing").tokens, None, &fields),
             Err(IndexError::Query(_))
         ));
     }
