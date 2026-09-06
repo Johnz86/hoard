@@ -47,7 +47,7 @@ Toolchain: Rust 1.95 stable, edition 2024, workspace resolver 3.
 | Sizes | `humansize` | 2.1 | `228 MB`, `26.4 GB` in mono columns. |
 | LAN discovery | `mdns-sd` | 0.16 | `_hoard._tcp` advertisement and browsing in `hoard-net`. |
 | CRC | `crc32fast` | 1.5 | The per-chunk CRC32 of the olah block-cache format. |
-| Tests | `tempfile`, `wiremock` | 3.27, 0.6 | Temp trees, mocked upstream and peers. `mockall` and `criterion` are declared in the root manifest and no crate uses them yet. |
+| Tests | `tempfile`, `wiremock` | 3.27, 0.6 | Temp trees, mocked upstream and peers. |
 
 Not chosen and why:
 

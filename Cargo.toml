@@ -86,8 +86,6 @@ strum = { version = "0.28", features = ["derive"] }
 # testing
 tempfile = "3.27"
 wiremock = "0.6"
-mockall = "0.15"
-criterion = { version = "0.8", features = ["html_reports"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
