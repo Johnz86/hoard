@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use hoard_core::{ArtifactId, RepoRowId};
 
+use crate::config::IndexConfig;
 use crate::error::{IndexError, Result};
 
 use super::Catalog;
@@ -93,7 +94,8 @@ impl Catalog {
     /// Counts one use and logs the artifact for the search index; the index picks the
     /// new `last_used` up on the next refresh.
     pub fn bump_artifact_use(&self, artifact: ArtifactId, at: Timestamp) -> Result<()> {
-        let mut counters = Counters::load(&self.database)?;
+        let mut counters =
+            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
         let transaction = self.database.rw_transaction()?;
         let stored: Option<ArtifactUse> = transaction.get().primary(artifact.get())?;
         transaction.upsert(ArtifactUse {

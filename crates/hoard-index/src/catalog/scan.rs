@@ -73,7 +73,7 @@ impl Catalog {
         progress: impl FnMut(&str, u64),
     ) -> Result<RescanReport> {
         let sources = available_sources(config)?;
-        let mut counters = Counters::load(&self.database)?;
+        let mut counters = Counters::load(&self.database, config.triage_confidence)?;
         let mut walk = Walk {
             settings: ScanSettings::new(config, policy),
             known: self.known_stamps(&sources)?,
@@ -81,7 +81,7 @@ impl Catalog {
             report: RescanReport::default(),
         };
         self.walk(&sources, &mut walk, &mut counters, progress)?;
-        self.sweep_artifacts(&mut counters, config.triage_confidence)?;
+        self.sweep_artifacts(&mut counters)?;
         let transaction = self.database.rw_transaction()?;
         counters.save(&transaction)?;
         let mut manifest: Manifest = transaction
@@ -124,7 +124,7 @@ impl Catalog {
         progress: impl FnMut(&str, u64),
     ) -> Result<()> {
         self.ensure_self_row(node)?;
-        let mut counters = Counters::load(&self.database)?;
+        let mut counters = Counters::load(&self.database, settings.triage)?;
         let mut walk = Walk {
             settings,
             known: HashMap::new(),
@@ -132,7 +132,7 @@ impl Catalog {
             report: RescanReport::default(),
         };
         self.walk(sources, &mut walk, &mut counters, progress)?;
-        self.sweep_artifacts(&mut counters, settings.triage)?;
+        self.sweep_artifacts(&mut counters)?;
         let transaction = self.database.rw_transaction()?;
         counters.save(&transaction)?;
         transaction.insert(Manifest {
@@ -147,6 +147,7 @@ impl Catalog {
             search_seq: 0,
         })?;
         transaction.commit()?;
+        self.recount_summary()?;
         Ok(())
     }
 
@@ -447,7 +448,7 @@ impl Catalog {
                 ..entry
             })?;
             if let Some(id) = known.artifact_id {
-                counters.touched.insert(id);
+                counters.touch(&transaction, id)?;
                 counters.pending.push(id);
             }
             walk.report.absent += 1;
@@ -461,7 +462,7 @@ impl Catalog {
     /// deletes the artifact and everything hanging off it once none does. A model split
     /// across shards is reached once per complete copy of its files, not once per file.
     /// The sweep commits in batches, because a fresh scan touches every artifact it wrote.
-    pub(super) fn sweep_artifacts(&self, counters: &mut Counters, triage: f32) -> Result<()> {
+    pub(super) fn sweep_artifacts(&self, counters: &mut Counters) -> Result<()> {
         let ids: Vec<i64> = counters.touched.iter().copied().collect();
         for batch in ids.chunks(CHUNK) {
             let transaction = self.database.rw_transaction()?;
@@ -473,53 +474,64 @@ impl Catalog {
             log_changes(&transaction, counters)?;
             transaction.commit()?;
         }
-        self.summarise(triage)
+        self.summarise(counters)
     }
 
-    /// Recounts what the facet rail reads as DISK PRESSURE and what the stats route prints
-    /// as its totals. An artifact reached by more than one path wastes every copy but the
-    /// first; an artifact no path reaches at all is not indexed bytes on this node.
-    pub(super) fn summarise(&self, triage: f32) -> Result<()> {
+    /// Moves what the facet rail reads as DISK PRESSURE and what the stats route prints as
+    /// its totals by the difference this pass made, reading only the records it touched. A
+    /// pass that touched nothing writes nothing.
+    pub(super) fn summarise(&self, counters: &Counters) -> Result<()> {
         let read = self.database.r_transaction()?;
-        let mut summary = Summary {
-            id: 0,
-            reclaimable_bytes: 0,
-            duplicate_artifacts: 0,
-            artifacts: 0,
-            present_artifacts: 0,
-            triage_artifacts: 0,
-            indexed_bytes: 0,
-            repositories: read.len().primary::<Repository>()?,
-            advertised_artifacts: 0,
-        };
-        for record in read.scan().primary::<ArtifactRecord>()?.all()? {
-            let record = record?;
-            let bytes = record.group_bytes.unwrap_or(record.artifact.size);
-            summary.artifacts += 1;
-            if record.artifact.needs_triage(triage) {
-                summary.triage_artifacts += 1;
-            }
-            if record.path_count > 0 {
-                summary.present_artifacts += 1;
-                summary.indexed_bytes = summary.indexed_bytes.saturating_add(bytes);
-                if record.artifact.sha256.is_some() {
-                    summary.advertised_artifacts += 1;
-                }
-            }
-            let copies = u64::from(record.path_count.saturating_sub(1));
-            if copies == 0 {
-                continue;
-            }
-            summary.reclaimable_bytes = summary
-                .reclaimable_bytes
-                .saturating_add(bytes.saturating_mul(copies));
-            summary.duplicate_artifacts += 1;
+        let stored: Option<Summary> = read.get().primary(0_u8)?;
+        let mut summary = stored.clone().unwrap_or_else(blank_summary);
+        for (id, before) in &counters.before {
+            let record: Option<ArtifactRecord> = read.get().primary(*id)?;
+            let after = SummaryPart::of(record.as_ref(), counters.triage);
+            shift_summary(&mut summary, *before, after);
         }
+        summary.repositories = read.len().primary::<Repository>()?;
         drop(read);
+        if stored.as_ref() == Some(&summary) {
+            return Ok(());
+        }
         let transaction = self.database.rw_transaction()?;
         transaction.upsert(summary)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Counts every artifact record again and writes what they add up to, which is what a
+    /// fresh scan, a migration and `hoard doctor` use to prove the incremental totals.
+    /// An artifact reached by more than one path wastes every copy but the first; an
+    /// artifact no path reaches at all is not indexed bytes on this node.
+    pub fn recount_summary(&self) -> Result<super::Totals> {
+        let triage = IndexConfig::default().triage_confidence;
+        let read = self.database.r_transaction()?;
+        let mut summary = Summary {
+            repositories: read.len().primary::<Repository>()?,
+            ..blank_summary()
+        };
+        for record in read.scan().primary::<ArtifactRecord>()?.all()? {
+            let record: ArtifactRecord = record?;
+            shift_summary(
+                &mut summary,
+                SummaryPart::default(),
+                SummaryPart::of(Some(&record), triage),
+            );
+        }
+        drop(read);
+        let totals = super::Totals {
+            artifacts: summary.artifacts,
+            present_artifacts: summary.present_artifacts,
+            triage_artifacts: summary.triage_artifacts,
+            indexed_bytes: summary.indexed_bytes,
+            repositories: summary.repositories,
+            advertised_artifacts: summary.advertised_artifacts,
+        };
+        let transaction = self.database.rw_transaction()?;
+        transaction.upsert(summary)?;
+        transaction.commit()?;
+        Ok(totals)
     }
 }
 
@@ -783,7 +795,7 @@ fn replace_known(
         walk.seen.insert(known.entry_id);
         walk.report.changed += 1;
         if let Some(id) = known.artifact_id {
-            counters.touched.insert(id);
+            counters.touch(transaction, id)?;
         }
         if let Some(entry) = transaction.get().primary::<Entry>(known.entry_id)? {
             counters.derived.removed(&entry);
@@ -801,6 +813,87 @@ pub(super) struct Counters {
     pub(super) touched: HashSet<i64>,
     pub(super) pending: Vec<i64>,
     pub(super) derived: DerivedShift,
+    triage: f32,
+    before: HashMap<i64, SummaryPart>,
+}
+
+/// What one artifact record contributes to the summary. A record that does not exist
+/// contributes nothing, which is what makes a created or removed record a plain difference.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SummaryPart {
+    artifacts: u64,
+    present: u64,
+    triage: u64,
+    indexed_bytes: u64,
+    advertised: u64,
+    reclaimable_bytes: u64,
+    duplicates: u64,
+}
+
+impl SummaryPart {
+    fn of(record: Option<&ArtifactRecord>, triage: f32) -> Self {
+        let Some(record) = record else {
+            return Self::default();
+        };
+        let bytes = record.group_bytes.unwrap_or(record.artifact.size);
+        let present = record.path_count > 0;
+        let copies = u64::from(record.path_count.saturating_sub(1));
+        Self {
+            artifacts: 1,
+            present: u64::from(present),
+            triage: u64::from(record.artifact.needs_triage(triage)),
+            indexed_bytes: match present {
+                true => bytes,
+                false => 0,
+            },
+            advertised: u64::from(present && record.artifact.sha256.is_some()),
+            reclaimable_bytes: bytes.saturating_mul(copies),
+            duplicates: u64::from(copies > 0),
+        }
+    }
+}
+
+/// Moves the summary by the difference one record made, so nothing but the records a pass
+/// touched is ever read.
+fn shift_summary(summary: &mut Summary, before: SummaryPart, after: SummaryPart) {
+    let moved = |total: u64, less: u64, more: u64| total.saturating_sub(less).saturating_add(more);
+    summary.artifacts = moved(summary.artifacts, before.artifacts, after.artifacts);
+    summary.present_artifacts = moved(summary.present_artifacts, before.present, after.present);
+    summary.triage_artifacts = moved(summary.triage_artifacts, before.triage, after.triage);
+    summary.indexed_bytes = moved(
+        summary.indexed_bytes,
+        before.indexed_bytes,
+        after.indexed_bytes,
+    );
+    summary.advertised_artifacts = moved(
+        summary.advertised_artifacts,
+        before.advertised,
+        after.advertised,
+    );
+    summary.reclaimable_bytes = moved(
+        summary.reclaimable_bytes,
+        before.reclaimable_bytes,
+        after.reclaimable_bytes,
+    );
+    summary.duplicate_artifacts = moved(
+        summary.duplicate_artifacts,
+        before.duplicates,
+        after.duplicates,
+    );
+}
+
+pub(super) fn blank_summary() -> Summary {
+    Summary {
+        id: 0,
+        reclaimable_bytes: 0,
+        duplicate_artifacts: 0,
+        artifacts: 0,
+        present_artifacts: 0,
+        triage_artifacts: 0,
+        indexed_bytes: 0,
+        repositories: 0,
+        advertised_artifacts: 0,
+    }
 }
 
 /// What one entry contributes to the counts kept on the records above it.
@@ -914,7 +1007,7 @@ fn shifted_u32(current: u32, by: i64) -> u32 {
 }
 
 impl Counters {
-    pub(super) fn load(database: &Database<'static>) -> Result<Self> {
+    pub(super) fn load(database: &Database<'static>, triage: f32) -> Result<Self> {
         let stored: Option<Allocator> = database.r_transaction()?.get().primary(0_u8)?;
         let allocator = stored.unwrap_or(Allocator {
             id: 0,
@@ -930,7 +1023,21 @@ impl Counters {
             touched: HashSet::new(),
             pending: Vec::new(),
             derived: DerivedShift::default(),
+            triage,
+            before: HashMap::new(),
         })
+    }
+
+    /// Records that this pass is about to change an artifact, keeping what its record
+    /// contributed to the summary beforehand so the pass moves the summary by a difference
+    /// rather than counting every record again. Call it before the record is written.
+    pub(super) fn touch(&mut self, transaction: &RwTransaction<'_>, id: i64) -> Result<()> {
+        self.touched.insert(id);
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.before.entry(id) {
+            let record: Option<ArtifactRecord> = transaction.get().primary(id)?;
+            slot.insert(SummaryPart::of(record.as_ref(), self.triage));
+        }
+        Ok(())
     }
 
     /// Writes the allocator and the present counts this pass moved, which is why every
@@ -1659,7 +1766,7 @@ fn store_artifact(
     counters: &mut Counters,
 ) -> Result<ArtifactRecord> {
     if let Some(id) = counters.artifacts_by_identity.get(&draft.identity).copied() {
-        counters.touched.insert(id);
+        counters.touch(transaction, id)?;
         counters.pending.push(id);
         return transaction
             .get()
@@ -1673,6 +1780,7 @@ fn store_artifact(
         Some(stored) => stored.id,
         None => next_id(&mut counters.artifacts)?,
     };
+    counters.touch(transaction, id)?;
     let (mut record, detail) = artifact_record(id, prepared, draft);
     if let Some(stored) = stored {
         record.first_seen = stored.first_seen;
@@ -1690,7 +1798,6 @@ fn store_artifact(
     transaction.upsert(detail)?;
     transaction.upsert(record.clone())?;
     counters.artifacts_by_identity.insert(draft.identity, id);
-    counters.touched.insert(id);
     counters.pending.push(id);
     Ok(record)
 }

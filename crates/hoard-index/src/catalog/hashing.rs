@@ -46,7 +46,7 @@ impl Catalog {
         config: &IndexConfig,
         mut progress: impl FnMut(u64),
     ) -> Result<HashReport> {
-        let mut counters = Counters::load(&self.database)?;
+        let mut counters = Counters::load(&self.database, config.triage_confidence)?;
         let mut report = HashReport::default();
         let mut after = 0;
         loop {
@@ -61,7 +61,7 @@ impl Catalog {
             report.merged += self.record_batch(&digests, &mut counters)?;
             progress(report.hashed);
         }
-        self.sweep_artifacts(&mut counters, config.triage_confidence)?;
+        self.sweep_artifacts(&mut counters)?;
         Ok(report)
     }
 
@@ -138,6 +138,7 @@ impl Catalog {
             };
             let artifact_id = match entry.artifact_id {
                 Some(id) => {
+                    counters.touch(&transaction, id)?;
                     let outcome = rekey_artifact(&transaction, id, &digest.sha256, counters)?;
                     merged += u64::from(outcome.merged);
                     Some(outcome.artifact_id)
@@ -219,7 +220,7 @@ fn rekey_artifact(
         .get()
         .secondary(ArtifactRecordKey::identity, identity)?;
     let Some(claimed) = claimed.filter(|claimed| claimed.id != record.id) else {
-        counters.touched.insert(record.id);
+        counters.touch(transaction, record.id)?;
         counters.pending.push(record.id);
         transaction.upsert(identified(record, identity, sha))?;
         return unchanged;
@@ -230,9 +231,9 @@ fn rekey_artifact(
     };
     let survivor_id = survivor.id;
     let loser_id = loser.id;
+    counters.touch(transaction, survivor_id)?;
+    counters.touch(transaction, loser_id)?;
     absorb(transaction, survivor, loser, identity, sha)?;
-    counters.touched.insert(survivor_id);
-    counters.touched.insert(loser_id);
     counters.pending.push(survivor_id);
     counters.pending.push(loser_id);
     Ok(Rekeyed {

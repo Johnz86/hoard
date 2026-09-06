@@ -2453,6 +2453,85 @@ fn legacy_entry(id: i64, repo_id: i64, size: u64, state: State) -> Entry {
 }
 
 #[test]
+fn the_summary_is_exact_after_incremental_passes() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("models");
+    fs::create_dir_all(&input)?;
+    for index in 0..4 {
+        fs::write(
+            input.join(format!("w{index}.safetensors")),
+            lora_header_named(&format!("t{index}")),
+        )?;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let exact = |stage: &str| -> Result<()> {
+        let stored = catalog.totals()?;
+        let recounted = catalog.recount_summary()?;
+        assert_eq!(stored, recounted, "the summary drifted after {stage}");
+        Ok(())
+    };
+    exact("a scan")?;
+
+    catalog.hash_pending(&config, |_| {})?;
+    exact("hashing")?;
+
+    let mirrored = RepoId::parse_ref(RepoType::Models, "openai/whisper")?;
+    let served = catalog.ingest_served(&ServedFile {
+        repo: mirrored,
+        commit: CommitSha::from_bytes([0x11; 20]),
+        rel_path: "model.safetensors".to_owned(),
+        size: 4096,
+        sha256: Sha256::from_bytes([0x42; 32]),
+        git_sha1: None,
+        cache_root: directory.path().join("repos"),
+    })?;
+    exact("an ingest")?;
+
+    assert_eq!(catalog.retire_entries(&[served.entry])?, 1);
+    exact("a retirement")?;
+
+    let laptop = catalog.upsert_peer(&NodeId::new("laptop-1")?, "laptop", None)?;
+    let pass = catalog.begin_pass(laptop.id)?;
+    catalog.apply_digest(
+        laptop.id,
+        &[remote_entry(
+            Sha256::from_bytes([0x77; 32]),
+            "loras/only-there.safetensors",
+        )],
+        pass,
+    )?;
+    exact("a digest")?;
+
+    let next = catalog.begin_pass(laptop.id)?;
+    assert_eq!(catalog.retract_digest(laptop.id, next)?, 1);
+    exact("a retraction")?;
+
+    fs::remove_file(input.join("w0.safetensors"))?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    exact("a rescan that dropped a path")?;
+
+    let before = catalog.totals()?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    assert_eq!(
+        catalog.totals()?,
+        before,
+        "a rescan that changed nothing changes nothing"
+    );
+    exact("a rescan that touched nothing")?;
+    Ok(())
+}
+
+#[test]
 fn an_entry_is_found_by_its_location_alone() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let config = IndexConfig {

@@ -50,7 +50,8 @@ impl Catalog {
     /// catalog already holds by content. The search index is refreshed by the caller.
     pub fn ingest_served(&self, file: &ServedFile) -> Result<IngestRecord> {
         let triage = IndexConfig::default().triage_confidence;
-        let mut counters = Counters::load(&self.database)?;
+        let mut counters =
+            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
         let transaction = self.database.rw_transaction()?;
         let record = {
             let mut ingesting = Ingesting {
@@ -99,7 +100,8 @@ impl Catalog {
         if ids.is_empty() {
             return Ok(0);
         }
-        let mut counters = Counters::load(&self.database)?;
+        let mut counters =
+            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
         let transaction = self.database.rw_transaction()?;
         let mut retired = 0;
         for id in ids {
@@ -108,7 +110,7 @@ impl Catalog {
                 continue;
             };
             if let Some(artifact) = stored.artifact_id {
-                counters.touched.insert(artifact);
+                counters.touch(&transaction, artifact)?;
                 counters.pending.push(artifact);
             }
             counters.derived.removed(&stored);
@@ -307,7 +309,7 @@ impl Ingesting<'_, '_> {
             .get()
             .secondary(ArtifactRecordKey::identity, identity)?;
         if let Some(stored) = stored {
-            self.touch(stored.id);
+            self.touch(stored.id)?;
             return Ok(Some(Classified {
                 id: stored.id,
                 created: false,
@@ -315,6 +317,7 @@ impl Ingesting<'_, '_> {
             }));
         }
         let id = next_id(&mut self.counters.artifacts)?;
+        self.touch(id)?;
         let inference = infer(&InferInput::new(format, path, file_name, file.size));
         let (record, detail) = record_of(RecordFacts {
             id,
@@ -337,7 +340,6 @@ impl Ingesting<'_, '_> {
         })?;
         self.transaction.upsert(detail)?;
         self.transaction.upsert(record)?;
-        self.touch(id);
         Ok(Some(Classified {
             id,
             created: true,
@@ -355,11 +357,11 @@ impl Ingesting<'_, '_> {
             true => stored.path_count.saturating_sub(1),
             false => stored.path_count.saturating_add(1),
         };
+        self.touch(id)?;
         self.transaction.upsert(ArtifactRecord {
             path_count,
             ..stored
         })?;
-        self.touch(id);
         Ok(())
     }
 
@@ -390,9 +392,10 @@ impl Ingesting<'_, '_> {
         Ok(())
     }
 
-    fn touch(&mut self, id: i64) {
-        self.counters.touched.insert(id);
+    fn touch(&mut self, id: i64) -> Result<()> {
+        self.counters.touch(self.transaction, id)?;
         self.counters.pending.push(id);
+        Ok(())
     }
 }
 

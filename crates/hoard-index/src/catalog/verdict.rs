@@ -2,6 +2,7 @@ use serde::Serialize;
 
 use hoard_core::{ArtifactId, Base, Role, SubRole};
 
+use crate::config::IndexConfig;
 use crate::error::{IndexError, Result};
 use crate::triage::check_verdict;
 
@@ -52,7 +53,8 @@ impl Catalog {
             base,
             decided_at: jiff::Timestamp::now().to_string(),
         };
-        let mut counters = Counters::load(&self.database)?;
+        let mut counters =
+            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
         let transaction = self.database.rw_transaction()?;
         let mut record = require_record(&transaction, id)?;
         apply_override(&mut record, &verdict);
@@ -90,7 +92,8 @@ impl Catalog {
     /// Takes the artifact out of the triage queue without a verdict, which is what a
     /// rejection leaves behind.
     pub fn clear_triage(&self, id: ArtifactId) -> Result<()> {
-        let mut counters = Counters::load(&self.database)?;
+        let mut counters =
+            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
         let transaction = self.database.rw_transaction()?;
         let mut record = require_record(&transaction, id)?;
         record.triage_cleared = true;

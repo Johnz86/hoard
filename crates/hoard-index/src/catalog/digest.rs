@@ -122,7 +122,8 @@ impl Catalog {
         rows: &[RemoteEntry],
         pass: u64,
     ) -> Result<DigestApplied> {
-        let mut counters = Counters::load(&self.database)?;
+        let mut counters =
+            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
         let transaction = self.database.rw_transaction()?;
         let node: Node = transaction
             .get()
@@ -147,6 +148,7 @@ impl Catalog {
         log_changes(&transaction, &mut counters)?;
         counters.save(&transaction)?;
         transaction.commit()?;
+        self.summarise(&counters)?;
         Ok(applied)
     }
 
@@ -166,7 +168,8 @@ impl Catalog {
     /// Drops the peer's remote entries an earlier pass stamped, and every artifact record
     /// nothing references any more. Returns how many entries went.
     pub fn retract_digest(&self, peer: i64, pass: u64) -> Result<u64> {
-        let mut counters = Counters::load(&self.database)?;
+        let mut counters =
+            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
         let transaction = self.database.rw_transaction()?;
         let mut artifacts = Vec::new();
         let mut removed = 0;
@@ -184,6 +187,7 @@ impl Catalog {
         artifacts.sort_unstable();
         artifacts.dedup();
         for id in artifacts {
+            counters.touch(&transaction, id)?;
             if retract_artifact(&transaction, id)? {
                 counters.pending.push(id);
             }
@@ -192,7 +196,7 @@ impl Catalog {
         counters.save(&transaction)?;
         transaction.commit()?;
         if removed > 0 {
-            self.summarise(IndexConfig::default().triage_confidence)?;
+            self.summarise(&counters)?;
         }
         Ok(removed)
     }
@@ -235,7 +239,8 @@ impl Catalog {
     /// Returns every entry a stopped process left mid-transfer to REMOTE, which is what
     /// clears a percentage that will never move again.
     pub fn reset_stale_pulls(&self) -> Result<u64> {
-        let mut counters = Counters::load(&self.database)?;
+        let mut counters =
+            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
         let transaction = self.database.rw_transaction()?;
         let pulling: Vec<Entry> = transaction
             .scan()
@@ -417,10 +422,11 @@ impl Applying<'_, '_> {
             .get()
             .secondary(ArtifactRecordKey::identity, identity)?;
         if let Some(stored) = stored {
-            self.touch(stored.id);
+            self.touch(stored.id)?;
             return Ok((stored.id, false));
         }
         let id = next_id(&mut self.counters.artifacts)?;
+        self.touch(id)?;
         self.transaction.upsert(SearchText {
             artifact_id: id,
             keys: String::new(),
@@ -463,12 +469,13 @@ impl Applying<'_, '_> {
             triage_cleared: false,
             first_seen: jiff::Timestamp::now().to_string(),
         })?;
-        self.touch(id);
         Ok((id, true))
     }
 
-    fn touch(&mut self, id: i64) {
+    fn touch(&mut self, id: i64) -> Result<()> {
+        self.counters.touch(self.transaction, id)?;
         self.counters.pending.push(id);
+        Ok(())
     }
 }
 

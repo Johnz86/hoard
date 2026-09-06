@@ -1754,7 +1754,10 @@ async fn health_stats_and_settings_answer_the_shell() {
 
     let stats = get(&world.state, "/api/v1/stats").await;
     assert_eq!(stats["artifacts"], 6);
-    assert_eq!(stats["repos"], 6);
+    assert_eq!(
+        stats["repos"], 7,
+        "the peer's namespace is a repository the totals now count"
+    );
     assert_eq!(stats["triage"], 1);
     assert_eq!(stats["roles"].as_array().expect("roles").len(), 6);
     assert_eq!(stats["cache"]["bytes"], 0);

@@ -61,7 +61,8 @@ impl Catalog {
     /// The repository and revision a pull of `repo` at `revision` lands in, created under
     /// the pull source when absent.
     pub fn pull_slot(&self, repo: &RepoId, revision: CommitSha, root: &Path) -> Result<PullSlot> {
-        let mut counters = Counters::load(&self.database)?;
+        let mut counters =
+            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
         let transaction = self.database.rw_transaction()?;
         pull_source(&transaction, root)?;
         let repo_id = pull_repository(&transaction, &mut counters, repo, root)?;
@@ -78,7 +79,8 @@ impl Catalog {
     /// the bytes are landing. The hashes and the record the path already carries are left
     /// alone, because nothing has verified the new bytes yet.
     pub fn mark_pull(&self, mark: &PullMark<'_>) -> Result<EntryId> {
-        let mut counters = Counters::load(&self.database)?;
+        let mut counters =
+            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
         let transaction = self.database.rw_transaction()?;
         let previous = entry_of_slot(&transaction, mark.slot, mark.rel_path)?;
         let id = match &previous {
@@ -117,7 +119,8 @@ impl Catalog {
     /// sharing the record of any copy the catalog already holds by content.
     pub fn file_pulled(&self, file: &PulledFile<'_>) -> Result<IngestRecord> {
         let threshold = IndexConfig::default().triage_confidence;
-        let mut counters = Counters::load(&self.database)?;
+        let mut counters =
+            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
         let transaction = self.database.rw_transaction()?;
         let identity = content_key(&file.sha256);
         let (artifact_id, created) = filed_artifact(&transaction, &mut counters, file, identity)?;

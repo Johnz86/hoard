@@ -143,6 +143,7 @@ impl Catalog {
         };
         if counts_are_stale {
             catalog.recount_derived()?;
+            catalog.recount_summary()?;
         }
         let manifest = catalog.manifest()?;
         if manifest.format_version != 5 {

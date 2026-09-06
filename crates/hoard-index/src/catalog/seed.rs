@@ -81,7 +81,7 @@ impl Catalog {
     /// the id it was given, in the order the seed first named them.
     pub fn seed(&self, repositories: &[SeedRepository]) -> Result<Vec<(u128, ArtifactId)>> {
         let triage = IndexConfig::default().triage_confidence;
-        let mut counters = Counters::load(&self.database)?;
+        let mut counters = Counters::load(&self.database, triage)?;
         let transaction = self.database.rw_transaction()?;
         let written = {
             let mut seeding = Seeding {
@@ -98,7 +98,7 @@ impl Catalog {
         };
         log_changes(&transaction, &mut counters)?;
         transaction.commit()?;
-        self.sweep_artifacts(&mut counters, triage)?;
+        self.sweep_artifacts(&mut counters)?;
         let transaction = self.database.rw_transaction()?;
         counters.save(&transaction)?;
         let mut manifest: Manifest = transaction
@@ -265,7 +265,7 @@ impl Seeding<'_, '_> {
     /// The record this entry contributes a path to, written once per identity.
     fn artifact(&mut self, seed: &SeedArtifact) -> Result<i64> {
         if let Some(id) = self.by_identity.get(&seed.identity).copied() {
-            self.touch(id);
+            self.touch(id)?;
             return Ok(id);
         }
         let stored: Option<ArtifactRecord> = self
@@ -276,6 +276,7 @@ impl Seeding<'_, '_> {
             Some(stored) => stored.id,
             None => next_id(&mut self.counters.artifacts)?,
         };
+        self.touch(id)?;
         self.transaction.upsert(SearchText {
             artifact_id: id,
             keys: tensor_keys(seed.tensors.as_ref()),
@@ -304,12 +305,12 @@ impl Seeding<'_, '_> {
         })?;
         self.by_identity.insert(seed.identity, id);
         self.written.push((seed.identity, ArtifactId::new(id)));
-        self.touch(id);
         Ok(id)
     }
 
-    fn touch(&mut self, id: i64) {
-        self.counters.touched.insert(id);
+    fn touch(&mut self, id: i64) -> Result<()> {
+        self.counters.touch(self.transaction, id)?;
         self.counters.pending.push(id);
+        Ok(())
     }
 }

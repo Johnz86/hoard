@@ -56,6 +56,9 @@ pub async fn run(context: Context) -> Result<()> {
         format!("{} known", nodes.len().saturating_sub(1)),
     ));
 
+    let counting = Arc::clone(&catalog);
+    checks.push(tokio::task::spawn_blocking(move || summary(&counting)).await??);
+
     let sources = tokio::task::spawn_blocking(move || catalog.sources()).await??;
     if config.index.sources.is_empty() {
         checks.push(Check::fail(
@@ -109,6 +112,27 @@ pub async fn run(context: Context) -> Result<()> {
         anyhow::bail!("{failures} checks failed");
     }
     Ok(())
+}
+
+/// The stored totals against a fresh count of every artifact record. They differ only when
+/// a writer moved the records without moving the totals, so the recount both reports the
+/// drift and leaves the totals correct.
+fn summary(catalog: &hoard_index::catalog::Catalog) -> Result<Check> {
+    let stored = catalog.totals()?;
+    let recounted = catalog.recount_summary()?;
+    Ok(match stored == recounted {
+        true => Check::pass(
+            "summary",
+            format!(
+                "{} artifacts, {} present, {} repositories",
+                recounted.artifacts, recounted.present_artifacts, recounted.repositories
+            ),
+        ),
+        false => Check::fail(
+            "summary",
+            format!("totals had drifted and were recounted: {stored:?} became {recounted:?}"),
+        ),
+    })
 }
 
 fn git_binary() -> Check {
