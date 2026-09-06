@@ -246,6 +246,74 @@ the two overlapping sets in `nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4` that both 
 `model/model` and both mark triage: a `*.index.json` claims two of the ten declared files
 and the naming convention takes the remaining eight.
 
+### Workstation, merged
+
+Commit `8757c76`, release build, every source `./hoard.toml` nominates: the HuggingFace
+cache, the ComfyUI tree, the LM Studio tree and one git source whose root no longer exists
+and is skipped with a warning. `./data/hoard.db` is the old SQLite file and is no longer
+read; `doctor` says so and offers to have it deleted.
+
+```sh
+cargo build --release
+time ./target/release/hoard --config hoard.toml scan
+time ./target/release/hoard --config hoard.toml scan
+./target/release/hoard --config hoard.toml doctor
+du -sh data/native
+./target/release/hoard --config hoard.toml ls 'role:lora'
+timeout 60 ./target/release/hoard --config hoard.toml serve
+curl -s -o /dev/null -w '%{time_total}\n' 'http://127.0.0.1:7099/api/v1/search?q=role%3Alora'
+```
+
+- First scan, which builds the catalog under `./data/native`: 5 m 42.385 s wall, reporting
+  `unchanged=728 changed=0 added=0 absent=0 hashed=445 merged=2`. The walk and the header
+  sniffing are a fraction of that. `[index] hash_policy = "background"` is what the wall
+  time mostly measures: the same run reads every byte of the 445 files it had no content
+  hash for, which on this disk are the ComfyUI and LM Studio weights. A cache blob already
+  names its hash, so the 477 `hf-cache` entries are not among them, and the second scan
+  hashes nothing.
+- Second scan immediately after: 0.229 s, reporting `unchanged=728 changed=0 added=0
+  absent=0 hashed=0 merged=0`. Nothing is re-opened and nothing is re-hashed.
+- `doctor`: git, the data directory, the node record, zero peers, the block cache and the
+  upstream all pass; the three reachable sources report 477 files and 414.4 GB
+  (`hf-cache`), 223 files and 819.7 GB (`comfy`) and 28 files and 405.8 GB (`lmstudio`);
+  the `clones` source fails because its root does not exist. One check failed, which is the
+  configuration rather than the catalog.
+- Catalog on disk: 6.8 MB for `data/native`, of which `catalog.redb` is 6.2 MB (8,957,952
+  bytes apparent) and the published `search-v1-1788676389726925773` directory is 572 KB.
+
+Query wall time is the whole process: opening the catalog, opening the Tantivy index,
+compiling the query, answering it and printing the page. Three runs each, median reported.
+
+| query | median | artifacts |
+| --- | --- | --- |
+| `ls 'role:lora'` | 15 ms | 35 |
+| `ls 'base:sdxl'` | 15 ms | 1 |
+| `ls 'format:gguf'` | 17 ms | 26 |
+| `ls 'node:self'` | 16 ms | 228 |
+| `ls 'state:served'` | 16 ms | 0 |
+| `ls 'film'` | 15 ms | 1 |
+| `ls ''` | 15 ms | 228 |
+
+At this size the query itself is not what the 15 ms measures; process start and opening the
+two files are, and every query costs the same to within 2 ms whether it matches one row or
+every row.
+
+Routes on a running server, `curl -s -o /dev/null -w '%{time_total}'`, three runs each,
+median reported:
+
+| route | median |
+| --- | --- |
+| `/api/v1/search?q=role%3Alora` | 0.9 ms |
+| `/api/v1/search?q=` | 1.7 ms |
+| `/api/v1/stats` | 1.0 ms |
+| `/api/v1/repos` | 2.4 ms |
+| `/api/models?limit=20` | 0.9 ms |
+| `/api/models/InternScience/Agents-A1` | 0.5 ms |
+
+The server holds the catalog and the Tantivy reader open, so a route pays only for the
+query, which is why each of these is one to two orders of magnitude under the same query
+run as a fresh `hoard ls` process. `/api/v1/repos` is the slowest of the six.
+
 ## Scale
 
 Synthetic loose source of header-only safetensors files, 1,000 per directory, one artifact
@@ -274,26 +342,38 @@ scan is 1.0 s slower at 100k, which is the price of the second secondary index t
 gained, `node`, writing one more row per file. The entry's own table is `7_2_id` after the
 migration; the storage measurements below predate it and name it `7_1_id`.
 
-| measure | 100k w1 | 100k w2 | 100k w3 | 100k w4 | 100k w5 | 100k w6 | 100k w11 | 1M w1 | 1M w2 | 1M w3 | 1M w4 | 1M w5 | 1M w6 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| scan wall | 5.226065725s | 5.900763157s | 5.476153652s | 5.657892353s | 5.672653469s | 5.623549612s | 6.618210648s | 57.77687964s | 75.282972971s | 85.709219721s | 85.449911878s | 84.603774091s | 85.078043138s |
-| peak rss growth during scan | 198 MB | 292 MB | 253 MB | 254 MB | 254 MB | 254 MB | 275 MB | 1560 MB | 842 MB | 731 MB | 741 MB | 732 MB | 732 MB |
-| rebuild wall | 596.949484ms | 440.388181ms | 802.170108ms | 943.869337ms | 883.471396ms | 1.076870421s | 1.135933202s | 4.40112116s | 5.294884595s | 8.497179982s | 10.39137641s | 10.551732892s | 11.886669682s |
-| peak rss growth during rebuild | 34 MB | 54 MB | 52 MB | 47 MB | 48 MB | 46 MB | 46 MB | 0 MB | 0 MB | 0 MB | 0 MB | 0 MB | 0 MB |
-| on disk, apparent | 518 MB | 261 MB | 261 MB | 265 MB | 265 MB | 265 MB | 265 MB | 4138 MB | 4138 MB | 4138 MB | 4173 MB | 4173 MB | 4174 MB |
-| on disk, allocated | 288 MB | 243 MB | 213 MB | 216 MB | 216 MB | 216 MB | 229 MB | 2983 MB | 2476 MB | 2112 MB | 2148 MB | 2148 MB | 2149 MB |
-| search offset 0 | 10.577049ms | 12.251924ms | 9.756606ms | removed | removed | removed | removed | 189.855663ms | 174.943704ms | 216.076995ms | removed | removed | removed |
-| search deep offset | 9.144823ms | 9.106715ms | 8.649164ms | removed | removed | removed | removed | 197.536743ms | 190.89815ms | 217.117028ms | removed | removed | removed |
-| search filtered | 7.200678ms | 7.238805ms | 6.967226ms | removed | removed | removed | removed | 177.39202ms | 168.239764ms | 188.590775ms | removed | removed | removed |
-| query empty by name | not measured | not measured | not measured | 221.111746ms | 33.894331ms | 13.27674ms | 13.43545ms | not measured | not measured | not measured | 3.011389042s | 577.455193ms | 125.506335ms |
-| query deep offset | not measured | not measured | not measured | 212.094065ms | 34.319659ms | 13.447428ms | 13.634569ms | not measured | not measured | not measured | 2.982565132s | 534.299433ms | 125.852064ms |
-| query role:lora with facets | not measured | not measured | not measured | 135.635441ms | 28.611903ms | 16.175599ms | 15.641774ms | not measured | not measured | not measured | 2.016078812s | 493.170639ms | 159.062959ms |
-| query filtered | not measured | not measured | not measured | 300.337912ms | 41.425115ms | 25.132866ms | 24.692991ms | not measured | not measured | not measured | 4.384522112s | 873.916709ms | 251.142862ms |
-| query node:self with facets | not measured | not measured | not measured | not measured | not measured | 58.87439ms | 64.457049ms | not measured | not measured | not measured | not measured | not measured | 1.082111424s |
-| peak rss growth during queries | not measured | not measured | not measured | 113 MB | 41 MB | 1 MB | 1 MB | not measured | not measured | not measured | 1190 MB | 409 MB | 0 MB |
-| peak rss growth during the collapse query | not measured | not measured | not measured | not measured | not measured | 42 MB | 34 MB | not measured | not measured | not measured | not measured | not measured | 300 MB |
-| rescan wall (1,000 changed) | not measured | not measured | 812.140523ms | 816.293704ms | 898.947574ms | 517.541105ms | 631.498106ms | not measured | not measured | 28.5581122s | 29.606316494s | 31.851403311s | 6.241905939s |
-| refresh wall | not measured | not measured | 28.341576ms | 31.047147ms | 31.89983ms | 27.67862ms | 31.797068ms | not measured | not measured | 28.598925ms | 35.828931ms | 33.576794ms | 29.871137ms |
+The merged column is commit `8757c76`, the merge of this branch into `master`, run with the
+harness as it stands, which is the w11 condition: `HashPolicy::Never` throughout. The 1M
+column it sits beside, w6, still hashed, so only the 100k pair is a like-for-like
+comparison. Commands:
+
+```sh
+HOARD_SCALE_ENTRIES=100000 HOARD_SCALE_DIR=<scratch>/scale \
+  cargo test --release -p hoard-index --test scale -- --nocapture --ignored
+HOARD_SCALE_ENTRIES=1000000 HOARD_SCALE_DIR=<scratch>/scale \
+  cargo test --release -p hoard-index --test scale -- --nocapture --ignored
+```
+
+| measure | 100k w1 | 100k w2 | 100k w3 | 100k w4 | 100k w5 | 100k w6 | 100k w11 | 100k merged | 1M w1 | 1M w2 | 1M w3 | 1M w4 | 1M w5 | 1M w6 | 1M merged |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| scan wall | 5.226065725s | 5.900763157s | 5.476153652s | 5.657892353s | 5.672653469s | 5.623549612s | 6.618210648s | 6.722465445s | 57.77687964s | 75.282972971s | 85.709219721s | 85.449911878s | 84.603774091s | 85.078043138s | 98.691301535s |
+| peak rss growth during scan | 198 MB | 292 MB | 253 MB | 254 MB | 254 MB | 254 MB | 275 MB | 275 MB | 1560 MB | 842 MB | 731 MB | 741 MB | 732 MB | 732 MB | 735 MB |
+| rebuild wall | 596.949484ms | 440.388181ms | 802.170108ms | 943.869337ms | 883.471396ms | 1.076870421s | 1.135933202s | 1.255604558s | 4.40112116s | 5.294884595s | 8.497179982s | 10.39137641s | 10.551732892s | 11.886669682s | 12.5640437s |
+| peak rss growth during rebuild | 34 MB | 54 MB | 52 MB | 47 MB | 48 MB | 46 MB | 46 MB | 45 MB | 0 MB | 0 MB | 0 MB | 0 MB | 0 MB | 0 MB | 0 MB |
+| on disk, apparent | 518 MB | 261 MB | 261 MB | 265 MB | 265 MB | 265 MB | 265 MB | 265 MB | 4138 MB | 4138 MB | 4138 MB | 4173 MB | 4173 MB | 4174 MB | 4175 MB |
+| on disk, allocated | 288 MB | 243 MB | 213 MB | 216 MB | 216 MB | 216 MB | 229 MB | 229 MB | 2983 MB | 2476 MB | 2112 MB | 2148 MB | 2148 MB | 2149 MB | 2242 MB |
+| search offset 0 | 10.577049ms | 12.251924ms | 9.756606ms | removed | removed | removed | removed | removed | 189.855663ms | 174.943704ms | 216.076995ms | removed | removed | removed | removed |
+| search deep offset | 9.144823ms | 9.106715ms | 8.649164ms | removed | removed | removed | removed | removed | 197.536743ms | 190.89815ms | 217.117028ms | removed | removed | removed | removed |
+| search filtered | 7.200678ms | 7.238805ms | 6.967226ms | removed | removed | removed | removed | removed | 177.39202ms | 168.239764ms | 188.590775ms | removed | removed | removed | removed |
+| query empty by name | not measured | not measured | not measured | 221.111746ms | 33.894331ms | 13.27674ms | 13.43545ms | 13.28162ms | not measured | not measured | not measured | 3.011389042s | 577.455193ms | 125.506335ms | 122.717398ms |
+| query deep offset | not measured | not measured | not measured | 212.094065ms | 34.319659ms | 13.447428ms | 13.634569ms | 13.43946ms | not measured | not measured | not measured | 2.982565132s | 534.299433ms | 125.852064ms | 123.029078ms |
+| query role:lora with facets | not measured | not measured | not measured | 135.635441ms | 28.611903ms | 16.175599ms | 15.641774ms | 15.190983ms | not measured | not measured | not measured | 2.016078812s | 493.170639ms | 159.062959ms | 145.8286ms |
+| query filtered | not measured | not measured | not measured | 300.337912ms | 41.425115ms | 25.132866ms | 24.692991ms | 24.023572ms | not measured | not measured | not measured | 4.384522112s | 873.916709ms | 251.142862ms | 235.649166ms |
+| query node:self with facets | not measured | not measured | not measured | not measured | not measured | 58.87439ms | 64.457049ms | 64.255697ms | not measured | not measured | not measured | not measured | not measured | 1.082111424s | 1.121332943s |
+| peak rss growth during queries | not measured | not measured | not measured | 113 MB | 41 MB | 1 MB | 1 MB | 1 MB | not measured | not measured | not measured | 1190 MB | 409 MB | 0 MB | 0 MB |
+| peak rss growth during the collapse query | not measured | not measured | not measured | not measured | not measured | 42 MB | 34 MB | 33 MB | not measured | not measured | not measured | not measured | not measured | 300 MB | 262 MB |
+| rescan wall (1,000 changed) | not measured | not measured | 812.140523ms | 816.293704ms | 898.947574ms | 517.541105ms | 631.498106ms | 642.38082ms | not measured | not measured | 28.5581122s | 29.606316494s | 31.851403311s | 6.241905939s | 7.364252708s |
+| refresh wall | not measured | not measured | 28.341576ms | 31.047147ms | 31.89983ms | 27.67862ms | 31.797068ms | 21.002736ms | not measured | not measured | 28.598925ms | 35.828931ms | 33.576794ms | 29.871137ms | 27.537449ms |
 
 `query role:lora with facets` matches a quarter of the catalog and is the one query here
 whose facet rail costs a second collection: the ROLE dimension is counted with its own key
@@ -369,6 +449,21 @@ comfortably faster than the scan. Allocated disk is 2149 MB against 2148 MB, so 
 refresh stays cheap at 29.9 ms for 1,000 changed artifacts. The rescan came in at 6.24 s
 against 31.9 s; nothing in this wave touches the rescan and the two runs did not see the
 same page cache, so that number is variance, not a result.
+
+The merge changes nothing measurable. At 100k every row is within noise of w11: the scan is
+6.72 s against 6.62 s, the four primary-path queries are 13.3, 13.4, 15.2 and 24.0 ms
+against 13.4, 13.6, 15.6 and 24.7 ms, the collapse query is 64.3 ms against 64.5 ms, disk
+is 265 MB apparent and 229 MB allocated on both, and the rescan is 642 ms against 631 ms.
+At 1M the four primary-path queries are 123, 123, 146 and 236 ms against w6's 126, 126, 159
+and 251 ms, the collapse query is 1.12 s against 1.08 s, and peak RSS growth is 735 MB for
+the scan, 0 MB for the four queries and 262 MB for the collapse query against 732, 0 and
+300. The 1M scan reads 98.7 s against w6's 85.1 s and allocated disk 2242 MB against 2149
+MB; w6 hashed and this run did not, so the two are not comparable and there is no 1M w11 to
+compare against. Every threshold stands where wave 6 left it: peak RSS under 2 GB and every
+primary-path query under 500 ms are met, allocated disk under 1.5 GB is missed at 2242 MB,
+the rebuild at 12.6 s is comfortably faster than the scan, and `query node:self with facets`
+at 1.12 s is the one query still over 500 ms, on the collapse path this branch has not yet
+bounded.
 
 Go for switching the index screen onto this catalog, which is the next wave. The queries a
 screen opens on, the empty one, a role or format filter, a page anywhere in the order, are
