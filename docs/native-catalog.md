@@ -474,19 +474,96 @@ way is the work left. The catalogs actually measured on this workstation hold 47
 where every query here is under a millisecond, so that remainder is a scale limit rather
 than a correctness one.
 
+### Performance wave 1
+
+Commit `7737aeb`, release build, the same workstation. The tree is synthetic: 100 loose
+repositories of 1,000 valid safetensors headers each, 100,000 files, `hash_policy =
+"never"`, `offline = true`, `repo_per_folder = true`. The before column is `d9e1636`, the
+merged catalog, over the same tree and the same configuration.
+
+```sh
+cargo build --release
+time ./target/release/hoard --config <tree>/hoard.toml scan
+timeout 300 ./target/release/hoard --config <tree>/hoard.toml serve
+curl -s -o /dev/null -w '%{time_total}\n' 'http://127.0.0.1:7311/api/v1/repos?limit=100'
+```
+
+Three runs per route, median reported, whole request including the response body.
+
+| route | before | after |
+| --- | --- | --- |
+| `GET /api/v1/repos?limit=1` | 63.3 ms | 0.52 ms |
+| `GET /api/v1/repos?limit=100` | 261.0 ms | 0.83 ms |
+| `GET /api/models?limit=1` | 61.5 ms | 0.75 ms |
+| `GET /api/models/org0/repo000` | 3.58 ms | 3.35 ms |
+| `HEAD /org0/repo000/resolve/main/w0.safetensors` | 2.18 ms | 0.63 ms |
+| `GET /api/v1/sources` | 38.9 ms | 0.45 ms |
+| `GET /api/v1/search?q=` | 14.6 ms | 14.2 ms |
+| `GET /api/v1/search?q=node:self` | 68.3 ms | 41.7 ms |
+| `GET /api/v1/search?q=role:lora` | 17.0 ms | 16.9 ms |
+| `GET /api/v1/triage?limit=20` | 73.8 ms | 78.5 ms |
+
+The three listings and `sources` are the wave: each of them used to read every entry of
+every repository to decide presence, count files or count owed hashes, and now reads a
+number off the record it already had. `resolve` is one location-key lookup rather than a
+scan of its repository. `triage` moved by less than the spread between its own three runs
+and is unchanged. The first scan of an existing catalog with the new binary runs the four
+migrations and recounts once, at 6.4 s against 0.7 s for the scan after it.
+
+The scale harness at 1M, against the merged column above:
+
+| measure | merged | wave 1 |
+| --- | --- | --- |
+| scan wall | 98.691301535s | 102.769339125s |
+| peak rss growth during scan | 735 MB | 731 MB |
+| rebuild wall | 12.5640437s | 13.936102691s |
+| on disk, apparent | 4175 MB | 4175 MB |
+| on disk, allocated | 2242 MB | 2564 MB |
+| query empty by name | 122.717398ms | 119.431554ms |
+| query deep offset | 123.029078ms | 119.874963ms |
+| query role:lora with facets | 145.8286ms | 147.175983ms |
+| query filtered | 235.649166ms | 234.181468ms |
+| query node:self with facets | 1.121332943s | 510.93955ms |
+| peak rss growth during the collapse query | 262 MB | 35 MB |
+| rescan wall (1,000 changed) | 7.364252708s | 6.983199391s |
+| refresh wall | 27.537449ms | 30.101233ms |
+
+At 100k the same two rows move the same way: `query node:self with facets` is 32.9 ms
+against 64.3 ms and the collapse query adds 20 MB against 33 MB. The collapse path now
+keeps a 40 byte row per matching document rather than an 88 byte hit in a map per segment
+and a second map to merge them, reads no facet ordinal until one row per artifact has been
+settled, and a facet pass keeps no candidates at all. `node:self` at 511 ms is under the
+500 ms threshold within its own run-to-run spread; it is no longer the outlier it was.
+
+Allocated disk grew 2242 to 2564 MB at 1M and 229 to 260 MB at 100k. That is the unique
+`location` secondary key on every entry, which is what buys the lookup, and it moves the
+1.5 GB disk threshold further away rather than closer. The entry's own table is `7_3_id`
+after this wave's migration; the storage measurements above predate it.
+
+The four record versions this wave added, each with a frozen encoding test on the version it
+supersedes: `Repository` v4 carries `present_files` and `present_bytes`, `Source` v3 carries
+`pending_hashes`, `Node` v2 carries `filed`, and `Entry` v3 carries `location`. `Catalog::open`
+counts them again once, and only when a row of the previous version was migrated. Every
+writer that moves an entry into or out of presence moves the counts above it, and
+`hoard doctor` gained a `summary` check that counts every artifact record again and reports
+any drift.
+
 ## Remaining work
 
 - Path identities hash the text to_string_lossy renders; discovery currently never yields
   two distinct non-UTF-8 paths, and a byte-exact identity must land with the identity
   redesign.
 - Bound the collapse the way the primary path is bounded. A query naming `node:`, `state:`,
-  `source:`, `repo:`, `rev:` or `hash:`, or sorting on revision, node or state, still
-  materializes one candidate per matching artifact: measured at 1M, `node:self` is 1.08 s
-  against a 500 ms threshold and adds 300 MB. Every other query is answered from primary
-  documents in under 260 ms while adding nothing that scales with the catalog.
-- Shrink the per-entry record further: revision, repository, source and absolute path are
-  written out per entry, which is what the 1M catalog is mostly made of. Intern them per
-  revision and reference them by id.
+  `source:`, `repo:`, `rev:` or `hash:`, or sorting on revision, node or state, still keeps
+  one row per matching artifact rather than one per page: measured at 1M, `node:self` is
+  511 ms and adds 35 MB, against 1.08 s and 300 MB before wave 1. What remains is holding
+  nothing that grows with the catalog at all.
+- Shrink the per-entry record further: revision, repository, source, absolute path and now
+  the location key are written out per entry, which is what the 1M catalog is mostly made
+  of. Intern them per revision and reference them by id. Allocated disk at 1M is 2564 MB
+  against a 1.5 GB threshold.
+- The `node` secondary key on every entry costs a whole index to answer a question the node
+  record now answers directly; drop it once nothing scans by node.
 - Preserve complete repository Git metadata and add stable cross-scan identities.
 - A rescan re-reads every revision's documents (README, configs, index files) before
   deciding units; measure this on the workstation cache and skip when every document's
