@@ -1405,13 +1405,13 @@ mod tests {
             "https://huggingface.co",
         )
         .expect("hub builds");
+        let catalog = test_catalog(root.path());
         let mirror = Arc::new(Mirror::new(
-            store.clone(),
+            Arc::clone(&catalog),
             Arc::clone(&cache),
             access,
             upstream,
         ));
-        let catalog = test_catalog(root.path());
         let puller = Puller::new(PullerConfig {
             store: store.clone(),
             catalog: Arc::clone(&catalog),
@@ -1469,6 +1469,11 @@ mod tests {
     }
 
     async fn peer_answering(server: &MockServer, bytes: &[u8], etag: &str) {
+        Mock::given(method("HEAD"))
+            .and(path("/api/models/kohya/film-grain"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/api/models/kohya/film-grain"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1605,10 +1610,11 @@ mod tests {
             "https://huggingface.co",
         )
         .expect("hub builds");
-        let mirror = Arc::new(Mirror::new(store, cache, access, upstream));
+        let catalog = test_catalog(dir.path());
+        let mirror = Arc::new(Mirror::new(Arc::clone(&catalog), cache, access, upstream));
         let puller = Puller::new(PullerConfig {
-            store: mirror.store().clone(),
-            catalog: test_catalog(dir.path()),
+            store,
+            catalog,
             mirror,
             root: PathBuf::from("/srv/pulled"),
             serve: true,
@@ -1858,15 +1864,16 @@ mod tests {
             "https://huggingface.co",
         )
         .expect("hub builds");
+        let catalog = test_catalog(dir.path());
         let mirror = Arc::new(Mirror::new(
-            store,
+            Arc::clone(&catalog),
             cache,
             Arc::new(AccessPolicy::default()),
             upstream,
         ));
         let puller = Puller::new(PullerConfig {
-            store: mirror.store().clone(),
-            catalog: test_catalog(dir.path()),
+            store,
+            catalog,
             mirror,
             root: PathBuf::from("/srv/pulled"),
             serve: true,

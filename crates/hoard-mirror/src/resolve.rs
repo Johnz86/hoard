@@ -15,7 +15,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::Stream;
 use hoard_core::{CommitSha, RepoId, Sha256, clean_repo_path};
-use hoard_index::store::Store;
+use hoard_index::catalog::Catalog;
 use serde_json::Value;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -29,7 +29,7 @@ use crate::cache::meta::{
 use crate::cache::{BlockCache, CacheEntry, CacheLayout, body_path};
 use crate::error::{MirrorError, Result};
 use crate::ingest::{CachedFile, IngestOutcome, ingest_cached_file};
-use crate::local::index_repo::{self, FileLocation, read_index, repo_row, revision_row};
+use crate::local::index_repo::{self, FileLocation, on_catalog};
 use crate::model::HubTimestamp;
 use crate::upstream::client::{Authorization, ProxyResponse};
 use crate::upstream::hub::{BlockFetch, HEADER_REPO_COMMIT, Hub, anonymous_whoami, quoted};
@@ -180,7 +180,7 @@ impl RemoteBytes {
 /// The ingest a fully fetched file runs, so the cache entry becomes a local artifact.
 #[derive(Debug, Clone)]
 pub struct IngestTrigger {
-    store: Store,
+    catalog: Arc<Catalog>,
     cache: Arc<BlockCache>,
     entry: SharedEntry,
     repo: RepoId,
@@ -194,7 +194,7 @@ impl IngestTrigger {
     pub async fn run(&self) -> Result<Option<IngestOutcome>> {
         let mut entry = self.entry.lock().await;
         ingest_cached_file(
-            &self.store,
+            &self.catalog,
             &self.cache,
             &mut entry,
             CachedFile {
@@ -360,7 +360,7 @@ pub async fn read_range(answer: &FileAnswer, range: Option<&str>) -> Result<Byte
 /// The Hub face of this node: what it holds, what it has cached and what it can fetch.
 #[derive(Debug, Clone)]
 pub struct Mirror {
-    store: Store,
+    catalog: Arc<Catalog>,
     cache: Arc<BlockCache>,
     access: Arc<AccessPolicy>,
     upstream: Hub,
@@ -369,14 +369,14 @@ pub struct Mirror {
 
 impl Mirror {
     pub fn new(
-        store: Store,
+        catalog: Arc<Catalog>,
         cache: Arc<BlockCache>,
         access: Arc<AccessPolicy>,
         upstream: Hub,
     ) -> Self {
         let cache = Arc::new(cache.scoped(&upstream.cache_scope()));
         Self {
-            store,
+            catalog,
             cache,
             access,
             upstream,
@@ -393,15 +393,15 @@ impl Mirror {
     /// each other's entries.
     pub fn with_upstream(&self, upstream: Hub) -> Self {
         Self::new(
-            self.store.clone(),
+            Arc::clone(&self.catalog),
             Arc::clone(&self.cache),
             Arc::clone(&self.access),
             upstream,
         )
     }
 
-    pub fn store(&self) -> &Store {
-        &self.store
+    pub fn catalog(&self) -> &Arc<Catalog> {
+        &self.catalog
     }
 
     /// The block cache keyed for this mirror's upstream. Its `root` is the whole tree,
@@ -689,13 +689,11 @@ impl Mirror {
     async fn index_revision(&self, repo: &RepoId, revision: &str) -> Result<Option<CommitSha>> {
         let wanted = repo.clone();
         let named = revision.to_owned();
-        read_index(&self.store, move |conn| {
-            let Ok(row) = repo_row(conn, &wanted) else {
-                return Ok(None);
-            };
-            Ok(revision_row(conn, &row, &named)
-                .ok()
-                .map(|revision| revision.sha))
+        on_catalog(&self.catalog, move |catalog| {
+            Ok(catalog
+                .repository(&wanted)?
+                .and_then(|repository| catalog.resolve_revision(&repository, &named))
+                .and_then(|revision| revision.sha))
         })
         .await
     }
@@ -795,7 +793,7 @@ impl Mirror {
     }
 
     async fn local_answer(&self, repo: &RepoId, sha: &CommitSha, path: &str) -> Option<FileAnswer> {
-        let location = index_repo::locate(&self.store, repo, sha, path)
+        let location = index_repo::locate(&self.catalog, repo, sha, path)
             .await
             .ok()?;
         if location.lfs_pointer_only {
@@ -901,7 +899,7 @@ impl Mirror {
             )))
         };
         let ingest = entry.as_ref().map(|entry| IngestTrigger {
-            store: self.store.clone(),
+            catalog: Arc::clone(&self.catalog),
             cache: Arc::clone(&self.cache),
             entry: Arc::clone(entry),
             repo: repo.clone(),
@@ -1210,14 +1208,10 @@ fn block_end(entry: &CacheEntry, position: u64, limit: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use futures::StreamExt;
-    use hoard_core::{NodeId, RepoType};
-    use hoard_index::config::SourceKind;
-    use hoard_index::store::blob::{set_sha256, upsert_blob};
-    use hoard_index::store::entry::{NewEntry, upsert_entry};
-    use hoard_index::store::node::{NewNode, upsert_node};
-    use hoard_index::store::repo::{NewRepo, upsert_repo};
-    use hoard_index::store::revision::{NewRevision, RefKind, upsert_ref, upsert_revision};
-    use jiff::Timestamp;
+    use hoard_core::{RepoType, State};
+    use hoard_index::catalog::{SeedEntry, SeedRepository, SeedRevision};
+    use hoard_index::config::{IndexConfig, SourceKind};
+    use hoard_index::store::revision::RefKind;
     use sha2::{Digest, Sha256 as Sha256Hasher};
     use tempfile::TempDir;
     use wiremock::matchers::{body_json, method, path as path_matcher, query_param};
@@ -1300,26 +1294,34 @@ mod tests {
 
     fn harness(upstream: &str, config: MirrorConfig) -> Harness {
         let root = TempDir::new().expect("temp dir");
-        let store = Store::open_in_memory().expect("store opens");
-        let conn = store.write().expect("writer");
-        upsert_node(
-            &conn,
-            &NewNode {
-                node_id: NodeId::new("node-a").expect("node id"),
-                name: "hoard".to_owned(),
-                url: None,
-                is_self: true,
-            },
-        )
-        .expect("node inserts");
-        drop(conn);
+        let catalog = open_catalog(root.path());
         Harness {
-            mirror: mirror_at(root.path(), upstream, config, store),
+            mirror: mirror_at(root.path(), upstream, config, catalog),
             _root: root,
         }
     }
 
-    fn mirror_at(root: &Path, upstream: &str, config: MirrorConfig, store: Store) -> Mirror {
+    fn open_catalog(root: &Path) -> Arc<Catalog> {
+        Arc::new(
+            Catalog::open_or_scan(
+                &IndexConfig {
+                    data_dir: root.join("native"),
+                    sources: Vec::new(),
+                    ..IndexConfig::default()
+                },
+                "node-a",
+                |_, _| {},
+            )
+            .expect("catalog opens"),
+        )
+    }
+
+    fn mirror_at(
+        root: &Path,
+        upstream: &str,
+        config: MirrorConfig,
+        catalog: Arc<Catalog>,
+    ) -> Mirror {
         let offline = config.offline;
         let access = AccessPolicy::compile(&config).expect("rules compile");
         let cache = BlockCache::at_root(Arc::new(config), root);
@@ -1327,34 +1329,39 @@ mod tests {
             .expect("client builds")
             .with_retry(RetryPolicy::immediate(2));
         let hub = Hub::new(client, upstream).expect("hub builds");
-        Mirror::new(store, Arc::new(cache), Arc::new(access), hub)
+        Mirror::new(catalog, Arc::new(cache), Arc::new(access), hub)
     }
 
-    fn index_file(store: &Store, dir: &Path, bytes: &[u8]) -> PathBuf {
+    fn index_file(catalog: &Catalog, dir: &Path, bytes: &[u8]) -> PathBuf {
         let abs = dir.join("model.safetensors");
         std::fs::write(&abs, bytes).expect("file writes");
-        let conn = store.write().expect("writer");
-        let node = hoard_index::store::node::local_node(&conn).expect("node");
-        let repo_row = upsert_repo(&conn, &NewRepo::new(repo(), node.id, SourceKind::Loose))
-            .expect("repo inserts");
-        let revision = upsert_revision(&conn, &NewRevision::new(repo_row, commit()))
-            .expect("revision inserts");
-        upsert_ref(&conn, repo_row, "main", RefKind::Branch, revision).expect("ref inserts");
-        let blob = upsert_blob(&conn, "fingerprint", bytes.len() as u64, Timestamp::now())
-            .expect("blob inserts");
-        set_sha256(
-            &conn,
-            blob,
-            Sha256::from_bytes(Sha256Hasher::digest(bytes).into()),
-            Some(hoard_index::hash::git_blob_sha1_bytes(bytes)),
-            Timestamp::now(),
-        )
-        .expect("hashes store");
-        let mut entry = NewEntry::new(revision, "model.safetensors", node.id);
-        entry.blob = Some(blob);
-        entry.abs_path = Some(abs.to_string_lossy().into_owned());
-        entry.size = bytes.len() as u64;
-        upsert_entry(&conn, &entry, Timestamp::now()).expect("entry inserts");
+        catalog
+            .seed(&[SeedRepository {
+                repo: repo(),
+                source: "loose".to_owned(),
+                kind: SourceKind::Loose,
+                root_path: dir.to_path_buf(),
+                git_dir: None,
+                revisions: vec![SeedRevision {
+                    name: "main".to_owned(),
+                    sha: Some(commit()),
+                    refs: vec![("main".to_owned(), RefKind::Branch)],
+                    title: None,
+                    author: None,
+                    committed: None,
+                    entries: vec![SeedEntry {
+                        rel_path: "model.safetensors".to_owned(),
+                        abs_path: Some(abs.to_string_lossy().into_owned()),
+                        size: bytes.len() as u64,
+                        state: State::Local,
+                        is_symlink: false,
+                        sha256: Some(Sha256::from_bytes(Sha256Hasher::digest(bytes).into())),
+                        git_sha1: Some(hoard_index::hash::git_blob_sha1_bytes(bytes)),
+                        artifact: None,
+                    }],
+                }],
+            }])
+            .expect("the catalog seeds");
         abs
     }
 
@@ -1439,7 +1446,7 @@ mod tests {
             .await;
         let harness = harness(&server.uri(), config(false, true));
         let dir = TempDir::new().expect("temp dir");
-        index_file(harness.mirror.store(), dir.path(), b"weights");
+        index_file(harness.mirror.catalog(), dir.path(), b"weights");
 
         let resolution = harness
             .mirror
@@ -1574,7 +1581,7 @@ mod tests {
         let harness = harness("http://127.0.0.1:1", config(true, true));
         let dir = TempDir::new().expect("temp dir");
         let bytes = b"local weights".to_vec();
-        index_file(harness.mirror.store(), dir.path(), &bytes);
+        index_file(harness.mirror.catalog(), dir.path(), &bytes);
 
         let answer = harness
             .mirror
@@ -2252,7 +2259,7 @@ mod tests {
             .expect("proxied once");
 
         let offline = Mirror::new(
-            online.mirror.store().clone(),
+            Arc::clone(online.mirror.catalog()),
             Arc::clone(online.mirror.cache()),
             Arc::new(AccessPolicy::compile(&config(true, true)).expect("rules compile")),
             Hub::new(
@@ -2356,7 +2363,7 @@ mod tests {
             open._root.path(),
             &server.uri(),
             denied,
-            open.mirror.store().clone(),
+            Arc::clone(open.mirror.catalog()),
         );
 
         let error = strict
@@ -2396,7 +2403,7 @@ mod tests {
         denied.proxy = vec![AccessRule::glob("other/*", true)];
         let harness = harness(&server.uri(), denied);
         let bytes = vec![6u8; 64];
-        index_file(harness.mirror.store(), harness._root.path(), &bytes);
+        index_file(harness.mirror.catalog(), harness._root.path(), &bytes);
 
         let answer = harness
             .mirror
@@ -2534,7 +2541,7 @@ mod tests {
             harness._root.path(),
             &server.uri(),
             config(true, true),
-            harness.mirror.store().clone(),
+            Arc::clone(harness.mirror.catalog()),
         );
         let answer = offline
             .open_file(route)

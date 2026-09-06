@@ -110,7 +110,7 @@ impl AppState {
         let upstream = Hub::new(upstream_client, &mirror_config.upstream)
             .map_err(|error| ApiError::bad_request(format!("upstream url: {error}")))?;
         let mirror = Arc::new(Mirror::new(
-            store.clone(),
+            Arc::clone(&catalog),
             Arc::clone(&cache),
             Arc::clone(&access),
             upstream,

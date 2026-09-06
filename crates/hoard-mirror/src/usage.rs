@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hoard_core::{ArtifactId, RepoRowId};
-use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, PullRow, UsageDay, UsageEvent};
 use jiff::Timestamp;
 use serde::Serialize;
 
-use crate::error::{MirrorError, Result};
+use crate::error::Result;
+use crate::local::index_repo::on_catalog;
 
 /// The width of the USAGE tab's bar chart.
 pub const USAGE_WINDOW_DAYS: u32 = 7;
@@ -105,13 +105,12 @@ impl ServedRequest {
 /// Appends one served response to the catalog's log and marks its artifact as used.
 pub async fn log_served(catalog: &Arc<Catalog>, request: &ServedRequest) -> Result<()> {
     let event = request.event();
-    let catalog = Arc::clone(catalog);
-    on_catalog(move || {
+    on_catalog(catalog, move |catalog| {
         catalog.log_usage(&event)?;
-        match event.artifact {
-            Some(artifact) => catalog.bump_artifact_use(artifact, event.at),
-            None => Ok(()),
+        if let Some(artifact) = event.artifact {
+            catalog.bump_artifact_use(artifact, event.at)?;
         }
+        Ok(())
     })
     .await
 }
@@ -138,8 +137,7 @@ pub async fn usage_summary(
     days: u32,
     limit: u32,
 ) -> Result<UsageSummary> {
-    let catalog = Arc::clone(catalog);
-    on_catalog(move || {
+    on_catalog(catalog, move |catalog| {
         Ok(UsageSummary {
             days: catalog.usage_days(repo, days.max(1))?,
             pulls: catalog.recent_pulls(repo, limit)?,
@@ -156,19 +154,6 @@ pub async fn pulls_on_lan(catalog: &Arc<Catalog>, repo: RepoRowId) -> Result<u64
             .await?
             .pulls_on_lan(),
     )
-}
-
-/// Runs catalog work off the reactor: the catalog is a file, so every read and write of it
-/// belongs on a blocking thread.
-async fn on_catalog<T, F>(work: F) -> Result<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> std::result::Result<T, IndexError> + Send + 'static,
-{
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|_| MirrorError::Index(IndexError::TaskJoin))?
-        .map_err(MirrorError::Index)
 }
 
 #[cfg(test)]
