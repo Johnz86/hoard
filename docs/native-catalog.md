@@ -173,6 +173,10 @@ of the shallowest README in each revision.
   or that feature and never reaches the binary.
 - A query answers from the published index even when a rescan has logged changes no refresh
   has applied, and says so with `stale`; only a catalog with no index at all is refused.
+- The Hub and git faces read the catalog: repository metadata, trees, paths-info, commits,
+  listings, file locations by path and by content hash, and the clone directory the git face
+  serves. A file the mirror fetches from upstream is filed under the mirror source as a
+  served entry with its hashes, and classified when its name makes it an artifact.
 - Every transaction that touches an artifact logs its id to a search change table;
   refresh_search replays the log after a durable cursor, one Tantivy commit per batch,
   deleting the artifact's documents by term and re-adding its entries, and prunes what it
@@ -386,9 +390,11 @@ than a correctness one.
 
 ## Remaining replacement work
 
-- Move what is still on SQLite to the catalog: the SQLite scan and its hashing, the Hub and
-  git faces' own lookups, the mirror's ingest and served state, nodes, peers and gossip, and
-  `hoard doctor`'s node check; then remove SQLite.
+- Move what is still on SQLite to the catalog: the SQLite scan and its hashing, nodes, peers
+  and gossip, and `hoard doctor`'s node check; then remove SQLite.
+- A peer pull still records its repository and revision in SQLite before it fetches, so the
+  mirror no longer finds them in the index and probes the peer for the commit it already
+  knows. Moving the pull path to the catalog removes both round trips.
 - Convert the existing Store/Connection API and live scanner, mirror, cache eviction,
   gossip, watch and CLI callers to native transactions.
 - Path identities hash the text to_string_lossy renders; discovery currently never yields

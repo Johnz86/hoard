@@ -9,16 +9,12 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use hoard_core::{CommitSha, NodeId, RepoId, RepoRowId, RepoType, Sha256, State as ArtifactState};
+use hoard_core::{CommitSha, RepoId, RepoType, Sha256, State as ArtifactState};
+use hoard_index::catalog::{Catalog, SeedEntry, SeedRepository, SeedRevision};
 use hoard_index::config::SourceKind;
 use hoard_index::store::Store;
-use hoard_index::store::blob::{set_sha256, upsert_blob};
-use hoard_index::store::entry::{NewEntry, upsert_entry};
-use hoard_index::store::node::{NewNode, upsert_node};
-use hoard_index::store::repo::{NewRepo, upsert_repo};
-use hoard_index::store::revision::{NewRevision, RefKind, upsert_ref, upsert_revision};
+use hoard_index::store::revision::RefKind;
 
-use crate::api::common::Conn;
 use crate::config::HoardConfig;
 use crate::state::AppState;
 use crate::{git, hub};
@@ -70,10 +66,6 @@ fn seeded() -> World {
     let head = git(&clone, &["rev-parse", "HEAD"]).trim().to_owned();
 
     let store = Store::open_in_memory().expect("store opens");
-    {
-        let conn = store.write().expect("writer");
-        seed(&conn, &clone.join(".git"));
-    }
     let mut config = HoardConfig::default();
     config.server.data_dir = dir.path().to_path_buf();
     config.index.data_dir = dir.path().to_path_buf();
@@ -81,6 +73,7 @@ fn seeded() -> World {
     config.mirror.cache_root = Some(dir.path().join("repos"));
     config.mirror.offline = true;
     let catalog = crate::testing::empty_catalog(dir.path(), "test");
+    seed_catalog(&catalog, &clone.join(".git"));
     World {
         state: AppState::new(config, store, catalog).expect("state builds"),
         head,
@@ -92,65 +85,57 @@ fn at() -> Timestamp {
     "2026-09-04T09:10:00Z".parse().expect("timestamp parses")
 }
 
-fn seed(conn: &Conn, git_dir: &Path) {
-    let node = upsert_node(
-        conn,
-        &NewNode::local(NodeId::new("workstation-1").expect("id"), "workstation"),
-    )
-    .expect("node");
-    let clone = upsert_repo(
-        conn,
-        &NewRepo {
-            git_dir: Some(git_dir.to_path_buf()),
-            ..NewRepo::new(
-                RepoId::parse_ref(RepoType::Models, CLONE_REPO).expect("reference"),
-                node,
-                SourceKind::Git,
-            )
-        },
-    )
-    .expect("repo");
-    let revision = upsert_revision(
-        conn,
-        &NewRevision::new(clone, CommitSha::from_bytes(LFS_REVISION)),
-    )
-    .expect("revision");
-    upsert_ref(conn, clone, "main", RefKind::Branch, revision).expect("ref");
-    let blob = upsert_blob(conn, "xxh3:lfs", LFS_SIZE, at()).expect("blob");
-    set_sha256(conn, blob, Sha256::from_bytes(LFS_SHA256), None, at()).expect("hash");
-    upsert_entry(
-        conn,
-        &NewEntry {
-            blob: Some(blob),
-            abs_path: Some(git_dir.to_string_lossy().into_owned()),
-            size: LFS_SIZE,
-            state: ArtifactState::Served,
-            ..NewEntry::new(revision, LFS_PATH, node)
-        },
-        at(),
-    )
-    .expect("entry");
-
-    cache_repo(conn, node);
-}
-
-fn cache_repo(conn: &Conn, node: i64) -> RepoRowId {
-    let repo = upsert_repo(
-        conn,
-        &NewRepo::new(
-            RepoId::parse_ref(RepoType::Models, CACHE_REPO).expect("reference"),
-            node,
-            SourceKind::HfCache,
-        ),
-    )
-    .expect("repo");
-    let revision = upsert_revision(
-        conn,
-        &NewRevision::new(repo, CommitSha::from_bytes([0x66; 20])),
-    )
-    .expect("revision");
-    upsert_ref(conn, repo, "main", RefKind::Branch, revision).expect("ref");
-    repo
+/// The two repositories the git face is asked about: the clone it can serve and the cache
+/// snapshot it must refuse.
+fn seed_catalog(catalog: &Catalog, git_dir: &Path) {
+    catalog
+        .seed(&[
+            SeedRepository {
+                repo: RepoId::parse_ref(RepoType::Models, CLONE_REPO).expect("reference"),
+                source: "clones".to_owned(),
+                kind: SourceKind::Git,
+                root_path: git_dir
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| git_dir.to_path_buf()),
+                git_dir: Some(git_dir.to_path_buf()),
+                revisions: vec![SeedRevision {
+                    name: "main".to_owned(),
+                    sha: Some(CommitSha::from_bytes(LFS_REVISION)),
+                    refs: vec![("main".to_owned(), RefKind::Branch)],
+                    title: None,
+                    author: None,
+                    committed: Some(at()),
+                    entries: vec![SeedEntry {
+                        rel_path: LFS_PATH.to_owned(),
+                        abs_path: Some(git_dir.to_string_lossy().into_owned()),
+                        size: LFS_SIZE,
+                        state: ArtifactState::Served,
+                        is_symlink: false,
+                        sha256: Some(Sha256::from_bytes(LFS_SHA256)),
+                        git_sha1: None,
+                        artifact: None,
+                    }],
+                }],
+            },
+            SeedRepository {
+                repo: RepoId::parse_ref(RepoType::Models, CACHE_REPO).expect("reference"),
+                source: "cache".to_owned(),
+                kind: SourceKind::HfCache,
+                root_path: git_dir.to_path_buf(),
+                git_dir: None,
+                revisions: vec![SeedRevision {
+                    name: "main".to_owned(),
+                    sha: Some(CommitSha::from_bytes([0x66; 20])),
+                    refs: vec![("main".to_owned(), RefKind::Branch)],
+                    title: None,
+                    author: None,
+                    committed: Some(at()),
+                    entries: Vec::new(),
+                }],
+            },
+        ])
+        .expect("the catalog seeds");
 }
 
 fn router(state: &AppState) -> Router {

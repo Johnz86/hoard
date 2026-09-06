@@ -256,8 +256,9 @@ the usage the Hub logs and the USAGE tab reads, the loadouts every loadout route
 `hoard loadout` store and resolve, every job a scan, apply or pull runs under, and the
 sources listing with the counts its last scan wrote and the files it still owes a hash. The
 catalog hashes its own files, inline when the scan asks for it and by a background pass
-otherwise. The SQLite scan and its hashing, nodes and peers, the Hub and git faces' own
-lookups, the mirror's ingest and gossip still read SQLite.
+otherwise. The Hub and git faces read it too, and the mirror holds it rather than the store:
+a file it fetches from upstream is filed there as a served entry. The SQLite scan and its
+hashing, nodes and peers, the pull path and gossip still read SQLite.
 
 Nodes:
 
@@ -270,8 +271,7 @@ mDNS _hoard._tcp -> peers table -> periodic GET /api/v1/peers/digest?since=curso
 ## Storage
 
 - Index: `<data-dir>/hoard.db` (SQLite WAL), recreatable from disk plus peers. What is left
-  in it: nodes and peers, and the rows the SQLite scan, the Hub and git faces, the mirror's
-  ingest and gossip still read.
+  in it: nodes and peers, and the rows the SQLite scan, the pull path and gossip still read.
 - Native catalog: `<data-dir>/native/`, holding `catalog.redb` plus `search-v1-<nanos>/`
   Tantivy directories. Beside the scanned sources, repositories, artifacts, entries and
   search text it holds the user data those screens read: shelves (the six builtin ones

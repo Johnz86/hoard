@@ -20,8 +20,6 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 
 use hoard_core::{RepoId, RepoType, Sha256, clean_repo_path};
-use hoard_index::store::node::local_node;
-use hoard_index::store::repo::repo_by_qualified;
 use hoard_mirror::git::{
     ADVERTISEMENT_CONTENT_TYPE, BatchRequest, CACHE_CONTROL, GitService, PUSH_REFUSED,
     RESULT_CONTENT_TYPE, advertise_refs, build_batch_response, is_clonable, lfs_batch,
@@ -30,6 +28,7 @@ use hoard_mirror::git::{
 
 use crate::error::{HubError, HubResult};
 use crate::hub::files::locate_contents;
+use crate::hub::on_catalog;
 use crate::state::AppState;
 
 /// The leading path segments of a repo reference, named as the Hub face names them so both
@@ -124,7 +123,7 @@ pub(crate) async fn batch(
     let mut wanted: Vec<Sha256> = request.objects.iter().map(|object| object.oid).collect();
     wanted.sort_unstable();
     wanted.dedup();
-    let located = locate_contents(state.store(), wanted).await?;
+    let located = locate_contents(state.catalog(), wanted).await?;
     let answer = build_batch_response(&request, state.public_url(), &|oid| {
         located.get(oid).cloned()
     });
@@ -168,17 +167,11 @@ async fn clone_dir(state: &AppState, params: &HashMap<String, String>) -> HubRes
 /// The clone directory of a repository this node can serve on the git face, or the
 /// documented 404 when it holds the repository some other way or not at all.
 async fn require_repo(state: &AppState, repo: &RepoId) -> HubResult<Option<PathBuf>> {
-    let qualified = repo.qualified();
-    let found = state
-        .store()
-        .call(move |conn| {
-            let node = local_node(conn)?;
-            Ok(repo_by_qualified(conn, &qualified, node.id)?.map(|row| (row.kind, row.git_dir)))
-        })
-        .await?;
+    let wanted = repo.clone();
+    let found = on_catalog(state.catalog(), move |catalog| catalog.repository(&wanted)).await?;
     match found {
-        Some((kind, git_dir)) if is_clonable(kind) => Ok(git_dir),
-        _ => Err(HubError::page_not_found()),
+        Some(record) if is_clonable(record.kind) => Ok(record.git_dir.map(PathBuf::from)),
+        Some(_) | None => Err(HubError::page_not_found()),
     }
 }
 
