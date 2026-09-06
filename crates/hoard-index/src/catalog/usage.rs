@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 
 use jiff::{Span, Timestamp, tz::TimeZone};
 use serde::Serialize;
@@ -40,6 +41,10 @@ impl UsageEvent {
         }
     }
 }
+
+/// The `YYYY-MM-DD` prefix a usage row's timestamp starts with, which is the day it counts
+/// towards.
+const DATE_WIDTH: usize = 10;
 
 /// One bar of the seven day usage chart.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -181,58 +186,28 @@ impl Catalog {
     /// Pull counts per UTC day for the last `days` days, ending today and including the
     /// days nobody pulled on, oldest first.
     pub fn usage_days(&self, repo: RepoRowId, days: u32) -> Result<Vec<UsageDay>> {
-        let days = days.max(1);
-        let today = Timestamp::now().to_zoned(TimeZone::UTC).date();
-        let logged = self.usage_of(repo)?;
-        let mut window = Vec::with_capacity(days as usize);
-        for offset in (0..days).rev() {
-            let date = today
-                .checked_sub(Span::new().days(i64::from(offset)))
-                .map_err(|error| IndexError::Catalog(format!("usage window: {error}")))?
-                .to_string();
-            let pulls = logged
-                .iter()
-                .filter(|row| row.at.starts_with(&date))
-                .count() as u64;
-            window.push(UsageDay { date, pulls });
-        }
-        Ok(window)
+        day_window(&self.usage_of(repo)?, days)
     }
 
     /// The most recent pulls of a repository, newest first.
     pub fn recent_pulls(&self, repo: RepoRowId, limit: u32) -> Result<Vec<PullRow>> {
-        let mut logged = self.usage_of(repo)?;
-        logged.sort_by(|left, right| {
-            right
-                .at
-                .cmp(&left.at)
-                .then_with(|| right.seq.cmp(&left.seq))
-        });
-        logged.truncate(limit as usize);
-        logged
-            .into_iter()
-            .map(|row| {
-                Ok(PullRow {
-                    when: row.at.parse().map_err(|error| {
-                        IndexError::Catalog(format!("usage row {} has no time: {error}", row.seq))
-                    })?,
-                    who: row.client,
-                    what: row.path,
-                    bytes: row.bytes,
-                    rate_bps: row.rate_bps,
-                })
-            })
-            .collect()
+        newest_pulls(self.usage_of(repo)?, limit)
     }
 
     /// How many different clients pulled from a repository.
     pub fn distinct_clients(&self, repo: RepoRowId) -> Result<u64> {
-        let clients: HashSet<String> = self
-            .usage_of(repo)?
-            .into_iter()
-            .filter_map(|row| row.client)
-            .collect();
-        Ok(clients.len() as u64)
+        Ok(distinct_clients_of(&self.usage_of(repo)?))
+    }
+
+    /// Everything the USAGE tab draws for one repository, from one read of its log rather
+    /// than the three the three views used to take separately.
+    pub fn usage_report(&self, repo: RepoRowId, days: u32, limit: u32) -> Result<UsageReport> {
+        let rows = self.usage_of(repo)?;
+        Ok(UsageReport {
+            days: day_window(&rows, days)?,
+            clients: distinct_clients_of(&rows),
+            pulls: newest_pulls(rows, limit)?,
+        })
     }
 
     fn usage_of(&self, repo: RepoRowId) -> Result<Vec<Usage>> {
@@ -245,6 +220,73 @@ impl Catalog {
         rows.retain(|row| row.repo_id == Some(repo.get()));
         Ok(rows)
     }
+}
+
+/// The pulls per day, the recent pulls and the client count of one repository, which is
+/// what the USAGE tab shows and what the `pulls on lan` fact counts.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UsageReport {
+    pub days: Vec<UsageDay>,
+    pub pulls: Vec<PullRow>,
+    pub clients: u64,
+}
+
+/// The last `days` UTC days, oldest first, counted in one pass over the log rather than one
+/// pass per day.
+fn day_window(rows: &[Usage], days: u32) -> Result<Vec<UsageDay>> {
+    let days = days.max(1);
+    let today = Timestamp::now().to_zoned(TimeZone::UTC).date();
+    let mut counted: HashMap<&str, u64> = HashMap::with_capacity(days as usize);
+    for row in rows {
+        let date = row.at.get(..DATE_WIDTH).unwrap_or(row.at.as_str());
+        *counted.entry(date).or_default() += 1;
+    }
+    let mut window = Vec::with_capacity(days as usize);
+    for offset in (0..days).rev() {
+        let date = today
+            .checked_sub(Span::new().days(i64::from(offset)))
+            .map_err(|error| IndexError::Catalog(format!("usage window: {error}")))?
+            .to_string();
+        let pulls = counted.get(date.as_str()).copied().unwrap_or_default();
+        window.push(UsageDay { date, pulls });
+    }
+    Ok(window)
+}
+
+/// The newest `limit` rows, newest first, kept in a heap so the whole log is never sorted.
+fn newest_pulls(rows: Vec<Usage>, limit: u32) -> Result<Vec<PullRow>> {
+    let limit = (limit as usize).min(rows.len());
+    let mut kept: BinaryHeap<Reverse<(String, u64, usize)>> = BinaryHeap::with_capacity(limit + 1);
+    for (index, row) in rows.iter().enumerate() {
+        kept.push(Reverse((row.at.clone(), row.seq, index)));
+        if kept.len() > limit {
+            kept.pop();
+        }
+    }
+    let mut ordered = kept.into_sorted_vec();
+    ordered.reverse();
+    ordered
+        .into_iter()
+        .map(|Reverse((_, seq, index))| {
+            let row = &rows[index];
+            Ok(PullRow {
+                when: row.at.parse().map_err(|error| {
+                    IndexError::Catalog(format!("usage row {seq} has no time: {error}"))
+                })?,
+                who: row.client.clone(),
+                what: row.path.clone(),
+                bytes: row.bytes,
+                rate_bps: row.rate_bps,
+            })
+        })
+        .collect()
+}
+
+fn distinct_clients_of(rows: &[Usage]) -> u64 {
+    rows.iter()
+        .filter_map(|row| row.client.as_deref())
+        .collect::<HashSet<&str>>()
+        .len() as u64
 }
 
 /// When an artifact was last served, read from a snapshot a caller already holds.

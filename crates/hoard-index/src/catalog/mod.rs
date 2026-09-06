@@ -51,7 +51,7 @@ pub use self::scan::RescanReport;
 pub use self::search::{QueryPage, QueryRequest};
 #[cfg(any(test, feature = "fixtures"))]
 pub use self::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
-pub use self::usage::{ArtifactUsage, PullRow, UsageDay, UsageEvent};
+pub use self::usage::{ArtifactUsage, PullRow, UsageDay, UsageEvent, UsageReport};
 pub use self::userdata::{NewProjection, NoiseRecord, ProjectionRecord, ShelfRecord};
 pub use self::verdict::OverrideRecord;
 

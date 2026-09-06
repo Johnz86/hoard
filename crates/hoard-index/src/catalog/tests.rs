@@ -4693,6 +4693,55 @@ fn usage_is_logged_summarised_and_reaches_the_used_token() -> Result<()> {
 }
 
 #[test]
+fn a_usage_window_counts_only_the_days_it_shows() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    let row = catalog
+        .artifact_row(ids.lora)?
+        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
+    let midday = jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date()
+        .at(12, 0, 0, 0)
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .map_err(|error| IndexError::Catalog(format!("noon: {error}")))?
+        .timestamp();
+    let mut events = Vec::with_capacity(500);
+    for index in 0..500_u32 {
+        let at = midday - std::time::Duration::from_secs(u64::from(index % 40) * 86_400);
+        events.push(UsageEvent {
+            client: Some(format!("client{}", index % 3)),
+            repo: Some(row.repo_id),
+            artifact: Some(row.artifact_id),
+            bytes: u64::from(index),
+            ..UsageEvent::new("keep.safetensors", at)
+        });
+    }
+    catalog.log_usage_batch(&events)?;
+
+    let window = catalog.usage_days(row.repo_id, 7)?;
+    assert_eq!(window.len(), 7);
+    let inside: u64 = (0..500_u32).filter(|index| index % 40 < 7).count() as u64;
+    assert_eq!(
+        window.iter().map(|day| day.pulls).sum::<u64>(),
+        inside,
+        "only the seven days the chart draws are counted: {window:?}"
+    );
+    for (offset, day) in window.iter().rev().enumerate() {
+        let expected = (0..500_u32)
+            .filter(|index| usize::try_from(index % 40).unwrap_or(usize::MAX) == offset)
+            .count() as u64;
+        assert_eq!(day.pulls, expected, "day {offset} of the window");
+    }
+
+    let report = catalog.usage_report(row.repo_id, 7, 20)?;
+    assert_eq!(report.days, window, "one load answers the same window");
+    assert_eq!(report.clients, catalog.distinct_clients(row.repo_id)?);
+    assert_eq!(report.pulls, catalog.recent_pulls(row.repo_id, 20)?);
+    assert_eq!(report.pulls.len(), 20);
+    Ok(())
+}
+
+#[test]
 fn a_usage_batch_writes_every_row_and_one_change_per_artifact() -> Result<()> {
     let (_directory, catalog, ids) = seeded_catalog()?;
     catalog.refresh_search(|_| {})?;

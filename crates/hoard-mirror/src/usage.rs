@@ -180,10 +180,11 @@ pub async fn usage_summary(
     limit: u32,
 ) -> Result<UsageSummary> {
     on_catalog(catalog, move |catalog| {
+        let report = catalog.usage_report(repo, days.max(1), limit)?;
         Ok(UsageSummary {
-            days: catalog.usage_days(repo, days.max(1))?,
-            pulls: catalog.recent_pulls(repo, limit)?,
-            clients: catalog.distinct_clients(repo)?,
+            days: report.days,
+            pulls: report.pulls,
+            clients: report.clients,
         })
     })
     .await

@@ -452,17 +452,16 @@ pub async fn repo_usage(
     let catalog = Arc::clone(state.catalog());
     let view = blocking(move || {
         let record = require_repository(&catalog, &repo)?;
-        let days = catalog.usage_days(record.id, USAGE_DAYS)?;
-        let pulls: Vec<PullView> = catalog
-            .recent_pulls(record.id, RECENT_PULLS)?
-            .into_iter()
-            .map(|pull| pull_view(pull, now))
-            .collect();
+        let report = catalog.usage_report(record.id, USAGE_DAYS, RECENT_PULLS)?;
         Ok(UsageView {
-            total: days.iter().map(|day| day.pulls).sum(),
-            days,
-            pulls,
-            clients: catalog.distinct_clients(record.id)?,
+            total: report.days.iter().map(|day| day.pulls).sum(),
+            days: report.days,
+            pulls: report
+                .pulls
+                .into_iter()
+                .map(|pull| pull_view(pull, now))
+                .collect(),
+            clients: report.clients,
         })
     })
     .await?;
