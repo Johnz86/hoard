@@ -19,7 +19,7 @@ pub enum CompareOp {
 }
 
 impl CompareOp {
-    /// The grammar spelling, which is also the SQL operator.
+    /// The grammar spelling.
     pub const fn as_str(self) -> &'static str {
         match self {
             CompareOp::Lt => "<",
@@ -138,7 +138,7 @@ impl fmt::Display for TokenKind {
 /// One filter as typed, with everything the strip renders and the compiler binds.
 ///
 /// `value` keeps the user's spelling; `normalized` and `values` carry the canonical form the
-/// SQL compiler binds, comma-OR expanded.
+/// query compiler binds, comma-OR expanded.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub raw: String,

@@ -27,8 +27,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Maintain the native catalog: scan into a directory, search it, report status,
-    /// rebuild its search index or compact it. One process at a time.
+    /// Maintain the native catalog: scan into a directory, search it, report status or
+    /// rebuild its search index. One process at a time.
     Catalog {
         #[command(subcommand)]
         command: catalog::CatalogCommand,

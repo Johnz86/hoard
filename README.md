@@ -2,16 +2,18 @@
 
 Local HuggingFace-compatible mirror and artifact index. Hoard discovers model, dataset and
 repository files across local disks, identifies them from their tensor headers, and indexes
-them in a native catalog (a redb database with a Tantivy search index). It serves that
-index through the HuggingFace Hub API, git over HTTP, and a
-dense web UI, proxying and block-caching `huggingface.co` for repos it doesn't hold
-locally. Nodes find each other on the LAN, gossip their index and pull artifacts peer to
-peer; loadouts pin a checkpoint plus its adapters and auxiliaries as a portable text file,
-applied to a node as symlinks.
+them in a native catalog: a redb database of typed records with a Tantivy search index
+rebuildable from those records alone. It serves that index through the HuggingFace Hub API,
+git over HTTP and a dense web UI, proxying and block-caching `huggingface.co` for repos it
+does not hold locally. Nodes find each other on the LAN, gossip their index and pull
+artifacts peer to peer; loadouts pin a checkpoint plus its adapters and auxiliaries as a
+portable text file, applied to a node as symlinks.
 
 - `docs/use-case.md`: designer's brief
 - `docs/feature-plan.md`: scope, phases, acceptance criteria
 - `docs/architecture.md`: stack, crate layout, data flow
+- `docs/native-catalog.md`: the catalog's layout, modules, grammar and measured numbers
+- `docs/handoff.md`: repository state, how the agentic loop is run, outstanding work
 - `docs/api/hub-compat.md`: HuggingFace Hub routes and error contract
 - `docs/api/hoard-api.md`: `/api/v1` JSON API for the UI and CLI
 - `docs/design/ui-spec.md`: UI tokens, layout and keyboard map from the design handoff
@@ -19,10 +21,16 @@ applied to a node as symlinks.
 
 ## Agentic development
 
-`CLAUDE.md` imports `AGENTS.md` and points at the docs above. `.claude/` holds the
-project settings (permission allowlist, rustfmt hook, enabled plugins), path-scoped rules
-for `crates/` and `web/`, the `/hoard-verify` and `/hoard-next-phase` skills, and the
-`rust-reviewer` agent. Start a phase with `/hoard-next-phase`.
+`CLAUDE.md` imports `AGENTS.md`, points at the docs above and states the compatibility
+policy. `.claude/` holds the project settings (permission allowlist, rustfmt hook, enabled
+plugins), path-scoped rules for `crates/` and `web/`, seven skills and three agents.
+
+Work runs as waves: write a plan with `/hoard-write-plan`, dispatch the `wave-implementer`
+agent with the plan path and the commit trailers, run `/hoard-verify`, then dispatch
+`perf-reviewer` or `rust-reviewer`. `/hoard-next-phase` starts a phase from
+`docs/feature-plan.md`; `/hoard-catalog`, `/hoard-measure` and `/hoard-perf-review` carry the
+catalog knowledge, the measurement protocol and the performance checklist. `docs/handoff.md`
+describes the loop in full.
 
 ## Build
 

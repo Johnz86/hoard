@@ -47,14 +47,14 @@ Toolchain: Rust 1.95 stable, edition 2024, workspace resolver 3.
 | Sizes | `humansize` | 2.1 | `228 MB`, `26.4 GB` in mono columns. |
 | LAN discovery | `mdns-sd` | 0.16 | `_hoard._tcp` advertisement and browsing in `hoard-net`. |
 | CRC | `crc32fast` | 1.5 | The per-chunk CRC32 of the olah block-cache format. |
-| Tests | `tempfile`, `wiremock`, `insta`, `mockall`, `criterion` | 3.27, 0.6, 1.48, 0.15, 0.8 | Temp trees, mocked upstream and peers, snapshots of API JSON, benches. |
+| Tests | `tempfile`, `wiremock` | 3.27, 0.6 | Temp trees, mocked upstream and peers. `mockall` and `criterion` are declared in the root manifest and no crate uses them yet. |
 
 Not chosen and why:
 
-- `rusqlite`: SQLite was the first index and was replaced. It takes one writer per file,
-  its schema lives in SQL beside the types rather than in them, and its FTS5 index cannot be
-  rebuilt without rewriting the rows it indexes; see
-  `docs/superpowers/specs/2026-09-05-native-catalog-decision.md`.
+- `rusqlite`: SQLite was the first index and was replaced by the native catalog. It takes
+  one writer per file, its schema lives in SQL beside the types rather than in them, and its
+  FTS5 index cannot be rebuilt without rewriting the rows it indexes; see
+  `docs/superpowers/specs/2026-09-05-native-catalog-decision.md`. No SQLite code remains.
 - `git2`: links libgit2; `gix` is pure Rust and read paths are all the index needs.
 - `tantivy` alone: it is a search index, not a store. It is used beside `native_db`; see
   `docs/superpowers/specs/2026-09-05-native-catalog-decision.md` for why that pairing was
@@ -94,10 +94,15 @@ hoard/
     use-case.md              designer's brief
     feature-plan.md          scope, phases, acceptance, status table
     architecture.md          this file
+    native-catalog.md        the catalog's layout, modules and measured numbers
+    handoff.md               repository state, the agentic loop, outstanding work
     api/hub-compat.md        HuggingFace Hub routes, derived from olah
     api/hoard-api.md         /api/v1 JSON contract for UI and CLI
     design/ui-spec.md        tokens, layout, columns, keys extracted from the design
     design/handoff/          Claude Design export, verbatim
+    superpowers/specs/       decision records
+    superpowers/research/    dependency research notes
+    superpowers/history/     condensed record of finished work
   src/
     main.rs                  clap entry
     cli/                     serve, scan, ls, path, loadout, apply, link, node, doctor
@@ -121,20 +126,22 @@ hoard/
           git_clone.rs       clones with LFS pointers
           loose.rs           bare folders and known tool layouts
         sniff/
-          safetensors.rs     header and __metadata__ via memmap
-          gguf.rs            metadata via ggus
+          safetensors.rs     header and __metadata__ via bounded File reads
+          gguf.rs            metadata via the hand-written v2/v3 header parser
           pickle.rs          zip listing for .ckpt/.pt/.pth/.bin
           readme.rs          frontmatter and body
           dataset.rs         parquet, arrow, jsonl, csv
         infer/
           rules.rs           key prefix and shape signature tables
           role.rs  base.rs  lora.rs  precision.rs  trigger.rs
-        triage.rs            queue, confirm, reject, noise list
         hash/                fingerprint, sha256, git blob sha1
         catalog/             the native_db + Tantivy catalog: the index
           mod.rs             Catalog open/status/integrity, format version, storage report
-          models.rs          native_model records: Source, Repository, ArtifactRecord, Entry, SearchChange, SearchText, Manifest
-          scan.rs            discovery -> sniff -> infer -> one transaction per source
+          models.rs          native_model records: Source, Repository, Revision, ArtifactRecord,
+                             ArtifactDetail, Entry, SearchText, SearchChange, Manifest,
+                             Summary, Allocator, Node and the user-data rows
+          scan.rs            discovery -> sniff -> infer -> one transaction per unit;
+                             Counters, DerivedShift, log_changes, the artifact sweep
           naming.rs          the config and card a revision carries, artifact names, file hashes
           search.rs          Tantivy schema, rebuild, per-entry documents collapsed per artifact
           query.rs           the grammar compiled against the Tantivy index
@@ -158,7 +165,9 @@ hoard/
           context.rs         sort keys, compat targets, the context a query compiles against
           facets.rs          per-dimension counts excluding own key, disk pressure
         shard.rs             groups a model split across files into one artifact
+        triage.rs            queue, confirm, reject, noise list
         watch.rs             notify-driven incremental rescans
+      tests/scale.rs         ignored harness: 100k and 1M synthetic entries
     hoard-mirror/            serving faces and upstreams, transport-agnostic
       src/
         config.rs            MirrorConfig: upstreams, cache root, rules, offline, xet
@@ -193,22 +202,24 @@ hoard/
         error.rs             NetError
     hoard-server/            axum wiring only
       src/
-        state.rs  error.rs  layers.rs  assets.rs  testing.rs (test-only fixtures)
-        hub/                 Hub-compatible routes
-          mod.rs  meta.rs  files.rs  proxy.rs
+        state.rs  config.rs  error.rs  layers.rs  assets.rs
+        testing.rs           test-only fixtures
+        hub/                 Hub-compatible routes: mod.rs meta.rs files.rs proxy.rs
         git/                 git smart HTTP and LFS routes (mod.rs)
-        api/                 /api/v1: search, compat, artifacts, repos, readme, shelves,
-                             loadouts, triage, sources, jobs, nodes, usage, link, apply, stats
+        api/                 /api/v1: search.rs compat.rs artifacts.rs repos.rs shelves.rs
+                             loadouts.rs triage.rs jobs.rs nodes.rs link.rs system.rs
+                             common.rs
         ui/                  embedded web/ and index.html fallback
   web/
     index.html
     css/tokens.css  css/hoard.css  vendor/pico.min.css  fonts/
     js/
-      app.js  api.js  search.js  facets.js  table.js  cards.js  inspector.js
+      app.js  api.js  dom.js  search.js  facets.js  table.js  cards.js  inspector.js
       detail.js  readme.js  loadout.js  shelves.js  nodes.js  jobs.js  keys.js  theme.js
-  tests/                     end-to-end: temp tree, router, Hub and git clients
-  benches/                   walker, grammar, facets
 ```
+
+End-to-end tests live beside the code they cover, in `tests.rs` modules under
+`crates/hoard-server/src/{api,hub,git}/`, driven by the `fixtures` feature of `hoard-index`.
 
 Dependency direction is strict: `hoard-core` <- `hoard-index` <- `hoard-mirror` <-
 `hoard-net` <- `hoard-server` <- `hoard`. No crate below `hoard-server` knows about axum.
@@ -289,8 +300,10 @@ mDNS _hoard._tcp -> node records -> periodic GET /api/v1/peers/digest?since=curs
   Every command that opens the index opens or creates it there, and `hoard scan` and the
   `/api/v1/scan` job rescan and refresh it; the server holds it as shared state. `hoard
   catalog` still takes any directory with `--directory`. A catalog has one format,
-  `catalog::FORMAT_VERSION`; a directory written in another is removed and scanned again.
+  `catalog::FORMAT_VERSION`, and a directory written in another is removed and scanned again
+  rather than converted; the "Compatibility" section of `CLAUDE.md` is the policy, and
+  `docs/native-catalog.md` describes the layout and the modules.
 - Mirror cache: `<data-dir>/repos/` in the olah layout (`docs/api/hub-compat.md`).
 - Projections: symlinks written by `hoard link` and `hoard apply`, tracked in the native
-  catalog so PATHS ON DISK can show `laptop · symlink`.
+  catalog so PATHS ON DISK can name the node and the link kind.
 - Config: `hoard.toml`; secrets only in `.env` (`HF_TOKEN`, `HOARD_NODE_TOKEN`).

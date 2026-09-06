@@ -21,7 +21,7 @@ speak. Sources: `docs/use-case.md` (brief), `docs/design/ui-spec.md` and
 | 8 | Nodes: discovery, gossip, peer pulls | done | M3 |
 | 9 | Shelves, loadouts, projection, usage | done | M4 Make it usable |
 | 10 | Live index and polish | partial | M4 |
-| 11 | Native catalog (native_db + Tantivy) | partial | experimental |
+| 11 | Native catalog (native_db + Tantivy) | partial | M1 |
 
 Tick a phase only when its acceptance check passes and `/hoard-verify` is clean.
 
@@ -41,11 +41,10 @@ Phase 10 is partial: the `notify` watcher, PyTorch zip key extraction and datase
 are in; the TREE and DISK views are not. `docs/design/ui-spec.md` records them as named in
 the proposal but absent from the prototype, so there is no design to build them from.
 
-Phase 11 is an experimental vertical slice behind `hoard catalog`; see
-`docs/native-catalog.md`. It is accepted for its own commands only when a scan of this
-workstation's HuggingFace cache yields the same artifact count, names and triage set as
-`hoard scan`, and when native search answers the exact-field queries the doc lists.
-Converting `serve` and the live store is not scheduled.
+Phase 11 replaced the SQLite index with the native catalog and is merged: every command,
+every route, both faces and gossip read and write it, and no SQLite code remains. It stays
+partial because of the items under "Remaining work" in `docs/native-catalog.md`, chiefly the
+per-entry record size at a million artifacts and the unbounded collapse path.
 
 ## Goals
 
@@ -258,11 +257,13 @@ docs, Claude Code project configuration.
 - `hoard-core`: `RepoId`, `RepoType`, `CommitSha`, `Sha256`, `BlobId`, `ArtifactId`,
   `NodeId`, `Role` with sub-roles and aliases, `Base`, `ArtifactFormat`, `Precision`,
   `State`, `Evidence`, `HoardError`.
-- `hoard-index::store`: schema for node, source, blob, artifact, tensor_summary, repo,
-  revision, ref, entry, override, noise, shelf, loadout, job, usage; migrations; typed
-  insert and query functions.
-- Accept: unit tests round-trip a synthetic repo with two revisions and a duplicate blob;
-  `insta` snapshot of the schema; role alias table parses every alias from the design.
+- `hoard-index::catalog`: the `native_model` records for node, source, artifact, tensor
+  summary, repository, revision, entry, override, noise, shelf, loadout, job and usage, the
+  secondary indexes over them, and typed request and response types so no caller names a
+  native_db or Tantivy type. One shape per record and no migrations; see the
+  "Compatibility" section of `CLAUDE.md`.
+- Accept: unit tests round-trip a synthetic repo with two revisions and a duplicate blob and
+  survive a process reopen; role alias table parses every alias from the design.
 
 ### Phase 2: Discovery and sniffing
 
@@ -276,7 +277,7 @@ docs, Claude Code project configuration.
 ### Phase 3: Inference, triage and search
 
 - Role, base, rank, precision, trigger words with evidence and confidence; triage confirm
-  and reject; grammar parser; SQL compilation; facets; compat; `hoard ls`.
+  and reject; grammar parser; compilation to a Tantivy query; facets; compat; `hoard ls`.
 - Accept: synthetic header fixtures for sd15, sdxl, flux and wan checkpoints, LoRAs per
   base, a VAE, a ControlNet, a motion module, an embedding, an ESRGAN upscaler, a GGUF
   llm and an ip-adapter classify with the expected role and base; every grammar row in
@@ -332,6 +333,17 @@ docs, Claude Code project configuration.
 
 - `notify` watcher, PyTorch zip key extraction, ONNX and dataset sniffing, TREE and DISK
   views, `?` key sheet, doctor command.
+
+### Phase 11: Native catalog
+
+- `hoard-index::catalog`: the native_db records, the Tantivy index built and refreshed from
+  them, the grammar compiled against it, and every reader and writer moved onto it. The
+  SQLite store and its FTS5 index are gone.
+- Accept: a scan of this workstation's disks yields the same artifact count, names and triage
+  set the SQLite index gave; `hoard doctor` passes every check; the scale harness meets its
+  thresholds at 1M entries.
+- Remaining: `docs/native-catalog.md` under "Remaining work" holds the open items with their
+  numbers.
 
 ## Risks and open decisions
 

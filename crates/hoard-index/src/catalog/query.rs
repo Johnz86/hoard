@@ -355,8 +355,7 @@ fn cutoff_second(context: &CompileContext, days: i64) -> Result<i64> {
     Ok(cutoff.as_second())
 }
 
-/// Free text: every word has to appear. A fuzzy token also accepts the words as prefixes,
-/// which is what the FTS branch of the SQL compiler buys.
+/// Free text: every word has to appear. A fuzzy token also accepts the words as prefixes.
 fn text_filter(token: &Token, field: Field) -> Box<dyn Query> {
     let words = all_of(
         token
