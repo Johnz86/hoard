@@ -185,12 +185,7 @@ pub(super) fn content_hashes(
     size: u64,
     threshold: u64,
 ) -> Result<(Sha256, Option<GitSha1>)> {
-    let sha256 = hash::sha256_file(path)?;
-    let git_sha1 = match size < threshold {
-        true => Some(hash::git_blob_sha1(path)?),
-        false => None,
-    };
-    Ok((sha256, git_sha1))
+    hash::content_digests(path, size < threshold)
 }
 
 #[cfg(test)]

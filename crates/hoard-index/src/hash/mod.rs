@@ -78,6 +78,43 @@ pub fn sha256_bytes(bytes: &[u8]) -> Sha256 {
     Sha256::from_bytes(finish::<32>(hasher.finalize().as_slice()))
 }
 
+/// The content hashes one file owes, read in a single pass.
+///
+/// A file under the LFS threshold owes both a sha256 and a git blob sha1, and reading it
+/// once for each doubles the bytes the hashing pass moves. Both hashers are fed from the
+/// same 1 MiB buffer instead. The read is an ordinary buffered read: no page cache hint is
+/// given, because no safe wrapper for one is in this workspace's dependency graph.
+pub fn content_digests(path: &Path, want_git_sha1: bool) -> Result<(Sha256, Option<CommitSha>)> {
+    let mut file = File::open(path).map_err(|error| IndexError::io(path, error))?;
+    let size = file
+        .metadata()
+        .map_err(|error| IndexError::io(path, error))?
+        .len();
+    let mut sha256 = Sha256Hasher::new();
+    let mut blob = want_git_sha1.then(|| {
+        let mut hasher = Sha1::new();
+        hasher.update(blob_prefix(size).as_bytes());
+        hasher
+    });
+    let mut buffer = vec![0u8; STREAM_BUFFER];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| IndexError::io(path, error))?;
+        if read == 0 {
+            break;
+        }
+        sha256.update(&buffer[..read]);
+        if let Some(blob) = &mut blob {
+            blob.update(&buffer[..read]);
+        }
+    }
+    Ok((
+        Sha256::from_bytes(finish::<32>(sha256.finalize().as_slice())),
+        blob.map(|blob| CommitSha::from_bytes(finish::<20>(blob.finalize().as_slice()))),
+    ))
+}
+
 /// The git object name of the file, `sha1("blob {len}\0" + bytes)`. This is the `oid` the
 /// Hub returns for files it does not store in LFS.
 pub fn git_blob_sha1(path: &Path) -> Result<CommitSha> {
@@ -205,6 +242,31 @@ mod tests {
             .expect("large file hashes");
         assert_eq!(seen, payload.len() as u64);
         assert_eq!(digest, sha256_bytes(&payload));
+    }
+
+    #[test]
+    fn content_digests_match_the_separate_hashers() {
+        let dir = TempDir::new().expect("temp dir");
+        for (name, payload) in [
+            ("empty.bin", Vec::new()),
+            ("small.bin", b"hoard\n".to_vec()),
+            (
+                "streamed.bin",
+                (0..251u8).cycle().take(STREAM_BUFFER * 2 + 7).collect(),
+            ),
+        ] {
+            let path = write(&dir, name, &payload);
+            let (sha256, git_sha1) = content_digests(&path, true).expect("both digests");
+            assert_eq!(sha256, sha256_file(&path).expect("sha256"), "{name}");
+            assert_eq!(
+                git_sha1,
+                Some(git_blob_sha1(&path).expect("git blob sha1")),
+                "{name}"
+            );
+            let (only_sha256, none) = content_digests(&path, false).expect("one digest");
+            assert_eq!(only_sha256, sha256, "{name}");
+            assert_eq!(none, None, "{name}");
+        }
     }
 
     #[test]

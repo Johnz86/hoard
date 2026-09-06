@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 
 use native_db::transaction::RwTransaction;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
@@ -7,7 +9,7 @@ use serde::Serialize;
 use hoard_core::{GitSha1, Sha256, State};
 
 use crate::config::IndexConfig;
-use crate::error::Result;
+use crate::error::{IndexError, Result};
 
 use super::Catalog;
 use super::models::{
@@ -20,6 +22,9 @@ use super::verdict::apply_override;
 
 /// How many files one hashing pass reads and records at a time.
 const HASH_BATCH: usize = 64;
+
+/// How many digests may wait to be written before a reader has to wait for the writer.
+const DIGEST_QUEUE: usize = 256;
 
 /// What one hashing run did: the files it read, the artifacts two copies of one file
 /// collapsed into, and the files it could not read.
@@ -37,16 +42,45 @@ pub fn content_key(sha: &Sha256) -> u128 {
 }
 
 impl Catalog {
-    /// Hashes every present entry that has no sha256 yet, in batches on a Rayon pool,
-    /// recording a sha256 for each and a git blob sha1 for files under the LFS threshold.
-    /// An artifact identified by its path is re-keyed to its sha256 and merged into an
-    /// artifact that already carries that identity. Returns what it did.
+    /// Hashes every present entry that has no sha256 yet and records what it read.
+    ///
+    /// Reading and writing run at the same time: a Rayon pool reads the files and sends
+    /// each digest down a bounded channel, and one writer drains it and commits every 64
+    /// digests or whenever the channel runs dry, so a multi-gigabyte file holds up nothing
+    /// but itself. An artifact identified by its path is re-keyed to its sha256 and merged
+    /// into an artifact that already carries that identity. Returns what it did.
     pub fn hash_pending(
         &self,
         config: &IndexConfig,
         mut progress: impl FnMut(u64),
     ) -> Result<HashReport> {
         let mut counters = Counters::load(&self.database, config.triage_confidence)?;
+        let mut report = HashReport::default();
+        let (sender, receiver) = mpsc::sync_channel::<Digest>(DIGEST_QUEUE);
+        let recording = &mut counters;
+        let merged = std::thread::scope(|scope| -> Result<u64> {
+            let writing = scope.spawn(move || self.record_digests(receiver, recording));
+            let read = self.read_digests(config, &sender, &mut progress);
+            drop(sender);
+            let merged = writing
+                .join()
+                .map_err(|_| IndexError::Catalog("the digest writer panicked".into()))??;
+            report = read?;
+            Ok(merged)
+        })?;
+        report.merged = merged;
+        self.sweep_artifacts(&mut counters)?;
+        Ok(report)
+    }
+
+    /// Reads every file owing a hash, sending each digest on as it is read. Returns the
+    /// files it read and the files it could not.
+    fn read_digests(
+        &self,
+        config: &IndexConfig,
+        sender: &mpsc::SyncSender<Digest>,
+        progress: &mut impl FnMut(u64),
+    ) -> Result<HashReport> {
         let mut report = HashReport::default();
         let mut after = 0;
         loop {
@@ -55,14 +89,53 @@ impl Catalog {
                 break;
             };
             after = last.id;
-            let digests = hash_batch(&batch, config.lfs_threshold);
-            report.hashed += digests.len() as u64;
-            report.unreadable += (batch.len() - digests.len()) as u64;
-            report.merged += self.record_batch(&digests, &mut counters)?;
+            let sent = AtomicU64::new(0);
+            batch.par_iter().for_each(|(entry, path)| {
+                match content_hashes(path, entry.size, config.lfs_threshold) {
+                    Ok((sha256, git_sha1)) => {
+                        let digest = Digest {
+                            entry_id: entry.id,
+                            sha256,
+                            git_sha1,
+                        };
+                        if sender.send(digest).is_ok() {
+                            sent.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(path = %path.display(), %error, "file is unhashable");
+                    }
+                }
+            });
+            let read = sent.load(Ordering::Relaxed);
+            report.hashed += read;
+            report.unreadable += batch.len() as u64 - read;
             progress(report.hashed);
         }
-        self.sweep_artifacts(&mut counters)?;
         Ok(report)
+    }
+
+    /// Commits digests as they arrive, in batches of at most [`HASH_BATCH`], and returns
+    /// how many artifacts two copies of one file collapsed into.
+    fn record_digests(
+        &self,
+        receiver: mpsc::Receiver<Digest>,
+        counters: &mut Counters,
+    ) -> Result<u64> {
+        let mut merged = 0;
+        let mut batch: Vec<Digest> = Vec::with_capacity(HASH_BATCH);
+        while let Ok(digest) = receiver.recv() {
+            batch.push(digest);
+            while batch.len() < HASH_BATCH {
+                match receiver.try_recv() {
+                    Ok(next) => batch.push(next),
+                    Err(_) => break,
+                }
+            }
+            merged += self.record_batch(&batch, counters)?;
+            batch.clear();
+        }
+        Ok(merged)
     }
 
     /// How many present files are still waiting for a content hash, as the writers that
@@ -175,25 +248,6 @@ struct Digest {
 struct Rekeyed {
     artifact_id: i64,
     merged: bool,
-}
-
-fn hash_batch(batch: &[(Entry, PathBuf)], threshold: u64) -> Vec<Digest> {
-    batch
-        .par_iter()
-        .filter_map(
-            |(entry, path)| match content_hashes(path, entry.size, threshold) {
-                Ok((sha256, git_sha1)) => Some(Digest {
-                    entry_id: entry.id,
-                    sha256,
-                    git_sha1,
-                }),
-                Err(error) => {
-                    tracing::debug!(path = %path.display(), %error, "file is unhashable");
-                    None
-                }
-            },
-        )
-        .collect()
 }
 
 /// Gives an artifact the identity its content proves. A record that already carries a
