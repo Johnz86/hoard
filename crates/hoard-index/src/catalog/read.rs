@@ -470,33 +470,55 @@ impl Catalog {
     ///
     /// The confidence a queued artifact is measured against is [`IndexConfig::default`]'s;
     /// the manifest does not yet carry the threshold the scan actually ran with.
+    ///
+    /// The queue is a `state:triage` page of the search index in artifact id order, so a
+    /// catalog holding a million settled artifacts pays for the page rather than for every
+    /// record. A verdict clears the record without moving the entry, so each page row is
+    /// still measured against its record before it is kept.
     pub fn triage_queue(&self, limit: u32) -> Result<Vec<TriageItem>> {
         let threshold = IndexConfig::default().triage_confidence;
+        let context = self.compile_context(TRIAGE_QUERY, jiff::Timestamp::now(), Vec::new())?;
         let snapshot = self.database.r_transaction()?;
-        let names = self.node_names(&snapshot)?;
-        let mut reader = Reader::new(&snapshot, &names);
-        let records: Vec<ArtifactRecord> = snapshot
-            .scan()
-            .primary()?
-            .all()?
-            .collect::<native_db::db_type::Result<_>>()?;
-        let mut items = Vec::new();
-        for record in &records {
-            if items.len() >= limit as usize {
+        let mut items = Vec::with_capacity(limit as usize);
+        let mut offset = 0;
+        while items.len() < limit as usize {
+            let page = self.query(QueryRequest {
+                raw: TRIAGE_QUERY,
+                sort: SortSpec::new(SortKey::Ident, false),
+                limit: TRIAGE_PAGE,
+                offset,
+                context: &context,
+            })?;
+            let exhausted = page.rows.len() < TRIAGE_PAGE as usize;
+            offset = offset.saturating_add(page.rows.len() as u32);
+            for row in page.rows {
+                if items.len() >= limit as usize {
+                    break;
+                }
+                let id = row.artifact_id.get();
+                let record: Option<ArtifactRecord> = snapshot.get().primary(id)?;
+                let Some(record) = record.filter(|record| {
+                    !record.triage_cleared && record.artifact.needs_triage(threshold)
+                }) else {
+                    continue;
+                };
+                let detail: Option<ArtifactDetail> = snapshot.get().primary(record.id)?;
+                items.push(triage_item(row, detail));
+            }
+            if exhausted {
                 break;
             }
-            if record.triage_cleared || !record.artifact.needs_triage(threshold) {
-                continue;
-            }
-            let Some(row) = reader.row(record)? else {
-                continue;
-            };
-            let detail: Option<ArtifactDetail> = snapshot.get().primary(record.id)?;
-            items.push(triage_item(row, detail));
         }
         Ok(items)
     }
 }
+
+/// What the queue asks the search index for, before a record settles whether a verdict has
+/// already been recorded.
+const TRIAGE_QUERY: &str = "state:triage";
+
+/// How many index rows one pass of the queue reads before measuring them against records.
+const TRIAGE_PAGE: u32 = 64;
 
 /// The queue's guess: the strongest evidence recorded for a field, falling back to what the
 /// artifact itself carries, with the confidence of whichever answer produced the guess.

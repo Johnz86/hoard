@@ -24,6 +24,9 @@ pub enum SortKey {
     Node,
     State,
     Used,
+    /// Artifact id, which no user-facing spelling names: it is what an internal reader asks
+    /// for when it wants the catalog's own record order rather than a column.
+    Ident,
 }
 
 impl SortKey {
@@ -40,6 +43,7 @@ impl SortKey {
             SortKey::Node => "node",
             SortKey::State => "state",
             SortKey::Used => "last_used",
+            SortKey::Ident => "artifact_id",
         }
     }
 }

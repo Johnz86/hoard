@@ -654,9 +654,8 @@ fn page_of(summary: Summary, request: &QueryRequest<'_>) -> Result<Vec<Hit>> {
     let window = Window::of(request, usize::try_from(total).unwrap_or(usize::MAX));
     let order = order_of(request.sort, window.reversed);
     match (SortColumn::of(request.sort.key), segments.len()) {
-        (SortColumn::Size | SortColumn::Used, _) | (SortColumn::Text, 0 | 1) => {
-            Ok(ranked_window(candidates, window, order))
-        }
+        (SortColumn::Size | SortColumn::Used | SortColumn::Ident, _)
+        | (SortColumn::Text, 0 | 1) => Ok(ranked_window(candidates, window, order)),
         (SortColumn::Text, _) => spelled_page(candidates, &segments, window, order),
     }
 }
@@ -666,7 +665,7 @@ fn page_of(summary: Summary, request: &QueryRequest<'_>) -> Result<Vec<Hit>> {
 fn order_of(sort: SortSpec, reversed: bool) -> Order {
     Order {
         rank: match SortColumn::of(sort.key) {
-            SortColumn::Size | SortColumn::Used => size_key,
+            SortColumn::Size | SortColumn::Used | SortColumn::Ident => size_key,
             SortColumn::Text => ordinal_key,
         },
         descending: sort.descending,
@@ -1394,6 +1393,7 @@ enum SortColumn {
     Size,
     Used,
     Text,
+    Ident,
 }
 
 impl SortColumn {
@@ -1401,6 +1401,7 @@ impl SortColumn {
         match key {
             SortKey::Size => SortColumn::Size,
             SortKey::Used => SortColumn::Used,
+            SortKey::Ident => SortColumn::Ident,
             SortKey::Role
             | SortKey::Name
             | SortKey::Base
@@ -1499,7 +1500,7 @@ impl HitColumns {
             size: fields.u64("size")?,
             last_used: match sort {
                 SortColumn::Used => Some(fields.i64(LAST_USED_COLUMN)?),
-                SortColumn::Size | SortColumn::Text => None,
+                SortColumn::Size | SortColumn::Text | SortColumn::Ident => None,
             },
             sort,
             strings: SegmentStrings::open(segment, key)?,
@@ -1531,6 +1532,7 @@ impl HitColumns {
             return None;
         };
         let sort = match self.sort {
+            SortColumn::Ident => 0,
             SortColumn::Size => size,
             SortColumn::Used => self
                 .last_used

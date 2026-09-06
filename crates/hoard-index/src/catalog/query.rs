@@ -51,7 +51,8 @@ fn sorts_on_an_entry(sort: SortKey) -> bool {
         | SortKey::Format
         | SortKey::Precision
         | SortKey::Size
-        | SortKey::Used => false,
+        | SortKey::Used
+        | SortKey::Ident => false,
     }
 }
 

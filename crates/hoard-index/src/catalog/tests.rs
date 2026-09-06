@@ -1859,6 +1859,103 @@ fn the_read_api_answers_the_inspector_the_repo_screens_and_the_queue() -> Result
 }
 
 #[test]
+fn the_triage_queue_pages_in_artifact_order() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let queued = |identity: u128| SeedArtifact {
+        tensors: Some(queued_tensors()),
+        ..seeded_artifact(
+            identity,
+            &format!("queued-{identity:x}"),
+            None,
+            Artifact {
+                role: Role::Unk,
+                role_confidence: 0.2,
+                ..seeded_facts()
+            },
+        )
+    };
+    let settled = |identity: u128| {
+        seeded_artifact(
+            identity,
+            &format!("settled-{identity:x}"),
+            None,
+            seeded_facts(),
+        )
+    };
+    let mut repositories = Vec::new();
+    for (index, identity) in [0xa1_u128, 0xa2, 0xb1, 0xa3, 0xb2, 0xa4].iter().enumerate() {
+        let triaged = *identity < 0xb0;
+        let artifact = match triaged {
+            true => queued(*identity),
+            false => settled(*identity),
+        };
+        let entry = SeedEntry {
+            state: match triaged {
+                true => State::Triage,
+                false => State::Local,
+            },
+            ..seeded_entry(&format!("f{index}.safetensors"), 1_024, Some(artifact))
+        };
+        repositories.push(seeded_revision(
+            seeded_repo(&format!("queue/r{index}"), RepoType::Models),
+            index as u8,
+            vec![entry],
+        ));
+    }
+    let written = catalog.seed(&repositories)?;
+    catalog.rebuild_search(|_| {})?;
+    let id = |identity: u128| {
+        written
+            .iter()
+            .find(|(seeded, _)| *seeded == identity)
+            .map(|(_, id)| id.get())
+            .ok_or_else(|| IndexError::Catalog("every seeded identity was written".into()))
+    };
+
+    let page = catalog.triage_queue(2)?;
+    assert_eq!(page.len(), 2, "a limit bounds the page");
+    let queued_ids = [id(0xa1)?, id(0xa2)?, id(0xa3)?, id(0xa4)?];
+    assert_eq!(
+        page.iter()
+            .map(|item| item.row.artifact_id.get())
+            .collect::<Vec<_>>(),
+        queued_ids[..2].to_vec(),
+        "the queue ascends by artifact id"
+    );
+    let whole = catalog.triage_queue(10)?;
+    assert_eq!(
+        whole
+            .iter()
+            .map(|item| item.row.artifact_id.get())
+            .collect::<Vec<_>>(),
+        queued_ids.to_vec(),
+        "only the artifacts needing a verdict appear, in artifact id order"
+    );
+    assert!(
+        whole.iter().all(|item| item.header.tensor_count == 2),
+        "each row carries the header its detail record holds"
+    );
+
+    catalog.clear_triage(ArtifactId::new(queued_ids[0]))?;
+    assert_eq!(
+        catalog
+            .triage_queue(10)?
+            .iter()
+            .map(|item| item.row.artifact_id.get())
+            .collect::<Vec<_>>(),
+        queued_ids[1..].to_vec(),
+        "a cleared record leaves the queue even though its entry keeps its state"
+    );
+    Ok(())
+}
+
+#[test]
 fn loadouts_are_stored_by_name_and_pins_resolve_through_the_catalog() -> Result<()> {
     let (_directory, catalog, ids) = seeded_catalog()?;
     let lora = catalog
