@@ -15,7 +15,8 @@ use super::models::{
 };
 use super::read::{Reader, repositories_of_source_in};
 use super::scan::{
-    Counters, RecordFacts, log_changes, next_id, preference, record_of, tensor_keys,
+    CHUNK, Counters, RecordFacts, log_changes, next_id, paths_of_artifact, preference,
+    present_paths, record_of, tensor_keys,
 };
 use super::{Catalog, EntryDetail};
 
@@ -101,6 +102,9 @@ impl Catalog {
     /// Moves entries back to REMOTE with no pull in flight, keeping the rows so the catalog
     /// still remembers the path, and logs each artifact behind them for the search index.
     /// Returns how many rows changed; the caller refreshes the search index.
+    ///
+    /// Each artifact a retired path belonged to is swept afterwards, so its path count and
+    /// the totals count the paths that are still present rather than the ones that were.
     pub fn retire_entries(&self, ids: &[EntryId]) -> Result<usize> {
         if ids.is_empty() {
             return Ok(0);
@@ -130,7 +134,37 @@ impl Catalog {
         log_changes(&transaction, &mut counters)?;
         counters.save(&transaction)?;
         transaction.commit()?;
+        self.recount_retired_paths(&mut counters)?;
         Ok(retired)
+    }
+
+    /// Recounts what each artifact a retirement touched still holds, and moves the totals by
+    /// the difference. The record stays whatever the count reaches: a retired path is a path
+    /// this catalog still remembers, which is the difference between evicting bytes and
+    /// forgetting a file.
+    fn recount_retired_paths(&self, counters: &mut Counters) -> Result<()> {
+        let ids: Vec<i64> = counters.touched.iter().copied().collect();
+        for batch in ids.chunks(CHUNK) {
+            let transaction = self.database.rw_transaction()?;
+            for id in batch {
+                let stored: Option<ArtifactRecord> = transaction.get().primary(*id)?;
+                let Some(record) = stored else {
+                    continue;
+                };
+                let paths = present_paths(
+                    &paths_of_artifact(&transaction, record.id)?,
+                    record.shard_count,
+                );
+                if paths != record.path_count {
+                    transaction.upsert(ArtifactRecord {
+                        path_count: paths,
+                        ..record
+                    })?;
+                }
+            }
+            transaction.commit()?;
+        }
+        self.summarise(counters)
     }
 }
 

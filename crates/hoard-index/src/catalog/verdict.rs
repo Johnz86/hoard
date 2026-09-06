@@ -36,6 +36,10 @@ impl Catalog {
     /// Records a user's verdict, rewrites the artifact's role, sub-role and base, clears
     /// triage, and logs the artifact for the search index. Refreshes the index.
     ///
+    /// A verdict settles a role at full confidence, which takes the artifact out of the
+    /// triage total, so the record is measured before and after and the totals moved by the
+    /// difference.
+    ///
     /// A role and a sub-role that disagree are refused rather than stored; see
     /// [`crate::triage::check_verdict`].
     pub fn put_override(
@@ -57,6 +61,7 @@ impl Catalog {
             Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
         let transaction = self.database.rw_transaction()?;
         let mut record = require_record(&transaction, id)?;
+        counters.touch(&transaction, id.get())?;
         apply_override(&mut record, &verdict);
         record.triage_cleared = true;
         transaction.upsert(record)?;
@@ -64,12 +69,13 @@ impl Catalog {
         counters.pending.push(id.get());
         log_changes(&transaction, &mut counters)?;
         transaction.commit()?;
+        self.summarise(&counters)?;
         self.refresh_search(|_| {})?;
         Ok(())
     }
 
     /// Forgets the verdict; the artifact keeps what the verdict wrote until a rescan
-    /// re-infers it. Returns whether one existed.
+    /// re-infers it, so nothing the totals count moves here. Returns whether one existed.
     pub fn clear_override(&self, id: ArtifactId) -> Result<bool> {
         let transaction = self.database.rw_transaction()?;
         let stored: Option<Override> = transaction.get().primary(id.get())?;
@@ -96,11 +102,13 @@ impl Catalog {
             Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
         let transaction = self.database.rw_transaction()?;
         let mut record = require_record(&transaction, id)?;
+        counters.touch(&transaction, id.get())?;
         record.triage_cleared = true;
         transaction.upsert(record)?;
         counters.pending.push(id.get());
         log_changes(&transaction, &mut counters)?;
         transaction.commit()?;
+        self.summarise(&counters)?;
         self.refresh_search(|_| {})?;
         Ok(())
     }

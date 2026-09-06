@@ -590,22 +590,11 @@ impl Catalog {
 
 /// Whether the sweep changed what the search index should hold for this artifact.
 pub(super) fn sweep_artifact(transaction: &RwTransaction<'_>, id: i64) -> Result<bool> {
-    let referencing: Vec<Entry> = transaction
-        .scan()
-        .secondary::<Entry>(EntryKey::artifact_id)?
-        .start_with(Some(id))?
-        .collect::<native_db::db_type::Result<_>>()?;
+    let referencing = paths_of_artifact(transaction, id)?;
     let Some(record) = transaction.get().primary::<ArtifactRecord>(id)? else {
         return Ok(false);
     };
-    let present = referencing
-        .iter()
-        .filter(|entry| entry.state != State::Remote)
-        .count();
-    let shards = usize::try_from(record.shard_count.unwrap_or(1))
-        .unwrap_or(1)
-        .max(1);
-    match u32::try_from(present.div_ceil(shards)).unwrap_or(u32::MAX) {
+    match present_paths(&referencing, record.shard_count) {
         0 => {
             for entry in referencing {
                 transaction.upsert(Entry {
@@ -632,6 +621,28 @@ pub(super) fn sweep_artifact(transaction: &RwTransaction<'_>, id: i64) -> Result
         _ => {}
     }
     Ok(false)
+}
+
+/// Every path pointing at one artifact, which is the bound on recounting what it holds.
+pub(super) fn paths_of_artifact(transaction: &RwTransaction<'_>, id: i64) -> Result<Vec<Entry>> {
+    Ok(transaction
+        .scan()
+        .secondary::<Entry>(EntryKey::artifact_id)?
+        .start_with(Some(id))?
+        .collect::<native_db::db_type::Result<_>>()?)
+}
+
+/// How many copies of an artifact its paths amount to: the paths whose bytes are on a node,
+/// counted in whole shard sets rather than in files.
+pub(super) fn present_paths(referencing: &[Entry], shard_count: Option<u32>) -> u32 {
+    let present = referencing
+        .iter()
+        .filter(|entry| entry.state != State::Remote)
+        .count();
+    let shards = usize::try_from(shard_count.unwrap_or(1))
+        .unwrap_or(1)
+        .max(1);
+    u32::try_from(present.div_ceil(shards)).unwrap_or(u32::MAX)
 }
 
 fn shard_count_of(

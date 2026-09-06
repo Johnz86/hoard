@@ -2611,6 +2611,7 @@ fn the_summary_is_exact_after_incremental_passes() -> Result<()> {
             lora_header_named(&format!("t{index}")),
         )?;
     }
+    fs::write(input.join("unclassified.safetensors"), plain_header())?;
     let config = IndexConfig {
         sources: vec![source(&input, "comfy")],
         ..IndexConfig::default()
@@ -2645,8 +2646,32 @@ fn the_summary_is_exact_after_incremental_passes() -> Result<()> {
     })?;
     exact("an ingest")?;
 
+    let before_retirement = catalog.totals()?;
     assert_eq!(catalog.retire_entries(&[served.entry])?, 1);
     exact("a retirement")?;
+    assert_eq!(
+        catalog.totals()?.present_artifacts,
+        before_retirement.present_artifacts - 1,
+        "a retired path leaves the artifact holding none"
+    );
+
+    catalog.rebuild_search(|_| {})?;
+    let queued = catalog
+        .triage_queue(10)?
+        .first()
+        .map(|item| item.row.artifact_id)
+        .ok_or_else(|| IndexError::Catalog("the unclassified file queues".into()))?;
+    let before_verdict = catalog.totals()?;
+    assert!(before_verdict.triage_artifacts > 0);
+    catalog.put_override(queued, Some(Role::Lora), None, None)?;
+    exact("an override")?;
+    assert_eq!(
+        catalog.totals()?.triage_artifacts,
+        before_verdict.triage_artifacts - 1,
+        "a verdict takes the artifact out of the triage total"
+    );
+    assert!(catalog.clear_override(queued)?);
+    exact("a cleared override")?;
 
     let laptop = catalog.upsert_peer(&NodeId::new("laptop-1")?, "laptop", None)?;
     let pass = catalog.begin_pass(laptop.id)?;
