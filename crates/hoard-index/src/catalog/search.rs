@@ -25,6 +25,7 @@ use crate::store::{FacetBucket, SearchRow};
 use super::models::{
     ArtifactRecord, Entry, EntryKey, Manifest, Repository, Revision, SearchChange, SearchText,
 };
+use super::nodes::NodeNames;
 use crate::error::{IndexError, Result};
 
 use super::query::{self, QueryFields};
@@ -129,13 +130,13 @@ impl Catalog {
         let (schema, fields) = Fields::build();
         let index = Index::create_in_dir(directory, schema)?;
         let mut writer = index.writer_with_num_threads(1, WRITER_BUDGET)?;
-        let node = self.manifest()?.node;
         let snapshot = self.database.r_transaction()?;
+        let names = self.node_names(&snapshot)?;
         progress(0);
         let mut indexing = Indexing {
             snapshot: &snapshot,
             fields: &fields,
-            node: &node,
+            names: &names,
             repository: None,
         };
         let mut indexed = 0_u64;
@@ -191,7 +192,6 @@ impl Catalog {
         if batch.is_empty() {
             return Ok(0);
         }
-        let node = manifest.node;
         let guard = self.open_index(&directory)?;
         let open = guard
             .as_ref()
@@ -204,10 +204,11 @@ impl Catalog {
             ids.sort_unstable();
             ids.dedup();
             let snapshot = self.database.r_transaction()?;
+            let names = self.node_names(&snapshot)?;
             let mut indexing = Indexing {
                 snapshot: &snapshot,
                 fields: &fields,
-                node: &node,
+                names: &names,
                 repository: None,
             };
             for id in ids {
@@ -217,6 +218,7 @@ impl Catalog {
                 }
             }
             drop(indexing);
+            drop(names);
             drop(snapshot);
             writer.commit()?;
             open.reader.reload()?;
@@ -493,7 +495,7 @@ impl Catalog {
             summary: &summary,
             path,
         })?;
-        let rows = self.rows(page_of(summary, &request)?, &manifest.node)?;
+        let rows = self.rows(page_of(summary, &request)?)?;
         Ok(QueryPage {
             query: parsed,
             rows,
@@ -544,8 +546,9 @@ impl Catalog {
     }
 
     /// The rows one page of collapsed hits stands for. Nothing but this page is read back.
-    fn rows(&self, hits: Vec<Hit>, node: &str) -> Result<Vec<SearchRow>> {
+    fn rows(&self, hits: Vec<Hit>) -> Result<Vec<SearchRow>> {
         let snapshot = self.database.r_transaction()?;
+        let names = self.node_names(&snapshot)?;
         let mut repositories: HashMap<i64, Repository> = HashMap::new();
         let mut rows = Vec::with_capacity(hits.len());
         for hit in hits {
@@ -577,7 +580,7 @@ impl Catalog {
                 entry: &entry,
                 repository,
                 artifact: &artifact,
-                node,
+                node: names.of(entry.node),
                 primary: true,
                 last_used: last_used_in(&snapshot, artifact.id)?,
             }));
@@ -1063,7 +1066,7 @@ impl Fields {
 struct Indexing<'a, 'db> {
     snapshot: &'a native_db::transaction::RTransaction<'db>,
     fields: &'a Fields,
-    node: &'a str,
+    names: &'a NodeNames,
     repository: Option<(i64, Repository)>,
 }
 
@@ -1105,7 +1108,7 @@ fn documents_of_artifact(
     }
     let snapshot = indexing.snapshot;
     let fields = indexing.fields;
-    let node = indexing.node;
+    let names = indexing.names;
     let artifact: ArtifactRecord = snapshot.get().primary(artifact_id)?.ok_or_else(|| {
         IndexError::Catalog(format!(
             "an entry references missing artifact {artifact_id}"
@@ -1125,7 +1128,7 @@ fn documents_of_artifact(
             entry,
             repository,
             artifact: &artifact,
-            node,
+            node: names.of(entry.node),
             primary: preferred == Some(entry.id),
             last_used,
         };

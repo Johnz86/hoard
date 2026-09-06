@@ -15,7 +15,7 @@ use hoard_core::{
     TensorSample, TensorSummary,
 };
 use hoard_index::catalog::{
-    Catalog, SeedArtifact, SeedEntry, SeedRepository, SeedRevision, UsageEvent,
+    Catalog, LOCAL_NODE, SeedArtifact, SeedEntry, SeedRepository, SeedRevision, UsageEvent,
 };
 use hoard_index::config::{SourceConfig, SourceKind};
 use hoard_index::store::Store;
@@ -267,6 +267,7 @@ fn seed_catalog(catalog: &Catalog, dir: &Path) -> [ArtifactId; 6] {
                 RepoType::Models,
                 0x55,
                 vec![SeedEntry {
+                    node: LOCAL_NODE,
                     state: ArtifactState::Triage,
                     ..seed_entry(
                         "mystery.bin",
@@ -364,6 +365,7 @@ fn seed_entry(
     artifact: Option<SeedArtifact>,
 ) -> SeedEntry {
     SeedEntry {
+        node: LOCAL_NODE,
         rel_path: rel_path.to_owned(),
         abs_path: Some(abs_path.to_owned()),
         size,

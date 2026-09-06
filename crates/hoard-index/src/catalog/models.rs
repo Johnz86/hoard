@@ -338,7 +338,7 @@ pub(super) struct EntryV1 {
 }
 
 /// The node an entry's bytes sit on. Every writer names this node until peers land.
-pub(super) const LOCAL_NODE: i64 = 1;
+pub const LOCAL_NODE: i64 = 1;
 
 /// One path, with the content hashes read from it and the node that holds it. `content` is
 /// the identity a sha256 makes, so a lookup by content hash is a secondary key read rather
@@ -712,6 +712,31 @@ pub(super) struct Job {
     pub(super) finished: Option<String>,
 }
 
+/// A machine this install knows about: this one, which is always [`LOCAL_NODE`], plus every
+/// peer discovered or configured.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 21, version = 1)]
+#[native_db]
+pub(super) struct Node {
+    #[primary_key]
+    pub(super) id: i64,
+    #[secondary_key(unique)]
+    pub(super) node_id: String,
+    pub(super) name: String,
+    pub(super) url: Option<String>,
+    pub(super) is_self: bool,
+    pub(super) online: bool,
+    pub(super) indexed_bytes: u64,
+    /// RFC 3339, like every other catalog timestamp.
+    pub(super) last_seen: Option<String>,
+    /// How far this node has read the peer's digest, as the peer's own cursor text.
+    pub(super) cursor: Option<String>,
+    pub(super) synced: Option<String>,
+    /// The resync pass the peer's rows were last confirmed in; rows stamped with an older
+    /// pass are what the peer stopped advertising.
+    pub(super) pass: u64,
+}
+
 /// Registers every record type. `native_db` compares each definition against every model
 /// already registered rather than only against the other versions of the same model, so a
 /// version 1 model must be defined last: it is what leaves each migrated model marked
@@ -744,5 +769,6 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<ArtifactUse>()?;
     models.define::<LoadoutDoc>()?;
     models.define::<Job>()?;
+    models.define::<Node>()?;
     Ok(models)
 }

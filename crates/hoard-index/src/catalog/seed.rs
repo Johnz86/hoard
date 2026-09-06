@@ -14,8 +14,8 @@ use crate::store::revision::RefKind;
 use super::Catalog;
 use super::hashing::content_key;
 use super::models::{
-    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, LOCAL_NODE, Manifest, Ref,
-    Repository, RepositoryKey, Revision, SearchText, Source, repository_key,
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, Manifest, Ref, Repository,
+    RepositoryKey, Revision, SearchText, Source, repository_key,
 };
 use super::scan::{Counters, counts, log_changes, next_id, preference, tensor_keys};
 
@@ -48,6 +48,8 @@ pub struct SeedRevision {
 #[derive(Debug, Clone)]
 pub struct SeedEntry {
     pub rel_path: String,
+    /// Which node holds the bytes: [`super::models::LOCAL_NODE`] for this one.
+    pub node: i64,
     pub abs_path: Option<String>,
     pub size: u64,
     pub state: State,
@@ -247,7 +249,7 @@ impl Seeding<'_, '_> {
             git_sha1: seed.git_sha1,
             mtime: None,
             inode: None,
-            node: LOCAL_NODE,
+            node: seed.node,
             pass: 0,
             pull_progress: None,
         })?;

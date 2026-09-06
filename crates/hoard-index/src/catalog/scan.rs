@@ -146,7 +146,7 @@ impl Catalog {
             search_seq: 0,
         })?;
         transaction.commit()?;
-        Ok(())
+        self.ensure_self_row(node)
     }
 
     /// The one pass a fresh scan and a rescan share. A fresh scan starts with nothing known,

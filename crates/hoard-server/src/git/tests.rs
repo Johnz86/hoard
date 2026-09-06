@@ -10,7 +10,7 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 use hoard_core::{CommitSha, RepoId, RepoType, Sha256, State as ArtifactState};
-use hoard_index::catalog::{Catalog, SeedEntry, SeedRepository, SeedRevision};
+use hoard_index::catalog::{Catalog, LOCAL_NODE, SeedEntry, SeedRepository, SeedRevision};
 use hoard_index::config::SourceKind;
 use hoard_index::store::Store;
 use hoard_index::store::revision::RefKind;
@@ -107,6 +107,7 @@ fn seed_catalog(catalog: &Catalog, git_dir: &Path) {
                     author: None,
                     committed: Some(at()),
                     entries: vec![SeedEntry {
+                        node: LOCAL_NODE,
                         rel_path: LFS_PATH.to_owned(),
                         abs_path: Some(git_dir.to_string_lossy().into_owned()),
                         size: LFS_SIZE,

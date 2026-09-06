@@ -1209,7 +1209,7 @@ fn block_end(entry: &CacheEntry, position: u64, limit: u64) -> u64 {
 mod tests {
     use futures::StreamExt;
     use hoard_core::{RepoType, State};
-    use hoard_index::catalog::{SeedEntry, SeedRepository, SeedRevision};
+    use hoard_index::catalog::{LOCAL_NODE, SeedEntry, SeedRepository, SeedRevision};
     use hoard_index::config::{IndexConfig, SourceKind};
     use hoard_index::store::revision::RefKind;
     use sha2::{Digest, Sha256 as Sha256Hasher};
@@ -1350,6 +1350,7 @@ mod tests {
                     author: None,
                     committed: None,
                     entries: vec![SeedEntry {
+                        node: LOCAL_NODE,
                         rel_path: "model.safetensors".to_owned(),
                         abs_path: Some(abs.to_string_lossy().into_owned()),
                         size: bytes.len() as u64,

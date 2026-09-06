@@ -6,8 +6,8 @@ use tempfile::TempDir;
 
 use hoard_core::{
     Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, Evidence, EvidenceSource, JobId,
-    Loadout, LoadoutPin, Precision, RepoId, RepoType, Role, Sha256, State, SubRole, TensorSample,
-    TensorSummary,
+    Loadout, LoadoutPin, NodeId, Precision, RepoId, RepoType, Role, Sha256, State, SubRole,
+    TensorSample, TensorSummary,
 };
 
 use crate::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
@@ -19,9 +19,9 @@ use crate::store::revision::RefKind;
 
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, ArtifactRecordV1, Entry, EntryKey, EntryV1,
-    Manifest, ManifestV1, Override, Ref, Repository, RepositoryKey, RepositoryV1, RepositoryV2,
-    Revision, RevisionV1, RevisionV2, SearchChange, SearchText, Source, SourceV1, Summary,
-    SummaryV1,
+    LOCAL_NODE, Manifest, ManifestV1, Node, Override, Ref, Repository, RepositoryKey, RepositoryV1,
+    RepositoryV2, Revision, RevisionV1, RevisionV2, SearchChange, SearchText, Source, SourceV1,
+    Summary, SummaryV1,
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
@@ -1450,6 +1450,7 @@ fn a_seeded_catalog_answers_like_a_scanned_one() -> Result<()> {
         shard_count: None,
     };
     let entry = |rel_path: &str, abs_path: &str| SeedEntry {
+        node: LOCAL_NODE,
         rel_path: rel_path.into(),
         abs_path: Some(abs_path.into()),
         size: 239_075_328,
@@ -1664,6 +1665,7 @@ fn seeded_catalog() -> Result<(TempDir, Catalog, SeededIds)> {
             seeded_repo("misc/mystery", RepoType::Models),
             0x55,
             vec![SeedEntry {
+                node: LOCAL_NODE,
                 state: State::Triage,
                 ..seeded_entry("mystery.bin", 1_200_000, Some(unknown))
             }],
@@ -1737,6 +1739,7 @@ fn seeded_entry(rel_path: &str, size: u64, artifact: Option<SeedArtifact>) -> Se
         _ => "/data/hub",
     };
     SeedEntry {
+        node: LOCAL_NODE,
         abs_path: Some(format!("{root}/{rel_path}")),
         rel_path: rel_path.to_owned(),
         size,
@@ -1965,6 +1968,7 @@ fn an_any_base_answers_only_its_own_bucket() -> Result<()> {
             author: None,
             committed: None,
             entries: vec![SeedEntry {
+                node: LOCAL_NODE,
                 rel_path: format!("{name}.safetensors"),
                 abs_path: Some(format!("/data/hub/{name}.safetensors")),
                 size: 1_024,
@@ -2762,6 +2766,90 @@ fn manifest_encoding_is_frozen() -> Result<()> {
         search_seq: 9,
     };
     insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn node_encoding_is_frozen() -> Result<()> {
+    let value = Node {
+        id: 2,
+        node_id: "laptop-1".to_owned(),
+        name: "laptop".to_owned(),
+        url: Some("http://laptop:7099".to_owned()),
+        is_self: false,
+        online: true,
+        indexed_bytes: 65_536,
+        last_seen: Some("2026-09-06T10:00:00Z".to_owned()),
+        cursor: Some("d1-2a".to_owned()),
+        synced: Some("2026-09-06T10:00:00Z".to_owned()),
+        pass: 3,
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn nodes_are_recorded_and_entries_name_their_node() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = Catalog::open_or_scan(
+        &IndexConfig {
+            data_dir: directory.path().join("native"),
+            ..IndexConfig::default()
+        },
+        "workstation",
+        |_, _| {},
+    )?;
+    let listed = catalog.list_nodes()?;
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].is_self);
+    assert_eq!(listed[0].id, LOCAL_NODE);
+    let this = catalog.ensure_local_node(&NodeId::new("workstation-1")?, "rig")?;
+    assert_eq!(this.node_id.as_str(), "workstation-1");
+    assert_eq!(catalog.status()?.node, "rig");
+    let laptop = catalog.upsert_peer(
+        &NodeId::new("laptop-1")?,
+        "laptop",
+        Some("http://laptop:7099"),
+    )?;
+    assert_eq!(laptop.id, 2);
+    let renamed = catalog.upsert_peer(&NodeId::new("laptop-1")?, "laptop-2", None)?;
+    assert_eq!(renamed.id, 2);
+    assert_eq!(
+        renamed.url.as_deref(),
+        Some("http://laptop:7099"),
+        "an absent address keeps the old one"
+    );
+    let at: jiff::Timestamp = "2026-09-06T10:00:00Z"
+        .parse()
+        .map_err(|_| IndexError::Catalog("timestamp".into()))?;
+    catalog.touch_node(2, at, 512)?;
+    let peer = catalog
+        .node(2)?
+        .ok_or_else(|| IndexError::Catalog("peer".into()))?;
+    assert!(peer.online);
+    assert_eq!(peer.indexed_bytes, 512);
+    catalog.set_node_online(2, false)?;
+    assert!(
+        !catalog
+            .node_by_name("laptop-2")?
+            .ok_or_else(|| IndexError::Catalog("peer".into()))?
+            .online
+    );
+    assert_eq!(
+        catalog
+            .node_by_id(&NodeId::new("laptop-1")?)?
+            .ok_or_else(|| IndexError::Catalog("peer".into()))?
+            .id,
+        2
+    );
+    assert_eq!(
+        catalog
+            .list_nodes()?
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["rig", "laptop-2"]
+    );
     Ok(())
 }
 

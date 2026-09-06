@@ -14,7 +14,7 @@ use hoard_core::{
     State as ArtifactState,
 };
 use hoard_index::catalog::{
-    Catalog, SeedArtifact, SeedEntry, SeedRepository, SeedRevision, UsageDay,
+    Catalog, LOCAL_NODE, SeedArtifact, SeedEntry, SeedRepository, SeedRevision, UsageDay,
 };
 use hoard_index::config::SourceKind;
 use hoard_index::store::Store;
@@ -88,17 +88,20 @@ fn seed_catalog(catalog: &Catalog, root: &Path) {
                         REVISION,
                         vec![
                             SeedEntry {
+                                node: LOCAL_NODE,
                                 sha256: Some(Sha256::from_bytes(SMALL_SHA256)),
                                 git_sha1: Some(CommitSha::from_bytes(SMALL_GIT_SHA1)),
                                 artifact: Some(lora_artifact()),
                                 ..seed_entry(root, SMALL_PATH, SMALL_SIZE as u64)
                             },
                             SeedEntry {
+                                node: LOCAL_NODE,
                                 sha256: Some(Sha256::from_bytes([0x5c; 32])),
                                 git_sha1: Some(CommitSha::from_bytes([0x5d; 20])),
                                 ..seed_entry(root, NESTED_PATH, SMALL_SIZE as u64)
                             },
                             SeedEntry {
+                                node: LOCAL_NODE,
                                 sha256: Some(Sha256::from_bytes(LFS_SHA256)),
                                 ..seed_entry(root, LFS_PATH, LFS_SIZE as u64)
                             },
@@ -111,6 +114,7 @@ fn seed_catalog(catalog: &Catalog, root: &Path) {
                 revisions: vec![seed_revision(
                     [0x33; 20],
                     vec![SeedEntry {
+                        node: LOCAL_NODE,
                         sha256: Some(Sha256::from_bytes([0x11; 32])),
                         git_sha1: Some(CommitSha::from_bytes([0x12; 20])),
                         ..seed_entry(root, SMALL_PATH, SMALL_SIZE as u64)
@@ -122,6 +126,7 @@ fn seed_catalog(catalog: &Catalog, root: &Path) {
                 revisions: vec![seed_revision(
                     [0x44; 20],
                     vec![SeedEntry {
+                        node: LOCAL_NODE,
                         sha256: Some(Sha256::from_bytes([0x21; 32])),
                         git_sha1: Some(CommitSha::from_bytes([0x24; 20])),
                         ..seed_entry(root, SMALL_PATH, SMALL_SIZE as u64)
@@ -158,6 +163,7 @@ fn seed_revision(sha: [u8; 20], entries: Vec<SeedEntry>) -> SeedRevision {
 
 fn seed_entry(root: &Path, rel_path: &str, size: u64) -> SeedEntry {
     SeedEntry {
+        node: LOCAL_NODE,
         rel_path: rel_path.to_owned(),
         abs_path: Some(root.join(rel_path).to_string_lossy().into_owned()),
         size,

@@ -100,8 +100,8 @@ impl Catalog {
         hashes: &[Sha256],
     ) -> Result<Vec<(Sha256, super::EntryDetail)>> {
         let snapshot = self.database.r_transaction()?;
-        let node = self.manifest()?.node;
-        let mut reader = super::read::Reader::new(&snapshot, &node);
+        let names = self.node_names(&snapshot)?;
+        let mut reader = super::read::Reader::new(&snapshot, &names);
         let mut found = Vec::with_capacity(hashes.len());
         for sha in hashes {
             let holders: Vec<Entry> = snapshot

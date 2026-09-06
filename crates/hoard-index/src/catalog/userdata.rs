@@ -12,7 +12,7 @@ use crate::error::{IndexError, Result};
 use crate::store::projection::NewProjection;
 
 use super::Catalog;
-use super::models::{Noise, NoiseKey, Projection, ProjectionKey, Setting, Shelf, ShelfKey};
+use super::models::{Node, Noise, NoiseKey, Projection, ProjectionKey, Setting, Shelf, ShelfKey};
 
 /// The shelves hoard ships with, in the order the rail lists them.
 const BUILTIN_SHELVES: [(&str, &str); 6] = [
@@ -391,6 +391,12 @@ impl Sequenced for Shelf {
 }
 
 impl Sequenced for Noise {
+    fn sequence(&self) -> u64 {
+        u64::try_from(self.id).unwrap_or_default()
+    }
+}
+
+impl Sequenced for Node {
     fn sequence(&self) -> u64 {
         u64::try_from(self.id).unwrap_or_default()
     }

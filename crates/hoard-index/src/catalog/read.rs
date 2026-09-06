@@ -22,6 +22,7 @@ use super::models::{
     ArtifactDetail, ArtifactRecord, Entry, EntryKey, Repository, RepositoryKey, Revision, Source,
     repository_key,
 };
+use super::nodes::NodeNames;
 use super::search::{EntryFacts, assemble_row, revision_of};
 use super::usage::last_used_in;
 use super::{Catalog, QueryRequest};
@@ -167,8 +168,8 @@ impl Catalog {
     /// a tie the lowest entry id, which is what the search index also collapses to.
     pub fn artifact_row(&self, id: ArtifactId) -> Result<Option<SearchRow>> {
         let snapshot = self.database.r_transaction()?;
-        let node = self.manifest()?.node;
-        let mut reader = Reader::new(&snapshot, &node);
+        let names = self.node_names(&snapshot)?;
+        let mut reader = Reader::new(&snapshot, &names);
         let Some(record) = reader.record(id.get())? else {
             return Ok(None);
         };
@@ -196,8 +197,8 @@ impl Catalog {
             return Ok(Vec::new());
         };
         let snapshot = self.database.r_transaction()?;
-        let node = self.manifest()?.node;
-        let mut reader = Reader::new(&snapshot, &node);
+        let names = self.node_names(&snapshot)?;
+        let mut reader = Reader::new(&snapshot, &names);
         let id = found.artifact_id.get();
         let Some(record) = reader.record(id)? else {
             return Ok(Vec::new());
@@ -218,8 +219,8 @@ impl Catalog {
             return Ok(Vec::new());
         };
         let snapshot = self.database.r_transaction()?;
-        let node = self.manifest()?.node;
-        let mut reader = Reader::new(&snapshot, &node);
+        let names = self.node_names(&snapshot)?;
+        let mut reader = Reader::new(&snapshot, &names);
         let entries = reader.entries_of_repo(repository.id.get())?;
         let mut rows = Vec::new();
         for entry in entries.iter().filter(|entry| entry.rel_path == path) {
@@ -256,8 +257,8 @@ impl Catalog {
     /// Every path the artifact occupies, in entry order.
     pub fn entries_of(&self, id: ArtifactId) -> Result<Vec<EntryDetail>> {
         let snapshot = self.database.r_transaction()?;
-        let node = self.manifest()?.node;
-        let mut reader = Reader::new(&snapshot, &node);
+        let names = self.node_names(&snapshot)?;
+        let mut reader = Reader::new(&snapshot, &names);
         let Some(record) = reader.record(id.get())? else {
             return Ok(Vec::new());
         };
@@ -274,7 +275,7 @@ impl Catalog {
     /// holds files on this disk.
     pub fn repository(&self, repo: &RepoId) -> Result<Option<RepositoryDetail>> {
         let snapshot = self.database.r_transaction()?;
-        let node = self.manifest()?.node;
+        let names = self.node_names(&snapshot)?;
         let sources: Vec<Source> = snapshot
             .scan()
             .primary()?
@@ -289,7 +290,7 @@ impl Catalog {
                 continue;
             };
             let present = repository_is_present(&snapshot, stored.id)?;
-            let detail = repository_detail(&stored, source.resolved_kind, &node);
+            let detail = repository_detail(&stored, source.resolved_kind, &names);
             if present {
                 return Ok(Some(detail));
             }
@@ -309,7 +310,7 @@ impl Catalog {
         limit: u32,
     ) -> Result<RepositoryPage> {
         let snapshot = self.database.r_transaction()?;
-        let node = self.manifest()?.node;
+        let names = self.node_names(&snapshot)?;
         let sources: Vec<Source> = snapshot
             .scan()
             .primary()?
@@ -344,7 +345,7 @@ impl Catalog {
                     .get(repository.source.as_str())
                     .copied()
                     .unwrap_or(SourceKind::Loose);
-                rows.push(repository_detail(repository, kind, &node));
+                rows.push(repository_detail(repository, kind, &names));
             }
         }
         Ok(RepositoryPage { rows, total })
@@ -396,8 +397,8 @@ impl Catalog {
     /// Every file one revision of a repository holds.
     pub fn revision_entries(&self, repo: RepoRowId, revision: u32) -> Result<Vec<EntryDetail>> {
         let snapshot = self.database.r_transaction()?;
-        let node = self.manifest()?.node;
-        let mut reader = Reader::new(&snapshot, &node);
+        let names = self.node_names(&snapshot)?;
+        let mut reader = Reader::new(&snapshot, &names);
         let entries: Vec<Entry> = reader
             .entries_of_repo(repo.get())?
             .into_iter()
@@ -424,8 +425,8 @@ impl Catalog {
         rel_path: &str,
     ) -> Result<Option<EntryDetail>> {
         let snapshot = self.database.r_transaction()?;
-        let node = self.manifest()?.node;
-        let mut reader = Reader::new(&snapshot, &node);
+        let names = self.node_names(&snapshot)?;
+        let mut reader = Reader::new(&snapshot, &names);
         let Some(entry) = reader
             .entries_of_repo(repo.get())?
             .into_iter()
@@ -445,8 +446,8 @@ impl Catalog {
     /// Every artifact reachable through one repository, most bytes first.
     pub fn repository_rows(&self, repo: RepoRowId, limit: u32) -> Result<Vec<SearchRow>> {
         let snapshot = self.database.r_transaction()?;
-        let node = self.manifest()?.node;
-        let mut reader = Reader::new(&snapshot, &node);
+        let names = self.node_names(&snapshot)?;
+        let mut reader = Reader::new(&snapshot, &names);
         let mut artifacts: Vec<i64> = reader
             .entries_of_repo(repo.get())?
             .into_iter()
@@ -474,8 +475,8 @@ impl Catalog {
     pub fn triage_queue(&self, limit: u32) -> Result<Vec<TriageItem>> {
         let threshold = IndexConfig::default().triage_confidence;
         let snapshot = self.database.r_transaction()?;
-        let node = self.manifest()?.node;
-        let mut reader = Reader::new(&snapshot, &node);
+        let names = self.node_names(&snapshot)?;
+        let mut reader = Reader::new(&snapshot, &names);
         let records: Vec<ArtifactRecord> = snapshot
             .scan()
             .primary()?
@@ -561,7 +562,11 @@ fn repository_is_present(snapshot: &RTransaction<'_>, repo: i64) -> Result<bool>
     })
 }
 
-fn repository_detail(repository: &Repository, kind: SourceKind, node: &str) -> RepositoryDetail {
+fn repository_detail(
+    repository: &Repository,
+    kind: SourceKind,
+    names: &NodeNames,
+) -> RepositoryDetail {
     let revisions: Vec<RevisionDetail> = repository
         .revisions
         .iter()
@@ -599,7 +604,7 @@ fn repository_detail(repository: &Repository, kind: SourceKind, node: &str) -> R
         root_path: repository.root_path.clone(),
         git_dir: repository.git_dir.clone(),
         default_ref: repository.default_ref.clone(),
-        node: node.to_owned(),
+        node: names.of_source(&repository.source).to_owned(),
         revisions,
         refs,
     }
@@ -609,15 +614,15 @@ fn repository_detail(repository: &Repository, kind: SourceKind, node: &str) -> R
 /// walks many entries of one repository reads that record once.
 pub(super) struct Reader<'a, 'db> {
     snapshot: &'a RTransaction<'db>,
-    node: &'a str,
+    names: &'a NodeNames,
     repositories: HashMap<i64, Repository>,
 }
 
 impl<'a, 'db> Reader<'a, 'db> {
-    pub(super) fn new(snapshot: &'a RTransaction<'db>, node: &'a str) -> Self {
+    pub(super) fn new(snapshot: &'a RTransaction<'db>, names: &'a NodeNames) -> Self {
         Self {
             snapshot,
-            node,
+            names,
             repositories: HashMap::new(),
         }
     }
@@ -674,7 +679,8 @@ impl<'a, 'db> Reader<'a, 'db> {
         entry: &Entry,
         last_used: Option<jiff::Timestamp>,
     ) -> Result<SearchRow> {
-        let node = self.node;
+        let names = self.names;
+        let node = names.of(entry.node);
         let repository = self.repository(entry.repo_id)?;
         let revision = revision_of(repository, entry)?;
         Ok(assemble_row(&EntryFacts {
@@ -689,7 +695,8 @@ impl<'a, 'db> Reader<'a, 'db> {
     }
 
     pub(super) fn detail(&mut self, entry: &Entry, deduped: bool) -> Result<EntryDetail> {
-        let node = self.node;
+        let names = self.names;
+        let node = names.of(entry.node);
         let repository = self.repository(entry.repo_id)?;
         let revision = revision_of(repository, entry)?;
         Ok(entry_detail(entry, repository, revision, node, deduped))

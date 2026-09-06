@@ -639,7 +639,7 @@ mod tests {
     use std::path::Path;
 
     use hoard_core::{Artifact, ArtifactFormat, Base, BlobId, RepoType, Role, State};
-    use hoard_index::catalog::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
+    use hoard_index::catalog::{LOCAL_NODE, SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
     use hoard_index::config::{IndexConfig, SourceKind};
     use hoard_index::store::revision::RefKind;
     use tempfile::TempDir;
@@ -701,6 +701,7 @@ mod tests {
 
     fn present(rel_path: &str, abs_path: &str, size: u64) -> SeedEntry {
         SeedEntry {
+            node: LOCAL_NODE,
             rel_path: rel_path.to_owned(),
             abs_path: Some(abs_path.to_owned()),
             size,
@@ -744,11 +745,13 @@ mod tests {
                     entries: vec![
                         present(README_PATH, &dir.join(README_PATH).to_string_lossy(), 64),
                         SeedEntry {
+                            node: LOCAL_NODE,
                             sha256: Some(CONFIG_SHA256.parse().expect("sha256 parses")),
                             git_sha1: Some(CONFIG_SHA1.parse().expect("sha1 parses")),
                             ..present("config.json", "/data/hub/blobs/config", 12)
                         },
                         SeedEntry {
+                            node: LOCAL_NODE,
                             sha256: Some(WEIGHTS_SHA256.parse().expect("sha256 parses")),
                             artifact: Some(weights_artifact()),
                             ..present(WEIGHTS, "/data/hub/blobs/weights", 4_265_146_304)

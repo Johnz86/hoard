@@ -3,6 +3,7 @@ mod ingest;
 mod jobs;
 mod loadouts;
 mod models;
+mod nodes;
 mod query;
 mod read;
 mod scan;
@@ -32,6 +33,8 @@ pub use self::hashing::HashReport;
 pub use self::ingest::{IngestRecord, MIRROR_SOURCE, ServedFile};
 pub use self::jobs::JobRecord;
 pub use self::loadouts::LoadoutRecord;
+pub use self::models::LOCAL_NODE;
+pub use self::nodes::NodeRecord;
 pub use self::read::{
     ArtifactDetailView, EntryDetail, RefDetail, RepositoryDetail, RepositoryFilter, RepositoryPage,
     RevisionDetail, SourceRecord, TriageItem,
@@ -136,6 +139,7 @@ impl Catalog {
             )));
         }
         catalog.seed_builtin_shelves()?;
+        catalog.ensure_self_row(&manifest.node)?;
         Ok(catalog)
     }
 
