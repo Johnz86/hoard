@@ -10,7 +10,8 @@ otherwise have to ask for is in the file.
 
 Write it to `docs/superpowers/plans/YYYY-MM-DD-<name>.md`. It is committed with the first
 task and **deleted when the wave lands** - git keeps the history, and a stale plan file in the
-tree is a trap for the next agent. Say in the handoff that you deleted it.
+tree is a trap for the next agent. The dispatcher deletes it, never the implementer: do not
+write a task that removes the plan file. Say in the handoff that you deleted it.
 
 ## The skeleton
 
