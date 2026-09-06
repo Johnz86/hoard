@@ -89,7 +89,7 @@ impl Catalog {
             counters.pending.push(artifact);
         }
         if let Some(previous) = &previous {
-            counters.presence.removed(previous);
+            counters.derived.removed(previous);
         }
         let entry = Entry {
             id,
@@ -104,7 +104,7 @@ impl Catalog {
             node: LOCAL_NODE,
             ..blank_entry(previous)
         };
-        counters.presence.added(&entry);
+        counters.derived.added(&entry);
         transaction.upsert(entry)?;
         log_changes(&transaction, &mut counters)?;
         counters.save(&transaction)?;
@@ -128,7 +128,7 @@ impl Catalog {
         };
         let state = pulled_state(file);
         if let Some(previous) = &previous {
-            counters.presence.removed(previous);
+            counters.derived.removed(previous);
         }
         let entry = Entry {
             id,
@@ -148,7 +148,7 @@ impl Catalog {
             node: LOCAL_NODE,
             ..blank_entry(previous)
         };
-        counters.presence.added(&entry);
+        counters.derived.added(&entry);
         transaction.upsert(entry)?;
         if created {
             count_artifact(

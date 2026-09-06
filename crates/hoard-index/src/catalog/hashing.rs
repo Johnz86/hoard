@@ -144,7 +144,7 @@ impl Catalog {
                 }
                 None => None,
             };
-            counters.presence.removed(&entry);
+            counters.derived.removed(&entry);
             let hashed = Entry {
                 artifact_id,
                 sha256: Some(digest.sha256),
@@ -152,11 +152,11 @@ impl Catalog {
                 git_sha1: entry.git_sha1.or(digest.git_sha1),
                 ..entry
             };
-            counters.presence.added(&hashed);
+            counters.derived.added(&hashed);
             transaction.upsert(hashed)?;
         }
         log_changes(&transaction, counters)?;
-        counters.presence.flush(&transaction)?;
+        counters.derived.flush(&transaction)?;
         transaction.commit()?;
         Ok(merged)
     }

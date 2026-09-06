@@ -236,6 +236,7 @@ fn blank(id: i64) -> Node {
         cursor: None,
         synced: None,
         pass: 0,
+        filed: 0,
     }
 }
 

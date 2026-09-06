@@ -256,7 +256,7 @@ impl Seeding<'_, '_> {
             pass: 0,
             pull_progress: None,
         };
-        self.counters.presence.added(&entry);
+        self.counters.derived.added(&entry);
         self.transaction.insert(entry)?;
         Ok(())
     }

@@ -19,9 +19,9 @@ use crate::search::{CompileContext, SortKey, SortSpec, parse};
 
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, ArtifactRecordV1, Entry, EntryKey, EntryV1,
-    LOCAL_NODE, Manifest, ManifestV1, Node, Override, Ref, Repository, RepositoryKey, RepositoryV1,
-    RepositoryV2, RepositoryV3, Revision, RevisionV1, RevisionV2, SearchChange, SearchText, Source,
-    SourceV1, SourceV2, Summary, SummaryV1, SummaryV2,
+    LOCAL_NODE, Manifest, ManifestV1, Node, NodeV1, Override, Ref, Repository, RepositoryKey,
+    RepositoryV1, RepositoryV2, RepositoryV3, Revision, RevisionV1, RevisionV2, SearchChange,
+    SearchText, Source, SourceV1, SourceV2, Summary, SummaryV1, SummaryV2,
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
@@ -3111,6 +3111,26 @@ fn node_encoding_is_frozen() -> Result<()> {
         cursor: Some("d1-2a".to_owned()),
         synced: Some("2026-09-06T10:00:00Z".to_owned()),
         pass: 3,
+        filed: 9,
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn node_v1_encoding_is_frozen() -> Result<()> {
+    let value = NodeV1 {
+        id: 2,
+        node_id: "laptop-1".to_owned(),
+        name: "laptop".to_owned(),
+        url: Some("http://laptop:7099".to_owned()),
+        is_self: false,
+        online: true,
+        indexed_bytes: 65_536,
+        last_seen: Some("2026-09-06T10:00:00Z".to_owned()),
+        cursor: Some("d1-2a".to_owned()),
+        synced: Some("2026-09-06T10:00:00Z".to_owned()),
+        pass: 3,
     };
     insta::assert_snapshot!(frozen_encoding(&value)?);
     Ok(())
@@ -3256,7 +3276,16 @@ fn a_digest_pages_hashed_local_artifacts_and_a_peers_rows_land_as_remote() -> Re
         },
         "the shared hash reuses this node's record"
     );
-    assert_eq!(catalog.filed_for(laptop.id)?, 2);
+    assert_eq!(
+        catalog.filed_for(laptop.id)?,
+        2,
+        "the peer's count follows what its digest filed"
+    );
+    assert_eq!(
+        catalog.filed_for(LOCAL_NODE)?,
+        3,
+        "this node files what its own scan found"
+    );
     catalog.rebuild_search(|_| {})?;
     let remote = search(&catalog, "node:laptop")?;
     assert_eq!(remote.total, 2);
@@ -3276,7 +3305,12 @@ fn a_digest_pages_hashed_local_artifacts_and_a_peers_rows_land_as_remote() -> Re
     let next_pass = catalog.begin_pass(laptop.id)?;
     catalog.apply_digest(laptop.id, &rows[..1], next_pass)?;
     assert_eq!(catalog.retract_digest(laptop.id, next_pass)?, 1);
-    assert_eq!(catalog.filed_for(laptop.id)?, 1);
+    assert_eq!(
+        catalog.filed_for(laptop.id)?,
+        1,
+        "a retracted row leaves the peer's count"
+    );
+    assert_eq!(catalog.filed_for(LOCAL_NODE)?, 3);
     catalog.refresh_search(|_| {})?;
     assert_eq!(search(&catalog, "node:laptop")?.total, 1);
     assert!(

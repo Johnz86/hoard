@@ -22,8 +22,8 @@ use crate::sniff::{self, SniffResult};
 use super::hashing::content_key;
 use super::models::{
     Allocator, ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE,
-    Manifest, Override, Ref, Repository, RepositoryKey, Revision, SearchChange, SearchText, Source,
-    Summary, repository_key,
+    Manifest, Node, Override, Ref, Repository, RepositoryKey, Revision, SearchChange, SearchText,
+    Source, Summary, repository_key,
 };
 use super::naming::{
     InferenceContext, Naming, artifact_name, content_hashes, disambiguate_labels, index_document,
@@ -123,6 +123,7 @@ impl Catalog {
         settings: ScanSettings,
         progress: impl FnMut(&str, u64),
     ) -> Result<()> {
+        self.ensure_self_row(node)?;
         let mut counters = Counters::load(&self.database)?;
         let mut walk = Walk {
             settings,
@@ -146,7 +147,7 @@ impl Catalog {
             search_seq: 0,
         })?;
         transaction.commit()?;
-        self.ensure_self_row(node)
+        Ok(())
     }
 
     /// The one pass a fresh scan and a rescan share. A fresh scan starts with nothing known,
@@ -221,7 +222,7 @@ impl Catalog {
     fn record_scan_stats(&self, sources: &[&SourceConfig], counters: &mut Counters) -> Result<()> {
         let at = jiff::Timestamp::now().to_string();
         let transaction = self.database.rw_transaction()?;
-        counters.presence.flush(&transaction)?;
+        counters.derived.flush(&transaction)?;
         let repositories: Vec<Repository> = transaction
             .scan()
             .primary()?
@@ -257,8 +258,10 @@ impl Catalog {
     pub(super) fn recount_derived(&self) -> Result<()> {
         let read = self.database.r_transaction()?;
         let mut counted: HashMap<i64, (u32, u64, u64)> = HashMap::new();
+        let mut filed: HashMap<i64, u64> = HashMap::new();
         for entry in read.scan().primary::<Entry>()?.all()? {
             let entry: Entry = entry?;
+            *filed.entry(entry.node).or_default() += 1;
             if entry.state == State::Remote {
                 continue;
             }
@@ -269,6 +272,11 @@ impl Catalog {
                 slot.2 = slot.2.saturating_add(1);
             }
         }
+        let nodes: Vec<Node> = read
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
         let repositories: Vec<Repository> = read
             .scan()
             .primary()?
@@ -305,6 +313,16 @@ impl Catalog {
             transaction.upsert(Source {
                 pending_hashes,
                 ..source
+            })?;
+        }
+        for node in nodes {
+            let counted = filed.get(&node.id).copied().unwrap_or_default();
+            if node.filed == counted {
+                continue;
+            }
+            transaction.upsert(Node {
+                filed: counted,
+                ..node
             })?;
         }
         transaction.commit()?;
@@ -420,7 +438,7 @@ impl Catalog {
             let Some(entry) = transaction.get().primary::<Entry>(known.entry_id)? else {
                 continue;
             };
-            counters.presence.removed(&entry);
+            counters.derived.removed(&entry);
             transaction.upsert(Entry {
                 state: State::Remote,
                 preference: preference(State::Remote, false),
@@ -768,7 +786,7 @@ fn replace_known(
             counters.touched.insert(id);
         }
         if let Some(entry) = transaction.get().primary::<Entry>(known.entry_id)? {
-            counters.presence.removed(&entry);
+            counters.derived.removed(&entry);
             transaction.remove(entry)?;
         }
     }
@@ -782,7 +800,7 @@ pub(super) struct Counters {
     artifacts_by_identity: HashMap<u128, i64>,
     pub(super) touched: HashSet<i64>,
     pub(super) pending: Vec<i64>,
-    pub(super) presence: PresenceShift,
+    pub(super) derived: DerivedShift,
 }
 
 /// What one entry contributes to the counts kept on the records above it.
@@ -794,14 +812,18 @@ struct Contribution {
 }
 
 /// What a pass moved in the counts derived from its entries: each repository's present
-/// files and bytes, and each source's owed hashes. Accumulating them means a repository
-/// and a source are rewritten once per pass rather than once per entry.
+/// files and bytes, each source's owed hashes, and each node's filed rows. Accumulating
+/// them means a record above the entries is rewritten once per pass rather than once per
+/// entry.
 #[derive(Debug, Default)]
-pub(super) struct PresenceShift(HashMap<i64, Contribution>);
+pub(super) struct DerivedShift {
+    repositories: HashMap<i64, Contribution>,
+    nodes: HashMap<i64, i64>,
+}
 
-impl PresenceShift {
+impl DerivedShift {
     /// Counts an entry the caller is about to write. An entry holding no bytes on any node
-    /// moves nothing.
+    /// moves only that node's filed count.
     pub(super) fn added(&mut self, entry: &Entry) {
         self.shift(entry, 1);
     }
@@ -812,11 +834,13 @@ impl PresenceShift {
     }
 
     fn shift(&mut self, entry: &Entry, sign: i64) {
+        let filed = self.nodes.entry(entry.node).or_default();
+        *filed = filed.saturating_add(sign);
         if entry.state == State::Remote {
             return;
         }
         let bytes = i64::try_from(entry.size).unwrap_or(i64::MAX);
-        let slot = self.0.entry(entry.repo_id).or_default();
+        let slot = self.repositories.entry(entry.repo_id).or_default();
         slot.files = slot.files.saturating_add(sign);
         slot.bytes = slot.bytes.saturating_add(sign.saturating_mul(bytes));
         if owes_a_hash(entry) {
@@ -824,11 +848,11 @@ impl PresenceShift {
         }
     }
 
-    /// Writes what has accumulated onto the repositories and sources it names, and starts
-    /// again empty.
+    /// Writes what has accumulated onto the repositories, sources and nodes it names, and
+    /// starts again empty.
     pub(super) fn flush(&mut self, transaction: &RwTransaction<'_>) -> Result<()> {
         let mut owed: HashMap<String, i64> = HashMap::new();
-        for (repo_id, moved) in self.0.drain() {
+        for (repo_id, moved) in self.repositories.drain() {
             if moved == Contribution::default() {
                 continue;
             }
@@ -853,6 +877,18 @@ impl PresenceShift {
             };
             transaction.upsert(Source {
                 pending_hashes: shifted_u64(stored.pending_hashes, moved),
+                ..stored
+            })?;
+        }
+        for (node, moved) in self.nodes.drain() {
+            if moved == 0 {
+                continue;
+            }
+            let Some(stored) = transaction.get().primary::<Node>(node)? else {
+                continue;
+            };
+            transaction.upsert(Node {
+                filed: shifted_u64(stored.filed, moved),
                 ..stored
             })?;
         }
@@ -893,14 +929,14 @@ impl Counters {
             artifacts_by_identity: HashMap::new(),
             touched: HashSet::new(),
             pending: Vec::new(),
-            presence: PresenceShift::default(),
+            derived: DerivedShift::default(),
         })
     }
 
     /// Writes the allocator and the present counts this pass moved, which is why every
     /// writer commits through it.
     pub(super) fn save(&mut self, transaction: &RwTransaction<'_>) -> Result<()> {
-        self.presence.flush(transaction)?;
+        self.derived.flush(transaction)?;
         transaction.upsert(Allocator {
             id: 0,
             repos: self.repos,
@@ -1594,7 +1630,7 @@ fn store_entry(
         pass: 0,
         pull_progress: None,
     };
-    counters.presence.added(&entry);
+    counters.derived.added(&entry);
     transaction.insert(entry)?;
     Ok(stored)
 }

@@ -111,7 +111,7 @@ impl Catalog {
                 counters.touched.insert(artifact);
                 counters.pending.push(artifact);
             }
-            counters.presence.removed(&stored);
+            counters.derived.removed(&stored);
             transaction.upsert(Entry {
                 state: State::Remote,
                 pull_progress: None,
@@ -188,9 +188,9 @@ impl Ingesting<'_, '_> {
             pull_progress: None,
         };
         if let Some(previous) = &previous {
-            self.counters.presence.removed(previous);
+            self.counters.derived.removed(previous);
         }
-        self.counters.presence.added(&entry);
+        self.counters.derived.added(&entry);
         self.transaction.upsert(entry)?;
         if let Some(found) = classified.as_ref().filter(|found| found.created) {
             self.count_artifact(file.size, found.triage)?;

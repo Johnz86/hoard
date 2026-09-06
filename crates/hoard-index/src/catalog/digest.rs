@@ -176,7 +176,7 @@ impl Catalog {
             if let Some(id) = entry.artifact_id {
                 artifacts.push(id);
             }
-            counters.presence.removed(&entry);
+            counters.derived.removed(&entry);
             transaction.remove(entry)?;
             removed += 1;
         }
@@ -224,18 +224,11 @@ impl Catalog {
         Ok(())
     }
 
-    /// How many entries this node files for a peer.
+    /// How many entries this node files for a peer, as the writers that filed them left
+    /// the peer's count.
     pub fn filed_for(&self, peer: i64) -> Result<u64> {
-        let snapshot = self.database.r_transaction()?;
-        let scan = snapshot.scan();
-        let by_node = scan.secondary::<Entry>(EntryKey::node)?;
-        let mut filed = 0;
-        for entry in by_node.start_with(peer)? {
-            if entry?.node == peer {
-                filed += 1;
-            }
-        }
-        Ok(filed)
+        let stored: Option<Node> = self.database.r_transaction()?.get().primary(peer)?;
+        Ok(stored.map_or(0, |node| node.filed))
     }
 
     /// Returns every entry a stopped process left mid-transfer to REMOTE, which is what
@@ -258,7 +251,7 @@ impl Catalog {
             if let Some(id) = entry.artifact_id {
                 counters.pending.push(id);
             }
-            counters.presence.removed(&entry);
+            counters.derived.removed(&entry);
             transaction.upsert(Entry {
                 state: State::Remote,
                 preference: preference(State::Remote, false),
@@ -326,7 +319,7 @@ impl Applying<'_, '_> {
             None => next_id(&mut self.counters.entries)?,
         };
         if let Some(previous) = &previous {
-            self.counters.presence.removed(previous);
+            self.counters.derived.removed(previous);
         }
         let entry = Entry {
             id,
@@ -350,7 +343,7 @@ impl Applying<'_, '_> {
             pass: self.pass,
             pull_progress: None,
         };
-        self.counters.presence.added(&entry);
+        self.counters.derived.added(&entry);
         self.transaction.upsert(entry)?;
         applied.entries += 1;
         Ok(applied)

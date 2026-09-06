@@ -50,7 +50,7 @@ pub(super) struct Source {
     pub(super) last_scan: Option<String>,
     /// The present files under this root that carry no sha256 yet. Moved by the same
     /// writers that move a repository's present counts, through
-    /// [`super::scan::PresenceShift`]; a writer added later must do the same.
+    /// [`super::scan::DerivedShift`]; a writer added later must do the same.
     pub(super) pending_hashes: u64,
 }
 
@@ -176,7 +176,7 @@ pub(super) struct Repository {
     /// The entries of this repository whose bytes are on a node, and the bytes they hold.
     ///
     /// Every writer that changes an entry's presence, size or repository must move these
-    /// through [`super::scan::PresenceShift`]; a writer added later must do the same, or
+    /// through [`super::scan::DerivedShift`]; a writer added later must do the same, or
     /// the repositories listing and the Hub face will report counts that never settle.
     pub(super) present_files: u32,
     pub(super) present_bytes: u64,
@@ -860,10 +860,29 @@ pub(super) struct Job {
     pub(super) finished: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 21, version = 1)]
+#[native_db]
+pub(super) struct NodeV1 {
+    #[primary_key]
+    pub(super) id: i64,
+    #[secondary_key(unique)]
+    pub(super) node_id: String,
+    pub(super) name: String,
+    pub(super) url: Option<String>,
+    pub(super) is_self: bool,
+    pub(super) online: bool,
+    pub(super) indexed_bytes: u64,
+    pub(super) last_seen: Option<String>,
+    pub(super) cursor: Option<String>,
+    pub(super) synced: Option<String>,
+    pub(super) pass: u64,
+}
+
 /// A machine this install knows about: this one, which is always [`LOCAL_NODE`], plus every
 /// peer discovered or configured.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 21, version = 1)]
+#[native_model(id = 21, version = 2, from = NodeV1)]
 #[native_db]
 pub(super) struct Node {
     #[primary_key]
@@ -883,6 +902,47 @@ pub(super) struct Node {
     /// The resync pass the peer's rows were last confirmed in; rows stamped with an older
     /// pass are what the peer stopped advertising.
     pub(super) pass: u64,
+    /// The entries this catalog files against this node. Moved by the same writers that
+    /// move a repository's present counts, through [`super::scan::DerivedShift`]; a writer
+    /// added later must do the same.
+    pub(super) filed: u64,
+}
+
+impl From<NodeV1> for Node {
+    fn from(node: NodeV1) -> Self {
+        Self {
+            id: node.id,
+            node_id: node.node_id,
+            name: node.name,
+            url: node.url,
+            is_self: node.is_self,
+            online: node.online,
+            indexed_bytes: node.indexed_bytes,
+            last_seen: node.last_seen,
+            cursor: node.cursor,
+            synced: node.synced,
+            pass: node.pass,
+            filed: 0,
+        }
+    }
+}
+
+impl From<Node> for NodeV1 {
+    fn from(node: Node) -> Self {
+        Self {
+            id: node.id,
+            node_id: node.node_id,
+            name: node.name,
+            url: node.url,
+            is_self: node.is_self,
+            online: node.online,
+            indexed_bytes: node.indexed_bytes,
+            last_seen: node.last_seen,
+            cursor: node.cursor,
+            synced: node.synced,
+            pass: node.pass,
+        }
+    }
 }
 
 /// Registers every record type. `native_db` compares each definition against every model
@@ -907,6 +967,8 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<Source>()?;
     models.define::<EntryV1>()?;
     models.define::<Entry>()?;
+    models.define::<NodeV1>()?;
+    models.define::<Node>()?;
     models.define::<ArtifactDetail>()?;
     models.define::<SearchText>()?;
     models.define::<Allocator>()?;
@@ -920,6 +982,5 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<ArtifactUse>()?;
     models.define::<LoadoutDoc>()?;
     models.define::<Job>()?;
-    models.define::<Node>()?;
     Ok(models)
 }
