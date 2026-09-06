@@ -5462,6 +5462,224 @@ fn facets_and_nodes_survive_a_multi_segment_index() -> Result<()> {
 }
 
 #[test]
+fn tallies_keyed_by_ordinal_merge_across_segments_by_the_term_they_spell() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let native = directory.path().join("native");
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    for round in 0..3 {
+        fs::write(
+            input.join(format!("loras/round-{round}.safetensors")),
+            lora_header_named(&format!("block_{round}")),
+        )?;
+        catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+        catalog.refresh_search(|_| {})?;
+    }
+    assert!(
+        catalog.search_segments()? > 1,
+        "the refreshes leave the ordinals spread over several segments"
+    );
+    let page = search(&catalog, "")?;
+    assert_eq!(page.total, 5);
+    assert_eq!(page.nodes, 1, "every segment sits on the one node");
+    let lora = page
+        .facets
+        .role
+        .iter()
+        .find(|bucket| bucket.value == "lora")
+        .map(|bucket| bucket.count);
+    assert_eq!(
+        lora,
+        Some(4),
+        "one ordinal per segment sums into one bucket: {:?}",
+        page.facets.role
+    );
+    let roles: u64 = page.facets.role.iter().map(|bucket| bucket.count).sum();
+    assert_eq!(roles, page.total, "every artifact is counted exactly once");
+    let formats: Vec<(&str, u64)> = page
+        .facets
+        .format
+        .iter()
+        .map(|bucket| (bucket.value.as_str(), bucket.count))
+        .collect();
+    assert_eq!(
+        formats,
+        [("safetensors", 5)],
+        "a term every segment spells is one bucket, not one per segment"
+    );
+    assert_eq!(search(&catalog, "role:lora")?.total, 4);
+    Ok(())
+}
+
+#[test]
+fn a_segment_with_deletes_answers_what_a_fresh_index_answers() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    for round in 0..3 {
+        fs::write(
+            input.join(format!("loras/extra-{round}.safetensors")),
+            lora_header_named(&format!("short_{round}")),
+        )?;
+    }
+    let native = directory.path().join("native");
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    assert_eq!(
+        catalog.search_deleted_documents()?,
+        0,
+        "a fresh index deletes nothing"
+    );
+    for round in 0..3 {
+        fs::write(
+            input.join(format!("loras/extra-{round}.safetensors")),
+            lora_header_named(&format!("a_much_longer_block_name_{round}")),
+        )?;
+    }
+    let rescanned = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    assert_eq!(rescanned.changed, 3);
+    catalog.refresh_search(|_| {})?;
+    assert!(
+        catalog.search_deleted_documents()? > 0,
+        "a refresh over changed artifacts leaves the old segment carrying deletes"
+    );
+    let deleted = search(&catalog, "")?;
+    let names: Vec<String> = deleted.rows.iter().map(|row| row.name.clone()).collect();
+    let lora = search(&catalog, "role:lora")?;
+
+    catalog.rebuild_search(|_| {})?;
+    assert_eq!(catalog.search_deleted_documents()?, 0);
+    let fresh = search(&catalog, "")?;
+    assert_eq!(
+        deleted.total, fresh.total,
+        "a deleted document is counted by neither"
+    );
+    assert_eq!(deleted.nodes, fresh.nodes);
+    assert_eq!(
+        names,
+        fresh
+            .rows
+            .iter()
+            .map(|row| row.name.clone())
+            .collect::<Vec<String>>()
+    );
+    assert_eq!(
+        deleted.facets, fresh.facets,
+        "the rail counts the living documents alone"
+    );
+    assert_eq!(lora.total, search(&catalog, "role:lora")?.total);
+    Ok(())
+}
+
+#[test]
+fn a_base_bucket_keeps_its_label_only_when_every_segment_agrees() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let labelled = |name: &str, label: &str, identity: u128| SeedRepository {
+        repo: RepoId::new(RepoType::Models, Some("acme".to_owned()), name.to_owned()),
+        source: "cache".to_owned(),
+        kind: SourceKind::HfCache,
+        root_path: "/vault".into(),
+        git_dir: None,
+        revisions: vec![SeedRevision {
+            name: "main".to_owned(),
+            sha: None,
+            refs: Vec::new(),
+            title: None,
+            author: None,
+            committed: None,
+            entries: vec![seeded_entry(
+                &format!("{name}.safetensors"),
+                1_024,
+                Some(seeded_artifact(
+                    identity,
+                    name,
+                    Some("acme"),
+                    Artifact {
+                        base: Base::new("sdxl 1.0"),
+                        base_label: Some(label.to_owned()),
+                        ..seeded_facts()
+                    },
+                )),
+            )],
+        }],
+    };
+    let bucket_label = |catalog: &Catalog| -> Result<Option<String>> {
+        Ok(search(catalog, "")?
+            .facets
+            .base
+            .into_iter()
+            .find(|bucket| bucket.value == "sdxl10")
+            .and_then(|bucket| bucket.label))
+    };
+    catalog.seed(&[
+        labelled("first", "SDXL 1.0", 0x1),
+        labelled("second", "SDXL 1.0", 0x2),
+    ])?;
+    catalog.rebuild_search(|_| {})?;
+    assert_eq!(
+        bucket_label(&catalog)?,
+        Some("SDXL 1.0".to_owned()),
+        "one segment whose artifacts agree carries the label"
+    );
+    catalog.seed(&[labelled("third", "SDXL Turbo", 0x3)])?;
+    catalog.refresh_search(|_| {})?;
+    assert!(
+        catalog.search_segments()? > 1,
+        "the refresh puts the differing label in a segment of its own"
+    );
+    assert_eq!(
+        bucket_label(&catalog)?,
+        None,
+        "a segment that spells another label takes the label off the bucket"
+    );
+    catalog.seed(&[labelled("fourth", "SDXL 1.0", 0x4)])?;
+    catalog.refresh_search(|_| {})?;
+    assert_eq!(
+        bucket_label(&catalog)?,
+        None,
+        "an agreeing segment afterwards does not restore it"
+    );
+    assert_eq!(search(&catalog, "")?.total, 4);
+    Ok(())
+}
+
+#[test]
+fn an_absent_facet_column_tallies_nothing_and_breaks_nothing() -> Result<()> {
+    let (_directory, catalog) = fixture()?;
+    catalog.rebuild_search(|_| {})?;
+    let page = search(&catalog, "")?;
+    assert_eq!(page.total, 2);
+    assert_eq!(page.nodes, 1);
+    assert!(
+        page.facets.precision.is_empty(),
+        "a segment with no precision term has no precision bucket: {:?}",
+        page.facets.precision
+    );
+    assert!(
+        page.facets.base.is_empty(),
+        "a segment with no base term has no base bucket: {:?}",
+        page.facets.base
+    );
+    let mut formats: Vec<(&str, u64)> = page
+        .facets
+        .format
+        .iter()
+        .map(|bucket| (bucket.value.as_str(), bucket.count))
+        .collect();
+    formats.sort_unstable();
+    assert_eq!(formats, [("csv", 1), ("jsonl", 1)]);
+    let roles: u64 = page.facets.role.iter().map(|bucket| bucket.count).sum();
+    assert_eq!(roles, page.total);
+    Ok(())
+}
+
+#[test]
 fn the_primary_path_answers_exactly_what_the_collapse_path_answers() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let hub = directory.path().join("hub");

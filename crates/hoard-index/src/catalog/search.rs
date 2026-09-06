@@ -7,12 +7,14 @@ use serde::Serialize;
 use tantivy::collector::{Collector, Count, SegmentCollector};
 use tantivy::columnar::StrColumn;
 use tantivy::fastfield::Column;
-use tantivy::query::{BooleanQuery, Query, QueryClone, TermQuery};
+use tantivy::query::{BooleanQuery, Query, QueryClone, TermQuery, Weight};
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, Schema, TEXT, TantivyDocument, TextFieldIndexing,
     TextOptions,
 };
-use tantivy::{DocId, Index, Score, Searcher, SegmentOrdinal, SegmentReader, Term};
+use tantivy::{
+    COLLECT_BLOCK_BUFFER_LEN, DocId, Index, Score, Searcher, SegmentOrdinal, SegmentReader, Term,
+};
 
 use hoard_core::{EntryId, RepoRowId};
 
@@ -580,10 +582,8 @@ impl Catalog {
                 Some(_) => Some(pass.narrowed(excluded.box_clone())?),
                 None => None,
             };
-            let labelled = index == BASE_DIMENSION;
-            let mut buckets =
-                count_buckets(narrowed.as_ref().unwrap_or(pass.summary), index, labelled)?;
-            if labelled {
+            let mut buckets = count_buckets(narrowed.as_ref().unwrap_or(pass.summary), index)?;
+            if index == BASE_DIMENSION {
                 for bucket in &mut buckets {
                     let scoped = BooleanQuery::intersection(vec![
                         excluded.box_clone(),
@@ -667,6 +667,27 @@ impl Catalog {
             .as_ref()
             .ok_or_else(|| IndexError::Catalog("search index was closed".into()))?;
         Ok(open.reader.searcher().segment_readers().len())
+    }
+
+    /// How many documents the published index carries a delete for, which is what puts a
+    /// segment on tantivy's per-document collection path.
+    #[cfg(test)]
+    pub(super) fn search_deleted_documents(&self) -> Result<u32> {
+        let directory = self
+            .manifest()?
+            .search_directory
+            .ok_or_else(|| IndexError::Catalog("search index needs building".into()))?;
+        let guard = self.open_index(&directory)?;
+        let open = guard
+            .as_ref()
+            .ok_or_else(|| IndexError::Catalog("search index was closed".into()))?;
+        Ok(open
+            .reader
+            .searcher()
+            .segment_readers()
+            .iter()
+            .map(SegmentReader::num_deleted_docs)
+            .sum())
     }
 
     /// Where a term falls in each segment's sort column: the lowest ordinal not below it,
@@ -1219,13 +1240,15 @@ fn spelled_page(
 /// value rather than one per hit.
 fn distinct_nodes(summary: &Summary) -> Result<u64> {
     let mut spelling = Spelling::new(&summary.segments);
-    let mut names: HashSet<String> = HashSet::with_capacity(summary.nodes.len());
-    for (segment, ordinal) in &summary.nodes {
-        names.insert(
-            spelling
-                .spell(*segment, NODE_DIMENSION, *ordinal)?
-                .to_owned(),
-        );
+    let mut names: HashSet<String> = HashSet::new();
+    for (segment, counted) in summary.tallies.iter().enumerate() {
+        for ordinal in counted.sat_on(NODE_DIMENSION) {
+            names.insert(
+                spelling
+                    .spell(segment as SegmentOrdinal, NODE_DIMENSION, ordinal)?
+                    .to_owned(),
+            );
+        }
     }
     Ok(names.len() as u64)
 }
@@ -1259,11 +1282,10 @@ fn only_primary(fields: &Fields, query: Box<dyn Query>) -> BooleanQuery {
     ])
 }
 
-/// One value of one dimension while it is being counted by ordinal, inside one segment,
-/// with the label ordinal every artifact in it agreed on, if they did.
-#[derive(Default)]
+/// The base label ordinal every artifact of one base term agreed on, if they did, inside
+/// one segment. The count itself lives in [`SegmentTallies::counts`].
+#[derive(Default, Clone, PartialEq, Eq, Debug)]
 struct OrdinalTally {
-    count: u64,
     label: Option<u64>,
     seen: bool,
 }
@@ -1303,44 +1325,92 @@ impl Tally {
     }
 }
 
-/// Adds one hit to the ordinal tallies of all five dimensions, observing the base label
-/// wherever a bucket may carry one.
-fn tally(tallies: &mut HashMap<(SegmentOrdinal, usize, u64), OrdinalTally>, hit: &Hit) {
-    for (dimension, ordinal) in hit.facets.iter().enumerate() {
-        if *ordinal == NO_TERM {
-            continue;
+/// What one segment counted: per facet dimension, one slot per term of that column's
+/// dictionary, and per base term the label its artifacts agreed on. A segment ordinal is a
+/// constant inside a collection and every facet dictionary is small, so a dimension is a
+/// vector indexed by ordinal rather than a map keyed by one.
+#[derive(Default, PartialEq, Eq, Debug)]
+struct SegmentTallies {
+    counts: [Vec<u64>; FACET_COLUMNS.len()],
+    labels: Vec<OrdinalTally>,
+}
+
+impl SegmentTallies {
+    fn sized_for(strings: &SegmentStrings) -> Self {
+        let counts: [Vec<u64>; FACET_COLUMNS.len()] =
+            std::array::from_fn(|dimension| vec![0; strings.terms(dimension)]);
+        let labels = vec![OrdinalTally::default(); counts[BASE_DIMENSION].len()];
+        Self { counts, labels }
+    }
+
+    /// Adds one hit to all five dimensions, observing the base label wherever a bucket may
+    /// carry one. An ordinal outside the dictionary it was read from cannot happen for a
+    /// column of the same segment, and answers false so the collector raises it as the
+    /// invalid fast fields it is.
+    #[inline]
+    fn observe(&mut self, hit: &Hit) -> bool {
+        for (dimension, ordinal) in hit.facets.iter().enumerate() {
+            if *ordinal == NO_TERM {
+                continue;
+            }
+            let slot = *ordinal as usize;
+            let Some(counted) = self.counts[dimension].get_mut(slot) else {
+                return false;
+            };
+            *counted += 1;
+            if dimension == BASE_DIMENSION {
+                let Some(label) = self.labels.get_mut(slot) else {
+                    return false;
+                };
+                label.observe(hit.base_label);
+            }
         }
-        let counted = tallies
-            .entry((hit.segment, dimension, *ordinal))
-            .or_default();
-        counted.count += 1;
-        if dimension == BASE_DIMENSION {
-            counted.observe(hit.base_label);
-        }
+        true
+    }
+
+    /// The ordinals of one dimension at least one counted document carried.
+    fn sat_on(&self, dimension: usize) -> impl Iterator<Item = u64> + '_ {
+        self.counts[dimension]
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count > 0)
+            .map(|(ordinal, _)| ordinal as u64)
     }
 }
 
 /// Spells one dimension's ordinal tallies out and merges the segments that spelled the same
 /// string. The counting itself happened once, while the set was collected.
-fn count_buckets(summary: &Summary, dimension: usize, labelled: bool) -> Result<Vec<FacetBucket>> {
+///
+/// Only the base dimension carries labels, and [`SegmentTallies::labels`] is indexed by base
+/// ordinal, so whether a bucket may carry one is the dimension itself and not the caller's
+/// to say.
+fn count_buckets(summary: &Summary, dimension: usize) -> Result<Vec<FacetBucket>> {
+    let labelled = dimension == BASE_DIMENSION;
     let mut spelling = Spelling::new(&summary.segments);
     let mut tallies: HashMap<String, Tally> = HashMap::new();
-    for ((segment, counted_dimension, ordinal), counted) in &summary.tallies {
-        if *counted_dimension != dimension {
-            continue;
-        }
-        let label = match counted.label {
-            Some(label) => Some(spelling.spell(*segment, LABEL_COLUMN, label)?.to_owned()),
-            None => None,
-        };
-        let value = spelling.spell(*segment, dimension, *ordinal)?.to_owned();
-        if value.is_empty() {
-            continue;
-        }
-        let tally = tallies.entry(value).or_default();
-        tally.count += counted.count;
-        if labelled {
-            tally.observe(label.as_deref().filter(|label| !label.is_empty()));
+    for (segment, counted) in summary.tallies.iter().enumerate() {
+        let segment = segment as SegmentOrdinal;
+        for ordinal in counted.sat_on(dimension) {
+            let held = match labelled {
+                true => counted
+                    .labels
+                    .get(ordinal as usize)
+                    .and_then(|held| held.label),
+                false => None,
+            };
+            let label = match held {
+                Some(held) => Some(spelling.spell(segment, LABEL_COLUMN, held)?.to_owned()),
+                None => None,
+            };
+            let value = spelling.spell(segment, dimension, ordinal)?.to_owned();
+            if value.is_empty() {
+                continue;
+            }
+            let tally = tallies.entry(value).or_default();
+            tally.count += counted.counts[dimension][ordinal as usize];
+            if labelled {
+                tally.observe(label.as_deref().filter(|label| !label.is_empty()));
+            }
         }
     }
     let mut buckets: Vec<FacetBucket> = tallies
@@ -1794,6 +1864,14 @@ impl SegmentStrings {
         self.sort
     }
 
+    /// How many terms one column's dictionary holds, which is how many ordinals a tally of
+    /// that column has to hold a slot for.
+    fn terms(&self, column: usize) -> usize {
+        self.columns[column]
+            .as_ref()
+            .map_or(0, |column| column.num_terms())
+    }
+
     fn first_ord(&self, column: usize, doc: DocId) -> u64 {
         self.columns[column]
             .as_ref()
@@ -1929,12 +2007,12 @@ pub(super) enum QueryPath {
 
 /// What both collections hand to the facet, node and paging code, so each of those is
 /// written once: the total, the candidates that can reach the requested window, every
-/// dimension's ordinal tallies, the node ordinals, and the columns to spell them from.
+/// segment's ordinal tallies, and the columns to spell them from. `tallies` is indexed by
+/// segment ordinal in step with `segments`.
 struct Summary {
     total: u64,
     candidates: Vec<Retained>,
-    tallies: HashMap<(SegmentOrdinal, usize, u64), OrdinalTally>,
-    nodes: HashSet<(SegmentOrdinal, u64)>,
+    tallies: Vec<SegmentTallies>,
     segments: Vec<SegmentStrings>,
 }
 
@@ -1977,6 +2055,40 @@ impl FacetPass<'_> {
     }
 }
 
+/// One block of documents read column by column: every buffer is as long as the block and
+/// holds what one column answered for it. Reused across the blocks of one segment.
+#[derive(Default)]
+struct Block {
+    docs: Vec<DocId>,
+    facets: [Vec<Option<u64>>; FACET_COLUMNS.len()],
+    base_label: Vec<Option<u64>>,
+    artifact: Vec<Option<i64>>,
+    entry: Vec<Option<i64>>,
+    preference: Vec<Option<i64>>,
+    used: Vec<Option<i64>>,
+    sort: Vec<Option<u64>>,
+}
+
+/// Empties one buffer and sizes it for the block, because a column that holds nothing for a
+/// document writes nothing into the slot it was given.
+fn refill<T: Copy>(buffer: &mut Vec<Option<T>>, held: usize) {
+    buffer.clear();
+    buffer.resize(held, None);
+}
+
+fn read_ordinals(column: Option<&StrColumn>, docs: &[DocId], buffer: &mut Vec<Option<u64>>) {
+    refill(buffer, docs.len());
+    if let Some(column) = column {
+        column.ords().first_vals(docs, buffer);
+    }
+}
+
+/// The ordinal one buffer holds for a document of the block, which is [`NO_TERM`] wherever
+/// the column held no term, exactly as [`SegmentStrings::first_ord`] answers.
+fn ordinal_at(buffer: &[Option<u64>], index: usize) -> u64 {
+    buffer.get(index).copied().flatten().unwrap_or(NO_TERM)
+}
+
 /// The fast fields one segment reads a hit out of, opened once per segment.
 struct HitColumns {
     ordinal: SegmentOrdinal,
@@ -2012,22 +2124,90 @@ impl HitColumns {
         })
     }
 
-    fn hit(&self, doc: DocId) -> Hit {
-        Hit {
-            segment: self.ordinal,
-            facets: std::array::from_fn(|dimension| self.strings.first_ord(dimension, doc)),
-            base_label: self.strings.first_ord(LABEL_COLUMN, doc),
+    /// Reads one block of documents column by column, so each fast field is asked once per
+    /// block rather than once per document per column.
+    /// Reads what a bucket pass needs: where the sort puts each document of the block and
+    /// which artifact it belongs to.
+    fn read_ranked(&self, docs: &[DocId], into: &mut Block) {
+        let held = docs.len();
+        into.docs.clear();
+        into.docs.extend_from_slice(docs);
+        refill(&mut into.artifact, held);
+        self.artifact.first_vals(docs, &mut into.artifact);
+        refill(&mut into.sort, held);
+        match self.sort {
+            SortColumn::Ident => into.sort.fill(Some(0)),
+            SortColumn::Size => self.size.first_vals(docs, &mut into.sort),
+            SortColumn::Used => {
+                refill(&mut into.used, held);
+                if let Some(column) = self.last_used.as_ref() {
+                    column.first_vals(docs, &mut into.used);
+                }
+                for (slot, used) in into.sort.iter_mut().zip(into.used.iter()) {
+                    *slot = Some(
+                        used.and_then(|used| u64::try_from(used).ok())
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+            SortColumn::Text => {
+                read_ordinals(
+                    self.strings.columns[self.strings.sort_column()].as_ref(),
+                    docs,
+                    &mut into.sort,
+                );
+                for slot in &mut into.sort {
+                    *slot = Some(slot.unwrap_or(NO_TERM));
+                }
+            }
         }
     }
 
-    /// The numeric part of a hit, without spelling out a single facet ordinal, which is all
-    /// a collapse needs until it knows which row per artifact survives.
-    fn retained(&self, doc: DocId) -> Option<Retained> {
-        let (Some(artifact_id), Some(entry_id), Some(preference), Some(sort)) = (
-            self.artifact.first(doc),
-            self.entry.first(doc),
-            self.preference.first(doc),
-            self.sort_of(doc),
+    /// Reads what a [`Retained`] needs on top of that: the entry the collapse prefers and
+    /// the preference it is chosen by.
+    fn read_rows(&self, docs: &[DocId], into: &mut Block) {
+        self.read_ranked(docs, into);
+        let held = docs.len();
+        refill(&mut into.entry, held);
+        self.entry.first_vals(docs, &mut into.entry);
+        refill(&mut into.preference, held);
+        self.preference.first_vals(docs, &mut into.preference);
+    }
+
+    /// Reads what a [`Hit`] needs: the five facet ordinals and the base label ordinal.
+    fn read_facets(&self, docs: &[DocId], into: &mut Block) {
+        for (dimension, buffer) in into.facets.iter_mut().enumerate() {
+            read_ordinals(self.strings.columns[dimension].as_ref(), docs, buffer);
+        }
+        read_ordinals(
+            self.strings.columns[LABEL_COLUMN].as_ref(),
+            docs,
+            &mut into.base_label,
+        );
+    }
+
+    fn read_block(&self, docs: &[DocId], into: &mut Block) {
+        self.read_rows(docs, into);
+        self.read_facets(docs, into);
+    }
+
+    fn hit_at(&self, block: &Block, index: usize) -> Hit {
+        Hit {
+            segment: self.ordinal,
+            facets: std::array::from_fn(|dimension| ordinal_at(&block.facets[dimension], index)),
+            base_label: ordinal_at(&block.base_label, index),
+        }
+    }
+
+    /// The numeric part of one document of a block, which is [`HitColumns::retained`] read
+    /// out of the buffers instead of out of the columns.
+    fn retained_at(&self, block: &Block, index: usize) -> Option<Retained> {
+        let (Some(doc), Some(artifact_id), Some(entry_id), Some(preference), Some(sort)) = (
+            block.docs.get(index).copied(),
+            block.artifact.get(index).copied().flatten(),
+            block.entry.get(index).copied().flatten(),
+            block.preference.get(index).copied().flatten(),
+            block.sort.get(index).copied().flatten(),
         ) else {
             return None;
         };
@@ -2043,24 +2223,40 @@ impl HitColumns {
 
     /// The two numbers a bucket search needs and nothing else, which is four fast-field
     /// reads fewer per document than a whole [`Retained`].
-    fn ranked(&self, doc: DocId) -> Option<(u64, i64)> {
-        Some((self.sort_of(doc)?, self.artifact.first(doc)?))
+    fn ranked_at(&self, block: &Block, index: usize) -> Option<(u64, i64)> {
+        Some((
+            block.sort.get(index).copied().flatten()?,
+            block.artifact.get(index).copied().flatten()?,
+        ))
     }
+}
 
-    /// Where the sort puts one document, reading only the column that sort orders by.
-    fn sort_of(&self, doc: DocId) -> Option<u64> {
-        Some(match self.sort {
-            SortColumn::Ident => 0,
-            SortColumn::Size => self.size.first(doc)?,
-            SortColumn::Used => self
-                .last_used
-                .as_ref()
-                .and_then(|column| column.first(doc))
-                .and_then(|used| u64::try_from(used).ok())
-                .unwrap_or_default(),
-            SortColumn::Text => self.strings.first_ord(self.strings.sort_column(), doc),
-        })
+/// Collects one segment a block of documents at a time, whether or not that segment carries
+/// deletes.
+///
+/// tantivy's own path drops to one `collect` per document as soon as a segment has a delete
+/// file, which is every segment a refresh has touched, so the block read would be dead on
+/// exactly the segments a long-lived index accumulates. The alive filter moves here instead,
+/// into a buffer reused across the blocks of the segment.
+fn blocked_segment<C: Collector>(
+    collector: &C,
+    weight: &dyn Weight,
+    ordinal: SegmentOrdinal,
+    reader: &SegmentReader,
+) -> tantivy::Result<<C::Child as SegmentCollector>::Fruit> {
+    let mut child = collector.for_segment(ordinal, reader)?;
+    match reader.alive_bitset() {
+        None => weight.for_each_no_score(reader, &mut |docs| child.collect_block(docs))?,
+        Some(alive) => {
+            let mut living: Vec<DocId> = Vec::with_capacity(COLLECT_BLOCK_BUFFER_LEN);
+            weight.for_each_no_score(reader, &mut |docs| {
+                living.clear();
+                living.extend(docs.iter().copied().filter(|doc| alive.is_alive(*doc)));
+                child.collect_block(&living);
+            })?;
+        }
     }
+    Ok(child.harvest())
 }
 
 /// The columns each searched segment kept, slotted by its ordinal so a hit naming a segment
@@ -2123,6 +2319,7 @@ impl Collector for ArtifactCollector {
     ) -> tantivy::Result<Self::Child> {
         Ok(ArtifactSegmentCollector {
             columns: HitColumns::open(ordinal, segment, self.sort.key)?,
+            block: Block::default(),
             retained: Vec::new(),
             invalid: false,
         })
@@ -2130,6 +2327,15 @@ impl Collector for ArtifactCollector {
 
     fn requires_scoring(&self) -> bool {
         false
+    }
+
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        ordinal: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> tantivy::Result<<Self::Child as SegmentCollector>::Fruit> {
+        blocked_segment(self, weight, ordinal, reader)
     }
 
     fn merge_fruits(
@@ -2156,12 +2362,16 @@ impl Collector for ArtifactCollector {
         collapse(&mut rows);
         let segments = segment_columns(columns, count)?;
         let total = rows.len() as u64;
-        let mut tallies = HashMap::new();
-        let mut nodes = HashSet::new();
+        let mut tallies: Vec<SegmentTallies> =
+            segments.iter().map(SegmentTallies::sized_for).collect();
         for row in &rows {
             let hit = hit_of(*row, &segments)?;
-            tally(&mut tallies, &hit);
-            nodes.insert((hit.segment, hit.facets[NODE_DIMENSION]));
+            let counted = tallies
+                .get_mut(hit.segment as usize)
+                .ok_or_else(missing_fast_fields)?;
+            if !counted.observe(&hit) {
+                return Err(missing_fast_fields());
+            }
         }
         let candidates = match self.retain {
             true => rows,
@@ -2171,7 +2381,6 @@ impl Collector for ArtifactCollector {
             total,
             candidates,
             tallies,
-            nodes,
             segments,
         })
     }
@@ -2179,6 +2388,7 @@ impl Collector for ArtifactCollector {
 
 struct ArtifactSegmentCollector {
     columns: HitColumns,
+    block: Block,
     retained: Vec<Retained>,
     invalid: bool,
 }
@@ -2187,9 +2397,16 @@ impl SegmentCollector for ArtifactSegmentCollector {
     type Fruit = tantivy::Result<SegmentHits>;
 
     fn collect(&mut self, doc: DocId, _: Score) {
-        match self.columns.retained(doc) {
-            Some(row) => self.retained.push(row),
-            None => self.invalid = true,
+        self.collect_block(&[doc]);
+    }
+
+    fn collect_block(&mut self, docs: &[DocId]) {
+        self.columns.read_rows(docs, &mut self.block);
+        for index in 0..docs.len() {
+            match self.columns.retained_at(&self.block, index) {
+                Some(row) => self.retained.push(row),
+                None => self.invalid = true,
+            }
         }
     }
 
@@ -2238,20 +2455,24 @@ impl PartialEq for Candidate {
 impl Eq for Candidate {}
 
 /// What every pass over the primary documents counts, whatever else it keeps: the matched
-/// total, every dimension's ordinal tallies and the node ordinals.
-#[derive(Default)]
+/// total and its segment's ordinal tallies.
 struct Counting {
     count: u64,
-    tallies: HashMap<(SegmentOrdinal, usize, u64), OrdinalTally>,
-    nodes: HashSet<(SegmentOrdinal, u64)>,
+    tallies: SegmentTallies,
 }
 
 impl Counting {
+    fn sized_for(strings: &SegmentStrings) -> Self {
+        Self {
+            count: 0,
+            tallies: SegmentTallies::sized_for(strings),
+        }
+    }
+
     #[inline]
-    fn observe(&mut self, hit: &Hit) {
+    fn observe(&mut self, hit: &Hit) -> bool {
         self.count += 1;
-        tally(&mut self.tallies, hit);
-        self.nodes.insert((hit.segment, hit.facets[NODE_DIMENSION]));
+        self.tallies.observe(hit)
     }
 }
 
@@ -2275,8 +2496,7 @@ fn merged(fruits: Vec<tantivy::Result<PrimarySummary>>) -> tantivy::Result<Summa
         .unwrap_or(0);
     let mut total = 0;
     let mut candidates = Vec::with_capacity(harvested.iter().map(|hit| hit.candidates.len()).sum());
-    let mut tallies = HashMap::new();
-    let mut nodes = HashSet::new();
+    let mut tallies: Vec<SegmentTallies> = (0..count).map(|_| SegmentTallies::default()).collect();
     let mut columns = Vec::with_capacity(harvested.len());
     for segment in harvested {
         let PrimarySummary {
@@ -2287,15 +2507,15 @@ fn merged(fruits: Vec<tantivy::Result<PrimarySummary>>) -> tantivy::Result<Summa
         } = segment;
         total += counting.count;
         candidates.extend(kept);
-        tallies.extend(counting.tallies);
-        nodes.extend(counting.nodes);
+        if let Some(slot) = tallies.get_mut(ordinal as usize) {
+            *slot = counting.tallies;
+        }
         columns.push((ordinal, strings));
     }
     Ok(Summary {
         total,
         candidates,
         tallies,
-        nodes,
         segments: segment_columns(columns, count)?,
     })
 }
@@ -2336,18 +2556,29 @@ impl Collector for PrimaryCollector {
         ordinal: SegmentOrdinal,
         segment: &SegmentReader,
     ) -> tantivy::Result<Self::Child> {
+        let columns = HitColumns::open(ordinal, segment, self.sort.key)?;
         Ok(PrimarySegmentCollector {
-            columns: HitColumns::open(ordinal, segment, self.sort.key)?,
             order: order_of(self.sort, self.reversed),
             keep: self.keep,
-            counting: Counting::default(),
+            counting: Counting::sized_for(&columns.strings),
             candidates: BinaryHeap::new(),
             invalid: false,
+            block: Block::default(),
+            columns,
         })
     }
 
     fn requires_scoring(&self) -> bool {
         false
+    }
+
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        ordinal: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> tantivy::Result<<Self::Child as SegmentCollector>::Fruit> {
+        blocked_segment(self, weight, ordinal, reader)
     }
 
     fn merge_fruits(
@@ -2360,6 +2591,7 @@ impl Collector for PrimaryCollector {
 
 struct PrimarySegmentCollector {
     columns: HitColumns,
+    block: Block,
     order: Order,
     keep: usize,
     counting: Counting,
@@ -2371,12 +2603,24 @@ impl SegmentCollector for PrimarySegmentCollector {
     type Fruit = tantivy::Result<PrimarySummary>;
 
     fn collect(&mut self, doc: DocId, _: Score) {
-        let Some(row) = self.columns.retained(doc) else {
-            self.invalid = true;
-            return;
-        };
-        self.counting.observe(&self.columns.hit(doc));
-        offer(&mut self.candidates, self.keep, self.order, row);
+        self.collect_block(&[doc]);
+    }
+
+    fn collect_block(&mut self, docs: &[DocId]) {
+        self.columns.read_block(docs, &mut self.block);
+        for index in 0..docs.len() {
+            let Some(row) = self.columns.retained_at(&self.block, index) else {
+                self.invalid = true;
+                continue;
+            };
+            if !self
+                .counting
+                .observe(&self.columns.hit_at(&self.block, index))
+            {
+                self.invalid = true;
+            }
+            offer(&mut self.candidates, self.keep, self.order, row);
+        }
     }
 
     fn harvest(self) -> Self::Fruit {
@@ -2417,18 +2661,29 @@ impl Collector for SamplingCollector {
         ordinal: SegmentOrdinal,
         segment: &SegmentReader,
     ) -> tantivy::Result<Self::Child> {
+        let columns = HitColumns::open(ordinal, segment, self.sort.key)?;
         Ok(SamplingSegmentCollector {
-            columns: HitColumns::open(ordinal, segment, self.sort.key)?,
             every: self.every.max(1),
             seen: 0,
-            counting: Counting::default(),
+            counting: Counting::sized_for(&columns.strings),
             sample: Vec::new(),
             invalid: false,
+            block: Block::default(),
+            columns,
         })
     }
 
     fn requires_scoring(&self) -> bool {
         false
+    }
+
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        ordinal: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> tantivy::Result<<Self::Child as SegmentCollector>::Fruit> {
+        blocked_segment(self, weight, ordinal, reader)
     }
 
     fn merge_fruits(
@@ -2441,6 +2696,7 @@ impl Collector for SamplingCollector {
 
 struct SamplingSegmentCollector {
     columns: HitColumns,
+    block: Block,
     every: usize,
     seen: usize,
     counting: Counting,
@@ -2452,15 +2708,27 @@ impl SegmentCollector for SamplingSegmentCollector {
     type Fruit = tantivy::Result<PrimarySummary>;
 
     fn collect(&mut self, doc: DocId, _: Score) {
-        let Some(row) = self.columns.retained(doc) else {
-            self.invalid = true;
-            return;
-        };
-        self.counting.observe(&self.columns.hit(doc));
-        if self.seen.is_multiple_of(self.every) {
-            self.sample.push(row);
+        self.collect_block(&[doc]);
+    }
+
+    fn collect_block(&mut self, docs: &[DocId]) {
+        self.columns.read_block(docs, &mut self.block);
+        for index in 0..docs.len() {
+            let Some(row) = self.columns.retained_at(&self.block, index) else {
+                self.invalid = true;
+                continue;
+            };
+            if !self
+                .counting
+                .observe(&self.columns.hit_at(&self.block, index))
+            {
+                self.invalid = true;
+            }
+            if self.seen.is_multiple_of(self.every) {
+                self.sample.push(row);
+            }
+            self.seen += 1;
         }
-        self.seen += 1;
     }
 
     fn harvest(self) -> Self::Fruit {
@@ -2500,6 +2768,7 @@ impl Collector for BucketCollector {
         let order = order_of(self.sort, self.reversed);
         Ok(BucketSegmentCollector {
             columns: HitColumns::open(ordinal, segment, self.sort.key)?,
+            block: Block::default(),
             order,
             counts: vec![0; self.boundaries.len() + 1],
             boundaries: in_segment(&self.boundaries, ordinal, order),
@@ -2509,6 +2778,15 @@ impl Collector for BucketCollector {
 
     fn requires_scoring(&self) -> bool {
         false
+    }
+
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        ordinal: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> tantivy::Result<<Self::Child as SegmentCollector>::Fruit> {
+        blocked_segment(self, weight, ordinal, reader)
     }
 
     fn merge_fruits(&self, fruits: Vec<tantivy::Result<Vec<u64>>>) -> tantivy::Result<Self::Fruit> {
@@ -2524,6 +2802,7 @@ impl Collector for BucketCollector {
 
 struct BucketSegmentCollector {
     columns: HitColumns,
+    block: Block,
     order: Order,
     boundaries: Vec<SegmentBoundary>,
     counts: Vec<u64>,
@@ -2534,16 +2813,23 @@ impl SegmentCollector for BucketSegmentCollector {
     type Fruit = tantivy::Result<Vec<u64>>;
 
     fn collect(&mut self, doc: DocId, _: Score) {
-        let Some((sort, artifact_id)) = self.columns.ranked(doc) else {
-            self.invalid = true;
-            return;
-        };
-        let key = self.order.key(sort);
-        let bucket = self.boundaries.partition_point(|boundary| {
-            boundary.compare(self.order, key, artifact_id) != Ordering::Greater
-        });
-        if let Some(slot) = self.counts.get_mut(bucket) {
-            *slot += 1;
+        self.collect_block(&[doc]);
+    }
+
+    fn collect_block(&mut self, docs: &[DocId]) {
+        self.columns.read_ranked(docs, &mut self.block);
+        for index in 0..docs.len() {
+            let Some((sort, artifact_id)) = self.columns.ranked_at(&self.block, index) else {
+                self.invalid = true;
+                continue;
+            };
+            let key = self.order.key(sort);
+            let bucket = self.boundaries.partition_point(|boundary| {
+                boundary.compare(self.order, key, artifact_id) != Ordering::Greater
+            });
+            if let Some(slot) = self.counts.get_mut(bucket) {
+                *slot += 1;
+            }
         }
     }
 
@@ -2578,6 +2864,7 @@ impl Collector for WindowCollector {
         let order = order_of(self.sort, self.reversed);
         Ok(WindowSegmentCollector {
             columns: HitColumns::open(ordinal, segment, self.sort.key)?,
+            block: Block::default(),
             order,
             from: self
                 .from
@@ -2595,6 +2882,15 @@ impl Collector for WindowCollector {
         false
     }
 
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        ordinal: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> tantivy::Result<<Self::Child as SegmentCollector>::Fruit> {
+        blocked_segment(self, weight, ordinal, reader)
+    }
+
     fn merge_fruits(
         &self,
         fruits: Vec<tantivy::Result<Vec<Retained>>>,
@@ -2610,6 +2906,7 @@ impl Collector for WindowCollector {
 
 struct WindowSegmentCollector {
     columns: HitColumns,
+    block: Block,
     order: Order,
     from: Option<SegmentBoundary>,
     to: Option<SegmentBoundary>,
@@ -2623,24 +2920,31 @@ impl SegmentCollector for WindowSegmentCollector {
     type Fruit = tantivy::Result<Vec<Retained>>;
 
     fn collect(&mut self, doc: DocId, _: Score) {
-        let Some(row) = self.columns.retained(doc) else {
-            self.invalid = true;
-            return;
-        };
-        let key = self.order.key(row.sort);
-        let before = self.from.as_ref().is_some_and(|from| {
-            from.compare(self.order, key, row.artifact_id) == Ordering::Greater
-        });
-        if before {
-            return;
-        }
-        match self
-            .to
-            .as_ref()
-            .is_some_and(|to| to.compare(self.order, key, row.artifact_id) != Ordering::Greater)
-        {
-            true => offer(&mut self.beyond, self.keep, self.order, row),
-            false => self.inside.push(row),
+        self.collect_block(&[doc]);
+    }
+
+    fn collect_block(&mut self, docs: &[DocId]) {
+        self.columns.read_rows(docs, &mut self.block);
+        for index in 0..docs.len() {
+            let Some(row) = self.columns.retained_at(&self.block, index) else {
+                self.invalid = true;
+                continue;
+            };
+            let key = self.order.key(row.sort);
+            let before = self.from.as_ref().is_some_and(|from| {
+                from.compare(self.order, key, row.artifact_id) == Ordering::Greater
+            });
+            if before {
+                continue;
+            }
+            match self
+                .to
+                .as_ref()
+                .is_some_and(|to| to.compare(self.order, key, row.artifact_id) != Ordering::Greater)
+            {
+                true => offer(&mut self.beyond, self.keep, self.order, row),
+                false => self.inside.push(row),
+            }
         }
     }
 
@@ -2661,13 +2965,275 @@ impl SegmentCollector for WindowSegmentCollector {
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+
+    use tantivy::collector::{Collector, SegmentCollector};
+    use tantivy::query::{AllQuery, EnableScoring, Query};
+    use tantivy::schema::TantivyDocument;
+    use tantivy::{DocId, Index, IndexWriter, SegmentReader, Term};
+
+    use crate::search::{SortKey, SortSpec};
 
     use super::{
-        BASE_FIELD, FORMAT_FIELD, HASH_FIELD, KEYWORD_FIELDS, NO_TERM, NODE_FIELD, ORG_FIELD,
-        Order, PRECISION_FIELD, Paging, REPO_FIELD, REVISION_FIELD, ROLE_FIELD, SAMPLE_FLOOR,
-        SOURCE_FIELD, STATE_FIELD, SUB_ROLE_FIELD, SegmentBoundary, Selection, SortColumn,
-        TRIGGER_FIELD, Window, bucket_of, ordinal_key,
+        ArtifactSegmentCollector, BASE_FIELD, Block, Counting, FACET_COLUMNS, FORMAT_FIELD, Fields,
+        HASH_FIELD, HitColumns, KEYWORD_FIELDS, LABEL_COLUMN, NO_TERM, NODE_FIELD, ORG_FIELD,
+        Order, PRECISION_FIELD, Paging, PrimaryCollector, PrimarySegmentCollector, REPO_FIELD,
+        REVISION_FIELD, ROLE_FIELD, Retained, SAMPLE_FLOOR, SOURCE_FIELD, STATE_FIELD,
+        SUB_ROLE_FIELD, SegmentBoundary, Selection, SortColumn, TRIGGER_FIELD, WRITER_BUDGET,
+        Window, bucket_of, order_of, ordinal_key,
     };
+
+    /// One indexed document as the columns a tallying collector reads: the five facet terms
+    /// in the order [`FACET_COLUMNS`] names them, the base label, and the size the sort
+    /// orders by. An empty term is one the document does not carry.
+    struct Indexed {
+        facets: [&'static str; FACET_COLUMNS.len()],
+        label: &'static str,
+        size: u64,
+    }
+
+    fn one_segment(rows: &[Indexed]) -> Index {
+        let (schema, fields) = Fields::build();
+        let index = Index::create_in_ram(schema);
+        let mut writer = index
+            .writer_with_num_threads(1, WRITER_BUDGET)
+            .expect("the in-memory index takes a writer");
+        for (id, row) in rows.iter().enumerate() {
+            let mut document = TantivyDocument::new();
+            let id = id as i64;
+            document.add_i64(fields.artifact, id);
+            document.add_i64(fields.entry, id);
+            document.add_i64(fields.preference, id);
+            document.add_u64(fields.size, row.size);
+            let keywords = [
+                ROLE_FIELD,
+                BASE_FIELD,
+                FORMAT_FIELD,
+                PRECISION_FIELD,
+                NODE_FIELD,
+            ];
+            for (keyword, value) in keywords.into_iter().zip(row.facets) {
+                if !value.is_empty() {
+                    document.add_text(fields.keyword(keyword), value);
+                }
+            }
+            if !row.label.is_empty() {
+                document.add_text(fields.base_label, row.label);
+            }
+            writer
+                .add_document(document)
+                .expect("the document is indexable");
+        }
+        writer.commit().expect("the segment commits");
+        index
+    }
+
+    fn tallying(segment: &SegmentReader, keep: usize) -> PrimarySegmentCollector {
+        let columns =
+            HitColumns::open(0, segment, SortKey::Size).expect("the segment opens its columns");
+        PrimarySegmentCollector {
+            order: order_of(by_size(), false),
+            keep,
+            counting: Counting::sized_for(&columns.strings),
+            candidates: BinaryHeap::new(),
+            invalid: false,
+            block: Block::default(),
+            columns,
+        }
+    }
+
+    /// The sort every collector in these tests is built with, so a collector driven by hand
+    /// and one driven through `collect_segment` are comparable.
+    fn by_size() -> SortSpec {
+        SortSpec::new(SortKey::Size, true)
+    }
+
+    fn collapsing(segment: &SegmentReader) -> ArtifactSegmentCollector {
+        ArtifactSegmentCollector {
+            columns: HitColumns::open(0, segment, SortKey::Size)
+                .expect("the segment opens its columns"),
+            block: Block::default(),
+            retained: Vec::new(),
+            invalid: false,
+        }
+    }
+
+    fn delete_artifact(index: &Index, artifact_id: i64) {
+        let (_, fields) = Fields::build();
+        let mut writer: IndexWriter<TantivyDocument> = index
+            .writer_with_num_threads(1, WRITER_BUDGET)
+            .expect("the in-memory index takes a writer");
+        writer.delete_term(Term::from_field_i64(fields.artifact, artifact_id));
+        writer.commit().expect("the delete commits");
+    }
+
+    fn ordered(mut rows: Vec<Retained>) -> Vec<Retained> {
+        rows.sort_unstable_by_key(|row| row.artifact_id);
+        rows
+    }
+
+    fn sample_rows() -> Vec<Indexed> {
+        [
+            (
+                ["lora", "sdxl", "safetensors", "fp16", "workstation"],
+                "SDXL",
+            ),
+            (
+                ["ckpt", "sdxl", "safetensors", "fp16", "workstation"],
+                "SDXL",
+            ),
+            (["lora", "flux", "safetensors", "", "laptop"], "Flux"),
+            (["lora", "sdxl", "gguf", "q4", "laptop"], ""),
+            (["vae", "", "safetensors", "fp16", "workstation"], ""),
+            (["lora", "flux", "gguf", "", "workstation"], "Flux"),
+            (["ckpt", "flux", "safetensors", "fp8", "laptop"], "Flux"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (facets, label))| Indexed {
+            facets,
+            label,
+            size: 1_000 - index as u64,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn a_block_tallies_and_keeps_exactly_what_one_document_at_a_time_does() {
+        let rows = sample_rows();
+        let index = one_segment(&rows);
+        let searcher = index.reader().expect("the index takes a reader").searcher();
+        let segment = searcher.segment_reader(0);
+        let docs: Vec<DocId> = (0..rows.len() as DocId).collect();
+
+        let mut single = tallying(segment, 3);
+        for doc in &docs {
+            single.collect(*doc, 0.0);
+        }
+        let mut blocked = tallying(segment, 3);
+        for block in docs.chunks(3) {
+            blocked.collect_block(block);
+        }
+
+        let single = single.harvest().expect("the per-document harvest succeeds");
+        let blocked = blocked.harvest().expect("the per-block harvest succeeds");
+        assert_eq!(single.counting.count, rows.len() as u64);
+        assert_eq!(blocked.counting.count, single.counting.count);
+        assert_eq!(blocked.counting.tallies, single.counting.tallies);
+        assert_eq!(ordered(blocked.candidates), ordered(single.candidates));
+    }
+
+    #[test]
+    fn a_collapsing_block_keeps_exactly_what_one_document_at_a_time_keeps() {
+        let rows = sample_rows();
+        let index = one_segment(&rows);
+        let searcher = index.reader().expect("the index takes a reader").searcher();
+        let segment = searcher.segment_reader(0);
+        let docs: Vec<DocId> = (0..rows.len() as DocId).collect();
+
+        let mut single = collapsing(segment);
+        for doc in &docs {
+            single.collect(*doc, 0.0);
+        }
+        let mut blocked = collapsing(segment);
+        for block in docs.chunks(3) {
+            blocked.collect_block(block);
+        }
+
+        let single = single.harvest().expect("the per-document harvest succeeds");
+        let blocked = blocked.harvest().expect("the per-block harvest succeeds");
+        assert_eq!(single.retained.len(), rows.len());
+        assert_eq!(ordered(blocked.retained), ordered(single.retained));
+    }
+
+    #[test]
+    fn a_segment_with_deletes_is_still_collected_in_blocks() {
+        let rows = sample_rows();
+        let index = one_segment(&rows);
+        delete_artifact(&index, 3);
+        let searcher = index.reader().expect("the index takes a reader").searcher();
+        let segment = searcher.segment_reader(0);
+        let alive = segment
+            .alive_bitset()
+            .expect("the segment carries the delete");
+        let living: Vec<DocId> = (0..rows.len() as DocId)
+            .filter(|doc| alive.is_alive(*doc))
+            .collect();
+        assert_eq!(living.len(), rows.len() - 1);
+
+        let mut single = tallying(segment, 3);
+        for doc in &living {
+            single.collect(*doc, 0.0);
+        }
+        let single = single.harvest().expect("the per-document harvest succeeds");
+
+        let weight = AllQuery
+            .weight(EnableScoring::disabled_from_searcher(&searcher))
+            .expect("an unscored weight opens");
+        let driven = PrimaryCollector {
+            sort: by_size(),
+            keep: 3,
+            reversed: false,
+        }
+        .collect_segment(weight.as_ref(), 0, segment)
+        .expect("the segment collects")
+        .expect("the harvest succeeds");
+
+        assert_eq!(driven.counting.count, living.len() as u64);
+        assert_eq!(driven.counting.tallies, single.counting.tallies);
+        assert_eq!(ordered(driven.candidates), ordered(single.candidates));
+    }
+
+    #[test]
+    fn an_absent_column_reads_as_no_term_in_a_block() {
+        let rows: Vec<Indexed> = sample_rows()
+            .into_iter()
+            .map(|row| Indexed {
+                facets: [
+                    row.facets[0],
+                    row.facets[1],
+                    row.facets[2],
+                    "",
+                    row.facets[4],
+                ],
+                ..row
+            })
+            .collect();
+        let index = one_segment(&rows);
+        let searcher = index.reader().expect("the index takes a reader").searcher();
+        let segment = searcher.segment_reader(0);
+        let columns =
+            HitColumns::open(0, segment, SortKey::Size).expect("the segment opens its columns");
+        let precision = FACET_COLUMNS
+            .iter()
+            .position(|name| *name == "precision")
+            .expect("precision is a facet dimension");
+        let docs: Vec<DocId> = (0..rows.len() as DocId).collect();
+        let mut block = Block::default();
+        columns.read_block(&docs, &mut block);
+
+        let mut named = 0;
+        for (index, doc) in docs.iter().enumerate() {
+            let hit = columns.hit_at(&block, index);
+            assert_eq!(
+                hit.facets[precision], NO_TERM,
+                "a column the segment never wrote reads as no term"
+            );
+            for dimension in 0..FACET_COLUMNS.len() {
+                let read = columns.strings.first_ord(dimension, *doc);
+                assert_eq!(hit.facets[dimension], read, "dimension {dimension}");
+                named += usize::from(read != NO_TERM);
+            }
+            assert_eq!(
+                hit.base_label,
+                columns.strings.first_ord(LABEL_COLUMN, *doc)
+            );
+        }
+        assert!(
+            named > 0,
+            "the columns the segment did write answer with ordinals"
+        );
+    }
 
     fn term_order(descending: bool) -> Order {
         Order {

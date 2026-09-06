@@ -175,10 +175,10 @@ count every matched document once and tally it into every facet dimension once.
 
 For M matched documents and K equal to offset plus limit, a window with K at most 16,384 for
 a term key, or 131,072 for a numeric one, is answered by one pass that keeps a heap of the K
-rows that can reach it: O(M) time and O(K) memory per segment, plus one tally per distinct
-facet value, and page selection O(K log K). Both constants are measured, in "Thresholds"
-below; they differ because the heap of a term key spells a term for every row it holds and a
-numeric key only compares integers.
+rows that can reach it: O(M) time and O(K) memory per segment, plus one tally slot per term
+of each facet column's dictionary in each segment, and page selection O(K log K). Both
+constants are measured, in "Thresholds" below; they differ because the heap of a term key
+spells a term for every row it holds and a numeric key only compares integers.
 
 A deeper window is found by rank instead, in three passes. The first counts and tallies the
 match and keeps every S-th matched row's sort key, for a sample S of about the square root of
@@ -215,6 +215,29 @@ own term rather than the next one above it. A term is spelled once per segment a
 only for a page row, a boundary, a facet bucket or the node set. A page nearer the end of the
 order is cut from the reversed order, so a deep offset selects and spells no more than a
 shallow one.
+
+A tally is a **vector indexed by term ordinal**, one per facet dimension per segment, sized
+at that column's `num_terms()`; the base dimension carries a second vector of the label
+ordinal its artifacts agreed on. A segment ordinal is a constant inside a segment collector
+and a facet dictionary is small, so counting a document is an increment at an index rather
+than a hash of a `(segment, dimension, ordinal)` key. The node total reads the ordinals of
+the node dimension that at least one document sat on. Segments are merged by the terms their
+ordinals spell, once per segment and value.
+
+Documents are read **a block at a time**. A collector that takes no score is driven through
+`for_each_no_score`, which hands `collect_block` up to 64 documents at once, so each column
+is asked once per block through `Column::first_vals` into a buffer the segment collector
+reuses, rather than once per document per column. `collect` is one block of one document, so
+there is one path. All five collectors read this way: the two that tally read the facet
+ordinals and the base label as well as the row, the collapse and window collectors read the
+row alone, and the bucket collector reads only the sort key and the artifact id.
+
+Every collector overrides `Collector::collect_segment`, because tantivy's own
+`default_collect_segment_impl` drops to one `collect` per document as soon as a segment has a
+delete file, and every segment a refresh has touched has one. The alive filter therefore lives
+here instead, filtering each block into a buffer the segment reuses, so a block read survives
+deletes. Without it the block path would be dead on exactly the segments a long-lived index
+accumulates, and slower than what it replaced.
 
 `Catalog::query` answers a whole index screen: the page in any of the ten sort orders, the
 distinct artifact and node totals, and the five facet dimensions. Each dimension is counted
@@ -546,6 +569,93 @@ size-sorted crossover offsets that had read 177.0, 177.6, 331.5 and 322.1 ms rea
 176.1, 175.4 and 174.5 ms. Nothing about an answer depended on this - the equality tests hold
 either way - only what it cost.
 
+### Tallying by ordinal and reading by block
+
+The tally wave, measured in one session on this workstation over one tree, on an otherwise
+idle machine, with nothing else running. `95d6fe0` is the head the wave started from,
+`d6897a2` is the per-segment vector tallies, `286784c` is those plus the block reads, and
+`e2e1809` is the head after the performance review that followed: blocks that survive
+deletes, and the collapse, window and bucket collectors blocked as well. The two 1M columns
+either side of the review are the first of two runs each; `e2e1809` is one run.
+
+| measure, 1M | 95d6fe0 | 286784c | e2e1809 |
+| --- | --- | --- | --- |
+| segments after rebuild | 3 | 3 | 3 |
+| query empty by name | 120.306 ms | 21.153 ms | 21.143 ms |
+| query deep offset | 120.761 ms | 21.436 ms | 21.448 ms |
+| query midpoint offset | 184.543 ms | 86.762 ms | 71.963 ms |
+| query midpoint offset by size | 170.409 ms | 72.186 ms | 58.298 ms |
+| query role:lora with facets | 146.224 ms | 24.106 ms | 24.182 ms |
+| query filtered | 234.624 ms | 38.370 ms | 38.341 ms |
+| query node:self with facets | 338.563 ms | 178.317 ms | 120.578 ms |
+| query midpoint offset after refresh | 189.095 ms | 110.939 ms | 76.649 ms |
+| segments after refresh | 4 | 4 | 4 |
+| resident rss over the queries | 56,238,080 (53.63 MiB) | 56,242,176 (53.64 MiB) | 16,314,368 (15.56 MiB) |
+| resident rss over the midpoint queries | 14,278,656 (13.62 MiB) | 14,278,656 (13.62 MiB) | 14,278,656 (13.62 MiB) |
+| peak rss growth during the queries | 0 | 0 | 0 |
+| scan wall | 74.261 s | 77.286 s | 75.719 s |
+| rebuild wall | 7.516 s | 8.799 s | 7.627 s |
+| on disk after rebuild, allocated | 1,399,234,560 | 1,399,762,944 | 1,398,345,728 |
+
+| measure, 100k | 95d6fe0 | d6897a2 | 286784c | e2e1809 |
+| --- | --- | --- | --- | --- |
+| query empty by name | 12.569 ms | 3.935 ms | 2.734 ms | 2.711 ms |
+| query deep offset | 12.822 ms | 4.209 ms | 2.973 ms | 2.951 ms |
+| query midpoint offset | 19.101 ms | 10.782 ms | 9.462 ms | 7.980 ms |
+| query midpoint offset by size | 14.441 ms | 5.849 ms | 4.773 ms | 4.617 ms |
+| query role:lora with facets | 14.995 ms | 4.271 ms | 2.878 ms | 2.844 ms |
+| query filtered | 23.596 ms | 6.553 ms | 4.203 ms | 4.164 ms |
+| query node:self with facets | 23.636 ms | 7.439 ms | 7.907 ms | 6.333 ms |
+| query midpoint offset after refresh | 20.478 ms | 12.023 ms | 13.286 ms | 9.336 ms |
+| resident rss over the queries | 1.93 MiB | 1.90 MiB | 1.84 MiB | 1.86 MiB |
+
+Every query row is the change. At 1M the first page of the default order fell from 120.3 ms
+to 21.1 ms, 5.7x; the deep page with it; `role:lora` with its facet rail from 146.2 ms to
+24.2 ms, 6.0x; the filtered query from 234.6 ms to 38.3 ms; the middle page from 184.5 ms to
+72.0 ms; and `node:self`, the collapse path, from 338.6 ms to 120.6 ms, 2.8x. The 100k
+columns split the mechanisms: of the 9.8 ms the first page lost, the per-segment vectors took
+8.6 ms and the block reads 1.2 ms more.
+
+**A block read is only worth anything if it survives deletes.** At `286784c` the collectors
+overrode `SegmentCollector::collect_block` and nothing else, which tantivy calls only while a
+segment has no delete file. `refresh_search` deletes an artifact's documents by term before
+re-adding them, so the first refresh puts every touched segment on the per-document path -
+where `collect` now cost *more* than the code it replaced, because one document went through
+ten `clear`, `resize(1)` and `first_vals` calls on a one-element slice. The 1M row that shows
+it is the midpoint after a refresh, which sat 4.6 ms above the plain midpoint before the wave,
+24.2 ms above it at `286784c`, and 4.7 ms above it again at `e2e1809`. Overriding
+`Collector::collect_segment` and doing the alive filtering there restores the block path on
+segments with deletes and is worth 34.3 ms of that row at 1M and 4.0 ms at 100k.
+
+Blocking the other three collectors is the rest of the review: the plain midpoint fell
+14.8 ms and the midpoint by size 13.9 ms, which is the bucket and window passes, and
+`node:self` fell 57.7 ms, which is the collapse collector reading four columns per document
+before. `query empty by name`, `query deep offset`, `role:lora` and the filtered query are
+unmoved either way, inside 0.1 ms, because they never take those passes.
+
+The 1M spread between the two runs at each commit: at `95d6fe0`, 119.4 to 120.3, 119.4 to
+120.8, 182.8 to 184.5, 168.5 to 170.4, 144.7 to 146.2, 232.5 to 234.6 and 320.3 to 338.6 ms;
+at `286784c`, 21.0 to 21.2, 21.3 to 21.4, 85.6 to 86.8, 71.3 to 72.2, 23.7 to 24.1, 37.8 to
+38.4 and 173.1 to 178.3 ms. Every difference above is far outside both.
+
+Resident memory over the queries reads 53.63 and 15.56 MiB at `95d6fe0`, 53.64 and 53.66 MiB
+at `286784c`, and 15.56 MiB at `e2e1809`: the same two values on both sides of the change. The
+row is a `VmRSS` difference across the five queries and is dominated by how much of the search
+directory the page cache has faulted in, so its own spread is 38 MiB wide and it measures
+nothing about this wave. What the wave adds is bounded and countable: nine buffers of at most
+64 slots per segment collector, about 9 KB per segment, plus one `u64` per term of each facet
+dictionary per segment.
+
+The scan, rebuild and disk rows are the same workload as before and are not on any path this
+wave touches: a rebuild writes documents and runs no collector. Its wall read 7.627 to
+8.799 s across the three columns against 7.108 to 7.516 s at `95d6fe0`, a difference the size
+of the spread of its own runs. One row moved for a reason the change cannot reach: peak RSS
+growth during the rescan and refresh read 227.98 MiB at `e2e1809` against 55.32 and 56.52 MiB
+before it. Neither a rescan nor a refresh runs a collector; the row is a high-water-mark
+difference measured after the queries, so a run that faulted less of the index in during the
+queries leaves the refresh more room to raise the mark. The absolute peak, the 864 MiB the
+scan grows by, is the same in every run.
+
 ### Thresholds
 
 At 1M entries, absolute: peak RSS growth during the scan under 2 GB, allocated disk under
@@ -574,6 +684,19 @@ same tree in one session:
 | `role:lora` and the filtered query unmoved | +4.7 ms and +7.4 ms, 3.2 per cent | **missed**, outside their spread |
 | `node:self` unmoved | 411.8, 381.4 and 322.4 ms across three commits | met, the spread exceeds the difference |
 | resident memory over the queries no higher than before | 15.56 MiB against 16.32 MiB | met |
+
+This wave's rows, measured at `e2e1809` against `95d6fe0` on the same tree in one session:
+
+| gate | measured | verdict |
+| --- | --- | --- |
+| `query empty by name` at least 40 per cent faster | 21.143 ms from 120.306 ms, 82.4 per cent | met |
+| `query deep offset` at least 40 per cent faster | 21.448 ms from 120.761 ms, 82.2 per cent | met |
+| `query role:lora with facets` at least 40 per cent faster | 24.182 ms from 146.224 ms, 83.5 per cent | met |
+| `query filtered` at least 40 per cent faster | 38.341 ms from 234.624 ms, 83.7 per cent | met |
+| the three midpoint rows no slower than their spread | 71.963, 58.298 and 76.649 ms from 184.543, 170.409 and 189.095 ms | met, 61, 66 and 59 per cent faster |
+| `node:self` no slower than its spread | 120.578 ms from 338.563 ms | met, 64 per cent faster |
+| resident memory over the queries no higher | 15.56 MiB against a before column of 53.63 and 15.56 MiB | met |
+| every query on the original list under 500 ms | slowest is `node:self` at 120.578 ms | met, by 379.4 ms |
 
 **Where the heap stops paying.** `Paging::DEFAULT.shallow` is the window above which a rank
 selection replaces the heap, and it is 16,384 rows for a text key and eight times that for a
@@ -715,15 +838,31 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
 
 ## Remaining work
 
-- **The tally is the floor under every primary query.** Collecting a matched document costs
-  about 105 ns against about 23 ns for a pass that only counts and buckets: six string-ordinal
-  reads one document at a time, then five `HashMap` entries and one `HashSet` insert, each
-  hashing a `(SegmentOrdinal, usize, u64)` key with SipHash. At 1M that is roughly 80 ms of
-  the 121 ms every primary query starts from, and it is paid again by each of the five
-  narrowed facet passes. The lever is a per-segment tally keyed by the ordinal alone, since
-  the segment is constant inside a segment collector, a `Vec` indexed by ordinal wherever the
-  dictionary is small enough, and block reads of the ordinal columns instead of one call per
-  document. This is the largest cost left on the primary path.
+- **A primary query counts its match twice.** `Selecting::of` runs a `Count` search to learn
+  the total before `Window::of` can say which slice of the order was asked for, and the
+  tallying pass that follows counts the same documents again in `Counting::count`. Now that a
+  tallying pass costs about what a counting pass costs, that first pass is about half of what
+  a shallow primary query spends: 21.1 ms at 1M for the two passes over a match of a million
+  documents. A sampled selection pays it as one of four passes. Removing it means the window
+  deciding what it needs after the collection rather than before, which is a change to
+  `Selecting` and `Window`, not to the collectors. This is the largest cost left on the
+  primary path.
+- **`Catalog::facets` runs one `Count` search per distinct base value in the answer**, with
+  no cap. The prefix rule that groups base labels means the exact-term count the tally holds
+  is not the count a click on that bucket produces, so each bucket is counted by running its
+  own query. `Base` is open ended, so the number of buckets is bounded by what the catalog
+  holds and not by its size: at 200 distinct bases that is 200 extra searches per request. The
+  synthetic tree carries three bases, so nothing measured here exercises it. The two ways out
+  are named under "Decisions someone has to take" in `docs/handoff.md`; neither is an
+  implementation detail.
+- **A tally holds a slot per term of the column, not per term the match used.**
+  `SegmentTallies::sized_for` allocates `num_terms()` slots per facet dimension per segment,
+  which is eight bytes per base value per segment whether the query matched it or not. The
+  five facet columns are small closed vocabularies except `base`, so a catalog with a hundred
+  thousand distinct bases would allocate 800 KB per segment per pass where the old map
+  allocated per value matched, and the review put the zeroing alone at about 12 ms per
+  request at that cardinality. It is below the noise at any plausible base count today; it is
+  the trade the vector makes and the number to watch if base cardinality ever grows.
 - **The base facet runs one query per distinct base value.** The prefix rule that groups base
   labels cannot be answered from ordinals, so `facets` re-runs each bucket's own query to
   count it. The synthetic tree carries three bases, so no measurement here exercises it; a

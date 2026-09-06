@@ -20,8 +20,8 @@ first; this document assumes it.
   dependency research; they stay. The wave plan files under `docs/superpowers/plans/` are
   deleted - git keeps them, and a stale plan in the tree is a trap for the next agent.
 - Phases 0 to 9 are done, 10 and 11 are partial. `docs/feature-plan.md` holds the table.
-- At the head of `master` after the paging wave all four checks pass:
-  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 774 passed,
+- At the head of `master` after the tally wave all four checks pass:
+  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 782 passed,
   0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness
   and its supplemental fixture, the mDNS test that needs a multicast route and the sniffer
   test that reads the local model caches. `cargo doc --workspace --no-deps` emits no warning.
@@ -114,13 +114,27 @@ Performance, with the numbers from `docs/native-catalog.md`:
   filtered query, are 4.7 and 7.4 ms slower at 1M and outside their own spread; they are back
   on their before numbers at 100k, so it does not scale, and it is codegen around the
   collector's inner loop rather than any extra work.
-- **The tally is the floor under every primary query.** Collecting a matched document costs
-  about 105 ns against about 23 ns for a pass that only counts: six one-at-a-time
-  string-ordinal reads, five `HashMap` entries and a `HashSet` insert per document, all
-  SipHashing a three-part key. That is roughly 80 ms of the 121 ms floor at 1M and is paid
-  again by each of the five narrowed facet passes. Per-segment tallies keyed by ordinal alone
-  and block reads of the ordinal columns are the lever; it is the largest cost left on the
-  primary path and the next wave.
+- **A tallying pass now costs about what a counting pass costs.** Each facet dimension is a
+  vector indexed by term ordinal per segment rather than a `HashMap` keyed by
+  `(segment, dimension, ordinal)` per document, and every collector reads its columns once
+  per block of up to 64 documents through `first_vals` rather than once per document. At 1M
+  the first page of the default order is 21.1 ms against 120.3 ms, the deep page 21.4 against
+  120.8, `role:lora` with its rail 24.2 against 146.2, the filtered query 38.3 against 234.6,
+  the middle page 72.0 against 184.5 and `node:self` 120.6 against 338.6. Of the 9.8 ms the
+  first page lost at 100k, the vectors took 8.6 ms and the block reads 1.2.
+- **A block read has to survive deletes to be worth anything.** tantivy's
+  `default_collect_segment_impl` drops to one `collect` per document as soon as a segment
+  carries a delete file, which every segment a refresh has touched does, so hoard's
+  collectors override `Collector::collect_segment` and filter each block through the alive
+  bitset themselves. Before that override the midpoint after a refresh sat 24.2 ms above the
+  plain midpoint at 1M against 4.6 ms before the wave; with it, 4.7 ms. A new collector in
+  this file must override `collect_segment` the same way or it silently falls back.
+- **A primary query still counts its match twice.** `Selecting::of` runs a `Count` search so
+  `Window::of` can say which slice of the order was asked for, and the tallying pass that
+  follows counts the same documents again. That first pass is now about half of what a
+  shallow primary query spends, and it is the largest cost left on the primary path. Removing
+  it means the window deciding what it needs after the collection rather than before, which
+  is a change to `Selecting` and `Window`, not to the collectors.
 - **The collapse-path queries are under the 500 ms target without being bounded.**
   `node:self` is 352 to 439 ms at 1M; any query naming `node:`, `state:`, `source:`,
   `repo:`, `rev:` or `hash:`, or sorting on revision, node or state, takes the same path and
@@ -132,6 +146,14 @@ Performance, with the numbers from `docs/native-catalog.md`:
 
 Decisions someone has to take:
 
+- **How should the base facet be counted?** `Catalog::facets` runs one `Count` search per
+  distinct base value in the answer, uncapped, because the prefix rule that groups base
+  labels means the exact-term count the tally already holds is not what a click on that
+  bucket produces. `Base` is open ended, so the bucket count is bounded by what the catalog
+  holds rather than by its size: at 200 distinct bases that is 200 extra searches per
+  request. Either the rail is truncated to the top N buckets by tally before the per-bucket
+  count is run, which changes what the UI shows, or the prefix rule is answered from ordinals,
+  which changes what a base bucket means. Neither is an implementer's call.
 - **May `hoard doctor` write?** Its `summary` check calls `Catalog::recount_summary`, which
   counts every artifact record again *and upserts the result*, so the check repairs the drift
   it is meant to detect. The repair is already named as such - `src/cli/doctor.rs::summary`
@@ -158,6 +180,12 @@ Smaller things, each verified:
   `state:triage` from the search index, and a peer-advertised artifact is filed as remote
   entries, which never carry that state. Whether a peer's triage should be visible at all is
   an open question, not obviously a bug.
+- The hourly cache eviction sweep is O(the whole mirror). `hoard-mirror`'s
+  `cache/reconcile.rs` calls `Catalog::served_cache_entries`, which calls
+  `read.rs::repositories_of_source_in` to walk **every** `Repository` row looking for the
+  mirror source, then scans every entry of each and collects one `Vec<EntryDetail>` before
+  anything is stat-ed. It is off the request path and the mirror source is small today;
+  chunking it the way `scan.rs` chunks its passes is the fix if it ever is not.
 - `docs/feature-plan.md` Phase 1 is named "Core types and index store" and its acceptance
   history was written against the SQLite schema. The bullets now describe the catalog; the
   phase name and the accepted-in-the-past framing are history rather than a description of
