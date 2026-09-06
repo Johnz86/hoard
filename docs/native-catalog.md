@@ -58,7 +58,9 @@ negates the whole token. Every token kind compiles:
 - `dupe:` (`duplicate:`) selects artifacts reached by more than one path.
 - `size:` compares a byte count with `<`, `<=`, `>`, `>=` or none for equality; a bare
   number is megabytes, so byte counts need the `b` suffix.
-- `used:` matches nothing, because the native catalog carries no usage yet.
+- `used:` compares an age in days against when an artifact was last served: `<Nd` and
+  `<=Nd` are the artifacts used inside the window, `>Nd`, `>=Nd` and `=Nd` the ones nobody
+  has used for that long. An artifact that was never served answers neither.
 - `compat:` resolves its value against this catalog and then matches the roles and bases
   that plug into it; a value naming nothing is not an error, it resolves to no target and
   the token is refused.
@@ -66,8 +68,8 @@ negates the whole token. Every token kind compiles:
 - Anything else is free text: every word has to appear, and `~` in front also accepts the
   words as prefixes. A key the grammar does not know is free text carrying a warning.
 
-Two documented divergences from the SQL compiler: free text and `trigger:` match whole
-words or the whole stored string rather than substrings, and `used:` matches nothing.
+One documented divergence from the SQL compiler: free text and `trigger:` match whole
+words or the whole stored string rather than substrings.
 
 `--sort` takes `role`, `name`, `base`, `format`, `precision`, `size`, `revision`, `node`,
 `state` or `used`, defaults to `name`, and `--desc` reverses it; every order ends on
@@ -154,8 +156,10 @@ of the shallowest README in each revision.
 - Every command that opens the index also opens or creates the native catalog at
   `<data_dir>/native`; `hoard scan` and the scan job rescan and refresh it after the SQLite
   scan; the server holds it as shared state.
-- `GET /api/v1/search`, `GET /api/v1/stats` and `hoard ls` read the native catalog; shelves
-  still come from SQLite until user data moves.
+- `GET /api/v1/search`, `GET /api/v1/stats` and `hoard ls` read the native catalog.
+- Shelves (with the six builtin ones seeded on open), settings, the noise list, projections
+  and the usage log are catalog records; the scan honours noise; the Hub logs every served
+  response and the `used:` token and the last-used column read the log.
 - The artifact sweep keeps the totals the stats route prints in its summary record, which is
   at model version 2; version 1 rows are migrated on open.
 - A `fixtures` feature exposes `Catalog::seed`, which writes repositories, entries,
@@ -370,10 +374,9 @@ than a correctness one.
 
 ## Remaining replacement work
 
-- Move the routes still on SQLite to the catalog: usage (`/repos/.../usage`, the `usage`
-  block of the artifact detail, `pulls on lan`), noise (`/triage/noise`, the noise rows a
-  rejection writes), shelves, loadouts, projection, sources and jobs, nodes and peers,
-  settings, the Hub and git faces, the mirror and gossip.
+- Move what is still on SQLite to the catalog: loadouts, jobs and sources, nodes and peers,
+  the Hub and git faces' own lookups other than usage attribution, the mirror's ingest and
+  served state, gossip and `hoard doctor`; then remove SQLite.
 - Convert the existing Store/Connection API and live scanner, mirror, cache eviction,
   gossip, watch and CLI callers to native transactions.
 - Path identities hash the text to_string_lossy renders; discovery currently never yields
@@ -387,8 +390,7 @@ than a correctness one.
 - Shrink the per-entry record further: revision, repository, source and absolute path are
   written out per entry, which is what the 1M catalog is mostly made of. Intern them per
   revision and reference them by id.
-- Implement user overrides/noise, shelves, loadouts, settings, projections, jobs,
-  usage, peer cursors and the associated graph constraints/cascades.
+- Implement loadouts, jobs, peer cursors and the associated graph constraints/cascades.
 - Preserve complete repository Git metadata and add stable cross-scan identities.
 - Add full hash scheduling, progressive identities and content deduplication.
 - Port the missing-file policies from the existing scan pipeline.

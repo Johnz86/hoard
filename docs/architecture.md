@@ -213,7 +213,8 @@ Serve, local hit on the Hub face:
 ```
 GET /org/name/resolve/main/file.safetensors
   -> resolve revision (index) -> entry -> blob path
-  -> stream with Range, x-repo-commit, etag = "sha256", x-linked-size -> usage log
+  -> stream with Range, x-repo-commit, etag = "sha256", x-linked-size
+  -> attribute the path through the catalog -> catalog usage log + artifact use count
 ```
 
 Serve, miss (peer or huggingface.co, rules permitting):
@@ -234,15 +235,16 @@ POST /org/repo.git/info/lfs/objects/batch -> hrefs to /org/repo/resolve/<sha>/<p
 Index screen search:
 
 ```
-GET /api/v1/search?q=... -> shelves (SQLite) -> Catalog::compile_context
+GET /api/v1/search?q=... -> Catalog::list_shelves -> Catalog::compile_context
   -> Catalog::query on a blocking thread -> page, totals, five facet dimensions
 ```
 
 `GET /api/v1/stats` and `hoard ls` read the same catalog, and so do the artifact inspector,
 compat, pull command, override and blob views, the repository list, detail, files, card and
-compat, and the triage queue with its confirm and reject. Usage counts, the noise list a
-rejection writes, shelves, loadouts, projection, sources and jobs, nodes and peers,
-settings, the Hub and git faces, the mirror and gossip still read SQLite.
+compat, the triage queue with its confirm and reject, the shelves and settings routes, the
+noise list a rejection writes, the projections `hoard link` and `hoard apply` record, and
+the usage the Hub logs and the USAGE tab reads. Loadouts, sources and jobs, nodes and peers,
+the Hub and git faces' own lookups, the mirror's ingest and gossip still read SQLite.
 
 Nodes:
 
@@ -254,13 +256,19 @@ mDNS _hoard._tcp -> peers table -> periodic GET /api/v1/peers/digest?since=curso
 
 ## Storage
 
-- Index: `<data-dir>/hoard.db` (SQLite WAL), recreatable from disk plus peers.
+- Index: `<data-dir>/hoard.db` (SQLite WAL), recreatable from disk plus peers. What is left
+  in it: loadouts, sources and jobs, nodes and peers, and the rows the Hub and git faces,
+  the mirror's ingest and gossip still read.
 - Native catalog: `<data-dir>/native/`, holding `catalog.redb` plus `search-v1-<nanos>/`
-  Tantivy directories. Every command that opens the index opens or creates it there, and
-  `hoard scan` and the `/api/v1/scan` job rescan and refresh it after the SQLite scan; the
-  server holds it as shared state. `hoard catalog` still takes any directory with
-  `--directory`.
+  Tantivy directories. Beside the scanned sources, repositories, artifacts, entries and
+  search text it holds the user data those screens read: shelves (the six builtin ones
+  seeded on every open), the shell's settings, the noise list a rejection writes and the
+  scan walks past, the projections a link records, and the usage log every served response
+  appends to with the per-artifact use count `used:` and the last-used column read. Every
+  command that opens the index opens or creates it there, and `hoard scan` and the
+  `/api/v1/scan` job rescan and refresh it after the SQLite scan; the server holds it as
+  shared state. `hoard catalog` still takes any directory with `--directory`.
 - Mirror cache: `<data-dir>/repos/` in the olah layout (`docs/api/hub-compat.md`).
-- Projections: symlinks written by `hoard link` and `hoard apply`, tracked in the index so
-  PATHS ON DISK can show `laptop · symlink`.
+- Projections: symlinks written by `hoard link` and `hoard apply`, tracked in the native
+  catalog so PATHS ON DISK can show `laptop · symlink`.
 - Config: `hoard.toml`; secrets only in `.env` (`HF_TOKEN`, `HOARD_NODE_TOKEN`).
