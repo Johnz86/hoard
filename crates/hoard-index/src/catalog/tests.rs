@@ -24,8 +24,8 @@ use super::models::{
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::{
-    Catalog, NewProjection, QueryPage, QueryRequest, RepositoryFilter, RescanReport, builder,
-    models, query,
+    Catalog, NewProjection, QueryPage, QueryRequest, RepositoryFilter, RescanReport, UsageEvent,
+    builder, models, query,
 };
 
 fn running_as_root() -> bool {
@@ -3026,5 +3026,59 @@ fn projections_are_recorded_by_link_path_and_cleared_by_profile() -> Result<()> 
     assert_eq!(catalog.clear_profile("comfyui")?, 1);
     assert!(catalog.remove_projection(catalog.list_projections(None)?[0].id)?);
     assert!(catalog.list_projections(None)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn usage_is_logged_summarised_and_reaches_the_used_token() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (_input, config) = loose_fixture(directory.path())?;
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    let row = search(&catalog, "role:lora")?.rows[0].clone();
+    let repo = row.repo_id;
+    let now = jiff::Timestamp::now();
+    for client in ["a", "b", "b"] {
+        catalog.log_usage(&UsageEvent {
+            client: Some(client.to_owned()),
+            repo: Some(repo),
+            artifact: Some(row.artifact_id),
+            bytes: 10,
+            rate_bps: Some(5),
+            ..UsageEvent::new("keep.safetensors", now)
+        })?;
+    }
+    catalog.bump_artifact_use(row.artifact_id, now)?;
+    assert_eq!(catalog.distinct_clients(repo)?, 2);
+    assert_eq!(catalog.recent_pulls(repo, 10)?.len(), 3);
+    let days = catalog.usage_days(repo, 7)?;
+    assert_eq!(days.len(), 7);
+    assert_eq!(days[6].pulls, 3, "today is the last bucket: {days:?}");
+    let usage = catalog.artifact_usage(row.artifact_id)?;
+    assert_eq!(usage.pulls, 1);
+    assert!(usage.last_used.is_some());
+    assert!(
+        catalog.pending_changes()? > 0,
+        "a bump logs the artifact for the index"
+    );
+    catalog.refresh_search(|_| {})?;
+    assert_eq!(search(&catalog, "used:<1d")?.total, 1);
+    assert_eq!(search(&catalog, "used:>30d")?.total, 0);
+    assert_eq!(
+        search(&catalog, "role:lora")?.rows[0].last_used,
+        usage.last_used
+    );
+    let context = catalog.compile_context("", now, Vec::new())?;
+    let by_use = catalog.query(QueryRequest {
+        raw: "",
+        sort: SortSpec::new(SortKey::Used, true),
+        limit: 10,
+        offset: 0,
+        context: &context,
+    })?;
+    assert_eq!(
+        by_use.rows[0].artifact_id, row.artifact_id,
+        "the used artifact sorts first descending"
+    );
     Ok(())
 }

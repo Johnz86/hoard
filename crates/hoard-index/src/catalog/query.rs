@@ -1,6 +1,7 @@
 use std::ops::Bound;
 
 use hoard_core::Role;
+use jiff::Span;
 use tantivy::Term;
 use tantivy::query::{
     AllQuery, BooleanQuery, EmptyQuery, Occur, PhrasePrefixQuery, Query, RangeQuery, TermQuery,
@@ -8,7 +9,7 @@ use tantivy::query::{
 use tantivy::schema::{Field, IndexRecordOption};
 
 use crate::error::{IndexError, Result};
-use crate::search::sql::MAX_SHELF_DEPTH;
+use crate::search::sql::{HOURS_PER_DAY, MAX_SHELF_DEPTH};
 use crate::search::{CompareOp, CompileContext, SortKey, Token, TokenKind, parse};
 
 use super::search::{
@@ -185,7 +186,7 @@ fn clause(token: &Token, fields: &QueryFields<'_>, depth: usize) -> Result<Box<d
             IndexRecordOption::Basic,
         ))),
         TokenKind::Size => Ok(size_filter(token, schema.size)),
-        TokenKind::Used => Ok(Box::new(EmptyQuery)),
+        TokenKind::Used => used_filter(token, schema.last_used, fields.context),
         TokenKind::Compat => compat_filter(token, fields),
         TokenKind::Shelf => shelf_filter(token, fields, depth),
         TokenKind::Text => Ok(text_filter(token, schema.text)),
@@ -315,6 +316,42 @@ fn size_range(field: Field, op: CompareOp, bytes: u64) -> Box<dyn Query> {
         ),
     };
     Box::new(RangeQuery::new(lower, upper))
+}
+
+/// `used:` compares an age in days against when an artifact was last served. `<Nd` and
+/// `<=Nd` ask for the artifacts used inside the window; `>Nd`, `>=Nd` and `=Nd` ask for the
+/// ones nobody has used for that long. An artifact that was never served answers neither.
+fn used_filter(token: &Token, field: Field, context: &CompileContext) -> Result<Box<dyn Query>> {
+    let op = token.op.unwrap_or(CompareOp::Gt);
+    let mut parts = Vec::with_capacity(token.values.len());
+    for value in &token.values {
+        let days: i64 = value
+            .parse()
+            .map_err(|_| IndexError::Query(format!("{value:?} is not an age in days")))?;
+        let cutoff = cutoff_second(context, days)?;
+        let boundary = |second: i64| Term::from_field_i64(field, second);
+        let (lower, upper) = match op {
+            CompareOp::Lt | CompareOp::Le => (Bound::Excluded(boundary(cutoff)), Bound::Unbounded),
+            CompareOp::Gt | CompareOp::Ge | CompareOp::Eq => (
+                Bound::Included(boundary(1)),
+                Bound::Excluded(boundary(cutoff)),
+            ),
+        };
+        parts.push(Box::new(RangeQuery::new(lower, upper)) as Box<dyn Query>);
+    }
+    Ok(any_of(parts))
+}
+
+/// The instant `days` before the query's clock, as the epoch second the index stores.
+fn cutoff_second(context: &CompileContext, days: i64) -> Result<i64> {
+    let span = Span::new()
+        .try_hours(days.saturating_mul(HOURS_PER_DAY))
+        .map_err(|error| IndexError::Query(format!("age {days}d is out of range: {error}")))?;
+    let cutoff = context
+        .now
+        .checked_sub(span)
+        .map_err(|error| IndexError::Query(format!("age {days}d is out of range: {error}")))?;
+    Ok(cutoff.as_second())
 }
 
 /// Free text: every word has to appear. A fuzzy token also accepts the words as prefixes,

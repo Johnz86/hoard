@@ -21,6 +21,7 @@ use super::models::{
     repository_key,
 };
 use super::search::{EntryFacts, assemble_row, revision_of};
+use super::usage::last_used_in;
 use super::{Catalog, QueryRequest};
 
 /// One path an artifact occupies, with the repository and revision it sits in resolved.
@@ -532,6 +533,7 @@ impl<'a, 'db> Reader<'a, 'db> {
         else {
             return Ok(None);
         };
+        let last_used = last_used_in(self.snapshot, record.id)?;
         let repository = self.repository(entry.repo_id)?;
         let revision = revision_of(repository, &entry)?;
         Ok(Some(assemble_row(&EntryFacts {
@@ -541,6 +543,7 @@ impl<'a, 'db> Reader<'a, 'db> {
             artifact: record,
             node,
             primary: true,
+            last_used,
         })))
     }
 

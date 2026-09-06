@@ -445,6 +445,36 @@ pub(super) struct Projection {
     pub(super) written_at: String,
 }
 
+/// One response this node served, which is what the USAGE tab reads back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 17, version = 1)]
+#[native_db]
+pub(super) struct Usage {
+    #[primary_key]
+    pub(super) seq: u64,
+    #[secondary_key(optional)]
+    pub(super) repo_id: Option<i64>,
+    pub(super) at: String,
+    pub(super) client: Option<String>,
+    pub(super) artifact_id: Option<i64>,
+    pub(super) path: String,
+    pub(super) bytes: u64,
+    pub(super) rate_bps: Option<u64>,
+    pub(super) status: u16,
+}
+
+/// How often one artifact has been served and when it last was, which is what `used:` and
+/// the last-used column read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 18, version = 1)]
+#[native_db]
+pub(super) struct ArtifactUse {
+    #[primary_key]
+    pub(super) artifact_id: i64,
+    pub(super) count: u64,
+    pub(super) last_used: String,
+}
+
 /// Registers every record type. `native_db` compares each definition against every model
 /// already registered rather than only against the other versions of the same model, so a
 /// version 1 model must be defined last: it is what leaves each migrated model marked
@@ -470,5 +500,7 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<Shelf>()?;
     models.define::<Noise>()?;
     models.define::<Projection>()?;
+    models.define::<Usage>()?;
+    models.define::<ArtifactUse>()?;
     Ok(models)
 }

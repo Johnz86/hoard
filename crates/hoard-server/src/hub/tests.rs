@@ -10,8 +10,11 @@ use tower::ServiceExt;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use hoard_core::{
-    ArtifactFormat, ArtifactId, BlobId, CommitSha, NodeId, RepoId, RepoRowId, RepoType, RevisionId,
-    Role, Sha256, SourceId, State as ArtifactState,
+    Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, NodeId, RepoId, RepoRowId,
+    RepoType, RevisionId, Role, Sha256, SourceId, State as ArtifactState,
+};
+use hoard_index::catalog::{
+    Catalog, SeedArtifact, SeedEntry, SeedRepository, SeedRevision, UsageDay,
 };
 use hoard_index::config::SourceKind;
 use hoard_index::store::Store;
@@ -22,7 +25,6 @@ use hoard_index::store::node::{NewNode, upsert_node};
 use hoard_index::store::repo::{NewRepo, upsert_repo};
 use hoard_index::store::revision::{NewRevision, RefKind, upsert_ref, upsert_revision};
 use hoard_index::store::source::upsert_source;
-use hoard_index::store::usage::{UsageDay, usage_days};
 use hoard_mirror::access::AccessRule;
 
 use crate::api::common::Conn;
@@ -76,10 +78,67 @@ fn seeded() -> World {
     config.mirror.cache_root = Some(root.join("repos"));
     config.mirror.offline = true;
     let catalog = crate::testing::empty_catalog(root, "test");
+    seed_catalog(&catalog, root);
     World {
         state: AppState::new(config, store, catalog).expect("state builds"),
         _dir: dir,
     }
+}
+
+/// The repository a served response is attributed to, as native records: the usage log the
+/// Hub writes reads the catalog, not SQLite.
+fn seed_catalog(catalog: &Catalog, root: &Path) {
+    catalog
+        .seed(&[SeedRepository {
+            repo: RepoId::parse_ref(RepoType::Models, LORA_REPO).expect("reference"),
+            source: "cache".to_owned(),
+            kind: SourceKind::HfCache,
+            root_path: root.to_path_buf(),
+            revisions: vec![SeedRevision {
+                name: "main".to_owned(),
+                sha: Some(CommitSha::from_bytes(REVISION)),
+                refs: vec![("main".to_owned(), RefKind::Branch)],
+                entries: vec![SeedEntry {
+                    rel_path: SMALL_PATH.to_owned(),
+                    abs_path: Some(root.join(SMALL_PATH).to_string_lossy().into_owned()),
+                    size: SMALL_SIZE as u64,
+                    state: ArtifactState::Local,
+                    is_symlink: false,
+                    artifact: Some(SeedArtifact {
+                        identity: 0x9f9f,
+                        artifact: Artifact {
+                            id: ArtifactId::new(0),
+                            blob: BlobId::new(0),
+                            sha256: Some(Sha256::from_bytes(SMALL_SHA256)),
+                            size: SMALL_SIZE as u64,
+                            format: ArtifactFormat::Safetensors,
+                            role: Role::Lora,
+                            sub_role: None,
+                            role_confidence: 0.9,
+                            base: Base::any(),
+                            base_label: None,
+                            base_confidence: 0.5,
+                            precision: None,
+                            quant: None,
+                            rank: None,
+                            alpha: None,
+                            params: None,
+                            context: None,
+                            trigger: None,
+                            sniff_version: 1,
+                        },
+                        name: "film-grain-35mm".to_owned(),
+                        org: Some("kohya".to_owned()),
+                        tensors: None,
+                        evidence: Vec::new(),
+                        card: None,
+                        group_bytes: None,
+                        shard_count: None,
+                    }),
+                }],
+            }],
+        }])
+        .expect("the catalog seeds");
 }
 
 /// The same node with an upstream it is allowed to proxy and cache, for the routes that
@@ -883,11 +942,17 @@ async fn a_served_response_is_written_to_the_usage_log() {
 /// a bounded wait rather than assuming the response and the row are the same instant.
 async fn pulls_logged(state: &AppState) -> u64 {
     for _ in 0..200 {
-        let days: Vec<UsageDay> = state
-            .store()
-            .call(move |conn| usage_days(conn, RepoRowId::new(1), 7))
-            .await
-            .expect("usage days");
+        let catalog = std::sync::Arc::clone(state.catalog());
+        let days: Vec<UsageDay> = tokio::task::spawn_blocking(move || {
+            let repo = catalog
+                .repository(&RepoId::parse_ref(RepoType::Models, LORA_REPO)?)?
+                .expect("the seeded repository")
+                .id;
+            catalog.usage_days(repo, 7)
+        })
+        .await
+        .expect("join")
+        .expect("usage days");
         let pulls: u64 = days.iter().map(|day| day.pulls).sum();
         if pulls > 0 {
             return pulls;

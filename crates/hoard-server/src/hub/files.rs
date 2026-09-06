@@ -17,12 +17,13 @@ use axum::response::{IntoResponse, Response};
 use futures::TryStreamExt;
 
 use hoard_core::{ArtifactId, CommitSha, RepoId, RepoRowId, Sha256};
+use hoard_index::catalog::Catalog;
 use hoard_index::store::Store;
 use hoard_index::store::blob::blob_by_sha256;
-use hoard_index::store::entry::{entries_for_blob, entries_for_revision};
+use hoard_index::store::entry::entries_for_blob;
 use hoard_index::store::node::local_node;
 use hoard_index::store::repo::repo_by_qualified;
-use hoard_index::store::revision::{resolve_revision, revision_by_sha};
+use hoard_index::store::revision::resolve_revision;
 use hoard_mirror::MirrorError;
 use hoard_mirror::git::LfsLocation;
 use hoard_mirror::resolve::{FileAnswer, FileRequest, IngestTrigger, read_range, served_response};
@@ -291,7 +292,7 @@ impl Meter {
     fn new(state: &AppState, served: &Served, answer: &FileAnswer, status: u16) -> Self {
         Self {
             inner: Some(Record {
-                store: state.store().clone(),
+                catalog: Arc::clone(state.catalog()),
                 repo: served.repo.clone(),
                 commit: answer.commit,
                 path: served.path.clone(),
@@ -325,7 +326,7 @@ impl Drop for Meter {
 }
 
 struct Record {
-    store: Store,
+    catalog: Arc<Catalog>,
     repo: RepoId,
     commit: CommitSha,
     path: String,
@@ -343,13 +344,13 @@ impl Record {
         {
             tracing::warn!(repo = %self.repo, %error, "a cached file was not ingested");
         }
-        let (repo, artifact) = attribute(&self.store, &self.repo, &self.commit, &self.path).await;
+        let (repo, artifact) = attribute(&self.catalog, &self.repo, &self.commit, &self.path).await;
         let request = ServedRequest::new(self.path.clone(), self.status)
             .from_client(self.client.clone())
             .for_repo(repo)
             .for_artifact(artifact)
             .served(self.bytes, self.elapsed);
-        if let Err(error) = log_served(&self.store, &request).await {
+        if let Err(error) = log_served(&self.catalog, &request).await {
             tracing::warn!(repo = %self.repo, %error, "a served response was not logged");
         }
     }
@@ -358,35 +359,39 @@ impl Record {
 /// Which repository row and artifact a served path belongs to, so the USAGE tab and the
 /// `used:` key see the pull.
 async fn attribute(
-    store: &Store,
+    catalog: &Arc<Catalog>,
     repo: &RepoId,
     commit: &CommitSha,
     path: &str,
 ) -> (Option<RepoRowId>, Option<ArtifactId>) {
-    let qualified = repo.qualified();
-    let commit = *commit;
-    let wanted = path.to_owned();
-    let found = store
-        .call(move |conn| {
-            let node = local_node(conn)?;
-            let Some(row) = repo_by_qualified(conn, &qualified, node.id)? else {
-                return Ok(None);
-            };
-            let artifact = match revision_by_sha(conn, row.id, &commit)? {
-                Some(revision) => entries_for_revision(conn, revision.id)?
-                    .into_iter()
-                    .find(|entry| entry.path == wanted)
-                    .and_then(|entry| entry.artifact),
-                None => None,
-            };
-            Ok(Some((row.id, artifact)))
-        })
-        .await;
+    let catalog = Arc::clone(catalog);
+    let wanted = repo.clone();
+    let commit = commit.to_hex();
+    let path = path.to_owned();
+    let found = tokio::task::spawn_blocking(move || {
+        let Some(record) = catalog.repository(&wanted)? else {
+            return Ok(None);
+        };
+        let artifact = match catalog.resolve_revision(&record, &commit) {
+            Some(revision) => catalog
+                .revision_entries(record.id, revision.ordinal)?
+                .into_iter()
+                .find(|entry| entry.rel_path == path)
+                .and_then(|entry| entry.artifact_id),
+            None => None,
+        };
+        Ok::<_, hoard_index::IndexError>(Some((record.id, artifact)))
+    })
+    .await;
     match found {
-        Ok(Some((repo, artifact))) => (Some(repo), artifact),
-        Ok(None) => (None, None),
-        Err(error) => {
+        Ok(Ok(Some((repo, artifact)))) => (Some(repo), artifact),
+        Ok(Ok(None)) => (None, None),
+        Ok(Err(error)) => {
             tracing::warn!(%error, "a served response could not be attributed");
+            (None, None)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "attributing a served response was cancelled");
             (None, None)
         }
     }

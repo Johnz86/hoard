@@ -13,7 +13,7 @@ use crate::store::SqlValue;
 const MATCH_EVERYTHING: &str = "1 = 1";
 const MATCH_NOTHING: &str = "1 = 0";
 pub(crate) const MAX_SHELF_DEPTH: usize = 4;
-const HOURS_PER_DAY: i64 = 24;
+pub(crate) const HOURS_PER_DAY: i64 = 24;
 
 const FREE_TEXT_SQL: &str = "(COALESCE(org, '') || ' ' || name || ' ' || base || ' ' || \
      COALESCE(trigger_words, '') || ' ' || role || ' ' || node) LIKE '%' || ? || '%'";

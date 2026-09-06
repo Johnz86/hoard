@@ -14,9 +14,12 @@ use hoard_core::{
     Precision, RepoId, RepoRowId, RepoType, RevisionId, Role, Sha256, State as ArtifactState,
     TensorSample, TensorSummary,
 };
-use hoard_index::catalog::{Catalog, SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
+use hoard_index::catalog::{
+    Catalog, SeedArtifact, SeedEntry, SeedRepository, SeedRevision, UsageEvent,
+};
 use hoard_index::config::{SourceConfig, SourceKind};
 use hoard_index::store::Store;
+use hoard_index::store::artifact;
 use hoard_index::store::artifact::{NewArtifact, upsert_artifact};
 use hoard_index::store::blob::{set_sha256, upsert_blob};
 use hoard_index::store::entry::{NewEntry, upsert_entry};
@@ -25,8 +28,6 @@ use hoard_index::store::repo::{NewRepo, upsert_repo};
 use hoard_index::store::revision::{NewRevision, RefKind, upsert_ref, upsert_revision};
 use hoard_index::store::shelf::seed_builtin_shelves;
 use hoard_index::store::source::upsert_source;
-use hoard_index::store::usage::{UsageEvent, bump_artifact_use, log_usage};
-use hoard_index::store::{artifact, usage};
 
 use crate::api;
 use crate::api::common::Conn;
@@ -84,6 +85,7 @@ fn seeded() -> World {
     config.mirror.cache_root = Some(dir.path().join("repos"));
     let catalog = crate::testing::empty_catalog(dir.path(), &config.node.name);
     let native = seed_catalog(&catalog, dir.path());
+    seed_catalog_usage(&catalog, native[0]);
     assert_eq!(
         native,
         [ids.0, ids.1, ids.2, ids.3, ids.4, ids.5],
@@ -293,6 +295,29 @@ fn seed_catalog(catalog: &Catalog, dir: &Path) -> [ArtifactId; 6] {
             .map(|(_, id)| *id)
             .expect("every seeded identity was written")
     })
+}
+
+/// The three pulls and the one use the LoRA carries, as the USAGE tab and the inspector
+/// read them back out of the catalog.
+fn seed_catalog_usage(catalog: &Catalog, lora: ArtifactId) {
+    let repo = catalog
+        .repository(&RepoId::parse_ref(RepoType::Models, "kohya/film-grain-35mm").expect("ref"))
+        .expect("the repository reads")
+        .expect("the seed wrote it")
+        .id;
+    for client in 0..3 {
+        catalog
+            .log_usage(&UsageEvent {
+                client: Some(format!("client-{client}")),
+                repo: Some(repo),
+                artifact: Some(lora),
+                bytes: LORA_SIZE,
+                rate_bps: Some(1_200_000_000),
+                ..UsageEvent::new("film-grain-35mm.safetensors", at())
+            })
+            .expect("usage logs");
+    }
+    catalog.bump_artifact_use(lora, at()).expect("use bumps");
 }
 
 fn facts(size: u64, format: ArtifactFormat, role: Role, role_confidence: f32) -> Artifact {
@@ -719,22 +744,6 @@ fn seed(
         ],
     )
     .expect("evidence");
-
-    for day in 0..3 {
-        log_usage(
-            conn,
-            &UsageEvent {
-                client: Some(format!("client-{day}")),
-                repo: Some(lora_repo),
-                artifact: Some(lora),
-                bytes: LORA_SIZE,
-                rate_bps: Some(1_200_000_000),
-                ..UsageEvent::new("film-grain-35mm.safetensors", at())
-            },
-        )
-        .expect("usage");
-    }
-    bump_artifact_use(conn, lora, at()).expect("use");
 
     (lora, ckpt, llm, vae, dataset, unknown)
 }
@@ -2357,17 +2366,20 @@ async fn every_mutating_route_refuses_a_request_without_the_node_token() {
 #[tokio::test]
 async fn usage_rows_stay_readable_after_a_pull_is_logged() {
     let world = seeded();
-    let counted = world
-        .state
-        .store()
-        .call(|conn| {
-            let repos =
-                hoard_index::store::repo::repos_by_qualified(conn, "models/kohya/film-grain-35mm")?;
-            let repo = repos.first().expect("the repo exists").id;
-            usage::distinct_clients(conn, repo)
-        })
-        .await
-        .expect("clients count");
+    let catalog = std::sync::Arc::clone(world.state.catalog());
+    let counted = tokio::task::spawn_blocking(move || {
+        let repo = catalog
+            .repository(&RepoId::parse_ref(
+                RepoType::Models,
+                "kohya/film-grain-35mm",
+            )?)?
+            .expect("the repo exists")
+            .id;
+        catalog.distinct_clients(repo)
+    })
+    .await
+    .expect("join")
+    .expect("clients count");
     assert_eq!(counted, 3);
 }
 

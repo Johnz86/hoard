@@ -28,6 +28,7 @@ use super::models::{
 use crate::error::{IndexError, Result};
 
 use super::query::{self, QueryFields};
+use super::usage::last_used_in;
 use super::{Catalog, OpenIndex};
 
 const WRITER_BUDGET: usize = 32 * 1024 * 1024;
@@ -40,6 +41,8 @@ const COMPAT_PROBE: u32 = 32;
 const BASE_DIMENSION: usize = 1;
 const NODE_DIMENSION: usize = 4;
 const BASE_LABEL_COLUMN: &str = "base_label";
+/// The column `used:` filters on and `sort=used` orders by, as epoch seconds.
+pub(super) const LAST_USED_COLUMN: &str = "last_used";
 /// The five facet dimensions, named as the columns a collapsed hit carries them in.
 const FACET_COLUMNS: [&str; FACET_DIMENSIONS.len()] =
     ["role", "base", "format", "precision", "node"];
@@ -576,6 +579,7 @@ impl Catalog {
                 artifact: &artifact,
                 node,
                 primary: true,
+                last_used: last_used_in(&snapshot, artifact.id)?,
             }));
         }
         Ok(rows)
@@ -616,7 +620,7 @@ fn page_of(summary: Summary, request: &QueryRequest<'_>) -> Result<Vec<Hit>> {
     let window = Window::of(request, usize::try_from(total).unwrap_or(usize::MAX));
     let order = order_of(request.sort, window.reversed);
     match (SortColumn::of(request.sort.key), segments.len()) {
-        (SortColumn::Size | SortColumn::Absent, _) | (SortColumn::Text, 0 | 1) => {
+        (SortColumn::Size | SortColumn::Used, _) | (SortColumn::Text, 0 | 1) => {
             Ok(ranked_window(candidates, window, order))
         }
         (SortColumn::Text, _) => spelled_page(candidates, &segments, window, order),
@@ -628,7 +632,7 @@ fn page_of(summary: Summary, request: &QueryRequest<'_>) -> Result<Vec<Hit>> {
 fn order_of(sort: SortSpec, reversed: bool) -> Order {
     Order {
         rank: match SortColumn::of(sort.key) {
-            SortColumn::Size | SortColumn::Absent => size_key,
+            SortColumn::Size | SortColumn::Used => size_key,
             SortColumn::Text => ordinal_key,
         },
         descending: sort.descending,
@@ -940,6 +944,7 @@ pub(super) struct Fields {
     pub(super) dupe: Field,
     pub(super) trigger_text: Field,
     pub(super) primary: Field,
+    pub(super) last_used: Field,
     keywords: [Field; KEYWORD_FIELDS.len()],
 }
 
@@ -959,6 +964,7 @@ impl Fields {
             dupe: schema.add_u64_field("dupe", INDEXED | FAST),
             trigger_text: schema.add_text_field("trigger_text", TEXT),
             primary: schema.add_u64_field("primary", INDEXED | FAST),
+            last_used: schema.add_i64_field(LAST_USED_COLUMN, INDEXED | FAST),
             keywords: KEYWORD_FIELDS.map(|name| schema.add_text_field(name, STRING | FAST)),
         };
         (schema.build(), fields)
@@ -976,6 +982,7 @@ impl Fields {
             artifact,
             node,
             primary,
+            last_used,
         } = facts;
         let inferred = &artifact.artifact;
         let repo = repository.repo.qualified();
@@ -1029,6 +1036,9 @@ impl Fields {
         }
         document.add_u64(self.dupe, u64::from(artifact.path_count > 1));
         document.add_u64(self.primary, u64::from(*primary));
+        if let Some(used) = last_used {
+            document.add_i64(self.last_used, used.as_second());
+        }
         if let Some(trigger) = inferred.trigger.as_deref() {
             document.add_text(self.trigger_text, trigger);
         }
@@ -1102,6 +1112,7 @@ fn documents_of_artifact(
         ))
     })?;
     let text: Option<SearchText> = snapshot.get().primary(artifact_id)?;
+    let last_used = last_used_in(snapshot, artifact_id)?;
     let preferred = entries
         .iter()
         .max_by_key(|entry| (entry.preference, Reverse(entry.id)))
@@ -1116,6 +1127,7 @@ fn documents_of_artifact(
             artifact: &artifact,
             node,
             primary: preferred == Some(entry.id),
+            last_used,
         };
         documents.push(fields.document(&facts, text.as_ref()));
     }
@@ -1131,6 +1143,7 @@ pub(super) struct EntryFacts<'a> {
     pub(super) artifact: &'a ArtifactRecord,
     pub(super) node: &'a str,
     pub(super) primary: bool,
+    pub(super) last_used: Option<jiff::Timestamp>,
 }
 
 pub(super) fn revision_of<'a>(repository: &'a Repository, entry: &Entry) -> Result<&'a Revision> {
@@ -1155,6 +1168,7 @@ pub(super) fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
         revision,
         artifact,
         node,
+        last_used,
         ..
     } = facts;
     let inferred = &artifact.artifact;
@@ -1189,7 +1203,7 @@ pub(super) fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
         path_count: artifact.path_count,
         dupe: artifact.path_count > 1,
         triage: entry.triage,
-        last_used: None,
+        last_used: *last_used,
         repo: repository.repo.qualified(),
         repo_id: RepoRowId::new(entry.repo_id),
         entry_id: EntryId::new(entry.id),
@@ -1316,7 +1330,7 @@ fn decode(
 #[derive(Clone, Copy)]
 enum SortColumn {
     Size,
-    Absent,
+    Used,
     Text,
 }
 
@@ -1324,7 +1338,7 @@ impl SortColumn {
     fn of(key: SortKey) -> Self {
         match key {
             SortKey::Size => SortColumn::Size,
-            SortKey::Used => SortColumn::Absent,
+            SortKey::Used => SortColumn::Used,
             SortKey::Role
             | SortKey::Name
             | SortKey::Base
@@ -1436,6 +1450,7 @@ struct HitColumns {
     preference: Column<i64>,
     size: Column<u64>,
     sort: SortColumn,
+    last_used: Option<Column<i64>>,
     strings: SegmentStrings,
 }
 
@@ -1446,13 +1461,18 @@ impl HitColumns {
         key: SortKey,
     ) -> tantivy::Result<Self> {
         let fields = segment.fast_fields();
+        let sort = SortColumn::of(key);
         Ok(Self {
             ordinal,
             artifact: fields.i64("artifact_id")?,
             entry: fields.i64("entry_id")?,
             preference: fields.i64("preference")?,
             size: fields.u64("size")?,
-            sort: SortColumn::of(key),
+            last_used: match sort {
+                SortColumn::Used => Some(fields.i64(LAST_USED_COLUMN)?),
+                SortColumn::Size | SortColumn::Text => None,
+            },
+            sort,
             strings: SegmentStrings::open(segment, key)?,
         })
     }
@@ -1468,7 +1488,12 @@ impl HitColumns {
         };
         let sort = match self.sort {
             SortColumn::Size => size,
-            SortColumn::Absent => NO_TERM,
+            SortColumn::Used => self
+                .last_used
+                .as_ref()
+                .and_then(|column| column.first(doc))
+                .and_then(|used| u64::try_from(used).ok())
+                .unwrap_or_default(),
             SortColumn::Text => self.strings.first_ord(SORT_COLUMN, doc),
         };
         Some(Hit {

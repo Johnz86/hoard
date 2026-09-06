@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use hoard_core::{ArtifactId, Base, Evidence, Role, Sha256, SubRole, format_size};
 use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, EntryDetail};
-use hoard_index::store::artifact;
 use hoard_index::store::row::SearchRow;
 
 use crate::api::common::{
@@ -130,6 +129,7 @@ struct Inspection {
     evidence: Vec<Evidence>,
     plugs_into: Vec<CompatRowView>,
     override_applied: bool,
+    usage: UsageSummary,
 }
 
 pub async fn detail(
@@ -141,21 +141,13 @@ pub async fn detail(
     let now = Timestamp::now();
     let catalog = Arc::clone(state.catalog());
     let inspected = blocking(move || inspect(&catalog, id, now)).await?;
-    let record = state
-        .store()
-        .call(move |conn| artifact::artifact(conn, id))
-        .await?;
     Ok(Json(ArtifactView {
         facts: facts(&inspected.row),
         evidence: inspected.evidence,
         entries: entry_views(&inspected.entries, &host),
         duplicates: Vec::new(),
         plugs_into: inspected.plugs_into,
-        usage: UsageSummary {
-            pulls: record.use_count,
-            last_used: record.last_used,
-            label: format!("{} {PULLS_LABEL}", record.use_count),
-        },
+        usage: inspected.usage,
         override_applied: inspected.override_applied,
         row: RowView::from(&inspected.row),
     }))
@@ -164,6 +156,7 @@ pub async fn detail(
 fn inspect(catalog: &Catalog, id: ArtifactId, now: Timestamp) -> Result<Inspection, IndexError> {
     let row = require_row(catalog, id)?;
     let plugs = compat_for(catalog, &row, PLUGS_INTO_LIMIT, now)?;
+    let usage = catalog.artifact_usage(id)?;
     Ok(Inspection {
         entries: catalog.entries_of(id)?,
         evidence: catalog
@@ -172,6 +165,11 @@ fn inspect(catalog: &Catalog, id: ArtifactId, now: Timestamp) -> Result<Inspecti
             .unwrap_or_default(),
         plugs_into: plugs.rows,
         override_applied: catalog.artifact_override(id)?.is_some(),
+        usage: UsageSummary {
+            pulls: usage.pulls,
+            last_used: usage.last_used,
+            label: format!("{} {PULLS_LABEL}", usage.pulls),
+        },
         row,
     })
 }

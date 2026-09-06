@@ -14,15 +14,14 @@ use hoard_index::IndexError;
 use hoard_index::catalog::{
     Catalog, EntryDetail, RepositoryDetail, RepositoryFilter, RevisionDetail,
 };
+use hoard_index::catalog::{PullRow, UsageDay};
 use hoard_index::shard::parse_shard_name;
 use hoard_index::sniff::parse_readme;
 use hoard_index::store::revision::RefKind;
 use hoard_index::store::row::SearchRow;
-use hoard_index::store::usage::{PullRow, UsageDay};
-use hoard_index::store::{artifact, node, repo, usage};
 
 use crate::api::common::{
-    Conn, DEFAULT_LIMIT, EntryView, Fact, MIDDOT, PullCommands, RowView, blocking, clamp_limit,
+    DEFAULT_LIMIT, EntryView, Fact, MIDDOT, PullCommands, RowView, blocking, clamp_limit,
     decode_row_cursor, encode_row_cursor, entry_views, facts, pull_commands, relative_time,
     repo_id, state_label,
 };
@@ -265,7 +264,7 @@ pub async fn detail(
     let now = Timestamp::now();
     let commands = pull_commands(&state, &repo, None);
     let catalog = Arc::clone(state.catalog());
-    let mut view = blocking(move || {
+    let view = blocking(move || {
         describe(
             &catalog,
             &Header {
@@ -279,13 +278,6 @@ pub async fn detail(
         )
     })
     .await?;
-    if let Some(id) = view.artifact_id {
-        let uses = state
-            .store()
-            .call(move |conn| Ok(artifact::artifact(conn, id)?.use_count))
-            .await?;
-        view.facts.push(Fact::new(PULLS_LABEL, uses.to_string()));
-    }
     Ok(Json(view))
 }
 
@@ -464,23 +456,23 @@ pub async fn repo_usage(
 ) -> ApiResult<Json<UsageView>> {
     let repo = repo_id(&repo_type, &org, &name)?;
     let now = Timestamp::now();
-    let view = state
-        .store()
-        .call(move |conn| {
-            let record = repo_row(conn, &repo)?;
-            let days = usage::usage_days(conn, record.id, USAGE_DAYS)?;
-            let pulls: Vec<PullView> = usage::recent_pulls(conn, record.id, RECENT_PULLS)?
-                .into_iter()
-                .map(|pull| pull_view(pull, now))
-                .collect();
-            Ok(UsageView {
-                total: days.iter().map(|day| day.pulls).sum(),
-                days,
-                pulls,
-                clients: usage::distinct_clients(conn, record.id)?,
-            })
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        let record = require_repository(&catalog, &repo)?;
+        let days = catalog.usage_days(record.id, USAGE_DAYS)?;
+        let pulls: Vec<PullView> = catalog
+            .recent_pulls(record.id, RECENT_PULLS)?
+            .into_iter()
+            .map(|pull| pull_view(pull, now))
+            .collect();
+        Ok(UsageView {
+            total: days.iter().map(|day| day.pulls).sum(),
+            days,
+            pulls,
+            clients: catalog.distinct_clients(record.id)?,
         })
-        .await?;
+    })
+    .await?;
     Ok(Json(view))
 }
 
@@ -493,19 +485,6 @@ fn pull_view(pull: PullRow, now: Timestamp) -> PullView {
         bytes: pull.bytes,
         rate_bps: pull.rate_bps,
     }
-}
-
-/// The repository as this node holds it, falling back to a peer's copy so a REMOTE repo
-/// still opens.
-fn repo_row(conn: &Conn, wanted: &RepoId) -> Result<repo::RepoRow, IndexError> {
-    let qualified = wanted.qualified();
-    let rows = repo::repos_by_qualified(conn, &qualified)?;
-    let local = node::local_node(conn).ok().map(|node| node.id);
-    rows.iter()
-        .find(|row| Some(row.node_row) == local)
-        .or_else(|| rows.first())
-        .cloned()
-        .ok_or_else(|| IndexError::not_found("repo", qualified))
 }
 
 /// The artifact the header describes: the largest weights file, else the largest artifact.
@@ -590,8 +569,8 @@ fn meta_line(primary: Option<&SearchRow>, entries: &[EntryDetail], now: Timestam
     parts.join(&format!(" {MIDDOT} "))
 }
 
-/// DERIVED FACTS: the inspector's facts plus what only a repository knows. The pull count
-/// is appended by the route, which reads it from the usage store.
+/// DERIVED FACTS: the inspector's facts plus what only a repository knows, which is when
+/// the catalog first saw the artifact and how often this node has served it.
 fn repo_facts(
     catalog: &Catalog,
     primary: Option<&SearchRow>,
@@ -606,6 +585,8 @@ fn repo_facts(
         .and_then(|detail| detail.first_seen)
         .map_or_else(|| "-".to_owned(), |seen| relative_time(now, seen));
     list.push(Fact::new("first seen", first_seen));
+    let pulls = catalog.artifact_usage(row.artifact_id)?.pulls;
+    list.push(Fact::new(PULLS_LABEL, pulls.to_string()));
     Ok(list)
 }
 
