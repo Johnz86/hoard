@@ -123,9 +123,6 @@ Smaller things, each verified:
   `state:triage` from the search index, and a peer-advertised artifact is filed as remote
   entries, which never carry that state. Whether a peer's triage should be visible at all is
   an open question, not obviously a bug.
-- Two rustdoc warnings: `public documentation for retract_digest links to private item CHUNK`
-  and the same for `reset_stale_pulls`, both in `crates/hoard-index/src/catalog/digest.rs`.
-  Either stop linking `CHUNK` or make it public.
 - `crates/hoard-net/Cargo.toml` declares `hex.workspace = true` and no code in the crate uses
   the `hex` crate (the only match is a local variable of that name in `digest.rs`).
 - `mockall` and `criterion` are declared in the root `[workspace.dependencies]` and no crate

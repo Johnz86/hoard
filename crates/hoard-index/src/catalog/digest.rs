@@ -170,7 +170,7 @@ impl Catalog {
     /// nothing references any more. Returns how many entries went.
     ///
     /// The peer's rows are found through the repositories filed under its own source, one
-    /// repository at a time and in chunks of [`CHUNK`] rows per transaction, so neither the
+    /// repository at a time and in chunks of `CHUNK` rows per transaction, so neither the
     /// pass nor an index by node has to see every entry this catalog holds.
     pub fn retract_digest(&self, peer: i64, pass: u64) -> Result<u64> {
         let stored: Option<Node> = self.database.r_transaction()?.get().primary(peer)?;
@@ -276,7 +276,7 @@ impl Catalog {
     /// clears a percentage that will never move again.
     ///
     /// Only a pull writes PULLING, so only the repositories filed under the pull source are
-    /// read, in chunks of [`CHUNK`] rows per transaction.
+    /// read, in chunks of `CHUNK` rows per transaction.
     pub fn reset_stale_pulls(&self) -> Result<u64> {
         let mut counters =
             Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
