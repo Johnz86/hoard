@@ -1521,12 +1521,27 @@ pub(super) fn preference(state: State, present: bool) -> i64 {
     (4 + weight + i64::from(present)) * 2 + 1
 }
 
+/// One artifact as the catalog is about to record it, whether a scan read its header or the
+/// mirror only knows its name, size and hash.
+pub(super) struct RecordFacts<'a> {
+    pub(super) id: i64,
+    pub(super) identity: u128,
+    pub(super) name: String,
+    pub(super) org: Option<String>,
+    pub(super) sha256: Option<Sha256>,
+    pub(super) size: u64,
+    pub(super) format: ArtifactFormat,
+    pub(super) inference: &'a Inference,
+    pub(super) tensors: Option<TensorSummary>,
+    pub(super) group_bytes: Option<u64>,
+    pub(super) shard_count: Option<u32>,
+}
+
 fn artifact_record(
     id: i64,
     prepared: &PreparedEntry<'_>,
     draft: &ArtifactDraft,
 ) -> (ArtifactRecord, ArtifactDetail) {
-    let inference = &draft.inference;
     let (tensors, group_bytes, shard_count) = match &prepared.role {
         EntryRole::Anchor(facts) => (
             facts.tensors.clone(),
@@ -1542,21 +1557,50 @@ fn artifact_record(
             None,
         ),
     };
-    let record = ArtifactRecord {
+    record_of(RecordFacts {
         id,
         identity: draft.identity,
         name: prepared.name.clone(),
         org: prepared.org.clone(),
+        sha256: prepared.presence.sha256,
+        size: prepared.presence.size,
+        format: prepared
+            .sniffed
+            .as_ref()
+            .map_or(ArtifactFormat::Unknown, |sniffed| sniffed.format),
+        inference: &draft.inference,
+        tensors,
+        group_bytes,
+        shard_count,
+    })
+}
+
+pub(super) fn record_of(facts: RecordFacts<'_>) -> (ArtifactRecord, ArtifactDetail) {
+    let RecordFacts {
+        id,
+        identity,
+        name,
+        org,
+        sha256,
+        size,
+        format,
+        inference,
+        tensors,
+        group_bytes,
+        shard_count,
+    } = facts;
+    let record = ArtifactRecord {
+        id,
+        identity,
+        name,
+        org,
         path_count: 1,
         artifact: Artifact {
             id: ArtifactId::new(id),
             blob: BlobId::new(id),
-            sha256: prepared.presence.sha256,
-            size: prepared.presence.size,
-            format: prepared
-                .sniffed
-                .as_ref()
-                .map_or(ArtifactFormat::Unknown, |sniffed| sniffed.format),
+            sha256,
+            size,
+            format,
             role: inference.role,
             sub_role: inference.sub_role,
             role_confidence: inference.role_confidence,

@@ -26,8 +26,8 @@ use super::models::{
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::{
-    Catalog, JobProgress, JobState, NewProjection, QueryPage, QueryRequest, RepositoryFilter,
-    RescanReport, UsageEvent, builder, models, query,
+    Catalog, JobProgress, JobState, MIRROR_SOURCE, NewProjection, QueryPage, QueryRequest,
+    RepositoryFilter, RescanReport, ServedFile, UsageEvent, builder, models, query,
 };
 
 fn running_as_root() -> bool {
@@ -2033,6 +2033,104 @@ fn seeded_facts() -> Artifact {
         trigger: None,
         sniff_version: 1,
     }
+}
+
+#[test]
+fn a_served_file_is_filed_under_the_mirror_source_and_found_by_hash() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = Catalog::open_or_scan(
+        &IndexConfig {
+            data_dir: directory.path().join("native"),
+            sources: Vec::new(),
+            ..IndexConfig::default()
+        },
+        "n",
+        |_, _| {},
+    )?;
+    let repo = RepoId::parse_ref(RepoType::Models, "openai/whisper")?;
+    let sha = Sha256::from_bytes([0x42; 32]);
+    let file = ServedFile {
+        repo: repo.clone(),
+        commit: CommitSha::from_bytes([0x11; 20]),
+        rel_path: "unet/model.safetensors".to_owned(),
+        size: 4096,
+        sha256: sha,
+        git_sha1: None,
+        cache_root: directory.path().join("repos"),
+    };
+    let first = catalog.ingest_served(&file)?;
+    assert!(first.artifact.is_some());
+    let again = catalog.ingest_served(&file)?;
+    assert_eq!(again, first, "the same file lands on the same rows");
+    let detail = catalog
+        .repository(&repo)?
+        .ok_or_else(|| IndexError::Catalog("repo".into()))?;
+    assert_eq!(detail.source, MIRROR_SOURCE);
+    assert_eq!(detail.revisions.len(), 1);
+    let entries = catalog.revision_entries(detail.id, 0)?;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].state, State::Served);
+    assert_eq!(entries[0].sha256, Some(sha));
+    assert!(!entries[0].deduped, "one fetch is one path");
+    let located = catalog.entries_by_sha256(&[sha])?;
+    assert_eq!(located.len(), 1);
+    assert_eq!(located[0].1.rel_path, "unet/model.safetensors");
+    catalog.refresh_search(|_| {})?;
+    let row = catalog
+        .artifact_by_sha256(&sha)?
+        .ok_or_else(|| IndexError::Catalog("row".into()))?;
+    assert_eq!(
+        row.artifact_id,
+        first
+            .artifact
+            .ok_or_else(|| IndexError::Catalog("artifact".into()))?
+    );
+    assert_eq!(row.state, State::Served);
+    let config = ServedFile {
+        rel_path: "config.json".to_owned(),
+        sha256: Sha256::from_bytes([0x43; 32]),
+        git_sha1: Some(CommitSha::from_bytes([0x44; 20])),
+        ..file
+    };
+    assert!(
+        catalog.ingest_served(&config)?.artifact.is_none(),
+        "a config is not an artifact"
+    );
+    assert_eq!(catalog.totals()?.artifacts, 1);
+    assert_eq!(catalog.revision_entries(detail.id, 0)?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_rescan_leaves_the_mirror_source_alone() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (_input, config) = loose_fixture(directory.path())?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let repo = RepoId::parse_ref(RepoType::Models, "openai/whisper")?;
+    catalog.ingest_served(&ServedFile {
+        repo: repo.clone(),
+        commit: CommitSha::from_bytes([0x11; 20]),
+        rel_path: "model.safetensors".to_owned(),
+        size: 10,
+        sha256: Sha256::from_bytes([0x42; 32]),
+        git_sha1: None,
+        cache_root: directory.path().join("repos"),
+    })?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    let detail = catalog
+        .repository(&repo)?
+        .ok_or_else(|| IndexError::Catalog("repo".into()))?;
+    assert_eq!(
+        catalog.revision_entries(detail.id, 0)?[0].state,
+        State::Served
+    );
+    Ok(())
 }
 
 fn git(dir: &Path, args: &[&str]) {

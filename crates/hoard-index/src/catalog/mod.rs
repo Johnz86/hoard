@@ -1,4 +1,5 @@
 mod hashing;
+mod ingest;
 mod jobs;
 mod loadouts;
 mod models;
@@ -28,6 +29,7 @@ use crate::store::DiskPressure;
 use self::models::{ArtifactRecord, Entry, Manifest, Repository, Source, Summary, define_models};
 
 pub use self::hashing::HashReport;
+pub use self::ingest::{IngestRecord, MIRROR_SOURCE, ServedFile};
 pub use self::jobs::JobRecord;
 pub use self::loadouts::LoadoutRecord;
 pub use self::read::{
