@@ -21,7 +21,7 @@ use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, LocationKey,
     Manifest, Placement, Repository, RepositoryKey, SearchChange, Source,
 };
-use super::search::QueryPath;
+use super::search::{Paging, QueryPath};
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::{
     Catalog, DigestApplied, FORMAT_VERSION, JobProgress, JobState, MIRROR_SOURCE, NewProjection,
@@ -4940,6 +4940,235 @@ fn shards_group_across_chunk_boundaries() -> Result<()> {
     Ok(())
 }
 
+/// A seeded catalog the paging tests page through: `count` artifacts over two revisions
+/// and two nodes, named in an order the artifact ids do not follow, with several roles,
+/// bases, formats and precisions, and a third of the sizes sharing one value so a page is
+/// cut through ties rather than around them. Every fifth artifact carries a second entry on
+/// the other node, which is what the collapse path has to reduce.
+fn paging_fixture(count: usize) -> Result<(TempDir, Catalog)> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let peer = catalog.upsert_peer(&NodeId::new("attic-node")?, "attic", None)?;
+    let roles = [Role::Ckpt, Role::Lora, Role::Vae, Role::Llm];
+    let formats = [
+        ArtifactFormat::Safetensors,
+        ArtifactFormat::Gguf,
+        ArtifactFormat::Bin,
+    ];
+    let bases = ["sdxl", "flux", "qwen"];
+    let precisions = ["fp16", "fp8", "bf16"];
+    let mut main = Vec::with_capacity(count);
+    let mut mirrored = Vec::new();
+    for index in 0..count {
+        let named = (index * 37 + 11) % count;
+        let size = match index % 3 {
+            0 => 4_096,
+            _ => 1_000 + index as u64 * 7,
+        };
+        let base = bases[index % bases.len()];
+        let artifact = seeded_artifact(
+            0x5000 + index as u128,
+            &format!("model-{named:03}"),
+            Some("acme"),
+            Artifact {
+                size,
+                role: roles[index % roles.len()],
+                base: Base::new(base),
+                base_label: Some(base.to_owned()),
+                format: formats[index % formats.len()],
+                precision: Some(Precision::new(precisions[index % precisions.len()])),
+                ..seeded_facts()
+            },
+        );
+        main.push(SeedEntry {
+            node: match index % 2 {
+                0 => LOCAL_NODE,
+                _ => peer.id,
+            },
+            ..seeded_entry(
+                &format!("weights/model-{index:03}.safetensors"),
+                size,
+                Some(artifact.clone()),
+            )
+        });
+        if index.is_multiple_of(5) {
+            mirrored.push(SeedEntry {
+                node: peer.id,
+                ..seeded_entry(
+                    &format!("mirror/model-{index:03}.safetensors"),
+                    size,
+                    Some(artifact),
+                )
+            });
+        }
+    }
+    let repository = SeedRepository {
+        revisions: vec![
+            SeedRevision {
+                name: "main".to_owned(),
+                sha: Some(CommitSha::from_bytes([0x21; 20])),
+                refs: vec![("main".to_owned(), RefKind::Branch)],
+                title: None,
+                author: None,
+                committed: None,
+                entries: main,
+            },
+            SeedRevision {
+                name: "v2".to_owned(),
+                sha: Some(CommitSha::from_bytes([0x22; 20])),
+                refs: vec![("v2".to_owned(), RefKind::Branch)],
+                title: None,
+                author: None,
+                committed: None,
+                entries: mirrored,
+            },
+        ],
+        ..seeded_repo("acme/paging", RepoType::Models)
+    };
+    catalog.seed(&[repository])?;
+    catalog.rebuild_search(|_| {})?;
+    Ok((directory, catalog))
+}
+
+#[test]
+fn a_page_is_assembled_from_retained_rows_only() -> Result<()> {
+    let (_directory, catalog) = paging_fixture(30)?;
+    let context = catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?;
+    for sort in [
+        SortSpec::new(SortKey::Name, false),
+        SortSpec::new(SortKey::Size, true),
+    ] {
+        for offset in [0, 7, 13, 25] {
+            let request = QueryRequest {
+                raw: "",
+                sort,
+                limit: 6,
+                offset,
+                context: &context,
+            };
+            let primary = catalog.query_via(request.clone(), QueryPath::Primary)?;
+            let collapsed = catalog.query_via(request, QueryPath::Collapse)?;
+            assert_eq!(primary.total, 30, "{sort:?} offset={offset}");
+            assert_eq!(primary.total, collapsed.total, "{sort:?} offset={offset}");
+            assert_eq!(primary.nodes, 2, "{sort:?} offset={offset}");
+            assert_eq!(primary.nodes, collapsed.nodes, "{sort:?} offset={offset}");
+            assert_eq!(primary.facets, collapsed.facets, "{sort:?} offset={offset}");
+            let paged: Vec<(ArtifactId, EntryId)> = primary
+                .rows
+                .iter()
+                .map(|row| (row.artifact_id, row.entry_id))
+                .collect();
+            let expected: Vec<(ArtifactId, EntryId)> = collapsed
+                .rows
+                .iter()
+                .map(|row| (row.artifact_id, row.entry_id))
+                .collect();
+            assert_eq!(paged, expected, "{sort:?} offset={offset}");
+            assert_eq!(paged.len(), 6.min(30 - offset as usize));
+        }
+    }
+    Ok(())
+}
+
+/// The artifact and entry of every row of a page, which is what two selections of the same
+/// window have to agree on exactly.
+fn identified(page: &QueryPage) -> Vec<(ArtifactId, EntryId)> {
+    page.rows
+        .iter()
+        .map(|row| (row.artifact_id, row.entry_id))
+        .collect()
+}
+
+const PAGED_KEYS: [SortKey; 10] = [
+    SortKey::Role,
+    SortKey::Name,
+    SortKey::Base,
+    SortKey::Format,
+    SortKey::Precision,
+    SortKey::Size,
+    SortKey::Revision,
+    SortKey::Node,
+    SortKey::State,
+    SortKey::Used,
+];
+
+#[test]
+fn a_sampled_page_matches_the_heap_page_everywhere_in_the_order() -> Result<()> {
+    let (_directory, catalog) = paging_fixture(60)?;
+    let context = catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?;
+    let paging = Paging::new(0, 8, 1000);
+    for key in PAGED_KEYS {
+        for descending in [false, true] {
+            for offset in (0..=60).step_by(5) {
+                let request = QueryRequest {
+                    raw: "",
+                    sort: SortSpec::new(key, descending),
+                    limit: 7,
+                    offset,
+                    context: &context,
+                };
+                let (sampled, _) = catalog.query_paged(request.clone(), paging)?;
+                let heaped = catalog.query(request)?;
+                let where_ = format!("{key:?} desc={descending} offset={offset}");
+                assert_eq!(identified(&sampled), identified(&heaped), "{where_}");
+                assert_eq!(sampled.total, heaped.total, "{where_}");
+                assert_eq!(sampled.nodes, heaped.nodes, "{where_}");
+                assert_eq!(sampled.facets, heaped.facets, "{where_}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_bucket_over_the_cap_falls_back_to_the_heap() -> Result<()> {
+    let (_directory, catalog) = paging_fixture(60)?;
+    let context = catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?;
+    let request = QueryRequest {
+        raw: "",
+        sort: SortSpec::new(SortKey::Size, false),
+        limit: 7,
+        offset: 25,
+        context: &context,
+    };
+    let (capped, _) = catalog.query_paged(request.clone(), Paging::new(0, 8, 0))?;
+    let heaped = catalog.query(request)?;
+    assert_eq!(identified(&capped), identified(&heaped));
+    assert_eq!(capped.total, heaped.total);
+    assert_eq!(capped.facets, heaped.facets);
+    Ok(())
+}
+
+#[test]
+fn a_sampled_page_reads_no_more_than_the_bucket_and_a_page() -> Result<()> {
+    let (_directory, catalog) = paging_fixture(60)?;
+    let context = catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?;
+    let request = QueryRequest {
+        raw: "",
+        sort: SortSpec::new(SortKey::Size, false),
+        limit: 7,
+        offset: 30,
+        context: &context,
+    };
+    let (sampled, kept) = catalog.query_paged(request.clone(), Paging::new(0, 8, 1000))?;
+    let (heaped, held) = catalog.query_paged(request, Paging::new(usize::MAX, 8, 1000))?;
+    assert_eq!(identified(&sampled), identified(&heaped));
+    assert_eq!(
+        held, 30,
+        "the heap holds every row between the nearer end and the window"
+    );
+    assert!(
+        kept <= 12,
+        "a sampled window holds its bucket of five and one page of seven, not {kept}"
+    );
+    Ok(())
+}
+
 #[test]
 fn every_sort_key_orders_the_page_and_paging_is_stable() -> Result<()> {
     let directory = tempfile::tempdir()?;
@@ -5034,6 +5263,143 @@ fn every_sort_key_orders_the_page_and_paging_is_stable() -> Result<()> {
     })?;
     let sizes: Vec<u64> = by_size.rows.iter().map(|row| row.size).collect();
     assert!(sizes.windows(2).all(|pair| pair[0] >= pair[1]), "{sizes:?}");
+    Ok(())
+}
+
+#[test]
+fn a_sampled_text_page_crosses_segments_whose_terms_interleave() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let native = directory.path().join("native");
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    for round in 0..3 {
+        fs::write(
+            input.join(format!("loras/extra-{round}.safetensors")),
+            lora_header(),
+        )?;
+        catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+        catalog.refresh_search(|_| {})?;
+    }
+    fs::write(input.join("loras/aaa-before.safetensors"), lora_header())?;
+    fs::write(input.join("loras/hhh-between.safetensors"), lora_header())?;
+    fs::write(input.join("loras/zzz-after.safetensors"), plain_header())?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.refresh_search(|_| {})?;
+    assert!(
+        catalog.search_segments()? >= 3,
+        "the refreshes leave terms spread over segments"
+    );
+    let context = catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?;
+    let paging = Paging::new(0, 4, 1000);
+    for key in [
+        SortKey::Name,
+        SortKey::Base,
+        SortKey::Role,
+        SortKey::Precision,
+    ] {
+        for descending in [false, true] {
+            for offset in (0..=8).step_by(2) {
+                let request = QueryRequest {
+                    raw: "",
+                    sort: SortSpec::new(key, descending),
+                    limit: 3,
+                    offset,
+                    context: &context,
+                };
+                let (sampled, _) = catalog.query_paged(request.clone(), paging)?;
+                let heaped = catalog.query(request)?;
+                let where_ = format!("{key:?} desc={descending} offset={offset}");
+                assert_eq!(sampled.total, 8, "{where_}");
+                assert_eq!(identified(&sampled), identified(&heaped), "{where_}");
+                assert_eq!(sampled.nodes, heaped.nodes, "{where_}");
+                assert_eq!(sampled.facets, heaped.facets, "{where_}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_boundary_absent_from_a_segment_maps_to_the_next_term() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let native = directory.path().join("native");
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    fs::write(input.join("loras/middle.safetensors"), lora_header())?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.refresh_search(|_| {})?;
+    assert_eq!(
+        catalog.search_segments()?,
+        2,
+        "the refresh commits the new artifact into a segment of its own"
+    );
+    let mut held = catalog.sort_bounds(SortKey::Name, "middle.safetensors")?;
+    held.sort_unstable();
+    assert_eq!(
+        held,
+        vec![(0, true, 1), (2, false, 2)],
+        "the segment holding the term answers exactly, the other answers past its last term"
+    );
+    let mut above = catalog.sort_bounds(SortKey::Name, "zzz.safetensors")?;
+    above.sort_unstable();
+    assert_eq!(
+        above,
+        vec![(1, false, 1), (2, false, 2)],
+        "a term above every term maps to the term count of each segment"
+    );
+    let mut between = catalog.sort_bounds(SortKey::Name, "keep.safetensors")?;
+    between.sort_unstable();
+    assert_eq!(
+        between,
+        vec![(0, false, 1), (1, true, 2)],
+        "a term the other segment sorts after maps to that segment's lowest ordinal"
+    );
+    for (ordinal, exact, terms) in catalog.sort_bounds(SortKey::Role, "lora")? {
+        assert!(
+            exact && ordinal < terms,
+            "a role sort reads the facet column both segments already opened"
+        );
+    }
+    for (ordinal, exact, terms) in catalog.sort_bounds(SortKey::Role, "zzzz")? {
+        assert_eq!(
+            (ordinal, exact),
+            (terms, false),
+            "a role above every role maps past the last term of each segment"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_published_index_reports_how_many_segments_it_answers_from() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let native = directory.path().join("native");
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
+    assert!(
+        catalog.search_segments().is_err(),
+        "a catalog with no published index has no segments to report"
+    );
+    catalog.rebuild_search(|_| {})?;
+    let built = catalog.search_segments()?;
+    assert_eq!(
+        built, 1,
+        "one commit of one writer thread builds one segment"
+    );
+    for round in 0..3 {
+        fs::write(
+            input.join(format!("loras/extra-{round}.safetensors")),
+            lora_header(),
+        )?;
+        catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+        catalog.refresh_search(|_| {})?;
+    }
+    assert!(
+        catalog.search_segments()? > built,
+        "each refresh commits its own segment"
+    );
     Ok(())
 }
 

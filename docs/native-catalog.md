@@ -170,9 +170,32 @@ matched rather than fixed before filtering.
 One document per artifact carries a `primary` mark: the entry a row would be assembled from,
 which is the highest availability preference and on a tie the lowest entry id. A query that
 filters and sorts only on fields every entry of an artifact agrees on is intersected with
-that mark and needs no collapse. For M matched documents and K equal to offset plus limit,
-collection is then O(M) time and O(K) memory per segment, plus one tally per distinct facet
-value, and page selection is O(K log K).
+that mark and needs no collapse. That path selects its window one of two ways, and both
+count every matched document once and tally it into every facet dimension once.
+
+For M matched documents and K equal to offset plus limit, a window with K at most 16,384 for
+a term key, or 131,072 for a numeric one, is answered by one pass that keeps a heap of the K
+rows that can reach it: O(M) time and O(K) memory per segment, plus one tally per distinct
+facet value, and page selection O(K log K). Both constants are measured, in "Thresholds"
+below; they differ because the heap of a term key spells a term for every row it holds and a
+numeric key only compares integers.
+
+A deeper window is found by rank instead, in three passes. The first counts and tallies the
+match and keeps every S-th matched row's sort key, for a sample S of about the square root of
+M, floored at 64 and capped at 4,096; the second counts the matched documents between
+consecutive sampled keys; the third keeps the documents of the one bucket that holds the
+requested rank, plus a heap of one page beyond it. That is O(M log S) time and
+O(S + B + limit) memory for a bucket B capped at 65,536. The square root is where the two
+costs meet: mapping a boundary into a segment costs a dictionary seek, so the second pass
+starts at O(S x segments), and the bucket the third pass reads holds about M/S rows. The
+stride is forced odd, because a stride sharing a factor with a period in the order documents
+were written samples only some residues of that period and leaves whole runs of equal keys
+with no boundary between them.
+
+A bucket over the cap costs more to hold than the heap does, so the heap answers the request
+instead and nothing about the answer depends on the sample. Either way, a window nearer the
+far end is cut from the reversed order, so the deepest window either selection sees is half
+the match.
 
 A query naming `node`, `state`, `source`, `repo`, `rev` or `hash`, or sorting on revision,
 node or state, still collapses, because those fields differ between the entries of one
@@ -184,10 +207,14 @@ memory proportional to matching artifacts.
 Keyword columns are string fast fields and the collectors keep **term ordinals**, not terms.
 Ordinals are lexicographic inside a segment and meaningless across segments, so a page
 ordered by a term sorts on ordinals while one segment holds every hit and otherwise bounds
-each segment on its own ordinals and merges the survivors by the terms they spell. A term is
-spelled once per segment and ordinal, only for a page row, a facet bucket or the node set. A
-page nearer the end of the order is cut from the reversed order, so a deep offset selects and
-spells no more than a shallow one.
+each segment on its own ordinals and merges the survivors by the terms they spell. A sampled
+boundary crosses segments the same way: its ordinal is spelled once, the terms settle the
+order between boundaries, and each boundary is then mapped back into every segment as the
+lowest ordinal whose term is not below it, with whether that ordinal spells the boundary's
+own term rather than the next one above it. A term is spelled once per segment and ordinal,
+only for a page row, a boundary, a facet bucket or the node set. A page nearer the end of the
+order is cut from the reversed order, so a deep offset selects and spells no more than a
+shallow one.
 
 `Catalog::query` answers a whole index screen: the page in any of the ten sort orders, the
 distinct artifact and node totals, and the five facet dimensions. Each dimension is counted
@@ -437,6 +464,88 @@ Allocated disk is `du` over the output directory; apparent disk sums file length
 grows `catalog.redb` in regions, so the apparent number is quantised and the allocated one is
 what the disk actually loses.
 
+### A page anywhere in the order, at 1M
+
+The paging wave, measured in one session on this workstation over one tree, on an otherwise
+idle machine. All three are checkpoints of the `wave/page-anywhere` branch that `master`
+carries as one commit: `55330c2` is the harness with its new rows on the previous search
+code, `d91302a` is the sampled selection as first written, and `2552309` is it after the
+performance review that followed.
+
+| measure | 55330c2 | d91302a | 2552309 |
+| --- | --- | --- | --- |
+| segments after rebuild | 3 | 3 | 3 |
+| query empty by name | 119.410 ms | 124.878 ms | 121.149 ms |
+| query deep offset | 119.454 ms | 125.401 ms | 120.742 ms |
+| query midpoint offset | 1.508 s | 204.113 ms | 184.532 ms |
+| query midpoint offset by size | 225.749 ms | 173.865 ms | 170.737 ms |
+| query midpoint offset after refresh | 1.544 s | 216.370 ms | 189.565 ms |
+| segments after refresh | 4 | 4 | 4 |
+| query role:lora with facets | 141.857 ms | 149.102 ms | 146.527 ms |
+| query filtered | 229.220 ms | 240.957 ms | 236.601 ms |
+| query node:self with facets | 411.839 ms | 381.425 ms | 322.365 ms |
+| resident rss over the queries | 17,113,088 (16.32 MiB) | 16,314,368 (15.56 MiB) | 16,314,368 (15.56 MiB) |
+| resident rss over the midpoint queries | 61,407,232 (58.56 MiB) | 13,754,368 (13.12 MiB) | 14,278,656 (13.62 MiB) |
+| peak rss growth during the queries | 0 | 0 | 0 |
+| scan wall | 75.003 s | 75.241 s | 76.749 s |
+| rebuild wall | 7.752 s | 8.251 s | 7.343 s |
+| on disk after rebuild, allocated | 1,398,964,224 | 1,398,095,872 | 1,398,759,424 |
+
+The three midpoint rows and the resident memory over them are the change. A page in the
+middle of the default order fell from 1.508 s to 184.5 ms, 8.2x, and the same page over the
+four segments a refresh leaves fell from 1.544 s to 189.6 ms; the memory the two midpoints
+hold above their own page fell from 58.56 MiB to 13.62 MiB. The midpoint by size fell from
+225.7 ms to 170.7 ms, a smaller effect because that key never spelled a term: it paid only
+for the heap, and now pays for two extra passes instead.
+
+Two costs the numbers separate. The 1.5 s was not the heap: sorting by name over three
+segments spelled a term for every one of the 500,050 rows the heap held, and that spelling
+was most of it, which is why the midpoint by size was 225 ms on the same window. The sampled
+selection removes both, because the bucket it spells from holds about a thousand rows rather
+than half the match.
+
+What the review's four fixes were worth, `d91302a` to `2552309`: 19.6 ms off the name
+midpoint and 26.8 ms off the same page after a refresh, which is the sample falling from a
+fixed 4,096 boundaries to the square root of the match, 1,000 of them, each of which had cost
+a dictionary seek in every segment that did not hold its term. The gap between the two
+midpoints, 12.3 ms at `d91302a` against 5.0 ms at `2552309`, is that per-segment seek cost
+and it shrank with the sample. The rest of the fixes, transposing the boundaries into one
+contiguous table per segment and reading only the sort column and the artifact id in the
+bucket pass, are inside the 184.5 ms and were not separately timed.
+
+`query empty by name`, `query deep offset`, `role:lora` and the filtered query took 5 to
+12 ms at `d91302a` that the review recovered most but not all of: against `55330c2` they now
+stand at +1.7, +1.3, +4.7 and +7.4 ms. The first two are inside the spread of their own runs;
+the last two are not, and are a 3.2 per cent regression on two rows this wave did not put on
+a new path. All four are shallow windows that still take the heap. At 100k the same four rows
+are back on their before numbers to within 0.7 ms, so whatever is left does not scale with
+the change; the reviewer refuted the three mechanical explanations and what remains is
+codegen around the collector's inner loop.
+
+`node:self` is the collapse path, which this wave did not touch; it read 411.839, 381.425 and
+322.365 ms across the three columns, a spread wider than any difference between them. The
+scan, rebuild and disk rows are the same workload as before and moved by less than their own
+spread.
+
+At 100k, `55330c2` to `2552309`: `query midpoint offset` 104.014 ms to 19.398 ms, `query
+midpoint offset by size` 15.564 ms to 14.623 ms, `query midpoint offset after refresh`
+111.448 ms to 20.654 ms, resident memory over the midpoints 1.09 MiB to 1.17 MiB. The 100k
+index is two segments after the rebuild and three after the refresh, and a 100k midpoint by
+size is a window of 50,050 rows, which is inside the numeric crossover below and so still
+takes the heap. Nothing else at 100k moved by more than a millisecond.
+
+**The sample must not resonate with the order documents were written in.** The stride was
+`counted / boundaries`, an even number for every round match, and the synthetic tree writes
+files whose size repeats with a period of 32. A stride of 1,000 shares a factor of 8 with
+that period, so the sample only ever landed on four of the 32 size classes and 28 of them
+got no boundary at all: with 1,002 boundaries the median bucket held 126 rows and the largest
+held 80,835, over the 65,536 cap, so a size-sorted page at some offsets silently fell back to
+the heap and paid for both. Forcing the stride odd makes it coprime with every power of two;
+the same measurement then reads a median of 657 and a largest bucket of 8,619, and the four
+size-sorted crossover offsets that had read 177.0, 177.6, 331.5 and 322.1 ms read 175.9,
+176.1, 175.4 and 174.5 ms. Nothing about an answer depended on this - the equality tests hold
+either way - only what it cost.
+
 ### Thresholds
 
 At 1M entries, absolute: peak RSS growth during the scan under 2 GB, allocated disk under
@@ -453,6 +562,46 @@ on an otherwise idle machine.
 | rebuild no slower than the scan | 7.51 s against 76.39 s | met |
 | every query on the original list under 500 ms | slowest is `node:self` at 474.98 ms before, 408.32 ms after | met |
 
+Three rows the original list did not carry, measured at `2552309` against `55330c2` on the
+same tree in one session:
+
+| gate | measured | verdict |
+| --- | --- | --- |
+| a page in the middle of the default order under 500 ms | 184.532 ms, from 1.508 s | met, by 315.5 ms |
+| the same page after a refresh, over four segments | 189.565 ms, from 1.544 s | met, by 310.4 ms |
+| a page in the middle by size under 500 ms | 170.737 ms, from 225.749 ms | met, by 329.3 ms |
+| the first page and the last page unmoved | +1.7 ms and +1.3 ms | met, inside their own spread |
+| `role:lora` and the filtered query unmoved | +4.7 ms and +7.4 ms, 3.2 per cent | **missed**, outside their spread |
+| `node:self` unmoved | 411.8, 381.4 and 322.4 ms across three commits | met, the spread exceeds the difference |
+| resident memory over the queries no higher than before | 15.56 MiB against 16.32 MiB | met |
+
+**Where the heap stops paying.** `Paging::DEFAULT.shallow` is the window above which a rank
+selection replaces the heap, and it is 16,384 rows for a text key and eight times that for a
+numeric one. Measured at 1M on the tree above with two release builds of the harness, one
+forced to the heap and one forced to the sample, each run once, each offset timed warm after
+the fixed list had already run; these numbers are therefore not comparable to the table
+above, only to each other.
+
+| window | heap, text | sampled, text | heap, numeric | sampled, numeric |
+| --- | --- | --- | --- | --- |
+| 8,292 | 147.209 ms | 189.469 ms | 127.316 ms | 175.926 ms |
+| 32,868 | 228.059 ms | 189.610 ms | 140.856 ms | 176.105 ms |
+| 131,172 | 476.414 ms | 188.873 ms | 175.330 ms | 175.431 ms |
+| 500,050 | 1.386 s | 186.409 ms | 141.718 ms | 174.519 ms |
+
+The sampled columns are flat, which is the property the wave was for: what a page costs does
+not depend on where in the order it sits. The heap column is what crosses them. A text key
+crosses between 8,292 and 32,868, at about 20,900 rows by interpolation, because the heap
+spells a term for every row it keeps; 16,384 is the power of two under that. A numeric key
+compares integers and does not cross until 131,172, where the two are level to 0.1 ms;
+131,072 is the constant, and `NUMERIC_SHALLOW` is the factor of 8 between them.
+
+Past that point the numeric heap is not monotone - it reads 175.330 ms at 131,172 and
+141.718 ms at 500,050 - so at the midpoint a numeric heap is about 33 ms faster than the
+sample on a single warm sample. It is not chosen there: that heap holds 500,050 rows in every
+segment it reads, which is the 58.56 MiB the wave removed, against about a thousand rows for
+the bucket. Where the two are level in time the bounded one is taken.
+
 The first two rows are the catalog at rest. The third is not: `publish` writes the new
 `search-v1-<nanos>` directory in full and keeps the old one until the new one is committed
 and named in the manifest, so for the length of a rebuild the disk holds two search
@@ -464,12 +613,6 @@ one serving is what makes a failed rebuild harmless.
 
 The disk gate was missed by 887,607,552 bytes at `95cd3ad` and is met by 100.4 MB at
 `1783f2b`, a 41.4 per cent reduction.
-
-One query is not on the original list and misses: a page in the **middle** of the order is
-1.529 s at 1M, against 118.9 ms for the last page. The deferred collector cuts a page near
-the end out of the reversed order, and neither end helps the middle. The last-page benchmark
-does not represent the middle of a result, and this wave did not change the collector. At
-100k the same query is 107 ms.
 
 Standalone query-process resident memory over the five queries is 71.50 MiB, against zero
 high-water growth: a query allocates, the process had simply already been higher during the
@@ -572,9 +715,25 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
 
 ## Remaining work
 
-- **Bound a page in the middle of the order.** The deferred collector cuts a page near the
-  end out of the reversed order, so the last page of 1M artifacts is 118 ms and the middle
-  one is 1.52 s. This is the largest measured miss left, and no threshold currently names it.
+- **The tally is the floor under every primary query.** Collecting a matched document costs
+  about 105 ns against about 23 ns for a pass that only counts and buckets: six string-ordinal
+  reads one document at a time, then five `HashMap` entries and one `HashSet` insert, each
+  hashing a `(SegmentOrdinal, usize, u64)` key with SipHash. At 1M that is roughly 80 ms of
+  the 121 ms every primary query starts from, and it is paid again by each of the five
+  narrowed facet passes. The lever is a per-segment tally keyed by the ordinal alone, since
+  the segment is constant inside a segment collector, a `Vec` indexed by ordinal wherever the
+  dictionary is small enough, and block reads of the ordinal columns instead of one call per
+  document. This is the largest cost left on the primary path.
+- **The base facet runs one query per distinct base value.** The prefix rule that groups base
+  labels cannot be answered from ordinals, so `facets` re-runs each bucket's own query to
+  count it. The synthetic tree carries three bases, so no measurement here exercises it; a
+  catalog with hundreds of bases pays hundreds of searches per query.
+- **The cap's fallback recollects rather than reusing the sampling pass.** When the chosen
+  bucket is over 65,536 rows the heap answers the whole request, and the tallies and node set
+  the sampling pass already computed are dropped and computed again. It is accepted as it
+  stands: reaching it needs a bucket that dodged every sample slot, which the odd stride
+  makes improbable, and the alternative is a second way to assemble a `Summary` for a path
+  that should not run.
 - **Bound the collapse the way the primary path is bounded.** A query naming `node:`,
   `state:`, `source:`, `repo:`, `rev:` or `hash:`, or sorting on revision, node or state,
   still keeps one row per matching artifact rather than one per page. At 1M `node:self` is

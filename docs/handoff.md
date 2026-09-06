@@ -20,8 +20,8 @@ first; this document assumes it.
   dependency research; they stay. The wave plan files under `docs/superpowers/plans/` are
   deleted - git keeps them, and a stale plan in the tree is a trap for the next agent.
 - Phases 0 to 9 are done, 10 and 11 are partial. `docs/feature-plan.md` holds the table.
-- At the head of `master` after the disk-budget wave all four checks pass:
-  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 762 passed,
+- At the head of `master` after the paging wave all four checks pass:
+  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 774 passed,
   0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness
   and its supplemental fixture, the mDNS test that needs a multicast route and the sniffer
   test that reads the local model caches. `cargo doc --workspace --no-deps` emits no warning.
@@ -103,9 +103,24 @@ Performance, with the numbers from `docs/native-catalog.md`:
   `ArtifactDetail` summary itself (497 MiB of pages, 37 per cent of the file), and one card
   per revision instead of one per artifact in `SearchText`. The per-table breakdown in
   `docs/native-catalog.md` is current.
-- **A page in the middle of the order takes 1.5 s at 1M.** The deferred collector cuts a
-  page near the end out of the reversed order and neither end helps the middle; the last
-  page is 119 ms. No threshold names this query, and it is the largest measured miss left.
+- **A page anywhere in the order costs a page.** A window of at most 16,384 rows for a text
+  key, or 131,072 for a numeric one, keeps the heap it always kept; a deeper one is found by
+  rank, in three passes that sample the order, count the documents between consecutive
+  samples and read only the bucket the rank falls in plus a page beyond it. Both constants
+  are measured, in the crossover table under "Thresholds" in `docs/native-catalog.md`. At 1M
+  the middle page of the default order is 184.5 ms against 1.508 s and holds 13.62 MiB above
+  its own page against 58.56 MiB; the same page after a refresh, over four segments, is
+  189.6 ms against 1.544 s. Two rows this wave did not put on a new path, `role:lora` and the
+  filtered query, are 4.7 and 7.4 ms slower at 1M and outside their own spread; they are back
+  on their before numbers at 100k, so it does not scale, and it is codegen around the
+  collector's inner loop rather than any extra work.
+- **The tally is the floor under every primary query.** Collecting a matched document costs
+  about 105 ns against about 23 ns for a pass that only counts: six one-at-a-time
+  string-ordinal reads, five `HashMap` entries and a `HashSet` insert per document, all
+  SipHashing a three-part key. That is roughly 80 ms of the 121 ms floor at 1M and is paid
+  again by each of the five narrowed facet passes. Per-segment tallies keyed by ordinal alone
+  and block reads of the ordinal columns are the lever; it is the largest cost left on the
+  primary path and the next wave.
 - **The collapse-path queries are under the 500 ms target without being bounded.**
   `node:self` is 352 to 439 ms at 1M; any query naming `node:`, `state:`, `source:`,
   `repo:`, `rev:` or `hash:`, or sorting on revision, node or state, takes the same path and

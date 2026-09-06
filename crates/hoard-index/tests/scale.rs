@@ -293,23 +293,32 @@ fn native_catalog_at_scale() {
             .expect("rebuild succeeds")
     });
     let rss_after_rebuild = peak_rss_kb();
+    let rebuilt_segments = catalog
+        .search_segments()
+        .expect("the rebuilt index reports its segments");
     let context = CompileContext::new(jiff::Timestamp::now()).with_local_node("scale");
-    let run = |raw: &str, offset: u32| {
+    let run_sorted = |raw: &str, offset: u32, sort: SortSpec| {
         catalog
             .query(QueryRequest {
                 raw,
-                sort: SortSpec::new(SortKey::Name, false),
+                sort,
                 limit: PAGE,
                 offset,
                 context: &context,
             })
             .expect("query succeeds")
     };
+    let run = |raw: &str, offset: u32| run_sorted(raw, offset, SortSpec::new(SortKey::Name, false));
     let rss_at_first_query = current_rss_kb();
     let (first, first_time) = timed(|| run("", 0));
     let deep_offset = u32::try_from(first.total.saturating_sub(u64::from(PAGE))).unwrap_or(0);
     let (_, deep_time) = timed(|| run("", deep_offset));
-    let (_, middle_time) = timed(|| run("", deep_offset / 2));
+    let midpoint = deep_offset / 2;
+    let rss_at_midpoints = current_rss_kb();
+    let (_, middle_time) = timed(|| run("", midpoint));
+    let (_, middle_size_time) =
+        timed(|| run_sorted("", midpoint, SortSpec::new(SortKey::Size, false)));
+    let resident_over_midpoints = current_rss_kb();
     let (loras, lora_time) = timed(|| run("role:lora", 0));
     let (_, filtered_time) = timed(|| run("fmt:safetensors size:>0", 0));
     let rss_after_queries = peak_rss_kb();
@@ -343,6 +352,20 @@ fn native_catalog_at_scale() {
     let (applied, refresh_time) =
         timed(|| catalog.refresh_search(|_| {}).expect("refresh succeeds"));
     let rss_after_refresh = peak_rss_kb();
+    let refreshed_segments = catalog
+        .search_segments()
+        .expect("the published index reports its segments");
+    let (_, refreshed_middle_time) = timed(|| {
+        catalog
+            .query(QueryRequest {
+                raw: "",
+                sort: SortSpec::new(SortKey::Name, false),
+                limit: PAGE,
+                offset: midpoint,
+                context: &context,
+            })
+            .expect("query after a refresh succeeds")
+    });
     let churned_apparent = directory_size(&output, apparent);
     let churned_allocated = directory_size(&output, allocated);
     let (catalog, after_refresh) = snapshot(&output, catalog, &format!("{count}-after-refresh"));
@@ -401,9 +424,14 @@ fn native_catalog_at_scale() {
                     .saturating_sub(after_rebuild.allocated_bytes),
             ),
         ),
+        ("segments after rebuild", rebuilt_segments.to_string()),
         ("query empty by name", format!("{first_time:?}")),
         ("query deep offset", format!("{deep_time:?}")),
         ("query midpoint offset", format!("{middle_time:?}")),
+        (
+            "query midpoint offset by size",
+            format!("{middle_size_time:?}"),
+        ),
         ("query role:lora with facets", format!("{lora_time:?}")),
         ("query filtered", format!("{filtered_time:?}")),
         ("query node:self with facets", format!("{collapse_time:?}")),
@@ -424,10 +452,19 @@ fn native_catalog_at_scale() {
             "resident rss over the queries",
             kb_between(rss_at_first_query, resident_over_queries),
         ),
+        (
+            "resident rss over the midpoint queries",
+            kb_between(rss_at_midpoints, resident_over_midpoints),
+        ),
         ("rescan wall (1,000 changed)", format!("{rescan_time:?}")),
         ("rescan report", format!("{rescanned:?}")),
         ("refresh wall", format!("{refresh_time:?}")),
         ("changes refreshed", applied.to_string()),
+        ("segments after refresh", refreshed_segments.to_string()),
+        (
+            "query midpoint offset after refresh",
+            format!("{refreshed_middle_time:?}"),
+        ),
         (
             "peak rss growth during rescan and refresh",
             kb_between(rss_after_collapse, rss_after_refresh),
