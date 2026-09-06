@@ -19,8 +19,9 @@ use crate::store::revision::RefKind;
 
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, ArtifactRecordV1, Entry, EntryKey, EntryV1,
-    Manifest, ManifestV1, Override, Ref, Repository, RepositoryKey, RepositoryV1, Revision,
-    RevisionV1, SearchChange, SearchText, Source, SourceV1, Summary, SummaryV1,
+    Manifest, ManifestV1, Override, Ref, Repository, RepositoryKey, RepositoryV1, RepositoryV2,
+    Revision, RevisionV1, RevisionV2, SearchChange, SearchText, Source, SourceV1, Summary,
+    SummaryV1,
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
@@ -1463,10 +1464,14 @@ fn a_seeded_catalog_answers_like_a_scanned_one() -> Result<()> {
         source: "cache".into(),
         kind: SourceKind::HfCache,
         root_path: "/data/hub".into(),
+        git_dir: None,
         revisions: vec![SeedRevision {
             name: "main".into(),
             sha: Some(CommitSha::from_bytes([0x22; 20])),
             refs: vec![("main".to_owned(), RefKind::Branch)],
+            title: None,
+            author: None,
+            committed: None,
             entries: vec![
                 entry(
                     "film-grain-35mm.safetensors",
@@ -1617,6 +1622,9 @@ fn seeded_catalog() -> Result<(TempDir, Catalog, SeededIds)> {
                     ("main".to_owned(), RefKind::Branch),
                     ("v1.0".to_owned(), RefKind::Tag),
                 ],
+                title: None,
+                author: None,
+                committed: None,
                 entries: vec![
                     seeded_entry("model.safetensors", 6_938_040_000, Some(ckpt)),
                     seeded_entry("README.md", 84, None),
@@ -1683,6 +1691,7 @@ fn seeded_repo(reference: &str, repo_type: RepoType) -> SeedRepository {
         source: "cache".to_owned(),
         kind: SourceKind::HfCache,
         root_path: PathBuf::from("/data/hub"),
+        git_dir: None,
         revisions: Vec::new(),
     }
 }
@@ -1693,6 +1702,9 @@ fn seeded_revision(repo: SeedRepository, byte: u8, entries: Vec<SeedEntry>) -> S
             name: "main".to_owned(),
             sha: Some(CommitSha::from_bytes([byte; 20])),
             refs: vec![("main".to_owned(), RefKind::Branch)],
+            title: None,
+            author: None,
+            committed: None,
             entries,
         }],
         ..repo
@@ -1944,10 +1956,14 @@ fn an_any_base_answers_only_its_own_bucket() -> Result<()> {
         source: "cache".into(),
         kind: SourceKind::HfCache,
         root_path: "/data/hub".into(),
+        git_dir: None,
         revisions: vec![SeedRevision {
             name: "main".into(),
             sha: None,
             refs: vec![("main".to_owned(), RefKind::Branch)],
+            title: None,
+            author: None,
+            committed: None,
             entries: vec![SeedEntry {
                 rel_path: format!("{name}.safetensors"),
                 abs_path: Some(format!("/data/hub/{name}.safetensors")),
@@ -2017,6 +2033,145 @@ fn seeded_facts() -> Artifact {
         trigger: None,
         sniff_version: 1,
     }
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "hoard")
+        .env("GIT_AUTHOR_EMAIL", "hoard@example.invalid")
+        .env("GIT_COMMITTER_NAME", "hoard")
+        .env("GIT_COMMITTER_EMAIL", "hoard@example.invalid")
+        .output()
+        .expect("git runs");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// One clone at `<input>/org/clone` holding a README committed as `first import`.
+fn git_fixture(directory: &Path) -> Result<(PathBuf, IndexConfig)> {
+    let input = directory.join("clones");
+    let clone = input.join("org").join("clone");
+    fs::create_dir_all(&clone)?;
+    git(&clone, &["init", "--initial-branch=main", "--quiet"]);
+    fs::write(clone.join("README.md"), "# clone\n")?;
+    git(&clone, &["add", "."]);
+    git(&clone, &["commit", "-m", "first import", "--quiet"]);
+    let config = IndexConfig {
+        sources: vec![SourceConfig {
+            kind: SourceKind::Git,
+            ..source(&input, "clones")
+        }],
+        ..IndexConfig::default()
+    };
+    Ok((input, config))
+}
+
+#[test]
+fn a_git_clone_keeps_its_git_dir_and_commit_metadata() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = git_fixture(directory.path())?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let repo = RepoId::parse_ref(RepoType::Models, "org/clone")?;
+    let detail = catalog
+        .repository(&repo)?
+        .ok_or_else(|| IndexError::Catalog("repo".into()))?;
+    assert_eq!(
+        detail.git_dir.as_deref(),
+        Some(input.join("org/clone/.git").to_string_lossy().as_ref())
+    );
+    let main = catalog
+        .resolve_revision(&detail, "main")
+        .ok_or_else(|| IndexError::Catalog("main".into()))?;
+    assert_eq!(main.title.as_deref(), Some("first import"));
+    assert_eq!(main.author.as_deref(), Some("hoard"));
+    assert!(main.committed.is_some());
+    let entry = catalog
+        .revision_entry(detail.id, main.ordinal, "README.md")?
+        .ok_or_else(|| IndexError::Catalog("readme".into()))?;
+    assert_eq!(entry.rel_path, "README.md");
+    assert!(
+        catalog
+            .revision_entry(detail.id, main.ordinal, "missing.bin")?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_version_2_repository_is_migrated_on_open() -> Result<()> {
+    let legacy = tempfile::tempdir()?;
+    let repo = RepoId::new(RepoType::Models, Some("acme".to_owned()), "styler");
+    {
+        let database = builder().create(models()?, legacy.path().join("catalog.redb"))?;
+        let transaction = database.rw_transaction()?;
+        transaction.insert(ManifestV1 {
+            id: 0,
+            format_version: 5,
+            generation: 1,
+            scanned_at: "then".to_owned(),
+            node: "old".to_owned(),
+            counts: Vec::new(),
+            search_directory: None,
+            search_generation: 0,
+        })?;
+        transaction.insert(Source {
+            name: "hub".to_owned(),
+            config: SourceConfig {
+                name: "hub".to_owned(),
+                ..frozen_source_config()
+            },
+            resolved_kind: SourceKind::Git,
+            file_count: 0,
+            byte_count: 0,
+            last_scan: None,
+        })?;
+        transaction.insert(RepositoryV2 {
+            id: 11,
+            key: models::repository_key("hub", &repo),
+            source: "hub".to_owned(),
+            repo: repo.clone(),
+            root_path: "/hub".to_owned(),
+            default_ref: "main".to_owned(),
+            revisions: vec![RevisionV2 {
+                name: "main".to_owned(),
+                sha: Some(CommitSha::from_bytes([7; 20])),
+                refs: vec![Ref {
+                    name: "main".to_owned(),
+                    kind: RefKind::Branch,
+                }],
+            }],
+        })?;
+        transaction.commit()?;
+    }
+    let reopened = Catalog::open(legacy.path())?;
+    let detail = reopened
+        .repository(&repo)?
+        .ok_or_else(|| IndexError::Catalog("repo".into()))?;
+    assert_eq!(detail.git_dir, None, "a v2 repository named no clone");
+    assert_eq!(detail.revisions.len(), 1);
+    assert_eq!(detail.revisions[0].title, None);
+    assert_eq!(detail.revisions[0].author, None);
+    assert_eq!(detail.revisions[0].committed, None);
+    assert_eq!(
+        detail.revisions[0].sha,
+        Some(CommitSha::from_bytes([7; 20]))
+    );
+    let read = reopened.database.r_transaction()?;
+    let old: Option<RepositoryV2> = read.get().primary(11_i64)?;
+    assert!(old.is_none(), "the v2 table is drained");
+    Ok(())
 }
 
 fn loose_fixture(directory: &Path) -> Result<(PathBuf, IndexConfig)> {
@@ -2300,8 +2455,35 @@ fn repository_encoding_is_frozen() -> Result<()> {
         source: "frozen".to_owned(),
         repo,
         root_path: "/frozen/source/datasets--frozen-org--frozen".to_owned(),
+        git_dir: Some("/frozen/source/datasets--frozen-org--frozen/.git".to_owned()),
         default_ref: "main".to_owned(),
         revisions: vec![Revision {
+            name: "main".to_owned(),
+            sha: Some(CommitSha::from_bytes([5; 20])),
+            refs: vec![Ref {
+                name: "refs/heads/main".to_owned(),
+                kind: RefKind::Tag,
+            }],
+            title: Some("frozen import".to_owned()),
+            author: Some("frozen-org".to_owned()),
+            committed: Some("2026-01-17T10:22:31Z".to_owned()),
+        }],
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn repository_v2_encoding_is_frozen() -> Result<()> {
+    let repo = RepoId::new(RepoType::Datasets, Some("frozen-org".to_owned()), "frozen");
+    let value = RepositoryV2 {
+        id: 11,
+        key: models::repository_key("frozen", &repo),
+        source: "frozen".to_owned(),
+        repo,
+        root_path: "/frozen/source/datasets--frozen-org--frozen".to_owned(),
+        default_ref: "main".to_owned(),
+        revisions: vec![RevisionV2 {
             name: "main".to_owned(),
             sha: Some(CommitSha::from_bytes([5; 20])),
             refs: vec![Ref {

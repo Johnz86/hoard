@@ -84,6 +84,23 @@ pub(super) struct RevisionV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 2, version = 2, from = RepositoryV1)]
 #[native_db]
+pub(super) struct RepositoryV2 {
+    #[primary_key]
+    pub(super) id: i64,
+    #[secondary_key(unique)]
+    pub(super) key: String,
+    pub(super) source: String,
+    pub(super) repo: RepoId,
+    pub(super) root_path: String,
+    pub(super) default_ref: String,
+    pub(super) revisions: Vec<RevisionV2>,
+}
+
+/// A repository as a scan found it, with the clone directory the git face serves from and
+/// what each revision's commit says about itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 2, version = 3, from = RepositoryV2)]
+#[native_db]
 pub(super) struct Repository {
     #[primary_key]
     pub(super) id: i64,
@@ -92,6 +109,7 @@ pub(super) struct Repository {
     pub(super) source: String,
     pub(super) repo: RepoId,
     pub(super) root_path: String,
+    pub(super) git_dir: Option<String>,
     pub(super) default_ref: String,
     pub(super) revisions: Vec<Revision>,
 }
@@ -104,13 +122,72 @@ pub(super) struct Ref {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(super) struct Revision {
+pub(super) struct RevisionV2 {
     pub(super) name: String,
     pub(super) sha: Option<CommitSha>,
     pub(super) refs: Vec<Ref>,
 }
 
-impl From<RepositoryV1> for Repository {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct Revision {
+    pub(super) name: String,
+    pub(super) sha: Option<CommitSha>,
+    pub(super) refs: Vec<Ref>,
+    pub(super) title: Option<String>,
+    pub(super) author: Option<String>,
+    /// RFC 3339, the way every other catalog timestamp is stored.
+    pub(super) committed: Option<String>,
+}
+
+impl From<RepositoryV2> for Repository {
+    fn from(repository: RepositoryV2) -> Self {
+        Self {
+            id: repository.id,
+            key: repository.key,
+            source: repository.source,
+            repo: repository.repo,
+            root_path: repository.root_path,
+            git_dir: None,
+            default_ref: repository.default_ref,
+            revisions: repository
+                .revisions
+                .into_iter()
+                .map(|revision| Revision {
+                    name: revision.name,
+                    sha: revision.sha,
+                    refs: revision.refs,
+                    title: None,
+                    author: None,
+                    committed: None,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<Repository> for RepositoryV2 {
+    fn from(repository: Repository) -> Self {
+        Self {
+            id: repository.id,
+            key: repository.key,
+            source: repository.source,
+            repo: repository.repo,
+            root_path: repository.root_path,
+            default_ref: repository.default_ref,
+            revisions: repository
+                .revisions
+                .into_iter()
+                .map(|revision| RevisionV2 {
+                    name: revision.name,
+                    sha: revision.sha,
+                    refs: revision.refs,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<RepositoryV1> for RepositoryV2 {
     fn from(repository: RepositoryV1) -> Self {
         Self {
             id: repository.id,
@@ -122,7 +199,7 @@ impl From<RepositoryV1> for Repository {
             revisions: repository
                 .revisions
                 .into_iter()
-                .map(|revision| Revision {
+                .map(|revision| RevisionV2 {
                     name: revision.name,
                     sha: revision.sha,
                     refs: revision
@@ -139,8 +216,8 @@ impl From<RepositoryV1> for Repository {
     }
 }
 
-impl From<Repository> for RepositoryV1 {
-    fn from(repository: Repository) -> Self {
+impl From<RepositoryV2> for RepositoryV1 {
+    fn from(repository: RepositoryV2) -> Self {
         Self {
             id: repository.id,
             key: repository.key,
@@ -642,6 +719,7 @@ pub(super) struct Job {
 pub(super) fn define_models() -> super::Result<Models> {
     let mut models = Models::new();
     models.define::<RepositoryV1>()?;
+    models.define::<RepositoryV2>()?;
     models.define::<Repository>()?;
     models.define::<ArtifactRecordV1>()?;
     models.define::<ArtifactRecord>()?;

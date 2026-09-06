@@ -94,10 +94,14 @@ fn seed_catalog(catalog: &Catalog, root: &Path) {
             source: "cache".to_owned(),
             kind: SourceKind::HfCache,
             root_path: root.to_path_buf(),
+            git_dir: None,
             revisions: vec![SeedRevision {
                 name: "main".to_owned(),
                 sha: Some(CommitSha::from_bytes(REVISION)),
                 refs: vec![("main".to_owned(), RefKind::Branch)],
+                title: None,
+                author: None,
+                committed: None,
                 entries: vec![SeedEntry {
                     rel_path: SMALL_PATH.to_owned(),
                     abs_path: Some(root.join(SMALL_PATH).to_string_lossy().into_owned()),

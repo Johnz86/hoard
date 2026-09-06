@@ -72,6 +72,9 @@ pub struct RevisionDetail {
     pub ordinal: u32,
     pub name: String,
     pub sha: Option<CommitSha>,
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub committed: Option<jiff::Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -81,6 +84,7 @@ pub struct RepositoryDetail {
     pub source: String,
     pub kind: SourceKind,
     pub root_path: String,
+    pub git_dir: Option<String>,
     pub default_ref: String,
     pub node: String,
     pub revisions: Vec<RevisionDetail>,
@@ -412,6 +416,32 @@ impl Catalog {
         Ok(details)
     }
 
+    /// The one file a revision holds at `rel_path`, or nothing when it holds none.
+    pub fn revision_entry(
+        &self,
+        repo: RepoRowId,
+        revision: u32,
+        rel_path: &str,
+    ) -> Result<Option<EntryDetail>> {
+        let snapshot = self.database.r_transaction()?;
+        let node = self.manifest()?.node;
+        let mut reader = Reader::new(&snapshot, &node);
+        let Some(entry) = reader
+            .entries_of_repo(repo.get())?
+            .into_iter()
+            .find(|entry| entry.revision == revision && entry.rel_path == rel_path)
+        else {
+            return Ok(None);
+        };
+        let deduped = match entry.artifact_id {
+            Some(id) => reader
+                .record(id)?
+                .is_some_and(|record| record.path_count > 1),
+            None => false,
+        };
+        reader.detail(&entry, deduped).map(Some)
+    }
+
     /// Every artifact reachable through one repository, most bytes first.
     pub fn repository_rows(&self, repo: RepoRowId, limit: u32) -> Result<Vec<SearchRow>> {
         let snapshot = self.database.r_transaction()?;
@@ -540,6 +570,12 @@ fn repository_detail(repository: &Repository, kind: SourceKind, node: &str) -> R
             ordinal: ordinal as u32,
             name: revision.name.clone(),
             sha: revision.sha,
+            title: revision.title.clone(),
+            author: revision.author.clone(),
+            committed: revision
+                .committed
+                .as_deref()
+                .and_then(|stamp| stamp.parse().ok()),
         })
         .collect();
     let refs = repository
@@ -561,6 +597,7 @@ fn repository_detail(repository: &Repository, kind: SourceKind, node: &str) -> R
         source: repository.source.clone(),
         kind,
         root_path: repository.root_path.clone(),
+        git_dir: repository.git_dir.clone(),
         default_ref: repository.default_ref.clone(),
         node: node.to_owned(),
         revisions,

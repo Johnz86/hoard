@@ -301,7 +301,7 @@ fn describe(
     let rows = catalog.repository_rows(record.id, REPO_ARTIFACTS)?;
     let primary = pick_primary(&rows);
     let entries = catalog.revision_entries(record.id, revision.ordinal)?;
-    let refs = ref_views(&record, &revision);
+    let refs = ref_views(&record, &revision, now);
     let paths = match primary {
         Some(row) => entry_views(&catalog.entries_of(row.artifact_id)?, &header.host),
         None => entry_views(&entries, &header.host),
@@ -511,16 +511,22 @@ fn require_revision(
         .ok_or_else(|| IndexError::not_found("revision", format!("{}@{wanted}", record.id)))
 }
 
-/// The REFS tab. A catalog holds no commit dates, so `when` is the placeholder the design
-/// prints for an unknown time.
-fn ref_views(record: &RepositoryDetail, current: &RevisionDetail) -> Vec<RefView> {
+/// The REFS tab. `when` is how long ago the ref's revision was committed, and the
+/// placeholder the design prints for an unknown time when the revision carries no date.
+fn ref_views(record: &RepositoryDetail, current: &RevisionDetail, now: Timestamp) -> Vec<RefView> {
     record
         .refs
         .iter()
         .map(|reference| {
             let sha = reference.sha.or(current.sha);
+            let committed = record
+                .revisions
+                .iter()
+                .find(|revision| revision.ordinal == reference.revision)
+                .and_then(|revision| revision.committed);
             RefView {
-                when: "-".to_owned(),
+                when: committed
+                    .map_or_else(|| "-".to_owned(), |committed| relative_time(now, committed)),
                 short: short_sha(sha),
                 current: reference.revision == current.ordinal,
                 name: reference.name.clone(),

@@ -30,6 +30,7 @@ pub struct SeedRepository {
     pub source: String,
     pub kind: SourceKind,
     pub root_path: PathBuf,
+    pub git_dir: Option<PathBuf>,
     pub revisions: Vec<SeedRevision>,
 }
 
@@ -38,6 +39,9 @@ pub struct SeedRevision {
     pub name: String,
     pub sha: Option<CommitSha>,
     pub refs: Vec<(String, RefKind)>,
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub committed: Option<jiff::Timestamp>,
     pub entries: Vec<SeedEntry>,
 }
 
@@ -136,6 +140,10 @@ impl Seeding<'_, '_> {
             source: seed.source.clone(),
             repo: seed.repo.clone(),
             root_path: seed.root_path.to_string_lossy().into_owned(),
+            git_dir: seed
+                .git_dir
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
             default_ref: seed
                 .revisions
                 .first()
@@ -147,6 +155,9 @@ impl Seeding<'_, '_> {
                 .map(|revision| Revision {
                     name: revision.name.clone(),
                     sha: revision.sha,
+                    title: revision.title.clone(),
+                    author: revision.author.clone(),
+                    committed: revision.committed.map(|stamp| stamp.to_string()),
                     refs: revision
                         .refs
                         .iter()

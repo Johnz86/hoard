@@ -802,6 +802,10 @@ fn repository(id: i64, source: &str, repo: &DiscoveredRepo) -> Repository {
         source: source.to_owned(),
         repo: repo.repo.clone(),
         root_path: repo.root_path.to_string_lossy().into_owned(),
+        git_dir: repo
+            .git_dir
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
         default_ref: repo.default_ref.clone(),
         revisions: repo
             .revisions
@@ -813,6 +817,9 @@ fn repository(id: i64, source: &str, repo: &DiscoveredRepo) -> Repository {
                     RevisionName::Commit(sha) => Some(sha),
                     RevisionName::Synthetic => None,
                 },
+                title: revision.title.clone(),
+                author: revision.author.clone(),
+                committed: revision.committed.map(|stamp| stamp.to_string()),
                 refs: repo
                     .refs
                     .iter()

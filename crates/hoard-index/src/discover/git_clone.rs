@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 
 use gix::bstr::ByteSlice;
 use gix::objs::tree::EntryKind;
+use jiff::Timestamp;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use hoard_core::{CommitSha, RepoId, RepoType};
@@ -114,7 +115,10 @@ fn read_clone(root: &Path, path: &Path, options: &WalkOptions) -> Result<Discove
                 };
                 let entries = read_tree(&repository, sha, &location)?;
                 let mut revision = DiscoveredRevision::new(RevisionName::Commit(sha), entries);
-                revision.title = commit_title(&repository, sha);
+                let facts = commit_facts(&repository, sha);
+                revision.title = facts.title;
+                revision.author = facts.author;
+                revision.committed = facts.committed;
                 shas.push(sha);
                 discovered.revisions.push(revision);
                 shas.len() - 1
@@ -373,11 +377,35 @@ pub fn lfs_object_path(git_dir: &Path, oid_hex: &str) -> PathBuf {
     }
 }
 
-fn commit_title(repository: &gix::Repository, sha: CommitSha) -> Option<String> {
-    let object_id = gix::ObjectId::try_from(sha.as_bytes().as_slice()).ok()?;
-    let commit = repository.find_commit(object_id).ok()?;
-    let message = commit.message().ok()?;
-    Some(message.summary().to_string())
+/// What a commit says about itself, as the repository and commit shapes print it.
+#[derive(Debug, Default)]
+struct CommitFacts {
+    title: Option<String>,
+    author: Option<String>,
+    committed: Option<Timestamp>,
+}
+
+fn commit_facts(repository: &gix::Repository, sha: CommitSha) -> CommitFacts {
+    let Some(commit) = gix::ObjectId::try_from(sha.as_bytes().as_slice())
+        .ok()
+        .and_then(|object_id| repository.find_commit(object_id).ok())
+    else {
+        return CommitFacts::default();
+    };
+    let author = commit.author().ok();
+    CommitFacts {
+        title: commit
+            .message()
+            .ok()
+            .map(|message| message.summary().to_string()),
+        author: author
+            .map(|author| author.name.trim().to_str_lossy().into_owned())
+            .filter(|name| !name.is_empty()),
+        committed: commit
+            .time()
+            .ok()
+            .and_then(|time| Timestamp::from_second(time.seconds).ok()),
+    }
 }
 
 fn commit_sha(id: &gix::hash::oid) -> Option<CommitSha> {
