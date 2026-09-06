@@ -6,6 +6,7 @@
 
 pub mod catalog;
 pub mod config;
+pub mod coordinate;
 pub mod discover;
 pub mod error;
 pub mod hash;

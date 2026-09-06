@@ -126,6 +126,7 @@ pub struct Catalog {
     database: Database<'static>,
     directory: PathBuf,
     search_cache: RwLock<Option<OpenIndex>>,
+    search_lane: parking_lot::Mutex<()>,
 }
 
 /// The Tantivy index a catalog is currently serving, kept open so a query does not pay for
@@ -168,6 +169,7 @@ impl Catalog {
             database,
             directory: directory.to_path_buf(),
             search_cache: RwLock::new(None),
+            search_lane: parking_lot::Mutex::new(()),
         };
         let manifest = catalog.manifest()?;
         if manifest.format_version != FORMAT_VERSION {

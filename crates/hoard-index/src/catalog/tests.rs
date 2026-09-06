@@ -508,7 +508,7 @@ fn an_unpublished_build_leaves_the_previous_index_serving() -> Result<()> {
         2,
         "the previous index still answers"
     );
-    catalog.publish("search-v1-staged".to_owned())?;
+    catalog.publish("search-v1-staged".to_owned(), before.search_seq)?;
     assert_eq!(
         catalog.manifest()?.search_directory.as_deref(),
         Some("search-v1-staged")
@@ -542,6 +542,99 @@ fn a_rebuild_prunes_the_index_directories_it_supersedes() -> Result<()> {
     assert!(catalog.directory.join(&second).exists());
     assert_eq!(search(&catalog, "")?.total, 2);
     Ok(())
+}
+
+fn seed_one_late_artifact(catalog: &Catalog) -> Result<()> {
+    catalog.seed(&[seeded_revision(
+        seeded_repo("acme/late-arrival", RepoType::Models),
+        0x7e,
+        vec![seeded_entry(
+            "late.safetensors",
+            4_096,
+            Some(seeded_artifact(
+                0x7e7e,
+                "late-arrival",
+                Some("acme"),
+                seeded_facts(),
+            )),
+        )],
+    )])?;
+    Ok(())
+}
+
+#[test]
+fn a_change_logged_during_a_rebuild_survives_to_the_next_refresh() -> Result<()> {
+    let (_directory, catalog) = fixture()?;
+    catalog.rebuild_search(|_| {})?;
+    assert_eq!(
+        catalog.pending_changes()?,
+        0,
+        "a fresh build drains the log"
+    );
+
+    let mut seeded = false;
+    catalog.rebuild_search(|_| {
+        if !seeded {
+            seeded = true;
+            seed_one_late_artifact(&catalog).expect("the late artifact is written");
+        }
+    })?;
+
+    assert_eq!(
+        search(&catalog, "")?.total,
+        2,
+        "the rebuild indexed the snapshot it opened, which predates the change"
+    );
+    assert!(
+        catalog.pending_changes()? >= 1,
+        "a change logged while the rebuild ran is left for the next refresh"
+    );
+    let applied = catalog.refresh_search(|_| {})?;
+    assert!(applied >= 1, "the refresh applies what the rebuild left");
+    assert_eq!(
+        search(&catalog, "")?.total,
+        3,
+        "the late artifact reaches the index"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_search_lane_serialises_a_refresh_and_a_rebuild() -> Result<()> {
+    let (_directory, catalog) = fixture()?;
+    catalog.rebuild_search(|_| {})?;
+    let pause = std::time::Duration::from_millis(50);
+    let reached_the_lane = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| -> Result<()> {
+        let rebuilding = scope.spawn(|| -> Result<std::time::Instant> {
+            let mut first = true;
+            catalog.rebuild_search(|_| {
+                if first {
+                    first = false;
+                    reached_the_lane.wait();
+                }
+                std::thread::sleep(pause);
+            })?;
+            Ok(std::time::Instant::now())
+        });
+        let refreshing = scope.spawn(|| -> Result<(std::time::Instant, std::time::Instant)> {
+            reached_the_lane.wait();
+            let asked = std::time::Instant::now();
+            catalog.refresh_search(|_| {})?;
+            Ok((asked, std::time::Instant::now()))
+        });
+        let published = rebuilding.join().expect("the rebuild thread joins")?;
+        let (asked, refreshed) = refreshing.join().expect("the refresh thread joins")?;
+        assert!(
+            refreshed >= published,
+            "the refresh returned only after the rebuild published"
+        );
+        assert!(
+            refreshed.duration_since(asked) >= pause,
+            "the refresh waited on the lane rather than running beside the rebuild"
+        );
+        Ok(())
+    })
 }
 
 #[test]

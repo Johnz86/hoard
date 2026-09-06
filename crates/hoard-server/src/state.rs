@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use secrecy::{ExposeSecret, SecretString};
 
 use hoard_index::catalog::Catalog;
+use hoard_index::coordinate::Coordinator;
 use hoard_mirror::MirrorError;
 use hoard_mirror::access::AccessPolicy;
 use hoard_mirror::cache::BlockCache;
@@ -71,6 +72,7 @@ struct Inner {
     config: HoardConfig,
     mirror_config: Arc<MirrorConfig>,
     catalog: Arc<Catalog>,
+    coordinator: Arc<Coordinator>,
     cache: Arc<BlockCache>,
     access: Arc<AccessPolicy>,
     mirror: Arc<Mirror>,
@@ -119,6 +121,7 @@ impl AppState {
             .ok()
             .filter(|token| !token.is_empty())
             .map(SecretString::from);
+        let coordinator = Arc::new(Coordinator::new(Arc::clone(&catalog), config.index.clone()));
         let local_node_name = config.node.name.clone();
         let public_url = config.server.resolved_public_url();
         let health = match mirror_config.offline {
@@ -136,6 +139,7 @@ impl AppState {
                     SINK_CAPACITY,
                 ),
                 catalog,
+                coordinator,
                 cache,
                 access,
                 mirror,
@@ -157,6 +161,12 @@ impl AppState {
     /// The catalog every route reads and `hoard scan` writes.
     pub fn catalog(&self) -> &Arc<Catalog> {
         &self.inner.catalog
+    }
+
+    /// The one lane every scan under `serve` runs on: the scan route submits here rather
+    /// than spawning, and shutdown drains it.
+    pub fn coordinator(&self) -> &Arc<Coordinator> {
+        &self.inner.coordinator
     }
 
     pub fn config(&self) -> &HoardConfig {

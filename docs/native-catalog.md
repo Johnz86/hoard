@@ -160,6 +160,19 @@ applied. A rescan followed by a refresh updates search without a rebuild. A quer
 from the published index even when a rescan has logged changes no refresh has applied, and
 says so with `stale`; only a catalog with no index at all is refused.
 
+`rebuild_search` and `refresh_search` are the two writers of the search directory and of the
+manifest's search fields, and they hold `Catalog::search_lane` for their whole run so they
+never overlap. It is a blocking `parking_lot::Mutex`, which does not poison, so a panic in
+one rebuild does not stop every later refresh; an async caller reaches it through
+`spawn_blocking` like every other catalog call, and nothing async holds it. Row writers need
+no lane of their own: redb allows one writer at a time and serialises commits.
+
+A rebuild reads the highest logged sequence **before** its snapshot opens and publishes with
+that number, so `publish` prunes only what the build actually indexed. A change logged while
+the build ran stays above the cursor and the next refresh applies it. Publishing with the
+highest sequence at publish time instead would drop that change unapplied with no record
+that it happened.
+
 ## Search document shape
 
 The index contains **one document per entry**. This preserves a requirement the earlier

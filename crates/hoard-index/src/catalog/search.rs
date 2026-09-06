@@ -129,11 +129,17 @@ impl Catalog {
     /// An interrupted rebuild publishes nothing, so the last usable index keeps answering.
     /// The callback receives the number of entries indexed.
     pub fn rebuild_search(&self, progress: impl FnMut(u64)) -> Result<()> {
+        let _lane = self.search_lane.lock();
+        let drained_through = self.indexable_through()?;
         let directory_name = format!("search-v1-{}", jiff::Timestamp::now().as_nanosecond());
         let directory = self.directory.join(&directory_name);
         std::fs::create_dir(&directory)?;
         self.build_index(&directory, progress)?;
-        self.publish(directory_name)
+        self.publish(directory_name, drained_through)
+    }
+
+    fn indexable_through(&self) -> Result<u64> {
+        Ok(self.highest_change_seq()?.max(self.manifest()?.search_seq))
     }
 
     pub(super) fn build_index(
@@ -172,25 +178,22 @@ impl Catalog {
 
     /// Switches the manifest to `directory_name` in one transaction, touching only the two
     /// search fields, then removes every other `search-v1-*` directory.
-    pub(super) fn publish(&self, directory_name: String) -> Result<()> {
+    ///
+    /// `drained_through` is the highest sequence the build's snapshot covered, read before
+    /// the snapshot opened. Only that far is pruned, so a change logged while the build ran
+    /// stays above the cursor for the next refresh to apply.
+    pub(super) fn publish(&self, directory_name: String, drained_through: u64) -> Result<()> {
         let transaction = self.database.rw_transaction()?;
         let mut manifest: Manifest = transaction.get().primary(0_u8)?.ok_or_else(|| {
             IndexError::Catalog("scan is incomplete; scan again into a new directory".into())
         })?;
-        let highest: Option<SearchChange> = transaction
-            .scan()
-            .primary::<SearchChange>()?
-            .all()?
-            .next_back()
-            .transpose()?;
-        let drained = highest.map_or(manifest.search_seq, |change| change.seq);
         manifest.search_directory = Some(directory_name.clone());
         manifest.search_generation = manifest.generation;
-        manifest.search_seq = drained;
+        manifest.search_seq = drained_through;
         transaction.upsert(manifest)?;
         transaction.commit()?;
         self.prune_search_directories(&directory_name);
-        self.prune_changes(drained)
+        self.prune_changes(drained_through)
     }
 
     /// Applies the logged changes after the manifest's cursor to the published index, one
@@ -202,6 +205,7 @@ impl Catalog {
     /// refresh running beside a writer returns rather than chasing the writer's new rows;
     /// the next refresh takes the rest.
     pub fn refresh_search(&self, mut progress: impl FnMut(u64)) -> Result<u64> {
+        let _lane = self.search_lane.lock();
         let manifest = self.manifest()?;
         let directory = manifest
             .search_directory

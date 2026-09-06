@@ -179,6 +179,9 @@ where
     )
     .with_graceful_shutdown(shutdown)
     .await;
+    if let Err(error) = closing.coordinator().shutdown().await {
+        tracing::warn!(%error, "the scan lane did not drain before the node stopped");
+    }
     if let Err(error) = closing.usage().flush().await {
         tracing::warn!(%error, "the last served responses were not logged");
     }

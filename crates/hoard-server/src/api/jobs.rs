@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::Json;
@@ -9,17 +10,14 @@ use serde::{Deserialize, Serialize};
 use hoard_core::{JobId, SourceId, format_size};
 use hoard_index::IndexError;
 use hoard_index::catalog::{
-    Catalog, HashReport, JobProgress, JobRecord, JobState, MIRROR_SOURCE, PEER_SOURCE, PULL_SOURCE,
-    RescanReport, SourceRecord,
+    Catalog, JobRecord, JobState, MIRROR_SOURCE, PEER_SOURCE, PULL_SOURCE, SourceRecord,
 };
 use hoard_index::config::{HashPolicy, IndexConfig};
+use hoard_index::coordinate::{Origin, ScanRequest};
 
 use crate::api::common::{authorize, blocking};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-
-/// The `job.kind` a scan records.
-const SCAN_KIND: &str = "scan";
 
 /// One source the catalog holds and what the last scan of it counted.
 ///
@@ -141,7 +139,8 @@ fn manager_of(name: &str) -> &'static str {
 /// Starts a scan and answers with the job it runs under.
 ///
 /// One job covers the whole run: the catalog rescan, the hashing it owes and the search
-/// refresh that publishes what changed.
+/// refresh that publishes what changed. The request is submitted to the one scan lane, so
+/// a second request for a source already waiting answers the job it merged into.
 pub async fn scan(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -155,120 +154,19 @@ pub async fn scan(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
-    let source = match wanted {
-        Some(wanted) => Some(resolve_source(&state, &wanted).await?),
+    let sources = match wanted {
+        Some(wanted) => Some(BTreeSet::from([resolve_source(&state, &wanted).await?])),
         None => None,
     };
-
-    let subject = source.clone();
-    let catalog = Arc::clone(state.catalog());
-    let job_id = blocking(move || catalog.create_job(SCAN_KIND, subject.as_deref())).await?;
-    let background = state.clone();
-    let config = narrowed(&state.config().index, source.as_deref());
-    tokio::spawn(async move {
-        if let Err(error) = hand_off_to_scanner(&background, config, hash, job_id).await {
-            tracing::error!(%error, "the scan failed");
-        }
-    });
+    let job_id = state
+        .coordinator()
+        .request(ScanRequest {
+            sources,
+            hash,
+            origin: Origin::Manual,
+        })
+        .await?;
     Ok(Json(ScanStarted { job_id }))
-}
-
-/// What one run covers: every configured root, or the one the request named.
-fn narrowed(config: &IndexConfig, source: Option<&str>) -> IndexConfig {
-    match source.and_then(|name| config.source(name)) {
-        Some(named) => config.over(vec![named.clone()]),
-        None => config.clone(),
-    }
-}
-
-async fn hand_off_to_scanner(
-    state: &AppState,
-    config: IndexConfig,
-    hash: HashPolicy,
-    job: JobId,
-) -> Result<(), IndexError> {
-    match run_scan(state, config, hash, job).await {
-        Ok(report) => {
-            tracing::info!(
-                unchanged = report.unchanged,
-                changed = report.changed,
-                added = report.added,
-                absent = report.absent,
-                "native catalog rescanned"
-            );
-            settle_scan(state, job, None).await
-        }
-        Err(error) => {
-            let message = error.to_string();
-            settle_scan(state, job, Some(message)).await?;
-            Err(error)
-        }
-    }
-}
-
-async fn run_scan(
-    state: &AppState,
-    config: IndexConfig,
-    hash: HashPolicy,
-    job: JobId,
-) -> Result<RescanReport, IndexError> {
-    phase(state, job, "rescanning the sources").await?;
-    let report = rescan_catalog(state, config.clone(), hash).await?;
-    match hash {
-        HashPolicy::Now | HashPolicy::Background => {
-            phase(state, job, "hashing").await?;
-            hash_catalog(state, config).await?;
-        }
-        HashPolicy::Never => {}
-    }
-    phase(state, job, "refreshing search").await?;
-    refresh_catalog(state).await?;
-    Ok(report)
-}
-
-async fn phase(state: &AppState, job: JobId, phase: &str) -> Result<(), IndexError> {
-    let catalog = Arc::clone(state.catalog());
-    let progress = JobProgress {
-        phase: Some(phase.to_owned()),
-        ..JobProgress::default()
-    };
-    tokio::task::spawn_blocking(move || catalog.update_job(job, &progress)).await?
-}
-
-async fn settle_scan(
-    state: &AppState,
-    job: JobId,
-    error: Option<String>,
-) -> Result<(), IndexError> {
-    let catalog = Arc::clone(state.catalog());
-    tokio::task::spawn_blocking(move || match error {
-        Some(error) => catalog.fail_job(job, &error),
-        None => catalog.finish_job(job),
-    })
-    .await?
-}
-
-/// Walks the sources again into the native catalog, on a blocking thread because it is file
-/// and database work.
-async fn rescan_catalog(
-    state: &AppState,
-    config: IndexConfig,
-    policy: HashPolicy,
-) -> Result<RescanReport, IndexError> {
-    let catalog = Arc::clone(state.catalog());
-    tokio::task::spawn_blocking(move || catalog.rescan(&config, policy, |_, _| {})).await?
-}
-
-/// Hashes what the walk left unhashed, which is what gives copies of one file one artifact.
-async fn hash_catalog(state: &AppState, config: IndexConfig) -> Result<HashReport, IndexError> {
-    let catalog = Arc::clone(state.catalog());
-    tokio::task::spawn_blocking(move || catalog.hash_pending(&config, |_| {})).await?
-}
-
-/// Applies to the search index what the walk and the hashing changed.
-async fn refresh_catalog(state: &AppState) -> Result<u64, IndexError> {
-    let catalog = Arc::clone(state.catalog());
-    tokio::task::spawn_blocking(move || catalog.refresh_search(|_| {})).await?
 }
 
 /// Reads what a scan request named: a configured source name, or the name, id or path of a

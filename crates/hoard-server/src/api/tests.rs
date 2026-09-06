@@ -1653,6 +1653,59 @@ async fn sources_scans_and_jobs_are_listed() {
     assert_eq!(bad["error"]["code"], "BadRequest");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn a_second_request_for_a_waiting_source_answers_the_job_it_merged_into() {
+    let world = seeded();
+    let catalog = std::sync::Arc::clone(world.state.catalog());
+    let (sender, held) = tokio::sync::oneshot::channel();
+    let holder = std::thread::spawn(move || {
+        let mut sender = Some(sender);
+        catalog.rebuild_search(|_| {
+            if let Some(sender) = sender.take() {
+                sender.send(()).ok();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        })
+    });
+    held.await.expect("the rebuild took the search lane");
+
+    let running = post(
+        &world.state,
+        "/api/v1/scan",
+        json!({ "source": "cache", "hash": "never" }),
+    )
+    .await;
+    let queued = post(&world.state, "/api/v1/scan", json!({ "hash": "never" })).await;
+    let merged = post(&world.state, "/api/v1/scan", json!({ "hash": "never" })).await;
+
+    let running = running["job_id"].as_str().expect("a job id").to_owned();
+    let queued = queued["job_id"].as_str().expect("a job id").to_owned();
+    let merged = merged["job_id"].as_str().expect("a job id").to_owned();
+    assert_eq!(
+        queued, merged,
+        "the third request merged into the one still waiting"
+    );
+    assert_ne!(
+        running, queued,
+        "a different source set queues a job of its own"
+    );
+
+    assert_eq!(settle(&world.state, &running).await["state"], "done");
+    assert_eq!(settle(&world.state, &queued).await["state"], "done");
+    tokio::task::spawn_blocking(move || holder.join())
+        .await
+        .expect("the holder thread joins")
+        .expect("the holder thread did not panic")
+        .expect("the held rebuild published");
+
+    let jobs = get(&world.state, "/api/v1/jobs").await;
+    assert_eq!(
+        jobs.as_array().expect("jobs").len(),
+        2,
+        "the merged request wrote no job row of its own: {jobs}"
+    );
+}
+
 #[tokio::test]
 async fn a_managed_source_is_listed_without_a_scan_action() {
     let world = seeded();

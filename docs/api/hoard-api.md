@@ -141,7 +141,12 @@ no `dir` at all and always uses the configured root.
   client offers the scan action on `can_scan` alone and never on a name it recognises.
 - `POST /api/v1/scan { "source" | null, "hash": "now" | "later" | "never" }` returns
   `{ "job_id" }`. `"background"` is accepted as an alias for `"later"`; omitting `hash`
-  also means `"later"`.
+  also means `"later"`. Every scan under `serve` runs on one lane, one at a time, in the
+  order asked, so a request answers its job id at once but may wait behind another. A
+  request naming a source that is already queued and has not started answers the job id it
+  merged into, and that queued scan takes the stronger of the two hash policies, `"now"`
+  over `"later"` over `"never"`. A node shutting down runs what the lane still holds before
+  it exits.
 - `GET /api/v1/jobs?state=`: scans, hash runs, pulls, applies with `phase`, `progress`
   (0..1), `bytes`, `rate_bps`, `started`, `finished`, `error`. `GET /api/v1/jobs/{id}`,
   `POST /api/v1/jobs/{id}/cancel`.

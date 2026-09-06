@@ -120,6 +120,7 @@ hoard/
     hoard-index/             discovery, sniffing, inference, the native catalog, search
       src/
         config.rs            IndexConfig: sources, globs, hashing policy, layouts
+        coordinate.rs        the one lane every scan under serve runs on
         discover/
           walker.rs          ignore-based parallel walk
           hf_cache.rs        ~/.cache/huggingface/hub layout
@@ -234,6 +235,11 @@ sources -> discover -> sniff (headers only) -> fingerprint -> infer (role, base,
 precision, trigger, confidence) -> catalog; sha256 in a background job; low confidence
 -> triage; the search index is refreshed from the change log the same run wrote
 ```
+
+Under `serve` every scan goes through `coordinate::Coordinator`: a request answers its job
+id at once and the lane runs the rescan, the hashing and the refresh one request at a time,
+merging a request for a source set that is queued and has not started into it. Shutdown
+drains the lane before the usage sink and the search refresher flush.
 
 Serve, local hit on the Hub face:
 

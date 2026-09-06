@@ -24,8 +24,8 @@ first; this document assumes it.
   deleted - git keeps them, and a stale plan in the tree is a trap for the next agent.
 - Phases 0 to 9 and 11 are done; 10 is partial, waiting on the watcher through `serve` and on
   a design for TREE and DISK. `docs/feature-plan.md` holds the table.
-- At the head of `master` after the doctor-and-sources wave all four checks pass:
-  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 790 passed,
+- At the head of `master` after the scan-coordination wave all four checks pass:
+  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 803 passed,
   0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness
   and its supplemental fixture, the mDNS test that needs a multicast route and the sniffer
   test that reads the local model caches. `cargo doc --workspace --no-deps` emits no warning.
@@ -172,7 +172,12 @@ Decisions taken on 2026-09-06, by the project owner:
   source the other holds, the configured hash policy is preserved, an overflowed watch marks
   its source dirty rather than losing the change, Hoard's own writes under the data directory
   are excluded, shutdown joins the watcher, and the rebuild-versus-write boundary is
-  enforced. **Scheduled as its own wave; no code in this one.**
+  enforced. **The coordination and the boundary are met:** `hoard_index::coordinate::Coordinator`
+  is the one lane every scan under `serve` runs on, `POST /api/v1/scan` submits to it and
+  `serve` drains it, and `Catalog::search_lane` serialises `rebuild_search` against
+  `refresh_search` while a rebuild now prunes only what it indexed. `crates/hoard-index/src/watch.rs`
+  is still started by nothing: the watcher wave makes it a producer of `ScanRequest`s with
+  `Origin::Watched` and adds the dirty-source, hash-policy and shutdown-join behaviour.
 - **Managed sources stay visible.** `GET /api/v1/sources` lists every source the catalog
   holds, including a peer's namespace, and each row carries `can_scan`, true exactly when the
   configuration names it, and `managed_by`, one of `"downloads"`, `"pulls"`, `"peer"` or

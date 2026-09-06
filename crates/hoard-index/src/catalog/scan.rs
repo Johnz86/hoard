@@ -105,6 +105,7 @@ impl Catalog {
                     database,
                     directory,
                     search_cache: std::sync::RwLock::new(None),
+                    search_lane: parking_lot::Mutex::new(()),
                 };
                 catalog.seed_builtin_shelves()?;
                 Ok(catalog)
