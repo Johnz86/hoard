@@ -14,12 +14,13 @@ use super::Catalog;
 use super::hashing::content_key;
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, Node,
-    Repository, RepositoryKey, Revision, SearchText, Source, entry_at, location_key,
+    Placement, Repository, RepositoryKey, Revision, SearchText, Source, entry_at, location_key,
     repository_key,
 };
 use super::nodes::PEER_SOURCE;
+use super::pulls::PULL_SOURCE;
 use super::read::Reader;
-use super::scan::{Counters, log_changes, next_id, preference, sweep_artifact};
+use super::scan::{CHUNK, Counters, log_changes, next_id, preference, sweep_artifact};
 
 /// One artifact of this node, flattened to what a peer needs to find and fetch it.
 #[derive(Debug, Clone, PartialEq)]
@@ -167,38 +168,73 @@ impl Catalog {
 
     /// Drops the peer's remote entries an earlier pass stamped, and every artifact record
     /// nothing references any more. Returns how many entries went.
+    ///
+    /// The peer's rows are found through the repositories filed under its own source, one
+    /// repository at a time and in chunks of [`CHUNK`] rows per transaction, so neither the
+    /// pass nor an index by node has to see every entry this catalog holds.
     pub fn retract_digest(&self, peer: i64, pass: u64) -> Result<u64> {
+        let stored: Option<Node> = self.database.r_transaction()?.get().primary(peer)?;
+        let node = stored
+            .ok_or_else(|| IndexError::Catalog(format!("node {peer} is not a known peer")))?;
+        let source = format!("{PEER_SOURCE}{}", node.node_id);
         let mut counters =
             Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
-        let transaction = self.database.rw_transaction()?;
         let mut artifacts = Vec::new();
         let mut removed = 0;
-        for entry in entries_of_node(&transaction, peer)? {
-            if entry.state != State::Remote || entry.pass == pass {
-                continue;
+        for repo_id in self.repositories_of_source(&source)? {
+            let stale = self.entries_of_earlier_passes(repo_id, peer, pass)?;
+            for batch in stale.chunks(CHUNK) {
+                let transaction = self.database.rw_transaction()?;
+                for entry in batch {
+                    if let Some(id) = entry.artifact_id {
+                        artifacts.push(id);
+                    }
+                    counters.derived.removed(entry);
+                    transaction.remove(entry.clone())?;
+                    removed += 1;
+                }
+                log_changes(&transaction, &mut counters)?;
+                counters.save(&transaction)?;
+                transaction.commit()?;
             }
-            if let Some(id) = entry.artifact_id {
-                artifacts.push(id);
-            }
-            counters.derived.removed(&entry);
-            transaction.remove(entry)?;
-            removed += 1;
         }
         artifacts.sort_unstable();
         artifacts.dedup();
-        for id in artifacts {
-            counters.touch(&transaction, id)?;
-            if retract_artifact(&transaction, id)? {
-                counters.pending.push(id);
+        for batch in artifacts.chunks(CHUNK) {
+            let transaction = self.database.rw_transaction()?;
+            for id in batch {
+                counters.touch(&transaction, *id)?;
+                if retract_artifact(&transaction, *id)? {
+                    counters.pending.push(*id);
+                }
             }
+            log_changes(&transaction, &mut counters)?;
+            counters.save(&transaction)?;
+            transaction.commit()?;
         }
-        log_changes(&transaction, &mut counters)?;
-        counters.save(&transaction)?;
-        transaction.commit()?;
         if removed > 0 {
             self.summarise(&counters)?;
         }
         Ok(removed)
+    }
+
+    /// The peer's remote rows in one repository that an earlier pass stamped.
+    fn entries_of_earlier_passes(&self, repo_id: i64, peer: i64, pass: u64) -> Result<Vec<Entry>> {
+        let read = self.database.r_transaction()?;
+        let rows: Vec<Entry> = read
+            .scan()
+            .secondary::<Entry>(EntryKey::repo_id)?
+            .start_with(repo_id)?
+            .collect::<native_db::db_type::Result<_>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|entry| {
+                entry.repo_id == repo_id
+                    && entry.node == peer
+                    && entry.state == State::Remote
+                    && entry.pass != pass
+            })
+            .collect())
     }
 
     pub fn peer_cursor(&self, peer: i64) -> Result<Option<String>> {
@@ -238,37 +274,50 @@ impl Catalog {
 
     /// Returns every entry a stopped process left mid-transfer to REMOTE, which is what
     /// clears a percentage that will never move again.
+    ///
+    /// Only a pull writes PULLING, so only the repositories filed under the pull source are
+    /// read, in chunks of [`CHUNK`] rows per transaction.
     pub fn reset_stale_pulls(&self) -> Result<u64> {
         let mut counters =
             Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
-        let transaction = self.database.rw_transaction()?;
-        let pulling: Vec<Entry> = transaction
-            .scan()
-            .primary()?
-            .all()?
-            .filter(|entry| {
-                entry
-                    .as_ref()
-                    .is_ok_and(|entry: &Entry| entry.state == State::Pulling)
-            })
-            .collect::<native_db::db_type::Result<_>>()?;
-        let reset = pulling.len() as u64;
-        for entry in pulling {
-            if let Some(id) = entry.artifact_id {
-                counters.pending.push(id);
+        let mut reset = 0;
+        for repo_id in self.repositories_of_source(PULL_SOURCE)? {
+            let pulling = self.entries_in_state(repo_id, State::Pulling)?;
+            for batch in pulling.chunks(CHUNK) {
+                let transaction = self.database.rw_transaction()?;
+                for entry in batch {
+                    if let Some(id) = entry.artifact_id {
+                        counters.pending.push(id);
+                    }
+                    counters.derived.removed(entry);
+                    transaction.upsert(Entry {
+                        state: State::Remote,
+                        preference: preference(State::Remote, false),
+                        pull_progress: None,
+                        ..entry.clone()
+                    })?;
+                    reset += 1;
+                }
+                log_changes(&transaction, &mut counters)?;
+                counters.save(&transaction)?;
+                transaction.commit()?;
             }
-            counters.derived.removed(&entry);
-            transaction.upsert(Entry {
-                state: State::Remote,
-                preference: preference(State::Remote, false),
-                pull_progress: None,
-                ..entry
-            })?;
         }
-        log_changes(&transaction, &mut counters)?;
-        counters.save(&transaction)?;
-        transaction.commit()?;
         Ok(reset)
+    }
+
+    /// One repository's entries in one state.
+    fn entries_in_state(&self, repo_id: i64, state: State) -> Result<Vec<Entry>> {
+        let read = self.database.r_transaction()?;
+        let rows: Vec<Entry> = read
+            .scan()
+            .secondary::<Entry>(EntryKey::repo_id)?
+            .start_with(repo_id)?
+            .collect::<native_db::db_type::Result<_>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|entry| entry.repo_id == repo_id && entry.state == state)
+            .collect())
     }
 }
 
@@ -334,7 +383,7 @@ impl Applying<'_, '_> {
             revision: ordinal,
             location: location_key(repo_id, ordinal, &row.path),
             rel_path: row.path.clone(),
-            abs_path: None,
+            placed: Placement::Absent,
             size: row.size,
             state: State::Remote,
             triage: false,
@@ -477,19 +526,6 @@ impl Applying<'_, '_> {
         self.counters.pending.push(id);
         Ok(())
     }
-}
-
-fn entries_of_node(transaction: &RwTransaction<'_>, node: i64) -> Result<Vec<Entry>> {
-    let scan = transaction.scan();
-    let by_node = scan.secondary::<Entry>(EntryKey::node)?;
-    let mut owned = Vec::new();
-    for entry in by_node.start_with(node)? {
-        let entry = entry?;
-        if entry.node == node {
-            owned.push(entry);
-        }
-    }
-    Ok(owned)
 }
 
 /// What a retraction leaves of the record its entries pointed at. An artifact no entry

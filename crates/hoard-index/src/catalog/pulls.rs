@@ -13,8 +13,8 @@ use super::Catalog;
 use super::hashing::content_key;
 use super::ingest::IngestRecord;
 use super::models::{
-    ArtifactRecord, ArtifactRecordKey, Entry, LOCAL_NODE, Repository, RepositoryKey, Revision,
-    SearchText, Source, Summary, entry_at, location_key, repository_key,
+    ArtifactRecord, ArtifactRecordKey, Entry, LOCAL_NODE, Placement, Repository, RepositoryKey,
+    Revision, SearchText, Source, Summary, entry_at, location_key, placement_in, repository_key,
 };
 use super::scan::{
     Counters, RecordFacts, log_changes, next_id, preference, record_of, tensor_keys,
@@ -99,7 +99,12 @@ impl Catalog {
             revision: mark.slot.revision,
             location: location_key(mark.slot.repo.get(), mark.slot.revision, mark.rel_path),
             rel_path: mark.rel_path.to_owned(),
-            abs_path: Some(mark.abs_path.to_string_lossy().into_owned()),
+            placed: placement_in(
+                &transaction,
+                mark.slot.repo.get(),
+                Some(&mark.abs_path.to_string_lossy()),
+                mark.rel_path,
+            )?,
             size: mark.size,
             state: mark.state,
             preference: preference(mark.state, mark.state != State::Remote),
@@ -140,7 +145,12 @@ impl Catalog {
             revision: file.slot.revision,
             location: location_key(file.slot.repo.get(), file.slot.revision, file.rel_path),
             rel_path: file.rel_path.to_owned(),
-            abs_path: Some(file.abs_path.to_string_lossy().into_owned()),
+            placed: placement_in(
+                &transaction,
+                file.slot.repo.get(),
+                Some(&file.abs_path.to_string_lossy()),
+                file.rel_path,
+            )?,
             size: file.sniff.size,
             state,
             triage: file.triage,
@@ -192,7 +202,7 @@ fn blank_entry(previous: Option<Entry>) -> Entry {
         revision: 0,
         location: String::new(),
         rel_path: String::new(),
-        abs_path: None,
+        placed: Placement::Absent,
         size: 0,
         state: State::Remote,
         triage: false,

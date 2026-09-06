@@ -31,8 +31,8 @@ use crate::error::{IndexError, Result};
 use crate::row::DiskPressure;
 
 use self::models::{
-    ArtifactRecord, Entry, Manifest, Node, NodeV1, Repository, RepositoryV3, Source, SourceV2,
-    Summary, define_models,
+    ArtifactRecord, Entry, EntryV3, Manifest, Node, NodeV1, Repository, RepositoryV3, Source,
+    SourceV2, Summary, define_models,
 };
 
 pub use self::digest::{DigestApplied, DigestEntry, DigestPage, RemoteEntry};
@@ -128,6 +128,7 @@ impl Catalog {
         let counts_are_stale = transaction.len().primary::<RepositoryV3>()? > 0
             || transaction.len().primary::<SourceV2>()? > 0
             || transaction.len().primary::<NodeV1>()? > 0;
+        let paths_are_absolute = transaction.len().primary::<EntryV3>()? > 0;
         transaction.migrate::<Manifest>()?;
         transaction.migrate::<Summary>()?;
         transaction.migrate::<Repository>()?;
@@ -141,6 +142,9 @@ impl Catalog {
             directory: directory.to_path_buf(),
             search_cache: RwLock::new(None),
         };
+        if paths_are_absolute {
+            catalog.fold_paths_under_their_roots()?;
+        }
         if counts_are_stale {
             catalog.recount_derived()?;
             catalog.recount_summary()?;

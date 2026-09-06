@@ -10,10 +10,10 @@ use crate::infer::{InferInput, infer};
 
 use super::hashing::content_key;
 use super::models::{
-    ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, Repository, RepositoryKey,
-    Revision, SearchText, Source, Summary, entry_at, location_key, repository_key,
+    ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, Placement, Repository,
+    RepositoryKey, Revision, SearchText, Source, Summary, entry_at, location_key, repository_key,
 };
-use super::read::Reader;
+use super::read::{Reader, repositories_of_source_in};
 use super::scan::{
     Counters, RecordFacts, log_changes, next_id, preference, record_of, tensor_keys,
 };
@@ -73,22 +73,27 @@ impl Catalog {
         let snapshot = self.database.r_transaction()?;
         let names = self.node_names(&snapshot)?;
         let mut reader = Reader::new(&snapshot, &names);
-        let of_node: Vec<Entry> = snapshot
-            .scan()
-            .secondary::<Entry>(EntryKey::node)?
-            .start_with(LOCAL_NODE)?
-            .collect::<native_db::db_type::Result<_>>()?;
         let mut details = Vec::new();
-        for entry in of_node.iter().filter(|entry| {
-            entry.node == LOCAL_NODE && entry.state == State::Served && entry.abs_path.is_none()
-        }) {
-            let deduped = match entry.artifact_id {
-                Some(id) => reader
-                    .record(id)?
-                    .is_some_and(|record| record.path_count > 1),
-                None => false,
-            };
-            details.push(reader.detail(entry, deduped)?);
+        for repo_id in repositories_of_source_in(&snapshot, MIRROR_SOURCE)? {
+            let rows: Vec<Entry> = snapshot
+                .scan()
+                .secondary::<Entry>(EntryKey::repo_id)?
+                .start_with(repo_id)?
+                .collect::<native_db::db_type::Result<_>>()?;
+            for entry in rows.iter().filter(|entry| {
+                entry.repo_id == repo_id
+                    && entry.node == LOCAL_NODE
+                    && entry.state == State::Served
+                    && entry.placed.is_absent()
+            }) {
+                let deduped = match entry.artifact_id {
+                    Some(id) => reader
+                        .record(id)?
+                        .is_some_and(|record| record.path_count > 1),
+                    None => false,
+                };
+                details.push(reader.detail(entry, deduped)?);
+            }
         }
         Ok(details)
     }
@@ -174,7 +179,7 @@ impl Ingesting<'_, '_> {
             revision: ordinal,
             location: location_key(repo_id, ordinal, &file.rel_path),
             rel_path: file.rel_path.clone(),
-            abs_path: None,
+            placed: Placement::Absent,
             size: file.size,
             state: State::Served,
             triage,

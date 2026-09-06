@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -13,8 +14,8 @@ use crate::error::{IndexError, Result};
 
 use super::Catalog;
 use super::models::{
-    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Override, SearchText,
-    Source,
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Override, Repository,
+    SearchText, Source,
 };
 use super::naming::content_hashes;
 use super::scan::{Counters, log_changes, owes_a_hash};
@@ -184,12 +185,25 @@ impl Catalog {
     }
 
     /// The next files owing a hash, in primary key order, with the path to read them from.
+    /// A row that carries no path of its own is placed under its repository's root, so the
+    /// roots the batch spans are read once each rather than once per file.
     fn pending_batch(&self, after: i64) -> Result<Vec<(Entry, PathBuf)>> {
         let read = self.database.r_transaction()?;
+        let mut roots: HashMap<i64, String> = HashMap::new();
         let mut batch = Vec::with_capacity(HASH_BATCH);
         for entry in read.scan().primary::<Entry>()?.range((after + 1)..)? {
-            let entry = entry?;
-            let Some(path) = entry.abs_path.clone().filter(|_| owes_a_hash(&entry)) else {
+            let entry: Entry = entry?;
+            if !owes_a_hash(&entry) {
+                continue;
+            }
+            let root = match roots.entry(entry.repo_id) {
+                std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let stored: Option<Repository> = read.get().primary(entry.repo_id)?;
+                    slot.insert(stored.map(|stored| stored.root_path).unwrap_or_default())
+                }
+            };
+            let Some(path) = entry.placed.resolve(root, &entry.rel_path) else {
                 continue;
             };
             batch.push((entry, PathBuf::from(path)));

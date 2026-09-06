@@ -6,8 +6,8 @@ use tempfile::TempDir;
 
 use hoard_core::{
     Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, EntryId, Evidence,
-    EvidenceSource, JobId, Loadout, LoadoutPin, NodeId, Precision, RepoId, RepoType, Role, Sha256,
-    State, SubRole, TensorSample, TensorSummary,
+    EvidenceSource, JobId, Loadout, LoadoutPin, NodeId, Precision, RepoId, RepoRowId, RepoType,
+    Role, Sha256, State, SubRole, TensorSample, TensorSummary,
 };
 
 use crate::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
@@ -19,9 +19,10 @@ use crate::search::{CompileContext, SortKey, SortSpec, parse};
 
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, ArtifactRecordV1, Entry, EntryKey, EntryV1,
-    EntryV2, LOCAL_NODE, Manifest, ManifestV1, Node, NodeV1, Override, Ref, Repository,
-    RepositoryKey, RepositoryV1, RepositoryV2, RepositoryV3, Revision, RevisionV1, RevisionV2,
-    SearchChange, SearchText, Source, SourceV1, SourceV2, Summary, SummaryV1, SummaryV2,
+    EntryV2, EntryV3, LOCAL_NODE, Manifest, ManifestV1, Node, NodeV1, Override, Placement, Ref,
+    Repository, RepositoryKey, RepositoryV1, RepositoryV2, RepositoryV3, Revision, RevisionV1,
+    RevisionV2, SearchChange, SearchText, Source, SourceV1, SourceV2, Summary, SummaryV1,
+    SummaryV2,
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
@@ -764,7 +765,7 @@ fn an_unreadable_file_is_recorded_as_absent_instead_of_aborting() -> Result<()> 
     assert_eq!(entries.len(), 2, "the unreadable file is still an entry");
     assert_eq!(absent.state, hoard_core::State::Remote);
     assert!(
-        absent.abs_path.is_some(),
+        !absent.placed.is_absent(),
         "the file is on this disk even though it could not be read"
     );
     assert!(absent.artifact_id.is_none());
@@ -811,7 +812,7 @@ fn an_lfs_pointer_is_an_absent_entry_without_an_artifact() -> Result<()> {
     assert!(entry.lfs_pointer);
     assert_eq!(entry.size, 123_456);
     assert_eq!(entry.state, hoard_core::State::Remote);
-    assert!(entry.abs_path.is_none());
+    assert!(entry.placed.is_absent());
     assert!(
         entry.artifact_id.is_none(),
         "a pointer stub is a path, not an artifact"
@@ -1252,7 +1253,7 @@ fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
         .map(|table| table.name.as_str())
         .collect();
     assert!(
-        names.iter().any(|name| name.starts_with("7_3_")),
+        names.iter().any(|name| name.starts_with("7_4_")),
         "the Entry table is listed: {names:?}"
     );
     assert!(
@@ -1262,7 +1263,7 @@ fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
     let entries = report
         .tables
         .iter()
-        .find(|table| table.name.starts_with("7_3_id"))
+        .find(|table| table.name.starts_with("7_4_id"))
         .map(|table| table.entries);
     assert_eq!(entries, Some(2));
     let reopened = Catalog::open(&native)?;
@@ -2531,7 +2532,7 @@ fn legacy_entry(id: i64, repo_id: i64, size: u64, state: State) -> Entry {
         revision: 0,
         location: models::location_key(repo_id, 0, &rel_path),
         rel_path,
-        abs_path: Some(format!("/hub/w{id}.safetensors")),
+        placed: Placement::At(format!("/hub/w{id}.safetensors")),
         size,
         state,
         triage: false,
@@ -2829,6 +2830,189 @@ fn loose_fixture(directory: &Path) -> Result<(PathBuf, IndexConfig)> {
 }
 
 #[test]
+fn an_entry_under_its_root_stores_no_absolute_path() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let read = catalog.database.r_transaction()?;
+    let entries: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(entries.len(), 2);
+    for entry in &entries {
+        assert_eq!(
+            entry.placed,
+            Placement::UnderRoot,
+            "a loose file sits where its repository says it does: {}",
+            entry.rel_path
+        );
+    }
+    drop(read);
+
+    let repo = catalog
+        .repositories(&RepositoryFilter::default(), None, 10)?
+        .rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| IndexError::Catalog("the scanned repository".into()))?;
+    let detail = catalog
+        .revision_entry(repo.id, 0, "loras/keep.safetensors")?
+        .ok_or_else(|| IndexError::Catalog("the scanned entry".into()))?;
+    assert_eq!(
+        detail.abs_path.as_deref(),
+        input.join("loras/keep.safetensors").to_str(),
+        "a reader still sees the whole path"
+    );
+
+    let elsewhere = "/hub/blobs/deadbeef".to_owned();
+    catalog.seed(&[SeedRepository {
+        revisions: vec![SeedRevision {
+            name: "main".to_owned(),
+            sha: Some(CommitSha::from_bytes([0x71; 20])),
+            refs: vec![("main".to_owned(), RefKind::Branch)],
+            title: None,
+            author: None,
+            committed: None,
+            entries: vec![SeedEntry {
+                abs_path: Some(elsewhere.clone()),
+                ..seeded_entry("model.safetensors", 64, None)
+            }],
+        }],
+        ..seeded_repo("hub/snapshotted", RepoType::Models)
+    }])?;
+    let read = catalog.database.r_transaction()?;
+    let blob: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    let blob = blob
+        .iter()
+        .find(|entry| entry.rel_path == "model.safetensors")
+        .ok_or_else(|| IndexError::Catalog("the seeded blob".into()))?;
+    assert_eq!(
+        blob.placed,
+        Placement::At(elsewhere),
+        "a snapshot pointing at a blob outside its root names the blob"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_version_3_entry_is_migrated_on_open() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("catalog.redb");
+    let repo = RepoId::new(RepoType::Models, Some("old".to_owned()), "rows");
+    {
+        let database = native_db::Builder::new().create(models()?, &path)?;
+        let transaction = database.rw_transaction()?;
+        transaction.insert(Manifest {
+            id: 0,
+            format_version: 5,
+            generation: 1,
+            scanned_at: "then".to_owned(),
+            node: "old".to_owned(),
+            counts: Vec::new(),
+            search_directory: None,
+            search_generation: 0,
+            search_seq: 0,
+        })?;
+        transaction.insert(Repository {
+            id: 1,
+            key: models::repository_key("legacy", &repo),
+            source: "legacy".to_owned(),
+            repo: repo.clone(),
+            root_path: "/legacy/root".to_owned(),
+            git_dir: None,
+            default_ref: "main".to_owned(),
+            revisions: vec![Revision {
+                name: "main".to_owned(),
+                sha: None,
+                refs: vec![Ref {
+                    name: "main".to_owned(),
+                    kind: RefKind::Branch,
+                }],
+                title: None,
+                author: None,
+                committed: None,
+            }],
+            present_files: 2,
+            present_bytes: 128,
+        })?;
+        for (id, abs_path) in [
+            (1_i64, "/legacy/root/under.safetensors"),
+            (2, "/elsewhere/blobs/loose.safetensors"),
+        ] {
+            let rel_path = match id {
+                1 => "under.safetensors",
+                _ => "loose.safetensors",
+            };
+            transaction.insert(EntryV3 {
+                id,
+                repo_id: 1,
+                artifact_id: None,
+                revision: 0,
+                location: models::location_key(1, 0, rel_path),
+                rel_path: rel_path.to_owned(),
+                abs_path: Some(abs_path.to_owned()),
+                size: 64,
+                state: State::Local,
+                triage: false,
+                preference: 19,
+                lfs_pointer: false,
+                is_symlink: false,
+                sha256: None,
+                content: None,
+                git_sha1: None,
+                mtime: Some(1),
+                inode: Some(2),
+                node: LOCAL_NODE,
+                pass: 0,
+                pull_progress: None,
+            })?;
+        }
+        transaction.commit()?;
+    }
+
+    let catalog = Catalog::open(directory.path())?;
+
+    let read = catalog.database.r_transaction()?;
+    let stale: Option<EntryV3> = read.get().primary(1_i64)?;
+    assert!(stale.is_none(), "the v3 table is drained");
+    let under: Option<Entry> = read.get().primary(1_i64)?;
+    assert_eq!(
+        under.map(|entry| entry.placed),
+        Some(Placement::UnderRoot),
+        "a path equal to the root joined with the relative path is folded"
+    );
+    let elsewhere: Option<Entry> = read.get().primary(2_i64)?;
+    assert_eq!(
+        elsewhere.map(|entry| entry.placed),
+        Some(Placement::At(
+            "/elsewhere/blobs/loose.safetensors".to_owned()
+        )),
+        "a path that leaves the root is kept in full"
+    );
+    drop(read);
+    let detail = catalog
+        .revision_entry(RepoRowId::new(1), 0, "under.safetensors")?
+        .ok_or_else(|| IndexError::Catalog("the migrated entry".into()))?;
+    assert_eq!(
+        detail.abs_path.as_deref(),
+        Some("/legacy/root/under.safetensors")
+    );
+    Ok(())
+}
+
+#[test]
 fn totals_follow_the_sweep() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
@@ -2930,7 +3114,7 @@ fn an_unchanged_rescan_reads_no_headers_and_a_deleted_file_is_marked_absent() ->
         .find(|entry| entry.rel_path.ends_with("gone.safetensors"))
         .ok_or_else(|| IndexError::Catalog("the deleted path keeps its row".into()))?;
     assert_eq!(gone.state, hoard_core::State::Remote);
-    assert!(gone.abs_path.is_some(), "the path it had is kept");
+    assert!(!gone.placed.is_absent(), "the path it had is kept");
     assert!(
         gone.artifact_id.is_none(),
         "its artifact had no other path and is gone"
@@ -3271,6 +3455,35 @@ fn artifact_detail_encoding_is_frozen() -> Result<()> {
 #[test]
 fn entry_encoding_is_frozen() -> Result<()> {
     let value = Entry {
+        id: 13,
+        repo_id: 11,
+        artifact_id: Some(7),
+        revision: 1,
+        location: models::location_key(11, 1, "unet/frozen.safetensors"),
+        rel_path: "unet/frozen.safetensors".to_owned(),
+        placed: Placement::At("/frozen/source/unet/frozen.safetensors".to_owned()),
+        size: 4096,
+        state: State::Triage,
+        triage: true,
+        preference: 19,
+        lfs_pointer: true,
+        is_symlink: true,
+        sha256: Some(Sha256::from_bytes([3; 32])),
+        content: Some(0x0303_0303_0303_0303_u128),
+        git_sha1: Some(CommitSha::from_bytes([7; 20])),
+        mtime: Some(1_767_225_600),
+        inode: Some(424_242),
+        node: 1,
+        pass: 4,
+        pull_progress: Some(0.5),
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn entry_v3_encoding_is_frozen() -> Result<()> {
+    let value = EntryV3 {
         id: 13,
         repo_id: 11,
         artifact_id: Some(7),

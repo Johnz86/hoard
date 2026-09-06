@@ -22,8 +22,8 @@ use crate::sniff::{self, SniffResult};
 use super::hashing::content_key;
 use super::models::{
     Allocator, ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE,
-    Manifest, Node, Override, Ref, Repository, RepositoryKey, Revision, SearchChange, SearchText,
-    Source, Summary, location_key, repository_key,
+    Manifest, Node, Override, Placement, Ref, Repository, RepositoryKey, Revision, SearchChange,
+    SearchText, Source, Summary, location_key, repository_key,
 };
 use super::naming::{
     InferenceContext, Naming, artifact_name, content_hashes, disambiguate_labels, index_document,
@@ -256,6 +256,54 @@ impl Catalog {
     /// Counts again, from the entries themselves, everything the records above them carry:
     /// each repository's present files and bytes and each source's owed hashes. This is
     /// what a catalog whose records predate one of those counts needs once on open.
+    /// Folds every entry that names its repository's root joined with its own relative path
+    /// back onto [`Placement::UnderRoot`], which is what the migration from version 3 leaves
+    /// to do: the upgrade names each path in full because it cannot see the repository.
+    ///
+    /// Works one repository at a time and commits in chunks, so the pass costs a repository
+    /// rather than the whole catalog at once.
+    pub(super) fn fold_paths_under_their_roots(&self) -> Result<()> {
+        let read = self.database.r_transaction()?;
+        let repositories: Vec<Repository> = read
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
+        drop(read);
+        for repository in repositories {
+            let read = self.database.r_transaction()?;
+            let rows: Vec<Entry> = read
+                .scan()
+                .secondary::<Entry>(EntryKey::repo_id)?
+                .start_with(repository.id)?
+                .collect::<native_db::db_type::Result<_>>()?;
+            drop(read);
+            let folded: Vec<Entry> = rows
+                .into_iter()
+                .filter(|entry| entry.repo_id == repository.id)
+                .filter_map(|entry| {
+                    let placed = Placement::of(
+                        entry
+                            .placed
+                            .resolve(&repository.root_path, &entry.rel_path)
+                            .as_deref(),
+                        &repository.root_path,
+                        &entry.rel_path,
+                    );
+                    (placed != entry.placed).then_some(Entry { placed, ..entry })
+                })
+                .collect();
+            for batch in folded.chunks(CHUNK) {
+                let transaction = self.database.rw_transaction()?;
+                for entry in batch {
+                    transaction.upsert(entry.clone())?;
+                }
+                transaction.commit()?;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn recount_derived(&self) -> Result<()> {
         let read = self.database.r_transaction()?;
         let mut counted: HashMap<i64, (u32, u64, u64)> = HashMap::new();
@@ -395,9 +443,11 @@ impl Catalog {
                 .start_with(repository.id)?
                 .collect::<native_db::db_type::Result<_>>()?;
             for entry in entries {
-                let (Some(abs_path), Some(mtime), Some(inode)) =
-                    (entry.abs_path.as_ref(), entry.mtime, entry.inode)
-                else {
+                let (Some(abs_path), Some(mtime), Some(inode)) = (
+                    entry.placed.resolve(&repository.root_path, &entry.rel_path),
+                    entry.mtime,
+                    entry.inode,
+                ) else {
                     continue;
                 };
                 let shard_count = match entry.artifact_id {
@@ -992,7 +1042,7 @@ impl DerivedShift {
 /// Whether this row still owes the catalog a sha256: bytes on this disk that nothing has
 /// read yet.
 pub(super) fn owes_a_hash(entry: &Entry) -> bool {
-    entry.sha256.is_none() && entry.state != State::Remote && entry.abs_path.is_some()
+    entry.sha256.is_none() && entry.state != State::Remote && !entry.placed.is_absent()
 }
 
 fn shifted_u64(current: u64, by: i64) -> u64 {
@@ -1244,7 +1294,7 @@ pub(super) enum EntryRole {
 }
 
 /// The largest number of standalone files one transaction covers.
-const CHUNK: usize = 1024;
+pub(super) const CHUNK: usize = 1024;
 
 /// Everything the per entry pass of one revision reads besides the entry itself.
 struct RevisionPlan<'a> {
@@ -1722,11 +1772,16 @@ fn store_entry(
             &prepared.discovered.rel_path,
         ),
         rel_path: prepared.discovered.rel_path.clone(),
-        abs_path: prepared
-            .presence
-            .abs_path
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned()),
+        placed: Placement::of(
+            prepared
+                .presence
+                .abs_path
+                .as_ref()
+                .map(|path| path.to_string_lossy())
+                .as_deref(),
+            &context.repo.root_path.to_string_lossy(),
+            &prepared.discovered.rel_path,
+        ),
         size: prepared.presence.size,
         state,
         triage,

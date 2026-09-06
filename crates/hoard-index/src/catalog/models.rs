@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use native_db::{Models, ToKey, native_db};
 use native_model::{Model, native_model};
 use serde::{Deserialize, Serialize};
@@ -527,7 +529,7 @@ impl From<EntryV2> for EntryV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 7, version = 3, from = EntryV2)]
 #[native_db]
-pub(super) struct Entry {
+pub(super) struct EntryV3 {
     #[primary_key]
     pub(super) id: i64,
     #[secondary_key]
@@ -559,6 +561,97 @@ pub(super) struct Entry {
     pub(super) location: String,
 }
 
+/// Where the bytes of an entry sit relative to its repository root.
+///
+/// Almost every entry a scan writes sits at its repository's root joined with its own
+/// relative path, and writing that whole absolute path out again is the largest redundant
+/// field of the largest table. An hf-cache blob, an LFS object and a cache entry do not,
+/// and carry the path they do sit at.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) enum Placement {
+    /// No node holds these bytes.
+    Absent,
+    /// The repository's root joined with the entry's relative path.
+    UnderRoot,
+    /// Somewhere else, named in full.
+    At(String),
+}
+
+impl Placement {
+    /// Where an absolute path sits, given the repository root and relative path it belongs
+    /// to. A path equal to the two joined is recorded as sitting under the root.
+    pub(super) fn of(abs_path: Option<&str>, root_path: &str, rel_path: &str) -> Self {
+        match abs_path {
+            None => Placement::Absent,
+            Some(path) if Path::new(path) == Path::new(root_path).join(rel_path) => {
+                Placement::UnderRoot
+            }
+            Some(path) => Placement::At(path.to_owned()),
+        }
+    }
+
+    /// The absolute path these bytes sit at, rebuilt from the repository root when the row
+    /// does not carry one.
+    pub(super) fn resolve(&self, root_path: &str, rel_path: &str) -> Option<String> {
+        match self {
+            Placement::Absent => None,
+            Placement::UnderRoot => Some(
+                Path::new(root_path)
+                    .join(rel_path)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            Placement::At(path) => Some(path.clone()),
+        }
+    }
+
+    pub(super) fn is_absent(&self) -> bool {
+        matches!(self, Placement::Absent)
+    }
+}
+
+/// One path, with the content hashes read from it and the node that holds it.
+///
+/// `content` is the identity a sha256 makes, so a lookup by content hash is a secondary key
+/// read rather than a scan; `location` names the one path a revision of a repository holds,
+/// so finding it is one key read and reading a whole revision is one prefix scan. `node` is
+/// not indexed: every reader that used to scan by it is scoped by source or repository
+/// instead, and how many rows a node holds is on the node's own record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 7, version = 4, from = EntryV3)]
+#[native_db]
+pub(super) struct Entry {
+    #[primary_key]
+    pub(super) id: i64,
+    #[secondary_key]
+    pub(super) repo_id: i64,
+    #[secondary_key(optional)]
+    pub(super) artifact_id: Option<i64>,
+    pub(super) revision: u32,
+    pub(super) rel_path: String,
+    pub(super) size: u64,
+    pub(super) state: State,
+    pub(super) triage: bool,
+    pub(super) preference: i64,
+    pub(super) lfs_pointer: bool,
+    pub(super) is_symlink: bool,
+    pub(super) sha256: Option<Sha256>,
+    #[secondary_key(optional)]
+    pub(super) content: Option<u128>,
+    pub(super) git_sha1: Option<GitSha1>,
+    pub(super) mtime: Option<i64>,
+    pub(super) inode: Option<u64>,
+    pub(super) node: i64,
+    pub(super) pass: u64,
+    pub(super) pull_progress: Option<f32>,
+    /// [`location_key`] of this row's repository, revision and relative path. Every writer
+    /// that changes one of those three must write it again.
+    #[secondary_key(unique)]
+    pub(super) location: String,
+    /// Where the bytes sit. Every writer that moves them must write it again.
+    pub(super) placed: Placement,
+}
+
 /// The one path a revision of a repository holds, as a key a lookup and a prefix scan can
 /// both use. The two numbers are zero padded to a fixed width so a prefix of the first two
 /// fields never reaches a longer number.
@@ -574,6 +667,24 @@ pub(super) fn revision_prefix(repo_id: i64, revision: u32) -> String {
     format!("{repo_id:020}\u{1}{revision:010}\u{1}")
 }
 
+/// Where a writer's absolute path sits, read against the repository the row belongs to. A
+/// repository the transaction cannot see yet leaves the path named in full.
+pub(super) fn placement_in(
+    transaction: &native_db::transaction::RwTransaction<'_>,
+    repo_id: i64,
+    abs_path: Option<&str>,
+    rel_path: &str,
+) -> super::Result<Placement> {
+    let stored: Option<Repository> = transaction.get().primary(repo_id)?;
+    Ok(match stored {
+        Some(repository) => Placement::of(abs_path, &repository.root_path, rel_path),
+        None => match abs_path {
+            Some(path) => Placement::At(path.to_owned()),
+            None => Placement::Absent,
+        },
+    })
+}
+
 /// The one entry a revision of a repository holds at `rel_path`, as one key read.
 pub(super) fn entry_at(
     transaction: &native_db::transaction::RwTransaction<'_>,
@@ -587,7 +698,7 @@ pub(super) fn entry_at(
     )?)
 }
 
-impl From<EntryV2> for Entry {
+impl From<EntryV2> for EntryV3 {
     fn from(entry: EntryV2) -> Self {
         Self {
             location: location_key(entry.repo_id, entry.revision, &entry.rel_path),
@@ -615,8 +726,8 @@ impl From<EntryV2> for Entry {
     }
 }
 
-impl From<Entry> for EntryV2 {
-    fn from(entry: Entry) -> Self {
+impl From<EntryV3> for EntryV2 {
+    fn from(entry: EntryV3) -> Self {
         Self {
             id: entry.id,
             repo_id: entry.repo_id,
@@ -638,6 +749,72 @@ impl From<Entry> for EntryV2 {
             node: entry.node,
             pass: entry.pass,
             pull_progress: entry.pull_progress,
+        }
+    }
+}
+
+impl From<EntryV3> for Entry {
+    fn from(entry: EntryV3) -> Self {
+        Self {
+            placed: match entry.abs_path {
+                Some(path) => Placement::At(path),
+                None => Placement::Absent,
+            },
+            id: entry.id,
+            repo_id: entry.repo_id,
+            artifact_id: entry.artifact_id,
+            revision: entry.revision,
+            rel_path: entry.rel_path,
+            size: entry.size,
+            state: entry.state,
+            triage: entry.triage,
+            preference: entry.preference,
+            lfs_pointer: entry.lfs_pointer,
+            is_symlink: entry.is_symlink,
+            sha256: entry.sha256,
+            content: entry.content,
+            git_sha1: entry.git_sha1,
+            mtime: entry.mtime,
+            inode: entry.inode,
+            node: entry.node,
+            pass: entry.pass,
+            pull_progress: entry.pull_progress,
+            location: entry.location,
+        }
+    }
+}
+
+/// The upgrade names every migrated path in full; `Catalog::open` then folds the ones that
+/// sit under their repository's root, which is the only place the root is known. Going back
+/// the other way cannot rebuild a path the row no longer carries, so a folded row reads as
+/// absent to a version that predates [`Placement`].
+impl From<Entry> for EntryV3 {
+    fn from(entry: Entry) -> Self {
+        Self {
+            abs_path: match entry.placed {
+                Placement::At(path) => Some(path),
+                Placement::Absent | Placement::UnderRoot => None,
+            },
+            id: entry.id,
+            repo_id: entry.repo_id,
+            artifact_id: entry.artifact_id,
+            revision: entry.revision,
+            rel_path: entry.rel_path,
+            size: entry.size,
+            state: entry.state,
+            triage: entry.triage,
+            preference: entry.preference,
+            lfs_pointer: entry.lfs_pointer,
+            is_symlink: entry.is_symlink,
+            sha256: entry.sha256,
+            content: entry.content,
+            git_sha1: entry.git_sha1,
+            mtime: entry.mtime,
+            inode: entry.inode,
+            node: entry.node,
+            pass: entry.pass,
+            pull_progress: entry.pull_progress,
+            location: entry.location,
         }
     }
 }
@@ -1086,6 +1263,7 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<Source>()?;
     models.define::<EntryV1>()?;
     models.define::<EntryV2>()?;
+    models.define::<EntryV3>()?;
     models.define::<Entry>()?;
     models.define::<NodeV1>()?;
     models.define::<Node>()?;

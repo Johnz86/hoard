@@ -138,6 +138,24 @@ impl SourceRecord {
     }
 }
 
+/// The repositories filed under one source, by id.
+///
+/// One row per repository is read however many files each holds, which is what every reader
+/// that used to reach for an index of entries by node walks instead.
+pub(super) fn repositories_of_source_in(
+    snapshot: &RTransaction<'_>,
+    source: &str,
+) -> Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    for repository in snapshot.scan().primary::<Repository>()?.all()? {
+        let repository: Repository = repository?;
+        if repository.source == source {
+            ids.push(repository.id);
+        }
+    }
+    Ok(ids)
+}
+
 /// One row of the triage queue: the artifact as the table shows it, the guess inference
 /// recorded, and the header that produced the guess.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -163,6 +181,11 @@ impl Catalog {
             .filter(|row| !row.name.starts_with(PEER_SOURCE))
             .map(SourceRecord::of)
             .collect()
+    }
+
+    /// The repositories filed under one source, by id.
+    pub(super) fn repositories_of_source(&self, source: &str) -> Result<Vec<i64>> {
+        repositories_of_source_in(&self.database.r_transaction()?, source)
     }
 
     /// The artifact's preferred entry as a row: the highest availability preference, and on
@@ -755,7 +778,7 @@ fn entry_detail(
         revision: revision.name.clone(),
         revision_sha: revision.sha,
         rel_path: entry.rel_path.clone(),
-        abs_path: entry.abs_path.clone(),
+        abs_path: entry.placed.resolve(&repository.root_path, &entry.rel_path),
         node: node.to_owned(),
         size: entry.size,
         state: entry.state,

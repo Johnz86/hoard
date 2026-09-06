@@ -1235,7 +1235,7 @@ pub(super) fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
         pull_progress: entry.pull_progress,
         trigger: inferred.trigger.clone(),
         path: entry.rel_path.clone(),
-        abs_path: entry.abs_path.clone(),
+        abs_path: entry.placed.resolve(&repository.root_path, &entry.rel_path),
         path_count: artifact.path_count,
         dupe: artifact.path_count > 1,
         triage: entry.triage,
