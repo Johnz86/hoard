@@ -206,7 +206,50 @@ impl Catalog {
                 }
             }
         }
-        self.retract_absent(walk, counters)
+        self.retract_absent(walk, counters)?;
+        self.record_scan_stats(sources)
+    }
+
+    /// Recounts what each walked source holds now that every unit of it is stored and the
+    /// paths the walk never reached have been retracted: the files still on this disk and
+    /// the bytes they occupy.
+    fn record_scan_stats(&self, sources: &[&SourceConfig]) -> Result<()> {
+        let at = jiff::Timestamp::now().to_string();
+        let transaction = self.database.rw_transaction()?;
+        let repositories: Vec<Repository> = transaction
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
+        for source in sources {
+            let Some(stored) = transaction.get().primary::<Source>(source.name.clone())? else {
+                continue;
+            };
+            let mut file_count = 0;
+            let mut byte_count = 0u64;
+            for repository in repositories
+                .iter()
+                .filter(|repository| repository.source == source.name)
+            {
+                let scan = transaction.scan().secondary::<Entry>(EntryKey::repo_id)?;
+                for entry in scan.start_with(repository.id)? {
+                    let entry: Entry = entry?;
+                    if entry.repo_id != repository.id || entry.state == State::Remote {
+                        continue;
+                    }
+                    file_count += 1;
+                    byte_count = byte_count.saturating_add(entry.size);
+                }
+            }
+            transaction.upsert(Source {
+                file_count,
+                byte_count,
+                last_scan: Some(at.clone()),
+                ..stored
+            })?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Writes the records a source needs before any of its files are read, and hands back
@@ -220,10 +263,19 @@ impl Catalog {
         counters: &mut Counters,
     ) -> Result<Vec<i64>> {
         let transaction = self.database.rw_transaction()?;
-        transaction.upsert(Source {
+        let stored: Option<Source> = transaction.get().primary(source.name.clone())?;
+        let carried = stored.unwrap_or_else(|| Source {
             name: source.name.clone(),
             config: source.clone(),
             resolved_kind: kind,
+            file_count: 0,
+            byte_count: 0,
+            last_scan: None,
+        });
+        transaction.upsert(Source {
+            config: source.clone(),
+            resolved_kind: kind,
+            ..carried
         })?;
         let mut ids = Vec::with_capacity(repos.len());
         for repo in repos {

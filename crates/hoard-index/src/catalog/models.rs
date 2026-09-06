@@ -13,11 +13,49 @@ use crate::store::revision::RefKind;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 1, version = 1)]
 #[native_db]
+pub(super) struct SourceV1 {
+    #[primary_key]
+    pub(super) name: String,
+    pub(super) config: SourceConfig,
+    pub(super) resolved_kind: SourceKind,
+}
+
+/// A nominated root, with what the last walk of it counted. A source no scan has reached
+/// yet reports no last scan and zeroes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 1, version = 2, from = SourceV1)]
+#[native_db]
 pub(super) struct Source {
     #[primary_key]
     pub(super) name: String,
     pub(super) config: SourceConfig,
     pub(super) resolved_kind: SourceKind,
+    pub(super) file_count: u64,
+    pub(super) byte_count: u64,
+    pub(super) last_scan: Option<String>,
+}
+
+impl From<SourceV1> for Source {
+    fn from(source: SourceV1) -> Self {
+        Self {
+            name: source.name,
+            config: source.config,
+            resolved_kind: source.resolved_kind,
+            file_count: 0,
+            byte_count: 0,
+            last_scan: None,
+        }
+    }
+}
+
+impl From<Source> for SourceV1 {
+    fn from(source: Source) -> Self {
+        Self {
+            name: source.name,
+            config: source.config,
+            resolved_kind: source.resolved_kind,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -524,6 +562,7 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<Manifest>()?;
     models.define::<SummaryV1>()?;
     models.define::<Summary>()?;
+    models.define::<SourceV1>()?;
     models.define::<Source>()?;
     models.define::<ArtifactDetail>()?;
     models.define::<SearchText>()?;

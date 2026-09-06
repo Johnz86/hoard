@@ -1930,7 +1930,7 @@ async fn sources_scans_and_jobs_are_listed() {
     assert_eq!(sources.as_array().expect("sources").len(), 1);
     assert_eq!(sources[0]["kind"], "hf-cache");
     assert_eq!(sources[0]["path"], "/data/hub");
-    assert_eq!(sources[0]["pending_hashes"], 4);
+    assert_eq!(sources[0]["pending_hashes"], 0);
 
     let started = post(
         &world.state,

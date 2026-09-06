@@ -8,10 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use hoard_core::{JobId, SourceId, format_size};
 use hoard_index::IndexError;
-use hoard_index::catalog::{Catalog, JobProgress, JobRecord, JobState, RescanReport};
+use hoard_index::catalog::{Catalog, JobProgress, JobRecord, JobState, RescanReport, SourceRecord};
 use hoard_index::config::HashPolicy;
 use hoard_index::scan::ScanOptions;
-use hoard_index::store::{blob, node, source};
 
 use crate::api::common::{authorize, blocking};
 use crate::error::{ApiError, ApiResult};
@@ -20,6 +19,10 @@ use crate::state::AppState;
 const SCAN_KIND: &str = hoard_index::scan::SCAN_JOB;
 
 /// One nominated root and what the last scan of it counted.
+///
+/// Sources carry no identity of their own in the catalog yet, so `id` is the source's
+/// one-based position in this listing, which is also how a scan request naming an id is
+/// read back. `blobs` and `pending_hashes` read zero because the catalog does not hash.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SourceView {
     pub id: SourceId,
@@ -67,30 +70,34 @@ pub struct JobFilter {
 }
 
 pub async fn sources(State(state): State<AppState>) -> ApiResult<Json<Vec<SourceView>>> {
-    let rows = state
-        .store()
-        .call(|conn| {
-            let pending = blob::pending_hash_count(conn)?;
-            let mut out = Vec::new();
-            for record in source::list_sources(conn)? {
-                out.push(SourceView {
-                    id: record.id,
-                    name: record.name,
-                    path: record.path.to_string_lossy().into_owned(),
-                    kind: record.kind.as_str().to_owned(),
-                    node: node::node(conn, record.node_row)?.name,
-                    files: record.file_count,
-                    blobs: record.blob_count,
-                    bytes: record.byte_count,
-                    bytes_human: format_size(record.byte_count),
-                    last_scan: record.last_scan,
-                    pending_hashes: pending,
-                });
-            }
-            Ok(out)
-        })
-        .await?;
-    Ok(Json(rows))
+    Ok(Json(source_views(&state).await?))
+}
+
+async fn source_views(state: &AppState) -> ApiResult<Vec<SourceView>> {
+    let catalog = Arc::clone(state.catalog());
+    let records = blocking(move || catalog.sources()).await?;
+    let node = state.node_name();
+    Ok(records
+        .into_iter()
+        .enumerate()
+        .map(|(position, record)| source_view(position, record, node))
+        .collect())
+}
+
+fn source_view(position: usize, record: SourceRecord, node: &str) -> SourceView {
+    SourceView {
+        id: SourceId::new(position as i64 + 1),
+        name: record.name,
+        path: record.path.to_string_lossy().into_owned(),
+        kind: record.kind.as_str().to_owned(),
+        node: node.to_owned(),
+        files: record.file_count,
+        blobs: 0,
+        bytes: record.byte_count,
+        bytes_human: format_size(record.byte_count),
+        last_scan: record.last_scan,
+        pending_hashes: 0,
+    }
 }
 
 /// Starts a scan and answers with the job it runs under.
@@ -208,19 +215,12 @@ async fn resolve_source(state: &AppState, wanted: &str) -> ApiResult<String> {
     if state.config().index.source(wanted).is_some() {
         return Ok(wanted.to_owned());
     }
-    let probe = wanted.to_owned();
-    let stored = state
-        .store()
-        .call(move |conn| {
-            Ok(source::list_sources(conn)?.into_iter().find(|record| {
-                record.name == probe
-                    || record.id.to_string() == probe
-                    || record.path.to_string_lossy() == probe
-            }))
-        })
-        .await?;
+    let stored = source_views(state)
+        .await?
+        .into_iter()
+        .find(|view| view.name == wanted || view.id.to_string() == wanted || view.path == wanted);
     stored
-        .map(|record| record.name)
+        .map(|view| view.name)
         .filter(|name| state.config().index.source(name).is_some())
         .ok_or_else(|| ApiError::not_found(format!("source {wanted}")))
 }

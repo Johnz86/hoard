@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use native_db::transaction::RTransaction;
 use serde::Serialize;
@@ -13,6 +14,7 @@ use crate::config::{IndexConfig, SourceKind};
 use crate::error::{IndexError, Result};
 use crate::search::{SortKey, SortSpec};
 use crate::store::SearchRow;
+use crate::store::convert::parse_opt_timestamp;
 use crate::store::revision::RefKind;
 use crate::triage::{TriageHeader, header_facts};
 
@@ -97,6 +99,33 @@ pub struct RepositoryPage {
     pub total: u64,
 }
 
+/// A nominated root and what the last scan of it counted. The counts are of the files the
+/// scan found on this disk; a path it no longer reaches is not counted.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SourceRecord {
+    pub name: String,
+    pub path: PathBuf,
+    pub kind: SourceKind,
+    pub file_count: u64,
+    pub byte_count: u64,
+    pub last_scan: Option<jiff::Timestamp>,
+}
+
+impl TryFrom<Source> for SourceRecord {
+    type Error = IndexError;
+
+    fn try_from(stored: Source) -> Result<Self> {
+        Ok(Self {
+            name: stored.name,
+            path: stored.config.path,
+            kind: stored.resolved_kind,
+            file_count: stored.file_count,
+            byte_count: stored.byte_count,
+            last_scan: parse_opt_timestamp(stored.last_scan)?,
+        })
+    }
+}
+
 /// One row of the triage queue: the artifact as the table shows it, the guess inference
 /// recorded, and the header that produced the guess.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -109,6 +138,17 @@ pub struct TriageItem {
 }
 
 impl Catalog {
+    /// Every nominated root this catalog holds, ordered by name.
+    pub fn sources(&self) -> Result<Vec<SourceRecord>> {
+        let read = self.database.r_transaction()?;
+        let rows: Vec<Source> = read
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
+        rows.into_iter().map(SourceRecord::try_from).collect()
+    }
+
     /// The artifact's preferred entry as a row: the highest availability preference, and on
     /// a tie the lowest entry id, which is what the search index also collapses to.
     pub fn artifact_row(&self, id: ArtifactId) -> Result<Option<SearchRow>> {

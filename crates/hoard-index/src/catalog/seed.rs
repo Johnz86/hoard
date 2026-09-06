@@ -163,12 +163,11 @@ impl Seeding<'_, '_> {
         Ok(())
     }
 
+    /// The source this repository sits under, with the files and bytes it seeds counted
+    /// into it the way a walk would.
     fn source(&mut self, seed: &SeedRepository) -> Result<()> {
         let stored: Option<Source> = self.transaction.get().primary(seed.source.clone())?;
-        if stored.is_some() {
-            return Ok(());
-        }
-        self.transaction.insert(Source {
+        let source = stored.unwrap_or_else(|| Source {
             name: seed.source.clone(),
             config: SourceConfig {
                 name: seed.source.clone(),
@@ -180,6 +179,26 @@ impl Seeding<'_, '_> {
                 repo_per_folder: false,
             },
             resolved_kind: seed.kind,
+            file_count: 0,
+            byte_count: 0,
+            last_scan: None,
+        });
+        let present = seed
+            .revisions
+            .iter()
+            .flat_map(|revision| revision.entries.iter())
+            .filter(|entry| entry.state != State::Remote);
+        let mut file_count = source.file_count;
+        let mut byte_count = source.byte_count;
+        for entry in present {
+            file_count += 1;
+            byte_count = byte_count.saturating_add(entry.size);
+        }
+        self.transaction.upsert(Source {
+            file_count,
+            byte_count,
+            last_scan: Some(SEEDED_AT.to_owned()),
+            ..source
         })?;
         Ok(())
     }

@@ -160,6 +160,9 @@ of the shallowest README in each revision.
 - Shelves (with the six builtin ones seeded on open), settings, the noise list, projections
   and the usage log are catalog records; the scan honours noise; the Hub logs every served
   response and the `used:` token and the last-used column read the log.
+- Loadouts, jobs and sources are catalog records: pins resolve through the catalog, every job
+  writer records natively, and a source carries the counts of its last scan. Hashing is not
+  native yet, so pending hashes read zero.
 - The artifact sweep keeps the totals the stats route prints in its summary record, which is
   at model version 2; version 1 rows are migrated on open.
 - A `fixtures` feature exposes `Catalog::seed`, which writes repositories, entries,
@@ -174,7 +177,8 @@ of the shallowest README in each revision.
   applied. A rescan followed by a refresh updates search without a rebuild.
 - Artifact identities are 128-bit hashes of the identity text, so the unique index holds
   fixed-width keys.
-- The manifest is at model version 2 and version 1 rows are migrated on open.
+- The manifest is at model version 2 and a source at version 2; version 1 rows of both are
+  migrated on open.
 - CLI operations run on blocking threads and report scan/index progress with indicatif.
 
 ## Search document shape
@@ -374,9 +378,9 @@ than a correctness one.
 
 ## Remaining replacement work
 
-- Move what is still on SQLite to the catalog: loadouts, jobs and sources, nodes and peers,
-  the Hub and git faces' own lookups other than usage attribution, the mirror's ingest and
-  served state, gossip and `hoard doctor`; then remove SQLite.
+- Move what is still on SQLite to the catalog: the SQLite scan and its hashing, the Hub and
+  git faces' own lookups, the mirror's ingest and served state, nodes, peers and gossip, and
+  `hoard doctor`'s node check; then remove SQLite.
 - Convert the existing Store/Connection API and live scanner, mirror, cache eviction,
   gossip, watch and CLI callers to native transactions.
 - Path identities hash the text to_string_lossy renders; discovery currently never yields
@@ -390,7 +394,7 @@ than a correctness one.
 - Shrink the per-entry record further: revision, repository, source and absolute path are
   written out per entry, which is what the 1M catalog is mostly made of. Intern them per
   revision and reference them by id.
-- Implement loadouts, jobs, peer cursors and the associated graph constraints/cascades.
+- Implement peer cursors and the associated graph constraints/cascades.
 - Preserve complete repository Git metadata and add stable cross-scan identities.
 - Add full hash scheduling, progressive identities and content deduplication.
 - Port the missing-file policies from the existing scan pipeline.

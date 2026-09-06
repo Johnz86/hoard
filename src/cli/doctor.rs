@@ -4,7 +4,6 @@ use anyhow::Result;
 
 use hoard_core::format_size;
 use hoard_index::store::node::list_nodes;
-use hoard_index::store::source::list_sources;
 
 use super::node::Context;
 
@@ -33,7 +32,11 @@ impl Check {
 }
 
 pub async fn run(context: Context) -> Result<()> {
-    let Context { config, store, .. } = context;
+    let Context {
+        config,
+        store,
+        catalog,
+    } = context;
     let mut checks = Vec::new();
 
     checks.push(git_binary());
@@ -50,7 +53,7 @@ pub async fn run(context: Context) -> Result<()> {
         format!("{} known", nodes.len().saturating_sub(1)),
     ));
 
-    let sources = store.call(list_sources).await?;
+    let sources = tokio::task::spawn_blocking(move || catalog.sources()).await??;
     if config.index.sources.is_empty() {
         checks.push(Check::fail(
             "sources",
@@ -58,7 +61,7 @@ pub async fn run(context: Context) -> Result<()> {
         ));
     }
     for source in &config.index.sources {
-        let indexed = sources.iter().find(|row| row.name == source.name);
+        let indexed = sources.iter().find(|record| record.name == source.name);
         checks.push(if !source.path.exists() {
             Check::fail(
                 "source",
@@ -70,16 +73,16 @@ pub async fn run(context: Context) -> Result<()> {
             )
         } else {
             match indexed {
-                Some(row) => Check::pass(
+                Some(record) if record.last_scan.is_some() => Check::pass(
                     "source",
                     format!(
                         "{} {} files, {}",
                         source.name,
-                        row.file_count,
-                        format_size(row.byte_count)
+                        record.file_count,
+                        format_size(record.byte_count)
                     ),
                 ),
-                None => Check::pass("source", format!("{} not scanned yet", source.name)),
+                Some(_) | None => Check::pass("source", format!("{} not scanned yet", source.name)),
             }
         });
     }

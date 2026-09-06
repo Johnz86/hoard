@@ -140,6 +140,14 @@ hoard/
           models.rs          native_model records: Source, Repository, ArtifactRecord, Entry, SearchEntry, SearchText, Manifest
           scan.rs            discovery -> sniff -> infer -> one transaction per source
           search.rs          Tantivy schema, rebuild, per-entry documents collapsed per artifact
+          read.rs            inspector, repository screens, triage queue, sources
+          query.rs           the grammar compiled against the Tantivy index
+          userdata.rs        shelves, settings, the noise list, projections
+          usage.rs           the served-response log and per-artifact use counts
+          verdict.rs         a user's override of what an artifact is
+          loadouts.rs        loadout documents and pin resolution
+          jobs.rs            scan, apply and pull job rows
+          seed.rs            synthetic records for tests, behind `fixtures`
         search/
           grammar.rs         winnow parser
           token.rs           token kinds and the parsed strip
@@ -243,8 +251,11 @@ GET /api/v1/search?q=... -> Catalog::list_shelves -> Catalog::compile_context
 compat, pull command, override and blob views, the repository list, detail, files, card and
 compat, the triage queue with its confirm and reject, the shelves and settings routes, the
 noise list a rejection writes, the projections `hoard link` and `hoard apply` record, and
-the usage the Hub logs and the USAGE tab reads. Loadouts, sources and jobs, nodes and peers,
-the Hub and git faces' own lookups, the mirror's ingest and gossip still read SQLite.
+the usage the Hub logs and the USAGE tab reads, the loadouts every loadout route and
+`hoard loadout` store and resolve, every job a scan, apply or pull runs under, and the
+sources listing with the counts its last scan wrote. The SQLite scan and its hashing, nodes
+and peers, the Hub and git faces' own lookups, the mirror's ingest and gossip still read
+SQLite.
 
 Nodes:
 
@@ -257,14 +268,15 @@ mDNS _hoard._tcp -> peers table -> periodic GET /api/v1/peers/digest?since=curso
 ## Storage
 
 - Index: `<data-dir>/hoard.db` (SQLite WAL), recreatable from disk plus peers. What is left
-  in it: loadouts, sources and jobs, nodes and peers, and the rows the Hub and git faces,
-  the mirror's ingest and gossip still read.
+  in it: nodes and peers, and the rows the SQLite scan, the Hub and git faces, the mirror's
+  ingest and gossip still read.
 - Native catalog: `<data-dir>/native/`, holding `catalog.redb` plus `search-v1-<nanos>/`
   Tantivy directories. Beside the scanned sources, repositories, artifacts, entries and
   search text it holds the user data those screens read: shelves (the six builtin ones
   seeded on every open), the shell's settings, the noise list a rejection writes and the
-  scan walks past, the projections a link records, and the usage log every served response
-  appends to with the per-artifact use count `used:` and the last-used column read. Every
+  scan walks past, the projections a link records, the usage log every served response
+  appends to with the per-artifact use count `used:` and the last-used column read, the
+  loadout documents the drawer edits, and the job rows a scan, apply or pull writes. Every
   command that opens the index opens or creates it there, and `hoard scan` and the
   `/api/v1/scan` job rescan and refresh it after the SQLite scan; the server holds it as
   shared state. `hoard catalog` still takes any directory with `--directory`.

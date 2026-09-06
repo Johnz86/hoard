@@ -24,13 +24,13 @@ use crate::config::IndexConfig;
 use crate::error::{IndexError, Result};
 use crate::store::DiskPressure;
 
-use self::models::{ArtifactRecord, Manifest, Repository, Summary, define_models};
+use self::models::{ArtifactRecord, Manifest, Repository, Source, Summary, define_models};
 
 pub use self::jobs::JobRecord;
 pub use self::loadouts::LoadoutRecord;
 pub use self::read::{
     ArtifactDetailView, EntryDetail, RefDetail, RepositoryDetail, RepositoryFilter, RepositoryPage,
-    RevisionDetail, TriageItem,
+    RevisionDetail, SourceRecord, TriageItem,
 };
 pub use self::scan::RescanReport;
 pub use self::search::{QueryPage, QueryRequest};
@@ -116,6 +116,7 @@ impl Catalog {
         transaction.migrate::<Summary>()?;
         transaction.migrate::<Repository>()?;
         transaction.migrate::<ArtifactRecord>()?;
+        transaction.migrate::<Source>()?;
         transaction.commit()?;
         let catalog = Self {
             database,

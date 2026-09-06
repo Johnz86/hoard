@@ -20,7 +20,7 @@ use crate::store::revision::RefKind;
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, ArtifactRecordV1, Entry, EntryKey, Manifest,
     ManifestV1, Override, Ref, Repository, RepositoryKey, RepositoryV1, Revision, RevisionV1,
-    SearchChange, SearchText, Source, Summary, SummaryV1,
+    SearchChange, SearchText, Source, SourceV1, Summary, SummaryV1,
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
@@ -1973,6 +1973,30 @@ fn totals_follow_the_sweep() -> Result<()> {
 }
 
 #[test]
+fn a_source_remembers_what_its_last_scan_found() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let catalog = Catalog::scan_sources(&directory.path().join("native"), "n", &config, |_, _| {})?;
+    let sources = catalog.sources()?;
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0].file_count, 2);
+    assert_eq!(
+        sources[0].byte_count,
+        fs::metadata(input.join("loras/keep.safetensors"))?.len()
+            + fs::metadata(input.join("loras/gone.safetensors"))?.len()
+    );
+    assert!(sources[0].last_scan.is_some());
+    fs::remove_file(input.join("loras/gone.safetensors"))?;
+    catalog.rescan(&config, |_, _| {})?;
+    assert_eq!(
+        catalog.sources()?[0].file_count,
+        1,
+        "absent rows are not counted"
+    );
+    Ok(())
+}
+
+#[test]
 fn an_unchanged_rescan_reads_no_headers_and_a_deleted_file_is_marked_absent() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
@@ -2152,6 +2176,20 @@ fn frozen_artifact() -> Artifact {
 #[test]
 fn source_encoding_is_frozen() -> Result<()> {
     let value = Source {
+        name: "frozen".to_owned(),
+        config: frozen_source_config(),
+        resolved_kind: SourceKind::Git,
+        file_count: 12,
+        byte_count: 4096,
+        last_scan: Some("2026-09-04T09:10:00Z".to_owned()),
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn source_v1_encoding_is_frozen() -> Result<()> {
+    let value = SourceV1 {
         name: "frozen".to_owned(),
         config: frozen_source_config(),
         resolved_kind: SourceKind::Git,
