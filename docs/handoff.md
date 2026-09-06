@@ -25,8 +25,8 @@ first; this document assumes it.
 - Phases 0 to 11 are done. `docs/feature-plan.md` holds the table. The TREE and DISK views
   are not an unfinished phase: they wait on a design decision and are recorded under that
   document's "Risks and open decisions".
-- At the head of `master` after the query-bounds wave all four checks pass:
-  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 823 passed,
+- At the head of `master` after the scan-correctness wave all four checks pass:
+  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 833 passed,
   0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness
   and its supplemental fixture, the mDNS test that needs a multicast route and the sniffer
   test that reads the local model caches. `cargo doc --workspace --no-deps` emits no warning.
@@ -152,6 +152,12 @@ Performance, with the numbers from `docs/native-catalog.md`:
   documents one run in one segment, so tantivy's 10,000-item pipeline now buffers 10,000
   artifacts' documents rather than 10,000 documents; the synthetic tree cannot show it, and
   wave 8 should read the rebuild RSS row knowing it.
+- **A revision the walk no longer finds keeps its slot forever.** An entry names its
+  revision by ordinal, so the slot is an identity and cannot be reclaimed while any entry
+  names it. A repository whose branch moves on every scan grows one stored revision per old
+  head, each carrying its title, author and commit but no refs. Reclaiming a slot needs the
+  entries of a retired revision removed rather than marked absent, which is the same decision
+  as pruning a deleted path's row; neither is taken.
 - **The usage views are O(rows of the repository).** The client count the USAGE tab shows is
   a claim about every pull the repository ever served, so bounding the chart alone would not
   bound the route: 20,000 rows cost 9.1 ms. It needs a maintained count, not a bound.
@@ -202,6 +208,21 @@ Decisions taken on 2026-09-06, by the project owner:
   `can_scan` alone and labels the rest; no source name appears in JavaScript, and the backend
   still answers 404 for a scan of a source it does not walk.
   **Done in this wave.**
+- **A source dropped from the configuration is deleted by the next full rescan.** Taken by
+  default in wave 5a, as the question wave 1 raised. `Catalog::rescan` now takes a
+  `RescanScope`: `Configured` says the config it was handed is the whole configuration, so a
+  stored source row outside it has been dropped; `Narrowed` says the caller chose a subset
+  and retires nothing. A dropped source's entries, repositories and the artifacts that lose
+  their last path are deleted, moving the derived counts through `DerivedShift` and logging
+  each artifact through `log_changes`. They are deleted rather than left as `Remote` rows
+  because a path of a dropped source is not a path this node stopped holding, it is a path
+  this catalog stopped being about: a repository row whose `Source` is gone is rendered by
+  `repositories()` under a default kind, is still counted by `Summary.repositories`, and
+  files every path a second time if the source is ever re-added. The mirror, pull and peer
+  source rows are never a scan's to retire, and a source whose root is merely unmounted
+  stays, because the configuration still names it. The effect on "Managed sources stay
+  visible" is that `managed_by: "nobody"` is now the state of a dropped source between the
+  drop and the next full rescan rather than a permanent one. **Taken in wave 5a.**
 - **The triage queue stays local and actionable.** A peer-only artifact stays searchable as a
   remote artifact and does not enter this node's queue: local evidence decides local triage.
   **Already the behaviour; recorded, no code.**
@@ -231,11 +252,10 @@ Smaller things, each verified:
 
 `docs/native-catalog.md` under "Remaining work" holds the rest: a truncated record panicking
 inside `native_model` before any hoard codec runs, `sweep_artifact` decompressing a cold row
-only to hand it back to `remove` because native_db 0.8.2 has no remove-by-key, byte-exact
-path identities,
-`triage_queue` needing rather than tolerating a search index, skipping a rescan's document
-re-read when every stamp is unchanged, revision ordinals recomputed on every rescan, counting
-a revision's artifact units for content another revision already claimed, complete repository
-git metadata with stable cross-scan identities, a read-only redb open once one exists, and
-power-loss recovery tests. `docs/feature-plan.md` under `### Phase 11` names which of them
-carry acceptance criteria as follow-ups of that phase.
+only to hand it back to `remove` because native_db 0.8.2 has no remove-by-key,
+`triage_queue` needing rather than tolerating a search index, storing a path whose bytes are
+outside UTF-8 now that its identity is byte-exact, reclaiming the slot of a revision the walk
+no longer finds, complete repository git metadata with stable cross-scan identities, a
+read-only redb open once one exists, and power-loss recovery tests. `docs/feature-plan.md`
+under `### Phase 11` names which of them carry acceptance criteria as follow-ups of that
+phase.

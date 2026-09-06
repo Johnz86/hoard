@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 
 use hoard_core::JobId;
 
-use crate::catalog::{Catalog, JobProgress, RescanReport};
+use crate::catalog::{Catalog, JobProgress, RescanReport, RescanScope};
 use crate::config::{HashPolicy, IndexConfig};
 use crate::error::{IndexError, Result};
 
@@ -265,7 +265,11 @@ fn settle(catalog: &Catalog, config: &IndexConfig, item: &Queued) -> Result<Resc
 
 fn run_scan(catalog: &Catalog, config: &IndexConfig, item: &Queued) -> Result<RescanReport> {
     phase(catalog, item.job, "rescanning the sources")?;
-    let report = catalog.rescan(config, item.hash, |_, _| {})?;
+    let scope = match item.sources {
+        Some(_) => RescanScope::Narrowed,
+        None => RescanScope::Configured,
+    };
+    let report = catalog.rescan(config, item.hash, scope, |_, _| {})?;
     match item.hash {
         HashPolicy::Now | HashPolicy::Background => {
             phase(catalog, item.job, "hashing")?;

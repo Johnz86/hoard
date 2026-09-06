@@ -45,7 +45,7 @@ pub use self::read::{
     ArtifactDetailView, EntryDetail, RefDetail, RepositoryDetail, RepositoryFilter, RepositoryPage,
     RevisionDetail, SourceRecord, TriageItem,
 };
-pub use self::scan::RescanReport;
+pub use self::scan::{RescanReport, RescanScope};
 pub use self::search::{QueryPage, QueryRequest};
 #[cfg(any(test, feature = "fixtures"))]
 pub use self::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};

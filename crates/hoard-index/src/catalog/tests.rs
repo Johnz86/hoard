@@ -13,7 +13,7 @@ use hoard_core::{
 
 use crate::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
 
-use crate::discover::RefKind;
+use crate::discover::{DiscoveredEntry, RefKind};
 use crate::error::{IndexError, Result};
 use crate::row::SearchRow;
 use crate::search::{CompileContext, SortKey, SortSpec, parse};
@@ -22,13 +22,13 @@ use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, LocationKey,
     Manifest, Node, Placement, Repository, RepositoryKey, SearchChange, Shelf, Source,
 };
-use super::scan::preference;
+use super::scan::{Presence, identity, preference};
 use super::search::{Cost, Paging, QueryPath};
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::{
     Catalog, DigestApplied, EntryDetail, FORMAT_VERSION, JobProgress, JobState, MIRROR_SOURCE,
     NewProjection, PullMark, PulledFile, QueryPage, QueryRequest, RemoteEntry, RepositoryDetail,
-    RepositoryFilter, RescanReport, ServedFile, UsageEvent, builder, models, query,
+    RepositoryFilter, RescanReport, RescanScope, ServedFile, UsageEvent, builder, models, query,
 };
 
 fn running_as_root() -> bool {
@@ -267,7 +267,7 @@ fn native_secondary_indexes_update_and_abort_atomically() -> Result<()> {
 }
 
 #[test]
-fn an_identity_is_a_hash_of_its_text_and_two_copies_share_it() -> Result<()> {
+fn an_identity_is_a_hash_of_the_paths_bytes_and_two_copies_share_it() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("files");
     fs::create_dir_all(input.join("a"))?;
@@ -291,13 +291,63 @@ fn an_identity_is_a_hash_of_its_text_and_two_copies_share_it() -> Result<()> {
     let read = catalog.database.r_transaction()?;
     assert_eq!(read.len().primary::<ArtifactRecord>()?, 1);
     let canonical = input.join("a/one.csv").canonicalize()?;
-    let expected = xxhash_rust::xxh3::xxh3_128(format!("path:{}", canonical.display()).as_bytes());
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    hasher.update(b"path:");
+    hasher.update(canonical.as_os_str().as_encoded_bytes());
     let found: Option<ArtifactRecord> = read
         .get()
-        .secondary(ArtifactRecordKey::identity, expected)?;
+        .secondary(ArtifactRecordKey::identity, hasher.digest128())?;
     assert!(
         found.is_some(),
-        "the identity is the xxh3-128 of the canonical path text"
+        "the identity is the xxh3-128 of the canonical path's bytes"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn two_paths_that_differ_only_in_invalid_utf8_have_distinct_identities() -> Result<()> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory = tempfile::tempdir()?;
+    let paths: Vec<PathBuf> = [
+        b"weights_\xfe.safetensors".as_slice(),
+        b"weights_\xff.safetensors".as_slice(),
+    ]
+    .iter()
+    .map(|name| directory.path().join(OsStr::from_bytes(name)))
+    .collect();
+    assert_eq!(
+        paths[0].to_string_lossy(),
+        paths[1].to_string_lossy(),
+        "the two names must be the pair a lossy rendering folds together"
+    );
+    for path in &paths {
+        fs::write(path, lora_header())?;
+    }
+
+    let identities: Vec<u128> = paths
+        .iter()
+        .map(|path| {
+            let entry = DiscoveredEntry {
+                rel_path: "weights.safetensors".to_owned(),
+                abs_path: Some(path.clone()),
+                size: 0,
+                stamp: None,
+                is_symlink: false,
+                sha256: None,
+                git_sha1: None,
+                lfs_pointer: false,
+            };
+            let presence = Presence::of(&entry, None);
+            identity(&entry, &presence)
+        })
+        .collect::<Result<_>>()?;
+
+    assert_ne!(
+        identities[0], identities[1],
+        "two paths no text can tell apart are still two files"
     );
     Ok(())
 }
@@ -343,7 +393,12 @@ fn exactly_one_document_per_artifact_is_primary_and_it_is_the_preferred_entry() 
         .write(true)
         .open(&solo)?
         .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     assert!(catalog.pending_changes()? > 0, "the rewrite is logged");
     catalog.refresh_search(|_| {})?;
     assert_eq!(
@@ -384,7 +439,12 @@ fn an_override_rewrites_the_artifact_reaches_search_and_survives_a_rescan() -> R
         .write(true)
         .open(&touched)?
         .set_modified(later)?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     catalog.refresh_search(|_| {})?;
     let after = search(&catalog, "role:ctrl")?;
     assert!(
@@ -986,6 +1046,369 @@ fn hf_cache_rows_match_the_legacy_shape() -> Result<()> {
     Ok(())
 }
 
+const STYLER: &str = "models--acme--styler";
+
+fn hub_config(hub: &Path) -> IndexConfig {
+    IndexConfig {
+        sources: vec![SourceConfig {
+            kind: SourceKind::HfCache,
+            ..source(hub, "hub")
+        }],
+        ..IndexConfig::default()
+    }
+}
+
+fn snapshot(hub: &Path, sha: CommitSha, rel_path: &str, tensor: &str) {
+    crate::discover::hf_cache::fixture::write_repo(
+        hub,
+        STYLER,
+        &sha.to_hex(),
+        &[(rel_path, &lora_header_named(tensor))],
+    );
+}
+
+fn paths_of_revision(
+    catalog: &Catalog,
+    repo: &RepositoryDetail,
+    ordinal: u32,
+) -> Result<Vec<String>> {
+    Ok(catalog
+        .revision_entries(repo.id, ordinal)?
+        .into_iter()
+        .map(|entry| entry.rel_path)
+        .collect())
+}
+
+#[test]
+fn a_reordered_source_keeps_every_entry_on_its_revision() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let held = CommitSha::from_bytes([0xcc; 20]);
+    let ahead = CommitSha::from_bytes([0xbb; 20]);
+    snapshot(&hub, held, "adapter.safetensors", "down");
+    fs::write(hub.join(STYLER).join("refs/dev"), ahead.to_hex())?;
+    let config = hub_config(&hub);
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let before = only_repository(&catalog)?;
+    assert_eq!(
+        before.revisions.len(),
+        2,
+        "the ref names a revision of its own"
+    );
+    assert_eq!(before.revisions[0].sha, Some(held));
+    assert_eq!(
+        paths_of_revision(&catalog, &before, 0)?,
+        ["adapter.safetensors"]
+    );
+
+    snapshot(&hub, ahead, "other.safetensors", "up");
+    fs::write(hub.join(STYLER).join("refs/main"), held.to_hex())?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+
+    let after = only_repository(&catalog)?;
+    assert_eq!(
+        after.revisions.len(),
+        2,
+        "a revision rediscovered in another position is not a second revision"
+    );
+    assert_eq!(
+        after.revisions[0].sha,
+        Some(held),
+        "the stored revision keeps its ordinal though discovery now lists it second"
+    );
+    assert_eq!(after.revisions[1].sha, Some(ahead));
+    assert_eq!(
+        paths_of_revision(&catalog, &after, 0)?,
+        ["adapter.safetensors"]
+    );
+    assert_eq!(
+        paths_of_revision(&catalog, &after, 1)?,
+        ["other.safetensors"]
+    );
+    let main = catalog
+        .resolve_revision(&after, "main")
+        .ok_or_else(|| IndexError::Catalog("main".into()))?;
+    assert_eq!(main.ordinal, 0);
+    Ok(())
+}
+
+#[test]
+fn a_new_revision_is_appended_and_a_vanished_one_keeps_its_slot() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let kept = CommitSha::from_bytes([0xbb; 20]);
+    let gone = CommitSha::from_bytes([0xcc; 20]);
+    let fresh = CommitSha::from_bytes([0xaa; 20]);
+    snapshot(&hub, kept, "kept.safetensors", "one");
+    snapshot(&hub, gone, "gone.safetensors", "two");
+    let config = hub_config(&hub);
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let before = only_repository(&catalog)?;
+    assert_eq!(before.revisions.len(), 2);
+    assert_eq!(before.revisions[1].sha, Some(gone));
+
+    fs::remove_dir_all(hub.join(STYLER).join("snapshots").join(gone.to_hex()))?;
+    snapshot(&hub, fresh, "fresh.safetensors", "three");
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+
+    let after = only_repository(&catalog)?;
+    assert_eq!(after.revisions.len(), 3);
+    assert_eq!(
+        after
+            .revisions
+            .iter()
+            .map(|revision| revision.sha)
+            .collect::<Vec<_>>(),
+        [Some(kept), Some(gone), Some(fresh)],
+        "a rediscovered revision keeps its slot, a new one is appended"
+    );
+    assert_eq!(
+        paths_of_revision(&catalog, &after, 0)?,
+        ["kept.safetensors"]
+    );
+    assert_eq!(
+        paths_of_revision(&catalog, &after, 2)?,
+        ["fresh.safetensors"]
+    );
+    let vanished = catalog.revision_entries(after.id, 1)?;
+    assert_eq!(
+        vanished.len(),
+        1,
+        "the slot still holds the entries filed under it"
+    );
+    assert_eq!(vanished[0].state, State::Remote);
+    let main = catalog
+        .resolve_revision(&after, "main")
+        .ok_or_else(|| IndexError::Catalog("main".into()))?;
+    assert_eq!(
+        main.ordinal, 2,
+        "a revision no ref reaches gives up the name that moved"
+    );
+    Ok(())
+}
+
+/// A revision holding a weight and the two documents that describe it.
+fn documented_revision(root: &Path) -> Result<IndexConfig> {
+    let input = root.join("files");
+    fs::create_dir(&input)?;
+    fs::write(
+        input.join("README.md"),
+        "---\ninstance_prompt: acme style\n---\nA style LoRA.\n",
+    )?;
+    fs::write(
+        input.join("config.json"),
+        "{\"architectures\":[\"UNet2DConditionModel\"]}",
+    )?;
+    fs::write(input.join("adapter.safetensors"), lora_header())?;
+    Ok(IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    })
+}
+
+#[test]
+#[cfg(unix)]
+fn an_unchanged_revision_is_rescanned_without_opening_its_documents() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir()?;
+    let config = documented_revision(directory.path())?;
+    let input = directory.path().join("files");
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+
+    for document in ["README.md", "config.json"] {
+        fs::set_permissions(input.join(document), fs::Permissions::from_mode(0o000))?;
+    }
+    let report = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    for document in ["README.md", "config.json"] {
+        fs::set_permissions(input.join(document), fs::Permissions::from_mode(0o600))?;
+    }
+
+    assert_eq!(
+        report,
+        RescanReport {
+            unchanged: 3,
+            changed: 0,
+            added: 0,
+            absent: 0,
+        },
+        "a revision no file changed in is settled before anything in it is opened"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_changed_weight_still_reads_the_revision_documents() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = documented_revision(directory.path())?;
+    let input = directory.path().join("files");
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    fs::write(
+        input.join("adapter.safetensors"),
+        lora_header_named("mid_block"),
+    )?;
+    let report = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    assert_eq!(report.changed, 1, "the rewritten weight is prepared again");
+
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "")?;
+    let adapter = rows
+        .rows
+        .iter()
+        .find(|row| row.path == "adapter.safetensors")
+        .ok_or_else(|| IndexError::Catalog("adapter".into()))?;
+    assert_eq!(
+        adapter.trigger.as_deref(),
+        Some("acme style"),
+        "the revision's README described the weight the walk read again"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_source_dropped_from_the_configuration_is_retired_by_the_next_full_rescan() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let kept = directory.path().join("kept");
+    let dropped = directory.path().join("dropped");
+    fs::create_dir(&kept)?;
+    fs::create_dir(&dropped)?;
+    fs::write(kept.join("kept.safetensors"), lora_header_named("kept"))?;
+    fs::write(
+        dropped.join("dropped.safetensors"),
+        lora_header_named("gone"),
+    )?;
+    let both = IndexConfig {
+        sources: vec![source(&kept, "kept"), source(&dropped, "dropped")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &both,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    catalog.rebuild_search(|_| {})?;
+    let before = catalog.totals()?;
+    assert_eq!(catalog.sources()?.len(), 2);
+    assert_eq!(before.present_artifacts, 2);
+
+    let only_kept = IndexConfig {
+        sources: vec![source(&kept, "kept")],
+        ..IndexConfig::default()
+    };
+    catalog.rescan(
+        &only_kept,
+        HashPolicy::Never,
+        RescanScope::Narrowed,
+        |_, _| {},
+    )?;
+    assert_eq!(
+        catalog.sources()?.len(),
+        2,
+        "a narrowed rescan retires nothing it was not asked to walk"
+    );
+
+    let report = catalog.rescan(
+        &only_kept,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    assert_eq!(report.absent, 1, "the dropped source's one path is retired");
+    let names: Vec<String> = catalog
+        .sources()?
+        .into_iter()
+        .map(|record| record.name)
+        .collect();
+    assert_eq!(names, ["kept"], "the dropped source row is gone");
+
+    let read = catalog.database.r_transaction()?;
+    let entries: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.rel_path.as_str())
+            .collect::<Vec<_>>(),
+        ["kept.safetensors"],
+        "the retired source's rows go with it"
+    );
+    assert_eq!(
+        read.len().primary::<Repository>()?,
+        1,
+        "a repository outlives no source"
+    );
+    assert_eq!(
+        read.len().primary::<ArtifactRecord>()?,
+        1,
+        "the artifact that lost its last path is swept"
+    );
+    drop(read);
+
+    let after = catalog.totals()?;
+    assert_eq!(
+        after.present_artifacts, 1,
+        "the totals follow the paths that are still present"
+    );
+    assert_eq!(after.artifacts, 1);
+
+    catalog.refresh_search(|_| {})?;
+    let rows = search(&catalog, "state:local")?;
+    let paths: Vec<&str> = rows.rows.iter().map(|row| row.path.as_str()).collect();
+    assert_eq!(paths, ["kept.safetensors"]);
+    Ok(())
+}
+
 #[test]
 fn a_revisions_own_readme_and_config_reach_inference() -> Result<()> {
     let directory = tempfile::tempdir()?;
@@ -1566,7 +1989,12 @@ fn disk_pressure_is_summarised_after_every_sweep() -> Result<()> {
         fs::metadata(input.join("a/one.csv"))?.len()
     );
     fs::remove_file(input.join("b/two.csv"))?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     let after = catalog.disk_pressure()?;
     assert_eq!(after.reclaimable_bytes, 0);
     assert_eq!(after.duplicate_blobs, 0);
@@ -2504,7 +2932,12 @@ fn a_rescan_leaves_the_mirror_source_alone() -> Result<()> {
         git_sha1: None,
         cache_root: directory.path().join("repos"),
     })?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     let detail = catalog
         .repository(&repo)?
         .ok_or_else(|| IndexError::Catalog("repo".into()))?;
@@ -2590,6 +3023,146 @@ fn a_git_clone_keeps_its_git_dir_and_commit_metadata() -> Result<()> {
 }
 
 #[test]
+fn a_clone_whose_branch_advanced_keeps_its_unchanged_files_on_the_branch() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = git_fixture(directory.path())?;
+    let clone = input.join("org").join("clone");
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let repo = RepoId::parse_ref(RepoType::Models, "org/clone")?;
+    assert_eq!(
+        paths_of_ref(&catalog, &repo, "main")?,
+        ["README.md"],
+        "the first commit holds the file"
+    );
+
+    fs::write(clone.join("NOTES.md"), "# notes\n")?;
+    git(&clone, &["add", "."]);
+    git(&clone, &["commit", "-m", "second import", "--quiet"]);
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+
+    let detail = repository_of(&catalog, &repo)?;
+    assert_eq!(
+        detail.revisions.len(),
+        2,
+        "the branch's old head keeps its slot"
+    );
+    let mut listed = paths_of_ref(&catalog, &repo, "main")?;
+    listed.sort();
+    assert_eq!(
+        listed,
+        ["NOTES.md", "README.md"],
+        "a file the second commit did not touch is still filed under the branch"
+    );
+    Ok(())
+}
+
+fn paths_of_ref(catalog: &Catalog, repo: &RepoId, wanted: &str) -> Result<Vec<String>> {
+    let detail = repository_of(catalog, repo)?;
+    let revision = catalog
+        .resolve_revision(&detail, wanted)
+        .ok_or_else(|| IndexError::Catalog(format!("no revision {wanted}")))?;
+    Ok(catalog
+        .revision_entries(detail.id, revision.ordinal)?
+        .into_iter()
+        .map(|entry| entry.rel_path)
+        .collect())
+}
+
+#[test]
+fn a_revision_that_lost_a_shard_is_prepared_again_though_its_survivors_are_unchanged() -> Result<()>
+{
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let shards = llm_shards();
+    hf_cache_repo(
+        &hub,
+        "Qwen",
+        "Qwen3-Thirds",
+        &[
+            ("model-00001-of-00003.safetensors", shards[0].clone()),
+            ("model-00002-of-00003.safetensors", shards[1].clone()),
+            ("model-00003-of-00003.safetensors", shards[2].clone()),
+        ],
+    )?;
+    let config = IndexConfig {
+        sources: vec![SourceConfig {
+            kind: SourceKind::HfCache,
+            ..source(&hub, "hub")
+        }],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let whole = only_artifact(&catalog)?;
+    assert_eq!(whole.shard_count, Some(3));
+
+    let snapshot = hub
+        .join("models--Qwen--Qwen3-Thirds")
+        .join("snapshots")
+        .join("b".repeat(40));
+    fs::remove_file(snapshot.join("model-00003-of-00003.safetensors"))?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+
+    let short = only_artifact(&catalog)?;
+    assert_eq!(
+        short.shard_count,
+        Some(2),
+        "a set that lost a member is a different model from the one on record"
+    );
+    let read = catalog.database.r_transaction()?;
+    let entries: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert!(
+        entries
+            .iter()
+            .filter(|entry| entry.state != State::Remote)
+            .all(|entry| entry.triage),
+        "an incomplete set is triage"
+    );
+    Ok(())
+}
+
+fn only_artifact(catalog: &Catalog) -> Result<ArtifactRecord> {
+    let read = catalog.database.r_transaction()?;
+    let mut records: Vec<ArtifactRecord> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    match records.len() {
+        1 => records
+            .pop()
+            .ok_or_else(|| IndexError::Catalog("record".into())),
+        found => Err(IndexError::Catalog(format!("{found} artifacts"))),
+    }
+}
+
+#[test]
 fn repository_counts_follow_every_writer() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
@@ -2608,7 +3181,12 @@ fn repository_counts_follow_every_writer() -> Result<()> {
     let kept_bytes = fs::metadata(input.join("loras/keep.safetensors"))?.len();
 
     fs::remove_file(input.join("loras/gone.safetensors"))?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     let rescanned = only_repository(&catalog)?;
     assert_eq!(rescanned.present_files, 1, "an absent path holds no bytes");
     assert_eq!(rescanned.present_bytes, kept_bytes);
@@ -2870,11 +3448,21 @@ fn the_summary_is_exact_after_incremental_passes() -> Result<()> {
     exact("a retraction")?;
 
     fs::remove_file(input.join("w0.safetensors"))?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     exact("a rescan that dropped a path")?;
 
     let before = catalog.totals()?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     assert_eq!(
         catalog.totals()?,
         before,
@@ -4059,7 +4647,12 @@ fn prepared_scan_units_validate_files_before_storing() -> Result<()> {
     let mut longer = lora_header_named("second");
     longer.extend_from_slice(&[0; 128]);
     fs::write(&weight, &longer)?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     let second = catalog
         .revision_entry(repo.id, 0, "w.safetensors")?
         .ok_or_else(|| IndexError::Catalog("the rescanned entry".into()))?;
@@ -4111,7 +4704,12 @@ fn new_and_existing_artifacts_keep_counts_and_search_changes() -> Result<()> {
     let fresh = search(&catalog, "")?.total;
     assert_eq!(fresh, 3, "three fresh artifacts, none shares an identity");
 
-    let unchanged = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    let unchanged = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     assert_eq!(unchanged.changed, 0, "nothing changed: {unchanged:?}");
     assert_eq!(unchanged.added, 0);
     assert_eq!(unchanged.absent, 0);
@@ -4125,7 +4723,12 @@ fn new_and_existing_artifacts_keep_counts_and_search_changes() -> Result<()> {
     fs::write(input.join("a.safetensors"), lora_header_named("changed"))?;
     fs::write(input.join("c.safetensors"), lora_header_named("c"))?;
     fs::remove_file(input.join("b-copy.safetensors"))?;
-    let moved = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    let moved = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     assert_eq!(moved.changed, 1, "a rewritten file: {moved:?}");
     assert_eq!(moved.added, 1, "a new file: {moved:?}");
     assert_eq!(moved.absent, 1, "a removed file: {moved:?}");
@@ -4207,7 +4810,12 @@ fn a_scan_before_the_first_publish_logs_nothing_and_logs_again_after_it() -> Res
 
     fs::write(input.join("w0.safetensors"), lora_header_named("changed"))?;
     fs::write(input.join("w8.safetensors"), lora_header_named("t8"))?;
-    let report = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    let report = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     assert_eq!(report.changed, 1);
     assert_eq!(report.added, 1);
     let logged = catalog.pending_changes()?;
@@ -4315,7 +4923,12 @@ fn pending_hashes_are_counted_without_a_scan() -> Result<()> {
 
     let touched = input.join("w1.safetensors");
     fs::write(&touched, lora_header_named("t1-again"))?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     assert_eq!(catalog.sources()?[0].pending_hashes, 1);
     assert_eq!(catalog.pending_hashes()?, 1);
     Ok(())
@@ -4449,7 +5062,12 @@ fn totals_follow_the_sweep() -> Result<()> {
             + fs::metadata(input.join("loras/gone.safetensors"))?.len()
     );
     fs::remove_file(input.join("loras/gone.safetensors"))?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     let after = catalog.totals()?;
     assert_eq!(after.artifacts, 1, "the orphan was removed");
     assert_eq!(after.present_artifacts, 1);
@@ -4477,7 +5095,12 @@ fn a_source_remembers_what_its_last_scan_found() -> Result<()> {
     );
     assert!(sources[0].last_scan.is_some());
     fs::remove_file(input.join("loras/gone.safetensors"))?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     assert_eq!(
         catalog.sources()?[0].file_count,
         1,
@@ -4495,7 +5118,12 @@ fn an_unchanged_rescan_reads_no_headers_and_a_deleted_file_is_marked_absent() ->
     let first = catalog.status()?;
     assert_eq!(first.generation, 1);
 
-    let unchanged = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    let unchanged = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     assert_eq!(
         unchanged,
         RescanReport {
@@ -4509,7 +5137,12 @@ fn an_unchanged_rescan_reads_no_headers_and_a_deleted_file_is_marked_absent() ->
     assert!(!catalog.status()?.search_ready, "a rescan needs a rebuild");
 
     fs::remove_file(input.join("loras/gone.safetensors"))?;
-    let retracted = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    let retracted = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     assert_eq!(
         retracted,
         RescanReport {
@@ -4568,7 +5201,12 @@ fn a_changed_file_is_reread_and_a_new_file_continues_the_ids() -> Result<()> {
         .set_modified(later)?;
     fs::write(input.join("loras/new.safetensors"), lora_header())?;
 
-    let report = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    let report = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     assert_eq!(
         report,
         RescanReport {
@@ -4935,7 +5573,12 @@ fn a_rescan_refreshes_the_index_without_a_rebuild() -> Result<()> {
 
     fs::remove_file(input.join("loras/gone.safetensors"))?;
     fs::write(input.join("loras/new.safetensors"), lora_header())?;
-    let report = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    let report = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     assert_eq!(report.added, 1);
     assert_eq!(report.absent, 1);
     assert!(
@@ -4977,7 +5620,12 @@ fn a_refresh_is_idempotent_and_resumes_from_the_cursor() -> Result<()> {
     let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
     catalog.rebuild_search(|_| {})?;
     fs::write(input.join("loras/new.safetensors"), lora_header())?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     let before = search_total_after_refresh(&catalog)?;
     let again = catalog.refresh_search(|_| {})?;
     assert_eq!(again, 0, "nothing after the cursor");
@@ -5016,7 +5664,12 @@ fn a_refresh_beside_a_writer_returns() -> Result<()> {
     catalog.rebuild_search(|_| {})?;
 
     fs::write(input.join("loras/first.safetensors"), lora_header())?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     let bounded = catalog.pending_changes()?;
     assert!(bounded >= 1, "the first artifact is logged");
 
@@ -5029,7 +5682,12 @@ fn a_refresh_beside_a_writer_returns() -> Result<()> {
         fs::write(input.join("loras/second.safetensors"), lora_header())
             .expect("a writer files another artifact");
         catalog
-            .rescan(&config, HashPolicy::Never, |_, _| {})
+            .rescan(
+                &config,
+                HashPolicy::Never,
+                RescanScope::Configured,
+                |_, _| {},
+            )
             .expect("the writer's rescan logs a change");
     })?;
     assert!(filed, "the writer ran while the refresh was applying");
@@ -5052,6 +5710,74 @@ fn a_refresh_beside_a_writer_returns() -> Result<()> {
             .iter()
             .any(|row| row.path.ends_with("second.safetensors")),
         "the writer's artifact is searchable after the second refresh"
+    );
+    Ok(())
+}
+
+fn artifact_names(catalog: &Catalog) -> Result<Vec<String>> {
+    let read = catalog.database.r_transaction()?;
+    let records: Vec<ArtifactRecord> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    let mut names: Vec<String> = records.into_iter().map(|record| record.name).collect();
+    names.sort();
+    Ok(names)
+}
+
+/// One repository of two snapshots sharing a file: `alone` holds `consolidated.safetensors`
+/// by itself, `beside` holds the same blob next to a four shard set.
+fn shared_snapshot_names(alone: CommitSha, beside: CommitSha) -> Result<Vec<String>> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let consolidated = shard_header(&["model.embed_tokens.weight"], 96);
+    let shards: Vec<Vec<u8>> = (0..4)
+        .map(|index| shard_header(&[&format!("model.layers.{index}.mlp.up_proj.weight")], 64))
+        .collect();
+    let mut crowded: Vec<(&str, &[u8])> =
+        vec![("consolidated.safetensors", consolidated.as_slice())];
+    let names: Vec<String> = (0..4)
+        .map(|index| format!("model-0000{}-of-00004.safetensors", index + 1))
+        .collect();
+    crowded.extend(
+        names
+            .iter()
+            .zip(&shards)
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+    );
+    crate::discover::hf_cache::fixture::write_repo(
+        &hub,
+        STYLER,
+        &alone.to_hex(),
+        &[("consolidated.safetensors", consolidated.as_slice())],
+    );
+    crate::discover::hf_cache::fixture::write_repo(&hub, STYLER, &beside.to_hex(), &crowded);
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &hub_config(&hub),
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    artifact_names(&catalog)
+}
+
+#[test]
+fn two_snapshots_sharing_content_are_named_the_same_way_round_in_either_order() -> Result<()> {
+    let first = CommitSha::from_bytes([0xaa; 20]);
+    let second = CommitSha::from_bytes([0xdd; 20]);
+    let alone_first = shared_snapshot_names(first, second)?;
+    let beside_first = shared_snapshot_names(second, first)?;
+    assert_eq!(
+        alone_first, beside_first,
+        "the walk order of the two snapshots must not decide either name"
+    );
+    assert_eq!(
+        alone_first,
+        ["consolidated.safetensors", "model"],
+        "the shared file is named as the file it is and the set is named as a set"
     );
     Ok(())
 }
@@ -5665,13 +6391,23 @@ fn a_sampled_text_page_crosses_segments_whose_terms_interleave() -> Result<()> {
             input.join(format!("loras/extra-{round}.safetensors")),
             lora_header(),
         )?;
-        catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+        catalog.rescan(
+            &config,
+            HashPolicy::Never,
+            RescanScope::Configured,
+            |_, _| {},
+        )?;
         catalog.refresh_search(|_| {})?;
     }
     fs::write(input.join("loras/aaa-before.safetensors"), lora_header())?;
     fs::write(input.join("loras/hhh-between.safetensors"), lora_header())?;
     fs::write(input.join("loras/zzz-after.safetensors"), plain_header())?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     catalog.refresh_search(|_| {})?;
     assert!(
         catalog.search_segments()? >= 3,
@@ -5715,7 +6451,12 @@ fn a_boundary_absent_from_a_segment_maps_to_the_next_term() -> Result<()> {
     let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
     catalog.rebuild_search(|_| {})?;
     fs::write(input.join("loras/middle.safetensors"), lora_header())?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     catalog.refresh_search(|_| {})?;
     assert_eq!(
         catalog.search_segments()?,
@@ -5780,7 +6521,12 @@ fn a_published_index_reports_how_many_segments_it_answers_from() -> Result<()> {
             input.join(format!("loras/extra-{round}.safetensors")),
             lora_header(),
         )?;
-        catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+        catalog.rescan(
+            &config,
+            HashPolicy::Never,
+            RescanScope::Configured,
+            |_, _| {},
+        )?;
         catalog.refresh_search(|_| {})?;
     }
     assert!(
@@ -5802,7 +6548,12 @@ fn facets_and_nodes_survive_a_multi_segment_index() -> Result<()> {
             input.join(format!("loras/extra-{round}.safetensors")),
             lora_header(),
         )?;
-        catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+        catalog.rescan(
+            &config,
+            HashPolicy::Never,
+            RescanScope::Configured,
+            |_, _| {},
+        )?;
         catalog.refresh_search(|_| {})?;
     }
     let page = search(&catalog, "")?;
@@ -5860,7 +6611,12 @@ fn tallies_keyed_by_ordinal_merge_across_segments_by_the_term_they_spell() -> Re
             input.join(format!("loras/round-{round}.safetensors")),
             lora_header_named(&format!("block_{round}")),
         )?;
-        catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+        catalog.rescan(
+            &config,
+            HashPolicy::Never,
+            RescanScope::Configured,
+            |_, _| {},
+        )?;
         catalog.refresh_search(|_| {})?;
     }
     assert!(
@@ -5923,7 +6679,12 @@ fn a_segment_with_deletes_answers_what_a_fresh_index_answers() -> Result<()> {
             lora_header_named(&format!("a_much_longer_block_name_{round}")),
         )?;
     }
-    let rescanned = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    let rescanned = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     assert_eq!(rescanned.changed, 3);
     catalog.refresh_search(|_| {})?;
     assert!(
@@ -6638,7 +7399,12 @@ fn a_query_serves_the_published_index_while_changes_are_pending() -> Result<()> 
     )?;
     catalog.rebuild_search(|_| {})?;
     fs::write(input.join("loras/new.safetensors"), lora_header())?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     let page = search(&catalog, "")?;
     assert!(page.stale, "the index has not seen the rescan yet");
     assert_eq!(page.total, 2, "the published index still answers");
@@ -6789,7 +7555,12 @@ fn shelves_settings_and_noise_live_in_the_catalog_and_noise_reaches_the_scan() -
     );
     assert!(catalog.is_noise(&gone)?);
     assert_eq!(catalog.list_noise()?.len(), 1);
-    let report = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    let report = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     assert_eq!(
         report.absent, 1,
         "a noisy path is walked past, so its row goes absent"
@@ -7077,7 +7848,12 @@ fn a_rescan_after_hashing_keeps_the_merged_artifact() -> Result<()> {
         |_, _| {},
     )?;
     catalog.hash_pending(&config, |_| {})?;
-    let report = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    let report = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     assert_eq!(report.unchanged, 2, "hashed files are unchanged files");
     assert_eq!(catalog.totals()?.artifacts, 1);
     fs::write(input.join("a/style.safetensors"), plain_header())?;
@@ -7086,7 +7862,12 @@ fn a_rescan_after_hashing_keeps_the_merged_artifact() -> Result<()> {
         .write(true)
         .open(input.join("a/style.safetensors"))?
         .set_modified(later)?;
-    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
     assert_eq!(
         catalog.pending_hashes()?,
         1,

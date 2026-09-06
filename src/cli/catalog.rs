@@ -6,7 +6,7 @@ use clap::Subcommand;
 use serde::Serialize;
 use serde_json::json;
 
-use hoard_index::catalog::{Catalog, QueryRequest, StorageReport};
+use hoard_index::catalog::{Catalog, QueryRequest, RescanScope, StorageReport};
 use hoard_index::config::HashPolicy;
 use hoard_index::search::{SortKey, SortSpec};
 
@@ -119,6 +119,10 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
             if config.index.sources.is_empty() {
                 anyhow::bail!("no sources are configured; add [[index.sources]] to hoard.toml");
             }
+            let scope = match source {
+                Some(_) => RescanScope::Narrowed,
+                None => RescanScope::Configured,
+            };
             let policy = HashPolicy::from(hash);
             let progress = progress_bar();
             progress.set_message("Scanning native catalog");
@@ -139,7 +143,7 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
             let rescan = match rescanned {
                 true => Some(
                     catalog
-                        .rescan(&config.index, policy, |phase, count| {
+                        .rescan(&config.index, policy, scope, |phase, count| {
                             progress.set_message(format!("{phase}: {count} entries"));
                         })
                         .context("rescanning native catalog")?,
@@ -279,7 +283,12 @@ mod tests {
         for index in 0..96 {
             std::fs::remove_file(input.join(format!("d{index}.jsonl")))?;
         }
-        catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+        catalog.rescan(
+            &config,
+            HashPolicy::Never,
+            RescanScope::Configured,
+            |_, _| {},
+        )?;
         let expected = catalog.count_summary()?;
         drop(catalog);
 

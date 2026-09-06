@@ -9,7 +9,7 @@ use rayon::prelude::{
 use serde::Serialize;
 
 use hoard_core::{
-    Artifact, ArtifactFormat, ArtifactId, BlobId, GitSha1, Sha256, State, TensorSummary,
+    Artifact, ArtifactFormat, ArtifactId, BlobId, CommitSha, GitSha1, Sha256, State, TensorSummary,
 };
 
 use crate::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
@@ -66,21 +66,34 @@ impl Catalog {
     /// is gone keeps its row with state `Remote`. Ids continue from the allocator, the
     /// generation increments, and the search index must be refreshed afterwards. The file is
     /// not compacted, so a shared catalog can rescan without an exclusive borrow.
+    ///
+    /// `scope` says whether `config` is the whole configuration or a narrowing of it. Only a
+    /// whole-configuration rescan retires a source the configuration no longer names.
     pub fn rescan(
         &self,
         config: &IndexConfig,
         policy: HashPolicy,
+        scope: RescanScope,
         progress: impl FnMut(&str, u64),
     ) -> Result<RescanReport> {
         let sources = available_sources(config)?;
         let mut counters = Counters::load(&self.database, config.triage_confidence)?;
+        let (known, sizes) = self.known_stamps(&sources)?;
         let mut walk = Walk {
             settings: ScanSettings::new(config, policy),
-            known: self.known_stamps(&sources)?,
+            known,
+            sizes,
             seen: HashSet::new(),
+            moved: Vec::new(),
             report: RescanReport::default(),
         };
         self.walk(&sources, &mut walk, &mut counters, progress)?;
+        match scope {
+            RescanScope::Configured => {
+                self.retire_dropped_sources(config, &mut counters, &mut walk.report)?;
+            }
+            RescanScope::Narrowed => {}
+        }
         self.sweep_artifacts(&mut counters)?;
         let transaction = self.database.rw_transaction()?;
         counters.save(&transaction)?;
@@ -129,7 +142,9 @@ impl Catalog {
         let mut walk = Walk {
             settings,
             known: HashMap::new(),
+            sizes: HashMap::new(),
             seen: HashSet::new(),
+            moved: Vec::new(),
             report: RescanReport::default(),
         };
         self.walk(sources, &mut walk, &mut counters, progress)?;
@@ -166,17 +181,20 @@ impl Catalog {
             progress(&format!("discovering {}", source.name), counters.entries);
             let discovered = discover::discover(source, &noise)?;
             let kind = discovered.kind();
-            let repo_ids = self.store_source(source, kind, discovered.repos(), counters)?;
-            for (repo, repo_id) in discovered.repos().iter().zip(repo_ids) {
-                for (ordinal, revision) in repo.revisions.iter().enumerate() {
+            let walked = self.store_source(source, kind, discovered.repos(), counters)?;
+            for (repo, walked) in discovered.repos().iter().zip(walked) {
+                for (revision, ordinal) in repo.revisions.iter().zip(walked.ordinals) {
+                    if unchanged_revision(walk, walked.id, ordinal, &revision.entries) {
+                        mark_unchanged(walk, &revision.entries, ordinal, 0..revision.entries.len());
+                        continue;
+                    }
                     let context = EntryContext {
                         repo,
-                        repo_id,
+                        repo_id: walked.id,
                         revision,
                         settings: walk.settings,
                         kind,
-                        ordinal: u32::try_from(ordinal)
-                            .map_err(|_| IndexError::Catalog("revision ordinal overflow".into()))?,
+                        ordinal,
                     };
                     let documents = revision_documents(&revision.entries);
                     let sets = shard_sets_by_name(&revision.entries, &documents);
@@ -186,11 +204,16 @@ impl Catalog {
                     for (unit, label) in units.iter().zip(labels) {
                         let prepare = match decide_unit(walk, &revision.entries, unit) {
                             UnitDecision::Skip => {
-                                mark_unchanged(walk, &revision.entries, unit.positions());
+                                mark_unchanged(
+                                    walk,
+                                    &revision.entries,
+                                    ordinal,
+                                    unit.positions().iter().copied(),
+                                );
                                 continue;
                             }
                             UnitDecision::Prepare { prepare, unchanged } => {
-                                mark_unchanged(walk, &revision.entries, &unchanged);
+                                mark_unchanged(walk, &revision.entries, ordinal, unchanged);
                                 prepare
                             }
                         };
@@ -205,7 +228,12 @@ impl Catalog {
                             label.as_deref(),
                         )?;
                         if changed_while_prepared(&prepared) {
-                            mark_unchanged(walk, &revision.entries, &prepare);
+                            mark_unchanged(
+                                walk,
+                                &revision.entries,
+                                ordinal,
+                                prepare.iter().copied(),
+                            );
                             continue;
                         }
                         let transaction = self.database.rw_transaction()?;
@@ -218,8 +246,38 @@ impl Catalog {
                 }
             }
         }
+        self.settle_moved(walk, counters)?;
         self.retract_absent(walk, counters)?;
         self.record_scan_stats(sources, counters)
+    }
+
+    /// Refiles the unchanged entries of a revision the walk found at another ordinal.
+    ///
+    /// An entry names its revision by ordinal, so a revision the catalog had not seen -
+    /// a git clone whose branch advanced onto a fresh commit - takes a new slot while every
+    /// file it holds is the file the catalog already read. Only the ordinal changes: the
+    /// bytes, the state and the presence are the ones already recorded, so no derived count
+    /// moves and only the search document behind the row is logged.
+    fn settle_moved(&self, walk: &mut Walk, counters: &mut Counters) -> Result<()> {
+        let moved = std::mem::take(&mut walk.moved);
+        for batch in moved.chunks(CHUNK) {
+            let transaction = self.database.rw_transaction()?;
+            for (entry_id, ordinal) in batch {
+                let Some(entry) = transaction.get().primary::<Entry>(*entry_id)? else {
+                    continue;
+                };
+                if let Some(artifact) = entry.artifact_id {
+                    counters.pending.push(artifact);
+                }
+                transaction.upsert(Entry {
+                    revision: *ordinal,
+                    ..entry
+                })?;
+            }
+            log_changes(&transaction, counters)?;
+            transaction.commit()?;
+        }
+        Ok(())
     }
 
     /// Records what each walked source holds now that every unit of it is stored and the
@@ -259,15 +317,16 @@ impl Catalog {
     }
 
     /// Writes the records a source needs before any of its files are read, and hands back
-    /// the identity given to each repository in discovery order. A repository the catalog
-    /// already holds keeps its id and takes the freshly discovered revisions and refs.
+    /// the identity and revision ordinals given to each repository in discovery order. A
+    /// repository the catalog already holds keeps its id and takes the freshly discovered
+    /// revisions and refs into the slots [`merged_revisions`] settled.
     fn store_source(
         &self,
         source: &SourceConfig,
         kind: SourceKind,
         repos: &[DiscoveredRepo],
         counters: &mut Counters,
-    ) -> Result<Vec<i64>> {
+    ) -> Result<Vec<WalkedRepo>> {
         let transaction = self.database.rw_transaction()?;
         let stored: Option<Source> = transaction.get().primary(source.name.clone())?;
         let carried = stored.unwrap_or_else(|| Source {
@@ -284,29 +343,137 @@ impl Catalog {
             resolved_kind: kind,
             ..carried
         })?;
-        let mut ids = Vec::with_capacity(repos.len());
+        let mut walked = Vec::with_capacity(repos.len());
         for repo in repos {
             let key = repository_key(&source.name, &repo.repo);
             let stored: Option<Repository> = transaction
                 .get()
                 .secondary(RepositoryKey::key, key.as_str())?;
-            let (repo_id, present) = match stored {
-                Some(stored) => (stored.id, (stored.present_files, stored.present_bytes)),
-                None => (counters.next_repo()?, (0, 0)),
+            let (id, present, held) = match stored {
+                Some(stored) => (
+                    stored.id,
+                    (stored.present_files, stored.present_bytes),
+                    stored.revisions,
+                ),
+                None => (counters.next_repo()?, (0, 0), Vec::new()),
             };
-            transaction.upsert(repository(repo_id, &source.name, repo, present))?;
-            ids.push(repo_id);
+            let (revisions, slots) = merged_revisions(&held, repo);
+            let ordinals = slots
+                .into_iter()
+                .map(|slot| {
+                    u32::try_from(slot)
+                        .map_err(|_| IndexError::Catalog("revision ordinal overflow".into()))
+                })
+                .collect::<Result<Vec<u32>>>()?;
+            transaction.upsert(repository(id, &source.name, repo, present, revisions))?;
+            walked.push(WalkedRepo { id, ordinals });
         }
         transaction.commit()?;
-        Ok(ids)
+        Ok(walked)
+    }
+
+    /// Deletes every stored source the configuration no longer names, with its repositories
+    /// and entries.
+    ///
+    /// A whole-configuration rescan walked everything the configuration has, so a source row
+    /// it did not walk is one that was dropped from the configuration rather than one this
+    /// run was narrowed away from. The sources the mirror, the pull queue and the peers keep
+    /// are theirs, not the configuration's, and are left alone. A source whose root is merely
+    /// unmounted stays too: the configuration still names it.
+    fn retire_dropped_sources(
+        &self,
+        config: &IndexConfig,
+        counters: &mut Counters,
+        report: &mut RescanReport,
+    ) -> Result<()> {
+        let configured: HashSet<&str> = config
+            .sources
+            .iter()
+            .map(|source| source.name.as_str())
+            .collect();
+        let read = self.database.r_transaction()?;
+        let stored: Vec<Source> = read
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
+        drop(read);
+        let dropped: Vec<String> = stored
+            .into_iter()
+            .map(|source| source.name)
+            .filter(|name| is_scanned_source(name) && !configured.contains(name.as_str()))
+            .collect();
+        for name in dropped {
+            self.retire_source(&name, counters, report)?;
+        }
+        Ok(())
+    }
+
+    /// Deletes every row of one source: its entries, its repositories and the source itself.
+    ///
+    /// A path of a source the configuration dropped is not a path this node has stopped
+    /// holding, it is a path this catalog has stopped being about, and a row left behind
+    /// outlives the source that explains it: nothing names its repository's source, the
+    /// repositories listing renders it under a default kind, the summary still counts it,
+    /// and re-adding the source files every path a second time. The artifacts that lose
+    /// their last path go with them, through the sweep that follows the pass.
+    fn retire_source(
+        &self,
+        name: &str,
+        counters: &mut Counters,
+        report: &mut RescanReport,
+    ) -> Result<()> {
+        for repo_id in self.repositories_of_source(name)? {
+            let read = self.database.r_transaction()?;
+            let mut ids: Vec<i64> = Vec::new();
+            for entry in read
+                .scan()
+                .secondary::<Entry>(EntryKey::location)?
+                .start_with(LocationKey::repository(repo_id))?
+            {
+                let entry: Entry = entry?;
+                ids.push(entry.id);
+            }
+            drop(read);
+            for batch in ids.chunks(CHUNK) {
+                let transaction = self.database.rw_transaction()?;
+                for id in batch {
+                    let Some(entry) = transaction.get().primary::<Entry>(*id)? else {
+                        continue;
+                    };
+                    counters.derived.removed(&entry);
+                    if let Some(artifact) = entry.artifact_id {
+                        counters.touch(&transaction, artifact)?;
+                        counters.pending.push(artifact);
+                    }
+                    transaction.remove(entry)?;
+                    report.absent += 1;
+                }
+                log_changes(&transaction, counters)?;
+                transaction.commit()?;
+            }
+            let transaction = self.database.rw_transaction()?;
+            counters.derived.flush(&transaction)?;
+            if let Some(stored) = transaction.get().primary::<Repository>(repo_id)? {
+                transaction.remove(stored)?;
+            }
+            transaction.commit()?;
+        }
+        let transaction = self.database.rw_transaction()?;
+        if let Some(stored) = transaction.get().primary::<Source>(name.to_owned())? {
+            transaction.remove(stored)?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Every path the catalog already holds for the selected sources, with the stamp that
-    /// proves it unchanged and the facts a decision needs before any file is opened.
+    /// proves it unchanged and the facts a decision needs before any file is opened, and how
+    /// many of them each stored revision holds.
     ///
     /// Keyed by [`path_hash`] rather than by the path: a million paths held as text is the
     /// largest thing a rescan keeps in memory, and nothing here reads the path back.
-    fn known_stamps(&self, sources: &[&SourceConfig]) -> Result<HashMap<u128, Known>> {
+    fn known_stamps(&self, sources: &[&SourceConfig]) -> Result<(KnownPaths, RevisionSizes)> {
         let names: HashSet<&str> = sources.iter().map(|source| source.name.as_str()).collect();
         let read = self.database.r_transaction()?;
         let repositories: Vec<Repository> = read
@@ -316,6 +483,7 @@ impl Catalog {
             .collect::<native_db::db_type::Result<_>>()?;
         let mut shards: HashMap<i64, Option<u32>> = HashMap::new();
         let mut known = HashMap::new();
+        let mut sizes: RevisionSizes = HashMap::new();
         for repository in repositories
             .iter()
             .filter(|repository| names.contains(repository.source.as_str()))
@@ -341,6 +509,7 @@ impl Catalog {
                     path_hash(Path::new(&abs_path)),
                     Known {
                         entry_id: entry.id,
+                        revision: entry.revision,
                         stamp: FileStamp {
                             inode,
                             mtime,
@@ -350,9 +519,10 @@ impl Catalog {
                         shard_count,
                     },
                 );
+                *sizes.entry((repository.id, entry.revision)).or_default() += 1;
             }
         }
-        Ok(known)
+        Ok((known, sizes))
     }
 
     /// A path the walk never reached is still a row: it keeps the path it had and records
@@ -635,18 +805,53 @@ fn available_sources(config: &IndexConfig) -> Result<Vec<&SourceConfig>> {
 /// how many files it left alone, read again, added or retracted.
 struct Walk {
     settings: ScanSettings,
-    known: HashMap<u128, Known>,
+    known: KnownPaths,
+    sizes: RevisionSizes,
     seen: HashSet<i64>,
+    /// Entries whose revision moved to another ordinal under them, with the ordinal it
+    /// moved to. Written once at the end of the pass rather than once per unit.
+    moved: Vec<(i64, u32)>,
     report: RescanReport,
+}
+
+/// One repository of a walked source: the row it was filed under, and the ordinal each of
+/// its discovered revisions takes in that row.
+struct WalkedRepo {
+    id: i64,
+    ordinals: Vec<u32>,
 }
 
 /// What the catalog already holds for one path, so a walk can decide without opening it.
 #[derive(Clone, Copy)]
 struct Known {
     entry_id: i64,
+    revision: u32,
     stamp: FileStamp,
     artifact_id: Option<i64>,
     shard_count: Option<u32>,
+}
+
+/// Every path of the selected sources the catalog holds bytes for, by [`path_hash`].
+type KnownPaths = HashMap<u128, Known>;
+
+/// How many of those paths each stored revision holds, by repository and ordinal.
+type RevisionSizes = HashMap<(i64, u32), usize>;
+
+/// Whether the configuration a rescan was handed is the whole of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RescanScope {
+    /// Every source the configuration names, so one it does not name has been dropped.
+    Configured,
+    /// A subset the caller chose, so a source outside it was simply not walked.
+    Narrowed,
+}
+
+/// Whether a source row belongs to the configured scan rather than to the mirror, the pull
+/// queue or a peer, each of which keeps its own source row that no scan owns.
+fn is_scanned_source(name: &str) -> bool {
+    name != super::MIRROR_SOURCE
+        && name != super::PULL_SOURCE
+        && !name.starts_with(super::PEER_SOURCE)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -677,6 +882,20 @@ fn known_of(walk: &Walk, entry: &DiscoveredEntry) -> Option<Known> {
 /// not a case this workspace budgets for.
 fn path_hash(path: &Path) -> u128 {
     xxhash_rust::xxh3::xxh3_128(path.as_os_str().as_encoded_bytes())
+}
+
+/// Whether nothing in a revision needs opening: it holds every path the catalog holds bytes
+/// for and no others, each at the same size, inode and mtime. The count is as much of the
+/// condition as the stamps are, because a revision that lost a file holds only unchanged
+/// paths too.
+fn unchanged_revision(
+    walk: &Walk,
+    repo_id: i64,
+    ordinal: u32,
+    entries: &[DiscoveredEntry],
+) -> bool {
+    walk.sizes.get(&(repo_id, ordinal)).copied().unwrap_or(0) == entries.len()
+        && entries.iter().all(|entry| unchanged_entry(walk, entry))
 }
 
 fn unchanged_entry(walk: &Walk, entry: &DiscoveredEntry) -> bool {
@@ -752,11 +971,21 @@ pub(super) fn stamp_moved(path: Option<&Path>, stamp: Option<FileStamp>) -> bool
     matches!(crate::hash::stamp(path), Ok(current) if current != stamp)
 }
 
-fn mark_unchanged(walk: &mut Walk, entries: &[DiscoveredEntry], positions: &[usize]) {
+/// Marks the paths this walk left alone as seen, and records the ones whose revision has
+/// moved to another ordinal since the row was written.
+fn mark_unchanged(
+    walk: &mut Walk,
+    entries: &[DiscoveredEntry],
+    ordinal: u32,
+    positions: impl IntoIterator<Item = usize>,
+) {
     for position in positions {
-        if let Some(known) = known_of(walk, &entries[*position]) {
+        if let Some(known) = known_of(walk, &entries[position]) {
             walk.seen.insert(known.entry_id);
             walk.report.unchanged += 1;
+            if known.revision != ordinal {
+                walk.moved.push((known.entry_id, ordinal));
+            }
         }
     }
 }
@@ -1096,8 +1325,15 @@ pub(super) fn next_id(counter: &mut u64) -> Result<i64> {
 }
 
 /// The stored shape of a discovered repository. `present` is what the copy already on
-/// record counted, because rediscovering a repository does not move a single file.
-fn repository(id: i64, source: &str, repo: &DiscoveredRepo, present: (u32, u64)) -> Repository {
+/// record counted, because rediscovering a repository does not move a single file, and
+/// `revisions` is what [`merged_revisions`] settled, not what discovery listed.
+fn repository(
+    id: i64,
+    source: &str,
+    repo: &DiscoveredRepo,
+    present: (u32, u64),
+    revisions: Vec<Revision>,
+) -> Repository {
     Repository {
         id,
         present_files: present.0,
@@ -1111,31 +1347,89 @@ fn repository(id: i64, source: &str, repo: &DiscoveredRepo, present: (u32, u64))
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
         default_ref: repo.default_ref.clone(),
-        revisions: repo
-            .revisions
+        revisions,
+    }
+}
+
+/// What a revision is matched by across scans: its commit, or its name when it has none.
+#[derive(PartialEq, Eq, Hash)]
+enum RevisionKey {
+    Commit(CommitSha),
+    Named(String),
+}
+
+fn revision_key(sha: Option<CommitSha>, name: &str) -> RevisionKey {
+    match sha {
+        Some(sha) => RevisionKey::Commit(sha),
+        None => RevisionKey::Named(name.to_owned()),
+    }
+}
+
+/// The shape discovery just gave one revision of a repository, before it is matched against
+/// what the catalog already holds.
+fn discovered_revision(repo: &DiscoveredRepo, position: usize) -> Revision {
+    let revision = &repo.revisions[position];
+    Revision {
+        name: revision_name(repo, position),
+        sha: match revision.name {
+            RevisionName::Commit(sha) => Some(sha),
+            RevisionName::Synthetic => None,
+        },
+        title: revision.title.clone(),
+        author: revision.author.clone(),
+        committed: revision.committed.map(|stamp| stamp.to_string()),
+        refs: repo
+            .refs
             .iter()
-            .enumerate()
-            .map(|(ordinal, revision)| Revision {
-                name: revision_name(repo, ordinal),
-                sha: match revision.name {
-                    RevisionName::Commit(sha) => Some(sha),
-                    RevisionName::Synthetic => None,
-                },
-                title: revision.title.clone(),
-                author: revision.author.clone(),
-                committed: revision.committed.map(|stamp| stamp.to_string()),
-                refs: repo
-                    .refs
-                    .iter()
-                    .filter(|reference| reference.revision == ordinal)
-                    .map(|reference| Ref {
-                        name: reference.name.clone(),
-                        kind: reference.kind,
-                    })
-                    .collect(),
+            .filter(|reference| reference.revision == position)
+            .map(|reference| Ref {
+                name: reference.name.clone(),
+                kind: reference.kind,
             })
             .collect(),
     }
+}
+
+/// The stored revisions of a repository merged with what discovery found now, and the
+/// ordinal each discovered revision takes in the merged list.
+///
+/// An entry names its revision by ordinal, so an ordinal is an identity and cannot follow
+/// discovery order: a snapshot whose commit sorts ahead of the stored ones would otherwise
+/// move every entry of the repository onto the wrong revision. A rediscovered revision
+/// keeps its slot and takes the fresh refs and metadata; a new one is appended; one the
+/// walk no longer found keeps its slot so the entries filed under it still resolve, and
+/// gives up its refs, because a ref is a pointer discovery just re-enumerated and a
+/// revision no ref reaches must not answer to a name that now belongs to another.
+fn merged_revisions(stored: &[Revision], repo: &DiscoveredRepo) -> (Vec<Revision>, Vec<usize>) {
+    let mut slots: HashMap<RevisionKey, usize> = HashMap::with_capacity(stored.len());
+    for (slot, revision) in stored.iter().enumerate() {
+        slots
+            .entry(revision_key(revision.sha, &revision.name))
+            .or_insert(slot);
+    }
+    let mut merged: Vec<Revision> = stored
+        .iter()
+        .map(|revision| Revision {
+            refs: Vec::new(),
+            ..revision.clone()
+        })
+        .collect();
+    let mut ordinals = Vec::with_capacity(repo.revisions.len());
+    for position in 0..repo.revisions.len() {
+        let found = discovered_revision(repo, position);
+        let slot = match slots.remove(&revision_key(found.sha, &found.name)) {
+            Some(slot) => {
+                merged[slot] = found;
+                slot
+            }
+            None => {
+                merged.push(found);
+                merged.len() - 1
+            }
+        };
+        ordinals.push(slot);
+    }
+    (merged, ordinals)
 }
 
 fn revision_name(repo: &DiscoveredRepo, ordinal: usize) -> String {
@@ -1611,24 +1905,32 @@ fn prepare_entry<'a>(
     })
 }
 
-fn identity(entry: &DiscoveredEntry, presence: &Presence) -> Result<u128> {
-    let text = match (presence.sha256, entry.git_sha1, entry.abs_path.as_deref()) {
-        (Some(sha), _, _) => format!("sha256:{sha}"),
-        (None, Some(sha), _) => format!("git:{sha}"),
-        (None, None, Some(path)) => format!(
-            "path:{}",
-            path.canonicalize()
-                .unwrap_or_else(|_| path.to_path_buf())
-                .display()
-        ),
+/// What the catalog knows one file's content by: its sha256, else its git blob sha, else
+/// the canonical path it sits at, hashed from the path's own bytes. A path outside UTF-8
+/// therefore hashes differently from the lossy text that renders it, once the walker admits
+/// one.
+pub(super) fn identity(entry: &DiscoveredEntry, presence: &Presence) -> Result<u128> {
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    match (presence.sha256, entry.git_sha1, entry.abs_path.as_deref()) {
+        (Some(sha), _, _) => hasher.update(format!("sha256:{sha}").as_bytes()),
+        (None, Some(sha), _) => hasher.update(format!("git:{sha}").as_bytes()),
+        (None, None, Some(path)) => {
+            hasher.update(b"path:");
+            hasher.update(
+                path.canonicalize()
+                    .unwrap_or_else(|_| path.to_path_buf())
+                    .as_os_str()
+                    .as_encoded_bytes(),
+            );
+        }
         (None, None, None) => {
             return Err(IndexError::Catalog(format!(
                 "absent entry has no content identity: {}",
                 entry.rel_path
             )));
         }
-    };
-    Ok(xxhash_rust::xxh3::xxh3_128(text.as_bytes()))
+    }
+    Ok(hasher.digest128())
 }
 
 struct EntryContext<'a> {
@@ -1755,13 +2057,31 @@ fn artifact_triage(prepared: &PreparedEntry<'_>, record: &ArtifactRecord, confid
     record.artifact.needs_triage(confidence) || incomplete
 }
 
+/// Which of two namings of one identity the record keeps.
+///
+/// The unit holding more of the content names it, because a shard set describes a model its
+/// anchor's file name does not; equal content is settled by the smaller name, so that two
+/// revisions naming one file differently agree whichever of them the walk reaches first.
+fn names_better(candidate: &ArtifactRecord, stored: &ArtifactRecord) -> bool {
+    naming_key(candidate) < naming_key(stored)
+}
+
+fn naming_key(record: &ArtifactRecord) -> (std::cmp::Reverse<u64>, &str, &str) {
+    (
+        std::cmp::Reverse(record.group_bytes.unwrap_or(record.artifact.size)),
+        record.name.as_str(),
+        record.org.as_deref().unwrap_or_default(),
+    )
+}
+
 /// The record this entry contributes a path to.
 ///
-/// A first path writes the record and names it; an identity the catalog already holds keeps
-/// its id, its name and when it was first seen, and takes what this file's header just
-/// proved. The identity is a unique secondary key, and a read inside the writing
-/// transaction sees the rows that transaction has already written, so two copies of one
-/// file in one unit reach the same record without a cache of what this pass has written.
+/// A first path writes the record; an identity the catalog already holds keeps its id, when
+/// it was first seen and its cleared verdict, takes what this file's header just proved, and
+/// keeps the better of the two names by [`names_better`] rather than the first one written.
+/// The identity is a unique secondary key, and a read inside the writing transaction sees
+/// the rows that transaction has already written, so two copies of one file in one unit
+/// reach the same record without a cache of what this pass has written.
 fn store_artifact(
     transaction: &RwTransaction<'_>,
     prepared: &PreparedEntry<'_>,
@@ -1784,8 +2104,10 @@ fn store_artifact(
     );
     if let Some(stored) = &stored {
         record.triage_cleared = stored.triage_cleared;
-        record.name = stored.name.clone();
-        record.org = stored.org.clone();
+        if !names_better(&record, stored) {
+            record.name = stored.name.clone();
+            record.org = stored.org.clone();
+        }
     }
     let verdict: Option<Override> = transaction.get().primary(id)?;
     if let Some(verdict) = &verdict {

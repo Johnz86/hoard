@@ -55,12 +55,14 @@ expects to move and why; the last wave measures them all.
    sampled selection and the per-segment tallies; the primary query counting its match once;
    the base facet rail capped to the buckets the UI renders before the per-bucket count
    (the default taken for the open decision, see "Decisions still open").
-5. **catalog-correctness.** The correctness items listed above, each with a test that
-   fails at `3a9fa1f`: `triage_queue` answering from the catalog when no index exists or
-   every catalog carrying one, revision ordinals stable across rescans, consistent unit
-   counting, git metadata and stable identities, byte-exact path identities, a rescan
-   skipping document re-reads when every stamp is unchanged, a maintained client count for
-   the USAGE tab, the eviction sweep chunked.
+5. **catalog-correctness, in two commits.** The correctness items listed above, each with
+   a test that fails at the commit its wave starts from. **5a, the scan half:** revision
+   ordinals stable across rescans, consistent unit counting, byte-exact path identities, a
+   rescan skipping document re-reads when every stamp is unchanged, and a source dropped
+   from the configuration retired by the next full rescan. **5b, the readers:**
+   `triage_queue` answering from the catalog when no index exists or every catalog carrying
+   one, git metadata and stable identities, a maintained client count for the USAGE tab, and
+   the eviction sweep chunked.
 6. **recovery.** Process-kill and power-loss tests for the catalog and the search
    directory: a scan, a hash pass, a refresh and a publish each killed at a chosen point
    reopen to a consistent catalog and complete on the next run to the same counts as an
@@ -84,8 +86,8 @@ review and the recommendations (below).
 
 The run is finished when every line holds:
 
-1. Waves 1 to 8 are on `master`, one commit each, each verified by
-   `.claude/skills/hoard-verify/SKILL.md` and reviewed before landing.
+1. Waves 1 to 8 are on `master`, one commit each except wave 5, which is two, 5a and 5b;
+   each verified by `.claude/skills/hoard-verify/SKILL.md` and reviewed before landing.
 2. `docs/feature-plan.md` marks Phase 10 and Phase 11 done, with the acceptance checks of
    each stated and passing.
 3. `docs/handoff.md` "Follow-ups" holds only the items named above as deliberately not code

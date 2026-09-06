@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use hoard_index::catalog::{Catalog, HashReport, RescanReport};
+use hoard_index::catalog::{Catalog, HashReport, RescanReport, RescanScope};
 use hoard_index::config::{HashPolicy, IndexConfig};
 use hoard_index::{IndexError, catalog};
 
@@ -16,6 +16,10 @@ pub async fn run(context: Context, source: Option<String>, hash: HashPolicy) -> 
     if config.index.sources.is_empty() {
         anyhow::bail!("no sources are configured; add [[index.sources]] to hoard.toml");
     }
+    let scope = match source {
+        Some(_) => RescanScope::Narrowed,
+        None => RescanScope::Configured,
+    };
     let index = match source.as_deref() {
         Some(name) => {
             let named = config
@@ -28,7 +32,7 @@ pub async fn run(context: Context, source: Option<String>, hash: HashPolicy) -> 
     };
 
     let bar = progress_bar();
-    let (report, hashed) = rescan(catalog, index, hash, &bar).await?;
+    let (report, hashed) = rescan(catalog, index, hash, scope, &bar).await?;
     bar.finish_and_clear();
 
     match hashed {
@@ -59,6 +63,7 @@ async fn rescan(
     catalog: Arc<Catalog>,
     config: IndexConfig,
     hash: HashPolicy,
+    scope: RescanScope,
     bar: &Arc<ProgressBar>,
 ) -> Result<(RescanReport, Option<HashReport>)> {
     let walking = Arc::clone(bar);
@@ -66,7 +71,7 @@ async fn rescan(
     let indexing = Arc::clone(bar);
     tokio::task::spawn_blocking(
         move || -> Result<(RescanReport, Option<catalog::HashReport>), IndexError> {
-            let report = catalog.rescan(&config, hash, |phase, count| {
+            let report = catalog.rescan(&config, hash, scope, |phase, count| {
                 walking.set_message(format!("{phase}: {count} entries"));
                 walking.tick();
             })?;

@@ -104,7 +104,9 @@ the catalog at `<data_dir>/native`.
 - A revision's documents (README, configs, index files) are sniffed first and give every
   later unit its inference context; each shard set and each chunk of 1,024 standalone files
   is then sniffed in parallel, prepared and committed as its own transaction, so memory grows
-  with a unit rather than with a source.
+  with a unit rather than with a source. A rescan settles a revision whose every path carries
+  the stamp the catalog stored before it opens any of them, so an unchanged revision costs
+  its documents nothing.
 - Only weight and dataset formats become artifacts; every file is still an entry record.
 - Shard sets, whether named `model-<n>-of-<m>` or listed by a `*.index.json` weight map,
   become one artifact anchored on the lowest shard. Members are entries pointing at that
@@ -115,10 +117,29 @@ the catalog at `<data_dir>/native`.
   ordinary artifact.
 - Every present file is hashed, inline when the scan is asked to hash now and by a background
   job otherwise. An artifact identified by its path becomes identified by its content once
-  hashed, merging copies. Artifact identities are 128-bit hashes of the identity text, so the
-  unique index holds fixed-width keys.
+  hashed, merging copies. Artifact identities are 128-bit hashes, of the text `sha256:<sha>`
+  or `git:<sha>` when a hash is known and of `path:` followed by the canonical path's own
+  bytes when none is, so the unique index holds fixed-width keys and two paths a lossy text
+  rendering would fold together stay two artifacts.
+- An entry names its revision by an ordinal into the repository's revision list, and the
+  ordinal is an identity rather than a position in discovery order. A rescan matches each
+  discovered revision to the stored list by commit sha, or by name when it has none: a
+  rediscovered revision keeps its slot and takes the fresh refs and metadata, a new one is
+  appended, and one the walk no longer finds keeps its slot so the entries filed under it
+  still resolve, giving up its refs so a name that has moved answers where it moved to.
+- An artifact reached from two revisions is named by the unit that holds more of its
+  content, and by the smaller name when they hold the same: a shard set outranks the file
+  its anchor is, and two revisions naming one file differently agree whichever of them the
+  walk reaches first.
 - Ids come from a persisted allocator; the generation increments per rescan; artifact path
   counts are swept from the entry index after every scan and orphaned artifacts are removed.
+- A rescan over the whole configuration deletes a stored source the configuration no longer
+  names, with its entries, its repositories and the artifacts that lose their last path. A
+  path of a dropped source is not a path this node stopped holding, it is a path this catalog
+  stopped being about, and a row left behind outlives the source that explains it: nothing
+  names its repository's source, the summary still counts it, and re-adding the source files
+  every path a second time. A rescan narrowed to named sources retires nothing, and the
+  mirror, pull and peer source rows are never a scan's to retire.
 - A completion manifest is published after all batches commit, so an interrupted scan stays
   unusable rather than exposing a partial catalog.
 - A rescan does not compact, so a catalog shared by the server can be walked again without
@@ -973,21 +994,18 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
 - **The USAGE tab reads a repository's whole log**, because the client count it shows is a
   claim about every pull the repository ever served. Bounding the chart alone would not bound
   the route: 20,000 rows cost 9.1 ms.
-- **Path identities hash the text `to_string_lossy` renders.** Discovery currently never
-  yields two distinct non-UTF-8 paths; a byte-exact identity must land with the identity
-  redesign.
 - **`Catalog::triage_queue` now needs a search index** rather than only tolerating a stale
   one. Every catalog a command or the server opens has one, but a catalog built by
   `scan_sources` alone answers the queue with an error until one is built.
-- **A rescan re-reads every revision's documents** (README, configs, index files) before
-  deciding units. Measure this on the workstation cache and skip when every document's stamp
-  is unchanged.
-- **Revision ordinals are recomputed from discovery on every rescan**, so a source that
-  reorders revisions leaves stale ordinals on existing entries.
-- **Count a revision's artifact units consistently** for a file whose content another revision
-  already claimed. A repository with two snapshots, one holding `consolidated.safetensors`
-  alone and one holding it beside a four shard set, keeps both artifacts at the right sizes
-  but can name them either way round.
+- **A path outside UTF-8 is identified but not stored.** The identity a scan computes is
+  byte-exact, but `Repository.root_path` and `Entry.placed` hold `to_string_lossy` text, the
+  walker drops a relative path that is not UTF-8, and `SourceConfig` cannot serialise a root
+  that is not, so such a path never reaches a row. Storing the bytes is the remaining half.
+- **A revision the walk no longer finds keeps its slot forever.** The slot is what makes an
+  entry's ordinal an identity, so it cannot be reclaimed while any entry names it; a
+  repository whose branch moves on every scan therefore grows one stored revision per head.
+  Reclaiming an empty slot needs the entries of a retired revision to be removed rather than
+  marked absent, which is the same decision as pruning a deleted path's row.
 - **Preserve complete repository Git metadata** and add stable cross-scan identities.
 - **Add a read-only open** once redb offers one, so searches can run beside a rebuild.
 - **Add process-kill and power-loss recovery tests.** The current tests check transaction

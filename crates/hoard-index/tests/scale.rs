@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use hoard_index::catalog::{Catalog, QueryRequest, StorageReport};
+use hoard_index::catalog::{Catalog, QueryRequest, RescanScope, StorageReport};
 use hoard_index::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
 use hoard_index::search::{CompileContext, Facets, SortKey, SortSpec};
 
@@ -351,7 +351,12 @@ fn native_catalog_at_scale() {
     touch(&tree, TOUCHED);
     let (rescanned, rescan_time) = timed(|| {
         catalog
-            .rescan(&config, HashPolicy::Never, |_, _| {})
+            .rescan(
+                &config,
+                HashPolicy::Never,
+                RescanScope::Configured,
+                |_, _| {},
+            )
             .expect("rescan succeeds")
     });
     let (applied, refresh_time) =
