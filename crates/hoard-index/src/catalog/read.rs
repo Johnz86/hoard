@@ -90,6 +90,10 @@ pub struct RepositoryDetail {
     pub node: String,
     pub revisions: Vec<RevisionDetail>,
     pub refs: Vec<RefDetail>,
+    /// The files of this repository whose bytes are on a node, and the bytes they hold, as
+    /// the writers that changed them left the counts.
+    pub present_files: u32,
+    pub present_bytes: u64,
 }
 
 /// What narrows the repositories listing: a case-insensitive substring of the qualified
@@ -290,7 +294,7 @@ impl Catalog {
             let Some(stored) = stored else {
                 continue;
             };
-            let present = repository_is_present(&snapshot, stored.id)?;
+            let present = stored.present_files > 0;
             let detail = repository_detail(&stored, source.resolved_kind, &names);
             if present {
                 return Ok(Some(detail));
@@ -334,7 +338,7 @@ impl Catalog {
             if !admits(repository, filter, text.as_deref()) {
                 continue;
             }
-            if filter.present_only && !repository_is_present(&snapshot, repository.id)? {
+            if filter.present_only && repository.present_files == 0 {
                 continue;
             }
             total += 1;
@@ -556,13 +560,6 @@ fn admits(repository: &Repository, filter: &RepositoryFilter, text: Option<&str>
     }
 }
 
-fn repository_is_present(snapshot: &RTransaction<'_>, repo: i64) -> Result<bool> {
-    let scan = snapshot.scan().secondary::<Entry>(EntryKey::repo_id)?;
-    scan.start_with(repo)?.try_fold(false, |present, entry| {
-        Ok(present || entry?.state != State::Remote)
-    })
-}
-
 fn repository_detail(
     repository: &Repository,
     kind: SourceKind,
@@ -608,6 +605,8 @@ fn repository_detail(
         node: names.of_source(&repository.source).to_owned(),
         revisions,
         refs,
+        present_files: repository.present_files,
+        present_bytes: repository.present_bytes,
     }
 }
 

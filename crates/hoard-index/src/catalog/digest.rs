@@ -176,6 +176,7 @@ impl Catalog {
             if let Some(id) = entry.artifact_id {
                 artifacts.push(id);
             }
+            counters.presence.removed(&entry);
             transaction.remove(entry)?;
             removed += 1;
         }
@@ -257,6 +258,7 @@ impl Catalog {
             if let Some(id) = entry.artifact_id {
                 counters.pending.push(id);
             }
+            counters.presence.removed(&entry);
             transaction.upsert(Entry {
                 state: State::Remote,
                 preference: preference(State::Remote, false),
@@ -318,11 +320,14 @@ impl Applying<'_, '_> {
             applied.artifacts += 1;
         }
         let previous = entry_at(self.transaction, repo_id, ordinal, &row.path)?;
-        let id = match previous {
+        let id = match &previous {
             Some(entry) => entry.id,
             None => next_id(&mut self.counters.entries)?,
         };
-        self.transaction.upsert(Entry {
+        if let Some(previous) = &previous {
+            self.counters.presence.removed(previous);
+        }
+        let entry = Entry {
             id,
             repo_id,
             artifact_id: Some(artifact_id),
@@ -343,7 +348,9 @@ impl Applying<'_, '_> {
             node: self.peer,
             pass: self.pass,
             pull_progress: None,
-        })?;
+        };
+        self.counters.presence.added(&entry);
+        self.transaction.upsert(entry)?;
         applied.entries += 1;
         Ok(applied)
     }
@@ -367,6 +374,8 @@ impl Applying<'_, '_> {
             git_dir: None,
             default_ref: crate::discover::DEFAULT_REF.to_owned(),
             revisions: Vec::new(),
+            present_files: 0,
+            present_bytes: 0,
         })?;
         Ok(id)
     }

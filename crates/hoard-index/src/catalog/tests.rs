@@ -20,15 +20,15 @@ use crate::search::{CompileContext, SortKey, SortSpec, parse};
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, ArtifactRecordV1, Entry, EntryKey, EntryV1,
     LOCAL_NODE, Manifest, ManifestV1, Node, Override, Ref, Repository, RepositoryKey, RepositoryV1,
-    RepositoryV2, Revision, RevisionV1, RevisionV2, SearchChange, SearchText, Source, SourceV1,
-    Summary, SummaryV1, SummaryV2,
+    RepositoryV2, RepositoryV3, Revision, RevisionV1, RevisionV2, SearchChange, SearchText, Source,
+    SourceV1, Summary, SummaryV1, SummaryV2,
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::{
     Catalog, DigestApplied, JobProgress, JobState, MIRROR_SOURCE, NewProjection, PullMark,
-    PulledFile, QueryPage, QueryRequest, RemoteEntry, RepositoryFilter, RescanReport, ServedFile,
-    UsageEvent, builder, models, query,
+    PulledFile, QueryPage, QueryRequest, RemoteEntry, RepositoryDetail, RepositoryFilter,
+    RescanReport, ServedFile, UsageEvent, builder, models, query,
 };
 
 fn running_as_root() -> bool {
@@ -2299,6 +2299,172 @@ fn a_version_2_repository_is_migrated_on_open() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn repository_counts_follow_every_writer() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let scanned_bytes = fs::metadata(input.join("loras/keep.safetensors"))?.len()
+        + fs::metadata(input.join("loras/gone.safetensors"))?.len();
+    let walked = only_repository(&catalog)?;
+    assert_eq!(walked.present_files, 2);
+    assert_eq!(walked.present_bytes, scanned_bytes);
+    let kept_bytes = fs::metadata(input.join("loras/keep.safetensors"))?.len();
+
+    fs::remove_file(input.join("loras/gone.safetensors"))?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    let rescanned = only_repository(&catalog)?;
+    assert_eq!(rescanned.present_files, 1, "an absent path holds no bytes");
+    assert_eq!(rescanned.present_bytes, kept_bytes);
+
+    let mirrored = RepoId::parse_ref(RepoType::Models, "openai/whisper")?;
+    let record = catalog.ingest_served(&ServedFile {
+        repo: mirrored.clone(),
+        commit: CommitSha::from_bytes([0x11; 20]),
+        rel_path: "model.safetensors".to_owned(),
+        size: 4096,
+        sha256: Sha256::from_bytes([0x42; 32]),
+        git_sha1: None,
+        cache_root: directory.path().join("repos"),
+    })?;
+    let served = repository_of(&catalog, &mirrored)?;
+    assert_eq!(served.present_files, 1);
+    assert_eq!(served.present_bytes, 4096);
+
+    assert_eq!(catalog.retire_entries(&[record.entry])?, 1);
+    let retired = repository_of(&catalog, &mirrored)?;
+    assert_eq!(retired.present_files, 0);
+    assert_eq!(retired.present_bytes, 0);
+
+    let laptop = catalog.upsert_peer(&NodeId::new("laptop-1")?, "laptop", None)?;
+    let pass = catalog.begin_pass(laptop.id)?;
+    catalog.apply_digest(
+        laptop.id,
+        &[remote_entry(
+            Sha256::from_bytes([0x77; 32]),
+            "loras/only-there.safetensors",
+        )],
+        pass,
+    )?;
+    let advertised = catalog
+        .repositories(&RepositoryFilter::default(), None, 50)?
+        .rows
+        .into_iter()
+        .filter(|row| row.node == "laptop")
+        .collect::<Vec<_>>();
+    assert_eq!(advertised.len(), 1);
+    assert_eq!(
+        (advertised[0].present_files, advertised[0].present_bytes),
+        (0, 0),
+        "a peer's rows are bytes this node does not hold"
+    );
+    assert_eq!(
+        rescanned.present_files, 1,
+        "the walked repository is intact"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_migrated_repository_recounts_its_presence() -> Result<()> {
+    let legacy = tempfile::tempdir()?;
+    let repo = RepoId::new(RepoType::Models, Some("acme".to_owned()), "styler");
+    {
+        let database = builder().create(models()?, legacy.path().join("catalog.redb"))?;
+        let transaction = database.rw_transaction()?;
+        transaction.insert(Manifest {
+            id: 0,
+            format_version: 5,
+            generation: 1,
+            scanned_at: "then".to_owned(),
+            node: "old".to_owned(),
+            counts: Vec::new(),
+            search_directory: None,
+            search_generation: 0,
+            search_seq: 0,
+        })?;
+        transaction.insert(Source {
+            name: "hub".to_owned(),
+            config: SourceConfig {
+                name: "hub".to_owned(),
+                ..frozen_source_config()
+            },
+            resolved_kind: SourceKind::Git,
+            file_count: 0,
+            byte_count: 0,
+            last_scan: None,
+        })?;
+        transaction.insert(RepositoryV3 {
+            id: 11,
+            key: models::repository_key("hub", &repo),
+            source: "hub".to_owned(),
+            repo: repo.clone(),
+            root_path: "/hub".to_owned(),
+            git_dir: None,
+            default_ref: "main".to_owned(),
+            revisions: frozen_revisions(),
+        })?;
+        for (id, size, state) in [(1_i64, 100_u64, State::Local), (2, 500, State::Remote)] {
+            transaction.insert(legacy_entry(id, 11, size, state))?;
+        }
+        transaction.commit()?;
+    }
+    let reopened = Catalog::open(legacy.path())?;
+    let detail = repository_of(&reopened, &repo)?;
+    assert_eq!(detail.present_files, 1, "a remote path holds no bytes here");
+    assert_eq!(detail.present_bytes, 100);
+    Ok(())
+}
+
+fn legacy_entry(id: i64, repo_id: i64, size: u64, state: State) -> Entry {
+    Entry {
+        id,
+        repo_id,
+        artifact_id: None,
+        revision: 0,
+        rel_path: format!("w{id}.safetensors"),
+        abs_path: Some(format!("/hub/w{id}.safetensors")),
+        size,
+        state,
+        triage: false,
+        preference: 0,
+        lfs_pointer: false,
+        is_symlink: false,
+        sha256: None,
+        content: None,
+        git_sha1: None,
+        mtime: None,
+        inode: None,
+        node: LOCAL_NODE,
+        pass: 0,
+        pull_progress: None,
+    }
+}
+
+fn only_repository(catalog: &Catalog) -> Result<RepositoryDetail> {
+    let page = catalog.repositories(&RepositoryFilter::default(), None, 50)?;
+    match page.rows.len() {
+        1 => page
+            .rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| IndexError::Catalog("row".into())),
+        found => Err(IndexError::Catalog(format!("{found} repositories"))),
+    }
+}
+
+fn repository_of(catalog: &Catalog, repo: &RepoId) -> Result<RepositoryDetail> {
+    catalog
+        .repository(repo)?
+        .ok_or_else(|| IndexError::Catalog(format!("no repository {}", repo.qualified())))
+}
+
 fn loose_fixture(directory: &Path) -> Result<(PathBuf, IndexConfig)> {
     let input = directory.join("models");
     fs::create_dir_all(input.join("loras"))?;
@@ -2571,6 +2737,20 @@ fn source_v1_encoding_is_frozen() -> Result<()> {
     Ok(())
 }
 
+fn frozen_revisions() -> Vec<Revision> {
+    vec![Revision {
+        name: "main".to_owned(),
+        sha: Some(CommitSha::from_bytes([5; 20])),
+        refs: vec![Ref {
+            name: "refs/heads/main".to_owned(),
+            kind: RefKind::Tag,
+        }],
+        title: Some("frozen import".to_owned()),
+        author: Some("frozen-org".to_owned()),
+        committed: Some("2026-01-17T10:22:31Z".to_owned()),
+    }]
+}
+
 #[test]
 fn repository_encoding_is_frozen() -> Result<()> {
     let repo = RepoId::new(RepoType::Datasets, Some("frozen-org".to_owned()), "frozen");
@@ -2582,17 +2762,26 @@ fn repository_encoding_is_frozen() -> Result<()> {
         root_path: "/frozen/source/datasets--frozen-org--frozen".to_owned(),
         git_dir: Some("/frozen/source/datasets--frozen-org--frozen/.git".to_owned()),
         default_ref: "main".to_owned(),
-        revisions: vec![Revision {
-            name: "main".to_owned(),
-            sha: Some(CommitSha::from_bytes([5; 20])),
-            refs: vec![Ref {
-                name: "refs/heads/main".to_owned(),
-                kind: RefKind::Tag,
-            }],
-            title: Some("frozen import".to_owned()),
-            author: Some("frozen-org".to_owned()),
-            committed: Some("2026-01-17T10:22:31Z".to_owned()),
-        }],
+        revisions: frozen_revisions(),
+        present_files: 3,
+        present_bytes: 12_288,
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn repository_v3_encoding_is_frozen() -> Result<()> {
+    let repo = RepoId::new(RepoType::Datasets, Some("frozen-org".to_owned()), "frozen");
+    let value = RepositoryV3 {
+        id: 11,
+        key: models::repository_key("frozen", &repo),
+        source: "frozen".to_owned(),
+        repo,
+        root_path: "/frozen/source/datasets--frozen-org--frozen".to_owned(),
+        git_dir: Some("/frozen/source/datasets--frozen-org--frozen/.git".to_owned()),
+        default_ref: "main".to_owned(),
+        revisions: frozen_revisions(),
     };
     insta::assert_snapshot!(frozen_encoding(&value)?);
     Ok(())

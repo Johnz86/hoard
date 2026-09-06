@@ -132,9 +132,9 @@ impl Seeding<'_, '_> {
             .transaction
             .get()
             .secondary(RepositoryKey::key, key.as_str())?;
-        let repo_id = match stored {
-            Some(stored) => stored.id,
-            None => self.counters.next_repo()?,
+        let (repo_id, present) = match stored {
+            Some(stored) => (stored.id, (stored.present_files, stored.present_bytes)),
+            None => (self.counters.next_repo()?, (0, 0)),
         };
         self.transaction.upsert(Repository {
             id: repo_id,
@@ -170,6 +170,8 @@ impl Seeding<'_, '_> {
                         .collect(),
                 })
                 .collect(),
+            present_files: present.0,
+            present_bytes: present.1,
         })?;
         for (ordinal, revision) in seed.revisions.iter().enumerate() {
             let ordinal = u32::try_from(ordinal)
@@ -231,7 +233,7 @@ impl Seeding<'_, '_> {
                 .artifact
                 .as_ref()
                 .is_some_and(|seed| seed.artifact.needs_triage(self.triage));
-        self.transaction.insert(Entry {
+        let entry = Entry {
             id: next_id(&mut self.counters.entries)?,
             repo_id,
             artifact_id,
@@ -252,7 +254,9 @@ impl Seeding<'_, '_> {
             node: seed.node,
             pass: 0,
             pull_progress: None,
-        })?;
+        };
+        self.counters.presence.added(&entry);
+        self.transaction.insert(entry)?;
         Ok(())
     }
 

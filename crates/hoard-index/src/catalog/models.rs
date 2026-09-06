@@ -97,10 +97,26 @@ pub(super) struct RepositoryV2 {
     pub(super) revisions: Vec<RevisionV2>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 2, version = 3, from = RepositoryV2)]
+#[native_db]
+pub(super) struct RepositoryV3 {
+    #[primary_key]
+    pub(super) id: i64,
+    #[secondary_key(unique)]
+    pub(super) key: String,
+    pub(super) source: String,
+    pub(super) repo: RepoId,
+    pub(super) root_path: String,
+    pub(super) git_dir: Option<String>,
+    pub(super) default_ref: String,
+    pub(super) revisions: Vec<Revision>,
+}
+
 /// A repository as a scan found it, with the clone directory the git face serves from and
 /// what each revision's commit says about itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 2, version = 3, from = RepositoryV2)]
+#[native_model(id = 2, version = 4, from = RepositoryV3)]
 #[native_db]
 pub(super) struct Repository {
     #[primary_key]
@@ -113,6 +129,13 @@ pub(super) struct Repository {
     pub(super) git_dir: Option<String>,
     pub(super) default_ref: String,
     pub(super) revisions: Vec<Revision>,
+    /// The entries of this repository whose bytes are on a node, and the bytes they hold.
+    ///
+    /// Every writer that changes an entry's presence, size or repository must move these
+    /// through [`super::scan::PresenceShift`]; a writer added later must do the same, or
+    /// the repositories listing and the Hub face will report counts that never settle.
+    pub(super) present_files: u32,
+    pub(super) present_bytes: u64,
 }
 
 /// One name a revision answers to, with what the name is: a moving branch or a fixed tag.
@@ -140,7 +163,39 @@ pub(super) struct Revision {
     pub(super) committed: Option<String>,
 }
 
-impl From<RepositoryV2> for Repository {
+impl From<RepositoryV3> for Repository {
+    fn from(repository: RepositoryV3) -> Self {
+        Self {
+            id: repository.id,
+            key: repository.key,
+            source: repository.source,
+            repo: repository.repo,
+            root_path: repository.root_path,
+            git_dir: repository.git_dir,
+            default_ref: repository.default_ref,
+            revisions: repository.revisions,
+            present_files: 0,
+            present_bytes: 0,
+        }
+    }
+}
+
+impl From<Repository> for RepositoryV3 {
+    fn from(repository: Repository) -> Self {
+        Self {
+            id: repository.id,
+            key: repository.key,
+            source: repository.source,
+            repo: repository.repo,
+            root_path: repository.root_path,
+            git_dir: repository.git_dir,
+            default_ref: repository.default_ref,
+            revisions: repository.revisions,
+        }
+    }
+}
+
+impl From<RepositoryV2> for RepositoryV3 {
     fn from(repository: RepositoryV2) -> Self {
         Self {
             id: repository.id,
@@ -166,8 +221,8 @@ impl From<RepositoryV2> for Repository {
     }
 }
 
-impl From<Repository> for RepositoryV2 {
-    fn from(repository: Repository) -> Self {
+impl From<RepositoryV3> for RepositoryV2 {
+    fn from(repository: RepositoryV3) -> Self {
         Self {
             id: repository.id,
             key: repository.key,
@@ -794,6 +849,7 @@ pub(super) fn define_models() -> super::Result<Models> {
     let mut models = Models::new();
     models.define::<RepositoryV1>()?;
     models.define::<RepositoryV2>()?;
+    models.define::<RepositoryV3>()?;
     models.define::<Repository>()?;
     models.define::<ArtifactRecordV1>()?;
     models.define::<ArtifactRecord>()?;

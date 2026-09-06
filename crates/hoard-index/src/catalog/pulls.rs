@@ -88,7 +88,10 @@ impl Catalog {
         if let Some(artifact) = previous.as_ref().and_then(|entry| entry.artifact_id) {
             counters.pending.push(artifact);
         }
-        transaction.upsert(Entry {
+        if let Some(previous) = &previous {
+            counters.presence.removed(previous);
+        }
+        let entry = Entry {
             id,
             repo_id: mark.slot.repo.get(),
             revision: mark.slot.revision,
@@ -100,7 +103,9 @@ impl Catalog {
             pull_progress: mark.progress,
             node: LOCAL_NODE,
             ..blank_entry(previous)
-        })?;
+        };
+        counters.presence.added(&entry);
+        transaction.upsert(entry)?;
         log_changes(&transaction, &mut counters)?;
         counters.save(&transaction)?;
         transaction.commit()?;
@@ -122,7 +127,10 @@ impl Catalog {
             None => next_id(&mut counters.entries)?,
         };
         let state = pulled_state(file);
-        transaction.upsert(Entry {
+        if let Some(previous) = &previous {
+            counters.presence.removed(previous);
+        }
+        let entry = Entry {
             id,
             repo_id: file.slot.repo.get(),
             revision: file.slot.revision,
@@ -139,7 +147,9 @@ impl Catalog {
             pull_progress: None,
             node: LOCAL_NODE,
             ..blank_entry(previous)
-        })?;
+        };
+        counters.presence.added(&entry);
+        transaction.upsert(entry)?;
         if created {
             count_artifact(
                 &transaction,
@@ -243,6 +253,8 @@ fn pull_repository(
         git_dir: None,
         default_ref: crate::discover::DEFAULT_REF.to_owned(),
         revisions: Vec::new(),
+        present_files: 0,
+        present_bytes: 0,
     })?;
     Ok(id)
 }

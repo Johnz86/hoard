@@ -212,15 +212,16 @@ impl Catalog {
             }
         }
         self.retract_absent(walk, counters)?;
-        self.record_scan_stats(sources)
+        self.record_scan_stats(sources, counters)
     }
 
-    /// Recounts what each walked source holds now that every unit of it is stored and the
+    /// Records what each walked source holds now that every unit of it is stored and the
     /// paths the walk never reached have been retracted: the files still on this disk and
-    /// the bytes they occupy.
-    fn record_scan_stats(&self, sources: &[&SourceConfig]) -> Result<()> {
+    /// the bytes they occupy, summed from the repositories under it.
+    fn record_scan_stats(&self, sources: &[&SourceConfig], counters: &mut Counters) -> Result<()> {
         let at = jiff::Timestamp::now().to_string();
         let transaction = self.database.rw_transaction()?;
+        counters.presence.flush(&transaction)?;
         let repositories: Vec<Repository> = transaction
             .scan()
             .primary()?
@@ -236,21 +237,53 @@ impl Catalog {
                 .iter()
                 .filter(|repository| repository.source == source.name)
             {
-                let scan = transaction.scan().secondary::<Entry>(EntryKey::repo_id)?;
-                for entry in scan.start_with(repository.id)? {
-                    let entry: Entry = entry?;
-                    if entry.repo_id != repository.id || entry.state == State::Remote {
-                        continue;
-                    }
-                    file_count += 1;
-                    byte_count = byte_count.saturating_add(entry.size);
-                }
+                file_count += u64::from(repository.present_files);
+                byte_count = byte_count.saturating_add(repository.present_bytes);
             }
             transaction.upsert(Source {
                 file_count,
                 byte_count,
                 last_scan: Some(at.clone()),
                 ..stored
+            })?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Counts every repository's present entries again from the entries themselves, which
+    /// is what a catalog whose repositories predate those counts needs once on open.
+    pub(super) fn recount_presence(&self) -> Result<()> {
+        let read = self.database.r_transaction()?;
+        let mut counted: HashMap<i64, (u32, u64)> = HashMap::new();
+        for entry in read.scan().primary::<Entry>()?.all()? {
+            let entry: Entry = entry?;
+            if entry.state == State::Remote {
+                continue;
+            }
+            let slot = counted.entry(entry.repo_id).or_insert((0, 0));
+            slot.0 = slot.0.saturating_add(1);
+            slot.1 = slot.1.saturating_add(entry.size);
+        }
+        let repositories: Vec<Repository> = read
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
+        drop(read);
+        let transaction = self.database.rw_transaction()?;
+        for repository in repositories {
+            let (present_files, present_bytes) =
+                counted.get(&repository.id).copied().unwrap_or((0, 0));
+            if repository.present_files == present_files
+                && repository.present_bytes == present_bytes
+            {
+                continue;
+            }
+            transaction.upsert(Repository {
+                present_files,
+                present_bytes,
+                ..repository
             })?;
         }
         transaction.commit()?;
@@ -288,11 +321,11 @@ impl Catalog {
             let stored: Option<Repository> = transaction
                 .get()
                 .secondary(RepositoryKey::key, key.as_str())?;
-            let repo_id = match stored {
-                Some(stored) => stored.id,
-                None => counters.next_repo()?,
+            let (repo_id, present) = match stored {
+                Some(stored) => (stored.id, (stored.present_files, stored.present_bytes)),
+                None => (counters.next_repo()?, (0, 0)),
             };
-            transaction.upsert(repository(repo_id, &source.name, repo))?;
+            transaction.upsert(repository(repo_id, &source.name, repo, present))?;
             ids.push(repo_id);
         }
         transaction.commit()?;
@@ -365,6 +398,7 @@ impl Catalog {
             let Some(entry) = transaction.get().primary::<Entry>(known.entry_id)? else {
                 continue;
             };
+            counters.presence.removed(&entry);
             transaction.upsert(Entry {
                 state: State::Remote,
                 preference: preference(State::Remote, false),
@@ -712,6 +746,7 @@ fn replace_known(
             counters.touched.insert(id);
         }
         if let Some(entry) = transaction.get().primary::<Entry>(known.entry_id)? {
+            counters.presence.removed(&entry);
             transaction.remove(entry)?;
         }
     }
@@ -725,6 +760,64 @@ pub(super) struct Counters {
     artifacts_by_identity: HashMap<u128, i64>,
     pub(super) touched: HashSet<i64>,
     pub(super) pending: Vec<i64>,
+    pub(super) presence: PresenceShift,
+}
+
+/// What a pass moved in the present file and byte counts of each repository it wrote to,
+/// so a repository's record is rewritten once per pass rather than once per entry.
+#[derive(Debug, Default)]
+pub(super) struct PresenceShift(HashMap<i64, (i64, i64)>);
+
+impl PresenceShift {
+    /// Counts an entry the caller is about to write. An entry holding no bytes on any node
+    /// moves nothing.
+    pub(super) fn added(&mut self, entry: &Entry) {
+        self.shift(entry, 1);
+    }
+
+    /// Counts an entry the caller is about to remove or move out of presence.
+    pub(super) fn removed(&mut self, entry: &Entry) {
+        self.shift(entry, -1);
+    }
+
+    fn shift(&mut self, entry: &Entry, sign: i64) {
+        if entry.state == State::Remote {
+            return;
+        }
+        let bytes = i64::try_from(entry.size).unwrap_or(i64::MAX);
+        let slot = self.0.entry(entry.repo_id).or_insert((0, 0));
+        slot.0 = slot.0.saturating_add(sign);
+        slot.1 = slot.1.saturating_add(sign.saturating_mul(bytes));
+    }
+
+    /// Writes what has accumulated onto the repositories it names and starts again empty.
+    pub(super) fn flush(&mut self, transaction: &RwTransaction<'_>) -> Result<()> {
+        for (repo_id, (files, bytes)) in self.0.drain() {
+            if files == 0 && bytes == 0 {
+                continue;
+            }
+            let Some(stored) = transaction.get().primary::<Repository>(repo_id)? else {
+                continue;
+            };
+            transaction.upsert(Repository {
+                present_files: shifted_u32(stored.present_files, files),
+                present_bytes: shifted_u64(stored.present_bytes, bytes),
+                ..stored
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn shifted_u64(current: u64, by: i64) -> u64 {
+    match by.is_negative() {
+        true => current.saturating_sub(by.unsigned_abs()),
+        false => current.saturating_add(by.unsigned_abs()),
+    }
+}
+
+fn shifted_u32(current: u32, by: i64) -> u32 {
+    u32::try_from(shifted_u64(u64::from(current), by)).unwrap_or(u32::MAX)
 }
 
 impl Counters {
@@ -743,10 +836,14 @@ impl Counters {
             artifacts_by_identity: HashMap::new(),
             touched: HashSet::new(),
             pending: Vec::new(),
+            presence: PresenceShift::default(),
         })
     }
 
-    pub(super) fn save(&self, transaction: &RwTransaction<'_>) -> Result<()> {
+    /// Writes the allocator and the present counts this pass moved, which is why every
+    /// writer commits through it.
+    pub(super) fn save(&mut self, transaction: &RwTransaction<'_>) -> Result<()> {
+        self.presence.flush(transaction)?;
         transaction.upsert(Allocator {
             id: 0,
             repos: self.repos,
@@ -799,9 +896,13 @@ pub(super) fn next_id(counter: &mut u64) -> Result<i64> {
     Ok(id)
 }
 
-fn repository(id: i64, source: &str, repo: &DiscoveredRepo) -> Repository {
+/// The stored shape of a discovered repository. `present` is what the copy already on
+/// record counted, because rediscovering a repository does not move a single file.
+fn repository(id: i64, source: &str, repo: &DiscoveredRepo, present: (u32, u64)) -> Repository {
     Repository {
         id,
+        present_files: present.0,
+        present_bytes: present.1,
         key: repository_key(source, &repo.repo),
         source: source.to_owned(),
         repo: repo.repo.clone(),
@@ -1410,7 +1511,7 @@ fn store_entry(
     let triage = stored.is_some_and(|(_, triage)| triage);
     let state = entry_state(&prepared, triage);
     let artifact_id = stored.map(|(id, _)| id);
-    transaction.insert(Entry {
+    let entry = Entry {
         id: entry_id,
         repo_id: context.repo_id,
         artifact_id,
@@ -1435,7 +1536,9 @@ fn store_entry(
         node: LOCAL_NODE,
         pass: 0,
         pull_progress: None,
-    })?;
+    };
+    counters.presence.added(&entry);
+    transaction.insert(entry)?;
     Ok(stored)
 }
 

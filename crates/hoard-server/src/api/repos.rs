@@ -216,10 +216,7 @@ pub async fn list(
                 .map(|record| encode_row_cursor(record.id.get(), &key)),
             false => None,
         };
-        let mut rows = Vec::with_capacity(listed.len());
-        for record in &listed {
-            rows.push(list_row(&catalog, record)?);
-        }
+        let rows = listed.iter().map(list_row).collect();
         Ok(RepoListView {
             next_cursor,
             rows,
@@ -230,13 +227,9 @@ pub async fn list(
     Ok(Json(view))
 }
 
-fn list_row(catalog: &Catalog, record: &RepositoryDetail) -> Result<RepoListRow, IndexError> {
-    let entries = match catalog.resolve_revision(record, &record.default_ref) {
-        Some(revision) => catalog.revision_entries(record.id, revision.ordinal)?,
-        None => Vec::new(),
-    };
-    let size = entries.iter().map(|entry| entry.size).sum();
-    Ok(RepoListRow {
+fn list_row(record: &RepositoryDetail) -> RepoListRow {
+    let size = record.present_bytes;
+    RepoListRow {
         id: record.id,
         repo: record.repo.qualified(),
         repo_type: record.repo.repo_type(),
@@ -245,11 +238,11 @@ fn list_row(catalog: &Catalog, record: &RepositoryDetail) -> Result<RepoListRow,
         node: record.node.clone(),
         kind: record.kind.as_str().to_owned(),
         default_ref: record.default_ref.clone(),
-        files: entries.len() as u64,
+        files: u64::from(record.present_files),
         size,
         size_human: format_size(size),
         last_modified: None,
-    })
+    }
 }
 
 pub async fn detail(

@@ -111,6 +111,7 @@ impl Catalog {
                 counters.touched.insert(artifact);
                 counters.pending.push(artifact);
             }
+            counters.presence.removed(&stored);
             transaction.upsert(Entry {
                 state: State::Remote,
                 pull_progress: None,
@@ -164,7 +165,7 @@ impl Ingesting<'_, '_> {
             None => next_id(&mut self.counters.entries)?,
         };
         let triage = classified.as_ref().is_some_and(|found| found.triage);
-        self.transaction.upsert(Entry {
+        let entry = Entry {
             id: entry_id,
             repo_id,
             artifact_id,
@@ -185,7 +186,12 @@ impl Ingesting<'_, '_> {
             node: LOCAL_NODE,
             pass: 0,
             pull_progress: None,
-        })?;
+        };
+        if let Some(previous) = &previous {
+            self.counters.presence.removed(previous);
+        }
+        self.counters.presence.added(&entry);
+        self.transaction.upsert(entry)?;
         if let Some(found) = classified.as_ref().filter(|found| found.created) {
             self.count_artifact(file.size, found.triage)?;
         }
@@ -240,6 +246,8 @@ impl Ingesting<'_, '_> {
             git_dir: None,
             default_ref: crate::discover::DEFAULT_REF.to_owned(),
             revisions: Vec::new(),
+            present_files: 0,
+            present_bytes: 0,
         })?;
         Ok(id)
     }
