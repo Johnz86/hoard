@@ -1991,12 +1991,14 @@ dependencies = [
 name = "hoard-index"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "gix",
  "globset",
  "hoard-core",
  "humansize",
  "ignore",
  "jiff",
+ "lz4_flex",
  "native_db",
  "native_model",
  "notify",

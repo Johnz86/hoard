@@ -20,11 +20,11 @@ first; this document assumes it.
   dependency research; they stay. The wave plan files under `docs/superpowers/plans/` are
   deleted - git keeps them, and a stale plan in the tree is a trap for the next agent.
 - Phases 0 to 9 are done, 10 and 11 are partial. `docs/feature-plan.md` holds the table.
-- At `fe9445b` all four checks pass: `cargo fmt --check`, clippy with `-D warnings`,
-  `cargo test --workspace` at 746 passed, 0 failed, 3 ignored, and `cargo build --workspace`.
-  The three ignored are the scale harness, the mDNS test that needs a multicast route and the
-  sniffer test that reads the local model caches. `cargo doc --workspace --no-deps` emits no
-  warning.
+- At the head of `master` after the disk-budget wave all four checks pass:
+  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 762 passed,
+  0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness
+  and its supplemental fixture, the mDNS test that needs a multicast route and the sniffer
+  test that reads the local model caches. `cargo doc --workspace --no-deps` emits no warning.
 
 ## Running the loop
 
@@ -92,17 +92,25 @@ plan and hands it to the same loop.
 
 Performance, with the numbers from `docs/native-catalog.md`:
 
-- **Allocated disk at 1M is 2276 MB against a 1.5 GB target.** This is the one threshold
-  missed by a wide margin, and it is the largest single piece of work left. Revision,
-  repository, source and the location key are still written out per entry, which is most of
-  what a 1M catalog is made of; interning that text per revision and referencing it by id is
-  the lever. The per-table storage breakdown in `docs/native-catalog.md` says where the bytes
-  are.
-- **The collapse-path queries sit at about 510 ms against a 500 ms target.** `node:self` is
-  the measured one; any query naming `node:`, `state:`, `source:`, `repo:`, `rev:` or
-  `hash:`, or sorting on revision, node or state, takes the same path. It still keeps one row
-  per matching artifact rather than one per page. The primary path is bounded and is the
-  model to follow.
+- **The 1M disk gate is met by 100.4 MB.** Allocated disk after the rebuild is
+  1,399,648,256 bytes against 1,500,000,000, a 41 per cent reduction from the computed
+  location key, the compact and LZ4 record codecs, the trimmed search columns and no longer
+  writing a change log before the first index is published. A rebuild that replaces a
+  published index holds two search directories while it runs and peaks at 1,463,869,440
+  bytes, inside the gate by 36.1 MB; that transient is the number to watch. The next levers,
+  in order of measured size, are intra-page slack (608,835,673 bytes, 45 per cent of the redb
+  file, which `compact` does not reclaim and only a dense rewrite would), the
+  `ArtifactDetail` summary itself (497 MiB of pages, 37 per cent of the file), and one card
+  per revision instead of one per artifact in `SearchText`. The per-table breakdown in
+  `docs/native-catalog.md` is current.
+- **A page in the middle of the order takes 1.5 s at 1M.** The deferred collector cuts a
+  page near the end out of the reversed order and neither end helps the middle; the last
+  page is 119 ms. No threshold names this query, and it is the largest measured miss left.
+- **The collapse-path queries are under the 500 ms target without being bounded.**
+  `node:self` is 352 to 439 ms at 1M; any query naming `node:`, `state:`, `source:`,
+  `repo:`, `rev:` or `hash:`, or sorting on revision, node or state, takes the same path and
+  still keeps one row per matching artifact rather than one per page. The primary path is
+  bounded and is the model to follow.
 - **The usage views are O(rows of the repository).** The client count the USAGE tab shows is
   a claim about every pull the repository ever served, so bounding the chart alone would not
   bound the route: 20,000 rows cost 9.1 ms. It needs a maintained count, not a bound.
@@ -140,7 +148,10 @@ Smaller things, each verified:
   phase name and the accepted-in-the-past framing are history rather than a description of
   the code.
 
-`docs/native-catalog.md` under "Remaining work" holds the rest: byte-exact path identities,
+`docs/native-catalog.md` under "Remaining work" holds the rest: a truncated record panicking
+inside `native_model` before any hoard codec runs, `sweep_artifact` decompressing a cold row
+only to hand it back to `remove` because native_db 0.8.2 has no remove-by-key, byte-exact
+path identities,
 `triage_queue` needing rather than tolerating a search index, skipping a rescan's document
 re-read when every stamp is unchanged, revision ordinals recomputed on every rescan, counting
 a revision's artifact units for content another revision already claimed, complete repository

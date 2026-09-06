@@ -10,8 +10,8 @@ use crate::infer::{InferInput, infer};
 
 use super::hashing::content_key;
 use super::models::{
-    ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, Placement, Repository,
-    RepositoryKey, Revision, SearchText, Source, Summary, entry_at, location_key, repository_key,
+    ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, LocationKey, Placement,
+    Repository, RepositoryKey, Revision, SearchText, Source, Summary, entry_at, repository_key,
 };
 use super::read::{Reader, repositories_of_source_in};
 use super::scan::{
@@ -76,11 +76,12 @@ impl Catalog {
         let mut reader = Reader::new(&snapshot, &names);
         let mut details = Vec::new();
         for repo_id in repositories_of_source_in(&snapshot, MIRROR_SOURCE)? {
-            let rows: Vec<Entry> = snapshot
+            let mut rows: Vec<Entry> = snapshot
                 .scan()
-                .secondary::<Entry>(EntryKey::repo_id)?
-                .start_with(repo_id)?
+                .secondary::<Entry>(EntryKey::location)?
+                .start_with(LocationKey::repository(repo_id))?
                 .collect::<native_db::db_type::Result<_>>()?;
+            rows.sort_unstable_by_key(|entry| entry.id);
             for entry in rows.iter().filter(|entry| {
                 entry.repo_id == repo_id
                     && entry.node == LOCAL_NODE
@@ -211,7 +212,6 @@ impl Ingesting<'_, '_> {
             repo_id,
             artifact_id,
             revision: ordinal,
-            location: location_key(repo_id, ordinal, &file.rel_path),
             rel_path: file.rel_path.clone(),
             placed: Placement::Absent,
             size: file.size,

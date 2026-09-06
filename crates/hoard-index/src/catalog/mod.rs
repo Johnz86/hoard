@@ -1,3 +1,4 @@
+mod codec;
 mod digest;
 mod hashing;
 mod ingest;
@@ -54,23 +55,46 @@ pub use self::verdict::OverrideRecord;
 
 /// The one shape this build reads and writes. A catalog whose manifest names another is
 /// rebuilt from disk rather than converted.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
-/// One redb table's share of the catalog file: the rows it holds, the bytes those rows
-/// occupy, and the bytes a compaction would reclaim.
+/// One redb table's share of the catalog file: the rows it holds, the payload bytes those
+/// rows spend, the btree pages holding them, and the space inside those pages that holds
+/// nothing.
+///
+/// `stored_bytes` is the key and value payload alone, which is what a record encoding
+/// changes. `metadata_bytes` is the branch keys and page headers around it, and
+/// `fragmented_bytes` is unused space inside pages already allocated: it is what the file
+/// spends beyond the two, not a quantity a compaction is promised to return.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TableStorage {
     pub name: String,
     pub entries: u64,
     pub stored_bytes: u64,
+    pub metadata_bytes: u64,
     pub fragmented_bytes: u64,
+    pub leaf_pages: u64,
+    pub branch_pages: u64,
+    pub tree_height: u32,
+}
+
+/// One name directly under the catalog directory, with the length its files claim and the
+/// blocks the filesystem gave them. `catalog.redb` and each `search-v1-<nanos>` directory
+/// are separate names, so redb and Tantivy are never added together by accident.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ComponentStorage {
+    pub name: String,
+    pub apparent_bytes: u64,
+    pub allocated_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StorageReport {
     pub file_bytes: u64,
     pub allocated_bytes: u64,
+    pub directory_apparent_bytes: u64,
+    pub directory_allocated_bytes: u64,
     pub tables: Vec<TableStorage>,
+    pub components: Vec<ComponentStorage>,
 }
 
 /// The totals the stats screen prints above its tables, as the sweep last measured them.
@@ -245,10 +269,21 @@ impl Catalog {
             tables.push(table_storage(name, table.len(), table.stats())?);
         }
         tables.sort_by_key(|table| std::cmp::Reverse(table.stored_bytes));
+        let mut components = components_of(directory)?;
+        components.sort_by_key(|component| std::cmp::Reverse(component.allocated_bytes));
         Ok(StorageReport {
             file_bytes: metadata.len(),
             allocated_bytes: allocated_bytes(&metadata),
+            directory_apparent_bytes: components
+                .iter()
+                .map(|component| component.apparent_bytes)
+                .sum(),
+            directory_allocated_bytes: components
+                .iter()
+                .map(|component| component.allocated_bytes)
+                .sum(),
             tables,
+            components,
         })
     }
 
@@ -299,8 +334,43 @@ fn table_storage(
         name,
         entries: entries.map_err(redb_error)?,
         stored_bytes: stats.stored_bytes(),
+        metadata_bytes: stats.metadata_bytes(),
         fragmented_bytes: stats.fragmented_bytes(),
+        leaf_pages: stats.leaf_pages(),
+        branch_pages: stats.branch_pages(),
+        tree_height: stats.tree_height(),
     })
+}
+
+/// What each name directly under the catalog directory costs, summing a directory over
+/// everything below it.
+fn components_of(directory: &Path) -> Result<Vec<ComponentStorage>> {
+    let mut components = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let (apparent_bytes, allocated_bytes) = sizes_below(&entry.path())?;
+        components.push(ComponentStorage {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            apparent_bytes,
+            allocated_bytes,
+        });
+    }
+    Ok(components)
+}
+
+fn sizes_below(path: &Path) -> Result<(u64, u64)> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Ok((metadata.len(), allocated_bytes(&metadata)));
+    }
+    let mut apparent = 0;
+    let mut allocated = 0;
+    for entry in std::fs::read_dir(path)? {
+        let (below_apparent, below_allocated) = sizes_below(&entry?.path())?;
+        apparent += below_apparent;
+        allocated += below_allocated;
+    }
+    Ok((apparent, allocated))
 }
 
 fn redb_error(error: impl std::fmt::Display) -> IndexError {

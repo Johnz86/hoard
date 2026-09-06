@@ -236,14 +236,37 @@ macro_rules! hex_newtype {
 
         impl Serialize for $ty {
             fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                serializer.serialize_str(&crate::hex_encode(&self.0))
+                match serializer.is_human_readable() {
+                    true => serializer.serialize_str(&crate::hex_encode(&self.0)),
+                    false => serializer.serialize_bytes(&self.0),
+                }
             }
         }
 
         impl<'de> Deserialize<'de> for $ty {
             fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                let raw = String::deserialize(deserializer)?;
-                raw.parse().map_err(serde::de::Error::custom)
+                struct Visitor;
+
+                impl serde::de::Visitor<'_> for Visitor {
+                    type Value = $ty;
+
+                    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        write!(f, concat!("a ", $label, " as ", stringify!($len), " bytes"))
+                    }
+
+                    fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<$ty, E> {
+                        let bytes: [u8; $len] = value
+                            .try_into()
+                            .map_err(|_| E::invalid_length(value.len(), &stringify!($len)))?;
+                        Ok(<$ty>::from_bytes(bytes))
+                    }
+                }
+
+                if deserializer.is_human_readable() {
+                    let raw = String::deserialize(deserializer)?;
+                    return raw.parse().map_err(serde::de::Error::custom);
+                }
+                deserializer.deserialize_bytes(Visitor)
             }
         }
     };
@@ -292,7 +315,10 @@ macro_rules! row_id {
 
         impl Serialize for $ty {
             fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                serializer.serialize_str(&self.to_string())
+                match serializer.is_human_readable() {
+                    true => serializer.serialize_str(&self.to_string()),
+                    false => serializer.serialize_i64(self.0),
+                }
             }
         }
 
@@ -323,7 +349,7 @@ macro_rules! row_id {
                 if deserializer.is_human_readable() {
                     deserializer.deserialize_any(Visitor)
                 } else {
-                    deserializer.deserialize_str(Visitor)
+                    deserializer.deserialize_i64(Visitor)
                 }
             }
         }

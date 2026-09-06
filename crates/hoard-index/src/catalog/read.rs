@@ -19,8 +19,8 @@ use crate::time::parse_opt_timestamp;
 use crate::triage::{TriageHeader, header_facts};
 
 use super::models::{
-    ArtifactDetail, ArtifactRecord, Entry, EntryKey, Repository, RepositoryKey, Revision, Source,
-    location_key, repository_key, revision_prefix,
+    ArtifactDetail, ArtifactRecord, Entry, EntryKey, LocationKey, Repository, RepositoryKey,
+    Revision, Source, repository_key,
 };
 use super::nodes::{NodeNames, PEER_SOURCE};
 use super::search::{EntryFacts, assemble_row, revision_of};
@@ -678,12 +678,15 @@ impl<'a, 'db> Reader<'a, 'db> {
             .collect::<native_db::db_type::Result<_>>()?)
     }
 
+    /// Every file of one repository, in (revision, path) order, as one prefix scan of the
+    /// location key. That is the index's own order and not entry-id order; a caller that
+    /// shows these rows orders them itself. [`Reader::repository_rows`] does.
     fn entries_of_repo(&self, repo: i64) -> Result<Vec<Entry>> {
         Ok(self
             .snapshot
             .scan()
-            .secondary::<Entry>(EntryKey::repo_id)?
-            .start_with(repo)?
+            .secondary::<Entry>(EntryKey::location)?
+            .start_with(LocationKey::repository(repo))?
             .collect::<native_db::db_type::Result<_>>()?)
     }
 
@@ -693,7 +696,7 @@ impl<'a, 'db> Reader<'a, 'db> {
             .snapshot
             .scan()
             .secondary::<Entry>(EntryKey::location)?
-            .start_with(revision_prefix(repo, revision).as_str())?
+            .start_with(LocationKey::revision(repo, revision))?
             .collect::<native_db::db_type::Result<_>>()?)
     }
 
@@ -704,10 +707,10 @@ impl<'a, 'db> Reader<'a, 'db> {
         revision: u32,
         rel_path: &str,
     ) -> Result<Option<Entry>> {
-        Ok(self
-            .snapshot
-            .get()
-            .secondary(EntryKey::location, location_key(repo, revision, rel_path))?)
+        Ok(self.snapshot.get().secondary(
+            EntryKey::location,
+            LocationKey::at(repo, revision, rel_path),
+        )?)
     }
 
     fn repository(&mut self, id: i64) -> Result<&Repository> {

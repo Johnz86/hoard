@@ -57,10 +57,10 @@ temporary goes inside the repository. `HF_HOME` points there too, so the client 
 the server rather than from its own cache. Skip this step and say so if no repository in the
 index has a revision sha.
 
-Three tests are ignored on purpose and stay ignored: the scale harness in
-`crates/hoard-index/tests/scale.rs`, the mDNS test that needs a multicast route, and the
-sniffer test that reads the local model caches. An ignored count other than three means a
-test was added or lost, not that something is being skipped.
+Four tests are ignored on purpose and stay ignored: the scale harness and the supplemental
+fixture in `crates/hoard-index/tests/scale.rs`, the mDNS test that needs a multicast route,
+and the sniffer test that reads the local model caches. An ignored count other than four
+means a test was added or lost, not that something is being skipped.
 
 When every step passes, report the final output line of each: the test counts including the
 ignored, the clippy line, and any warnings from `cargo doc`. Never mark a task complete with

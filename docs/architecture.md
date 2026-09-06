@@ -137,6 +137,7 @@ hoard/
         hash/                fingerprint, sha256, git blob sha1
         catalog/             the native_db + Tantivy catalog: the index
           mod.rs             Catalog open/status/integrity, format version, storage report
+          codec.rs           the compact and cold record encodings native_model writes with
           models.rs          native_model records: Source, Repository, Revision, ArtifactRecord,
                              ArtifactDetail, Entry, SearchText, SearchChange, Manifest,
                              Summary, Allocator, Node and the user-data rows

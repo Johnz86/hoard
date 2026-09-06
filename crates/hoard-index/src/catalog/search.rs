@@ -9,7 +9,8 @@ use tantivy::columnar::StrColumn;
 use tantivy::fastfield::Column;
 use tantivy::query::{BooleanQuery, Query, QueryClone, TermQuery};
 use tantivy::schema::{
-    FAST, Field, INDEXED, IndexRecordOption, STRING, Schema, TEXT, TantivyDocument,
+    FAST, Field, INDEXED, IndexRecordOption, Schema, TEXT, TantivyDocument, TextFieldIndexing,
+    TextOptions,
 };
 use tantivy::{DocId, Index, Score, Searcher, SegmentOrdinal, SegmentReader, Term};
 
@@ -68,6 +69,17 @@ pub(super) const REVISION_FIELD: usize = 9;
 pub(super) const ORG_FIELD: usize = 10;
 pub(super) const HASH_FIELD: usize = 11;
 pub(super) const TRIGGER_FIELD: usize = 12;
+/// The keyword fields something reads as a column: the five facet dimensions, plus the two
+/// the sort keys `revision` and `state` order by. Every other keyword is a filter term.
+const COLUMN_KEYWORDS: [usize; 7] = [
+    ROLE_FIELD,
+    BASE_FIELD,
+    FORMAT_FIELD,
+    PRECISION_FIELD,
+    NODE_FIELD,
+    STATE_FIELD,
+    REVISION_FIELD,
+];
 const KEYWORD_FIELDS: [&str; 13] = [
     "role",
     "sub_role",
@@ -142,7 +154,7 @@ impl Catalog {
         let mut indexed = 0_u64;
         for artifact in snapshot.scan().primary::<ArtifactRecord>()?.all()? {
             let artifact = artifact?;
-            for document in documents_of_artifact(&mut indexing, artifact.id)? {
+            for document in documents_of(&mut indexing, &artifact)? {
                 writer.add_document(document)?;
                 indexed += 1;
                 if indexed.is_multiple_of(512) {
@@ -984,24 +996,52 @@ pub(super) struct Fields {
     keywords: [Field; KEYWORD_FIELDS.len()],
 }
 
+/// One whole value as one term, with no field norms.
+///
+/// Field norms are read by relevance scoring alone, and nothing here ranks by score: both
+/// collectors take the score and drop it, ordering a page by a column instead. A norm is a
+/// byte per document per indexed field, so keeping them on sixteen keyword fields was the
+/// single largest file the index wrote.
+fn keyword_options() -> TextOptions {
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer("raw")
+            .set_fieldnorms(false)
+            .set_index_option(IndexRecordOption::Basic),
+    )
+}
+
 impl Fields {
+    /// Each field gets the options something reads, and nothing else.
+    ///
+    /// A keyword column is a fast field only where a facet dimension counts it or a sort
+    /// key orders by it; the rest are filter terms and carry postings alone. `base_label`
+    /// is read out of its column for the row and is never a term. `dupe` and `primary` are
+    /// term filters and are never read as columns. Text keeps positions, because the fuzzy
+    /// path is a phrase prefix query.
     pub(super) fn build() -> (Schema, Self) {
         let mut schema = Schema::builder();
+        let filter = keyword_options();
+        let column = keyword_options().set_fast(None);
+        let column_only = TextOptions::default().set_fast(None);
         let fields = Self {
             artifact: schema.add_i64_field("artifact_id", FAST | INDEXED),
             entry: schema.add_i64_field("entry_id", FAST),
             preference: schema.add_i64_field("preference", FAST),
             size: schema.add_u64_field("size", FAST | INDEXED),
             text: schema.add_text_field("text", TEXT),
-            name: schema.add_text_field("name", STRING | FAST),
-            base_label: schema.add_text_field("base_label", STRING | FAST),
-            revision_sha: schema.add_text_field("revision_sha", STRING),
-            repo_org: schema.add_text_field("repo_org", STRING),
-            dupe: schema.add_u64_field("dupe", INDEXED | FAST),
+            name: schema.add_text_field("name", column_only.clone()),
+            base_label: schema.add_text_field(BASE_LABEL_COLUMN, column_only),
+            revision_sha: schema.add_text_field("revision_sha", filter.clone()),
+            repo_org: schema.add_text_field("repo_org", filter.clone()),
+            dupe: schema.add_u64_field("dupe", INDEXED),
             trigger_text: schema.add_text_field("trigger_text", TEXT),
-            primary: schema.add_u64_field("primary", INDEXED | FAST),
+            primary: schema.add_u64_field("primary", INDEXED),
             last_used: schema.add_i64_field(LAST_USED_COLUMN, INDEXED | FAST),
-            keywords: KEYWORD_FIELDS.map(|name| schema.add_text_field(name, STRING | FAST)),
+            keywords: std::array::from_fn(|index| match COLUMN_KEYWORDS.contains(&index) {
+                true => schema.add_text_field(KEYWORD_FIELDS[index], column.clone()),
+                false => schema.add_text_field(KEYWORD_FIELDS[index], filter.clone()),
+            }),
         };
         (schema.build(), fields)
     }
@@ -1130,23 +1170,54 @@ fn documents_of_artifact(
     indexing: &mut Indexing<'_, '_>,
     artifact_id: i64,
 ) -> Result<Vec<TantivyDocument>> {
-    let entries: Vec<Entry> = indexing
+    let entries = entries_of(indexing, artifact_id)?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let artifact: ArtifactRecord =
+        indexing
+            .snapshot
+            .get()
+            .primary(artifact_id)?
+            .ok_or_else(|| {
+                IndexError::Catalog(format!(
+                    "an entry references missing artifact {artifact_id}"
+                ))
+            })?;
+    documents_from(indexing, &artifact, entries)
+}
+
+/// The same, for a caller that already holds the record: a rebuild walks the artifact table
+/// in order and would otherwise look each row up and decode it a second time.
+fn documents_of(
+    indexing: &mut Indexing<'_, '_>,
+    artifact: &ArtifactRecord,
+) -> Result<Vec<TantivyDocument>> {
+    let entries = entries_of(indexing, artifact.id)?;
+    match entries.is_empty() {
+        true => Ok(Vec::new()),
+        false => documents_from(indexing, artifact, entries),
+    }
+}
+
+fn entries_of(indexing: &Indexing<'_, '_>, artifact_id: i64) -> Result<Vec<Entry>> {
+    Ok(indexing
         .snapshot
         .scan()
         .secondary::<Entry>(EntryKey::artifact_id)?
         .start_with(Some(artifact_id))?
-        .collect::<native_db::db_type::Result<_>>()?;
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
+        .collect::<native_db::db_type::Result<_>>()?)
+}
+
+fn documents_from(
+    indexing: &mut Indexing<'_, '_>,
+    artifact: &ArtifactRecord,
+    entries: Vec<Entry>,
+) -> Result<Vec<TantivyDocument>> {
+    let artifact_id = artifact.id;
     let snapshot = indexing.snapshot;
     let fields = indexing.fields;
     let names = indexing.names;
-    let artifact: ArtifactRecord = snapshot.get().primary(artifact_id)?.ok_or_else(|| {
-        IndexError::Catalog(format!(
-            "an entry references missing artifact {artifact_id}"
-        ))
-    })?;
     let text: Option<SearchText> = snapshot.get().primary(artifact_id)?;
     let last_used = last_used_in(snapshot, artifact_id)?;
     let preferred = entries
@@ -1160,7 +1231,7 @@ fn documents_of_artifact(
             revision: revision_of(repository, entry)?,
             entry,
             repository,
-            artifact: &artifact,
+            artifact,
             node: names.of(entry.node),
             primary: preferred == Some(entry.id),
             last_used,

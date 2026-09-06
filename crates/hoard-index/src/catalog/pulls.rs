@@ -14,7 +14,7 @@ use super::hashing::content_key;
 use super::ingest::IngestRecord;
 use super::models::{
     ArtifactRecord, ArtifactRecordKey, Entry, LOCAL_NODE, Placement, Repository, RepositoryKey,
-    Revision, SearchText, Source, Summary, entry_at, location_key, placement_in, repository_key,
+    Revision, SearchText, Source, Summary, entry_at, placement_in, repository_key,
 };
 use super::scan::{
     Counters, RecordFacts, log_changes, next_id, preference, record_of, tensor_keys,
@@ -97,7 +97,6 @@ impl Catalog {
             id,
             repo_id: mark.slot.repo.get(),
             revision: mark.slot.revision,
-            location: location_key(mark.slot.repo.get(), mark.slot.revision, mark.rel_path),
             rel_path: mark.rel_path.to_owned(),
             placed: placement_in(
                 &transaction,
@@ -143,7 +142,6 @@ impl Catalog {
             id,
             repo_id: file.slot.repo.get(),
             revision: file.slot.revision,
-            location: location_key(file.slot.repo.get(), file.slot.revision, file.rel_path),
             rel_path: file.rel_path.to_owned(),
             placed: placement_in(
                 &transaction,
@@ -200,7 +198,6 @@ fn blank_entry(previous: Option<Entry>) -> Entry {
         repo_id: 0,
         artifact_id: None,
         revision: 0,
-        location: String::new(),
         rel_path: String::new(),
         placed: Placement::Absent,
         size: 0,

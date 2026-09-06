@@ -22,6 +22,7 @@ only statement of the policy; nothing here restates it.
 One line per file in `crates/hoard-index/src/catalog/`:
 
 - `mod.rs` open, `open_or_scan`, status, integrity, `FORMAT_VERSION`, storage report, compact.
+- `codec.rs` the compact and cold record encodings, named by `#[native_model(with = ...)]`.
 - `models.rs` every `native_model` record: `Source`, `Repository`, `Revision`,
   `ArtifactRecord`, `ArtifactDetail`, `Entry`, `SearchText`, `SearchChange`, `Manifest`,
   `Summary`, `Allocator`, `Node`, and the user-data rows.
@@ -60,7 +61,9 @@ Every writer of an entry commits through `scan::Counters`:
   count, so a record above the entries is rewritten once per pass rather than once per entry.
 - `log_changes(transaction, counters)` writes one `SearchChange` row per artifact the pass
   touched, in the same transaction that made the change. The sequence continues past both
-  the highest key the log holds and `Manifest.search_seq`.
+  the highest key the log holds and `Manifest.search_seq`. It writes nothing while no search
+  directory is published: a build reads the artifact records, not the log, and publishing
+  prunes the whole log unread. `Counters::load` reads that flag once per pass.
 - `Counters::save(transaction)` flushes the `DerivedShift` and writes the allocator back.
 
 **Every writer of an entry moves the derived counts.** A new writer that skips

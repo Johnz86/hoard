@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use hoard_core::{
     Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, EntryId, Evidence,
     EvidenceSource, JobId, Loadout, LoadoutPin, NodeId, Precision, RepoId, RepoType, Role, Sha256,
-    State, TensorSample, TensorSummary,
+    State, SubRole, TensorSample, TensorSummary,
 };
 
 use crate::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
@@ -18,14 +18,14 @@ use crate::row::SearchRow;
 use crate::search::{CompileContext, SortKey, SortSpec, parse};
 
 use super::models::{
-    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, Manifest,
-    Placement, Repository, RepositoryKey, SearchChange, Source,
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, LocationKey,
+    Manifest, Placement, Repository, RepositoryKey, SearchChange, Source,
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::{
-    Catalog, DigestApplied, JobProgress, JobState, MIRROR_SOURCE, NewProjection, PullMark,
-    PulledFile, QueryPage, QueryRequest, RemoteEntry, RepositoryDetail, RepositoryFilter,
+    Catalog, DigestApplied, FORMAT_VERSION, JobProgress, JobState, MIRROR_SOURCE, NewProjection,
+    PullMark, PulledFile, QueryPage, QueryRequest, RemoteEntry, RepositoryDetail, RepositoryFilter,
     RescanReport, ServedFile, UsageEvent, builder, models, query,
 };
 
@@ -210,7 +210,6 @@ fn duplicate_paths_collapse_after_correlated_entry_filtering() -> Result<()> {
     transaction.insert(repository)?;
     entry.id = 900;
     entry.repo_id = 900;
-    entry.location = models::location_key(900, entry.revision, &entry.rel_path);
     entry.state = hoard_core::State::Remote;
     entry.preference = 1;
     transaction.insert(entry)?;
@@ -1209,6 +1208,105 @@ fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
     assert_eq!(entries, Some(2));
     let reopened = Catalog::open(&native)?;
     assert_eq!(search(&reopened, "")?.total, 2);
+    Ok(())
+}
+
+#[test]
+fn storage_reports_current_table_payload_and_page_costs() -> Result<()> {
+    let (directory, catalog) = fixture()?;
+    catalog.rebuild_search(|_| {})?;
+    let native = directory.path().join("native");
+    drop(catalog);
+    let report = Catalog::storage(&native)?;
+
+    let listed: Vec<&str> = report
+        .tables
+        .iter()
+        .map(|table| table.name.as_str())
+        .collect();
+    for name in [
+        "7_1_id",
+        "7_1_artifact_id",
+        "7_1_content",
+        "7_1_location",
+        "3_1_id",
+        "3_1_identity",
+        "8_1_artifact_id",
+        "5_1_artifact_id",
+        "2_1_id",
+        "2_1_key",
+        "10_1_seq",
+    ] {
+        assert!(
+            listed.contains(&name),
+            "every primary and secondary table is listed, {name} is not: {listed:?}"
+        );
+    }
+    for name in listed.iter().filter(|name| **name != "metadata") {
+        let parts: Vec<&str> = name.splitn(3, '_').collect();
+        assert_eq!(parts.len(), 3, "a table is named model_version_key: {name}");
+        assert!(
+            parts[0].parse::<u32>().is_ok() && parts[1] == "1",
+            "every record is at native_model version 1: {name}"
+        );
+    }
+
+    let rows = report
+        .tables
+        .iter()
+        .find(|table| table.name.starts_with("7_1_id"))
+        .ok_or_else(|| IndexError::Catalog("the entry table is reported".into()))?;
+    assert_eq!(rows.entries, 2);
+    assert!(rows.stored_bytes > 0, "payload bytes are reported");
+    assert!(rows.leaf_pages > 0, "leaf pages are reported");
+    assert_eq!(rows.tree_height, 1, "two rows fit one leaf");
+    assert_eq!(
+        rows.branch_pages, 0,
+        "a one-level tree has no branch pages: {rows:?}"
+    );
+
+    let component_names: Vec<&str> = report
+        .components
+        .iter()
+        .map(|component| component.name.as_str())
+        .collect();
+    assert!(
+        component_names.contains(&"catalog.redb"),
+        "redb is its own component: {component_names:?}"
+    );
+    assert!(
+        component_names
+            .iter()
+            .any(|name| name.starts_with("search-v1-")),
+        "the published index is its own component: {component_names:?}"
+    );
+    let redb = report
+        .components
+        .iter()
+        .find(|component| component.name == "catalog.redb")
+        .ok_or_else(|| IndexError::Catalog("the redb component is reported".into()))?;
+    assert_eq!(redb.apparent_bytes, report.file_bytes);
+    assert_eq!(redb.allocated_bytes, report.allocated_bytes);
+    assert_eq!(
+        report.directory_allocated_bytes,
+        report
+            .components
+            .iter()
+            .map(|component| component.allocated_bytes)
+            .sum::<u64>(),
+        "the directory total is the components it names"
+    );
+    assert!(
+        report.directory_allocated_bytes > report.allocated_bytes,
+        "the search index costs more than nothing beside redb"
+    );
+
+    let stored: u64 = report.tables.iter().map(|table| table.stored_bytes).sum();
+    assert!(
+        stored < report.file_bytes,
+        "payload is what the rows spend, not what the file does: {stored} against {}",
+        report.file_bytes
+    );
     Ok(())
 }
 
@@ -2518,6 +2616,1273 @@ fn an_entry_is_found_by_its_location_alone() -> Result<()> {
         .collect();
     assert_eq!(paths, vec!["a".to_owned(), "a/b".to_owned()]);
     assert_eq!(catalog.revision_entries(record.id, 1)?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn location_keys_separate_repositories_revisions_and_paths() -> Result<()> {
+    use native_db::ToKey;
+    use native_db::db_type::Key;
+
+    assert_eq!(
+        LocationKey::repository(7).to_key(),
+        Key::new(7_i64.to_be_bytes().to_vec()),
+        "a repository prefix is the eight bytes of its id"
+    );
+    assert_eq!(
+        LocationKey::revision(7, 3).to_key(),
+        Key::new(
+            [
+                7_i64.to_be_bytes().as_slice(),
+                3_u32.to_be_bytes().as_slice()
+            ]
+            .concat()
+        ),
+        "a revision prefix is twelve bytes and nothing else"
+    );
+    assert_eq!(
+        LocationKey::at(7, 3, "a/b").to_key(),
+        Key::new(
+            [
+                7_i64.to_be_bytes().as_slice(),
+                3_u32.to_be_bytes().as_slice(),
+                "a/b".as_bytes(),
+            ]
+            .concat()
+        ),
+        "the path keeps its own bytes, unfolded"
+    );
+    assert_eq!(
+        LocationKey::at(7, 3, "").to_key(),
+        LocationKey::revision(7, 3).to_key(),
+        "an empty path is the revision prefix itself"
+    );
+    assert_ne!(
+        LocationKey::at(7, 3, "a").to_key(),
+        LocationKey::at(8, 3, "a").to_key(),
+        "adjacent repositories do not share a key"
+    );
+    assert_ne!(
+        LocationKey::at(7, 3, "a").to_key(),
+        LocationKey::at(7, 4, "a").to_key(),
+        "adjacent revisions do not share a key"
+    );
+
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let long = format!("nested/{}/weights.safetensors", "segment/".repeat(24));
+    let paths = [
+        "",
+        "a",
+        "a/b",
+        "ab",
+        "\u{e9}t\u{e9}/mod\u{e8}le.safetensors",
+        long.as_str(),
+    ];
+    let located = |rel_path: &str, size: u64| SeedEntry {
+        node: LOCAL_NODE,
+        rel_path: rel_path.to_owned(),
+        abs_path: Some(format!("/vault/{rel_path}")),
+        size,
+        state: State::Local,
+        is_symlink: false,
+        sha256: None,
+        git_sha1: None,
+        artifact: None,
+    };
+    let revision = |name: &str, offset: u64| SeedRevision {
+        name: name.to_owned(),
+        sha: None,
+        refs: vec![(name.to_owned(), RefKind::Branch)],
+        title: None,
+        author: None,
+        committed: None,
+        entries: paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| located(path, offset + index as u64))
+            .collect(),
+    };
+    let repository = |name: &str| -> Result<SeedRepository> {
+        Ok(SeedRepository {
+            repo: RepoId::parse_ref(RepoType::Models, &format!("acme/{name}"))?,
+            source: "cache".to_owned(),
+            kind: SourceKind::HfCache,
+            root_path: "/vault".into(),
+            git_dir: None,
+            revisions: vec![revision("main", 10), revision("next", 100)],
+        })
+    };
+    let first = repository("first")?;
+    let second = repository("second")?;
+    catalog.seed(&[first.clone(), second.clone()])?;
+    let left = repository_of(&catalog, &first.repo)?.id;
+    let right = repository_of(&catalog, &second.repo)?.id;
+    assert_eq!(
+        right.get(),
+        left.get() + 1,
+        "the two repositories are adjacent ids"
+    );
+
+    for (repo, base) in [(left, 0), (right, 0)] {
+        for (ordinal, offset) in [(0_u32, 10_u64), (1, 100)] {
+            for (index, path) in paths.iter().enumerate() {
+                let found = catalog
+                    .revision_entry(repo, ordinal, path)?
+                    .ok_or_else(|| IndexError::Catalog(format!("no entry at {path:?}")))?;
+                assert_eq!(
+                    found.size,
+                    base + offset + index as u64,
+                    "{path:?} of revision {ordinal} is its own row"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        catalog.revision_entries(left, 0)?.len(),
+        paths.len(),
+        "one revision holds exactly its own paths"
+    );
+    let listed: Vec<String> = catalog
+        .revision_entries(left, 0)?
+        .into_iter()
+        .map(|entry| entry.rel_path)
+        .collect();
+    let mut expected: Vec<String> = paths.iter().map(|path| (*path).to_owned()).collect();
+    expected.sort();
+    assert_eq!(listed, expected, "a revision reads back in path order");
+    assert!(
+        catalog.revision_entry(left, 2, "a")?.is_none(),
+        "a revision the repository does not have holds nothing"
+    );
+    Ok(())
+}
+
+#[test]
+fn computed_location_keys_follow_entry_updates() -> Result<()> {
+    let (directory, catalog) = fixture()?;
+    let native = directory.path().join("native");
+    let read = catalog.database.r_transaction()?;
+    let original: Entry = read
+        .scan()
+        .primary()?
+        .all()?
+        .next()
+        .transpose()?
+        .ok_or_else(|| IndexError::Catalog("the fixture has an entry".into()))?;
+    drop(read);
+    let repo_id = original.repo_id;
+    let revision = original.revision;
+    let at = |transaction: &native_db::transaction::RwTransaction<'_>,
+              rel_path: &str|
+     -> Result<Option<Entry>> {
+        Ok(transaction.get().secondary(
+            EntryKey::location,
+            LocationKey::at(repo_id, revision, rel_path),
+        )?)
+    };
+
+    let transaction = catalog.database.rw_transaction()?;
+    let moved = Entry {
+        rel_path: "moved/elsewhere.safetensors".to_owned(),
+        ..original.clone()
+    };
+    transaction.update(original.clone(), moved.clone())?;
+    assert!(
+        at(&transaction, &original.rel_path)?.is_none(),
+        "the key the row left is gone inside the transaction"
+    );
+    assert_eq!(
+        at(&transaction, &moved.rel_path)?.map(|entry| entry.id),
+        Some(moved.id),
+        "the key the row arrived at is there"
+    );
+    transaction.commit()?;
+
+    let transaction = catalog.database.rw_transaction()?;
+    let duplicate = Entry {
+        id: moved.id + 5000,
+        ..moved.clone()
+    };
+    let refused = transaction.insert(duplicate);
+    assert!(
+        refused.is_err(),
+        "a second row at one location is refused: {refused:?}"
+    );
+    drop(transaction);
+
+    let transaction = catalog.database.rw_transaction()?;
+    transaction.update(
+        moved.clone(),
+        Entry {
+            rel_path: "aborted.safetensors".to_owned(),
+            ..moved.clone()
+        },
+    )?;
+    transaction.abort()?;
+
+    drop(catalog);
+    let reopened = Catalog::open(&native)?;
+    let read = reopened.database.r_transaction()?;
+    let after: Option<Entry> = read.get().secondary(
+        EntryKey::location,
+        LocationKey::at(repo_id, revision, &moved.rel_path),
+    )?;
+    assert_eq!(
+        after.map(|entry| entry.id),
+        Some(moved.id),
+        "the aborted move left the committed key alone"
+    );
+    let aborted: Option<Entry> = read.get().secondary(
+        EntryKey::location,
+        LocationKey::at(repo_id, revision, "aborted.safetensors"),
+    )?;
+    assert!(aborted.is_none(), "an aborted move writes no key");
+    let vacated: Option<Entry> = read.get().secondary(
+        EntryKey::location,
+        LocationKey::at(repo_id, revision, &original.rel_path),
+    )?;
+    assert!(vacated.is_none(), "the original key stayed removed");
+    drop(read);
+
+    let transaction = reopened.database.rw_transaction()?;
+    transaction.remove(moved.clone())?;
+    transaction.commit()?;
+    let read = reopened.database.r_transaction()?;
+    let removed: Option<Entry> = read.get().secondary(
+        EntryKey::location,
+        LocationKey::at(repo_id, revision, &moved.rel_path),
+    )?;
+    assert!(removed.is_none(), "removing the row removes its key");
+    let remaining: Vec<Entry> = read
+        .scan()
+        .secondary::<Entry>(EntryKey::location)?
+        .start_with(LocationKey::repository(repo_id))?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert!(
+        remaining.iter().all(|entry| entry.id != moved.id),
+        "the repository prefix no longer reaches it"
+    );
+    Ok(())
+}
+
+#[test]
+fn repository_and_revision_listings_keep_their_order() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let shuffled = [
+        "m.safetensors",
+        "a.safetensors",
+        "z.safetensors",
+        "b/c.safetensors",
+    ];
+    let located = |rel_path: &str, size: u64| SeedEntry {
+        node: LOCAL_NODE,
+        rel_path: rel_path.to_owned(),
+        abs_path: Some(format!("/vault/{rel_path}")),
+        size,
+        state: State::Local,
+        is_symlink: false,
+        sha256: None,
+        git_sha1: None,
+        artifact: None,
+    };
+    let repo = RepoId::parse_ref(RepoType::Models, "acme/shuffled")?;
+    catalog.seed(&[SeedRepository {
+        repo: repo.clone(),
+        source: "cache".to_owned(),
+        kind: SourceKind::HfCache,
+        root_path: "/vault".into(),
+        git_dir: None,
+        revisions: (0..2)
+            .map(|ordinal| SeedRevision {
+                name: format!("rev{ordinal}"),
+                sha: None,
+                refs: vec![(format!("rev{ordinal}"), RefKind::Branch)],
+                title: None,
+                author: None,
+                committed: None,
+                entries: shuffled
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| located(path, 100 * ordinal + index as u64 + 1))
+                    .collect(),
+            })
+            .collect(),
+    }])?;
+    let record = repository_of(&catalog, &repo)?;
+    assert_eq!(record.revisions.len(), 2);
+    assert_eq!(
+        record.present_files,
+        (shuffled.len() * 2) as u32,
+        "every seeded path counts once"
+    );
+    assert_eq!(
+        record.present_bytes,
+        (1..=shuffled.len() as u64).sum::<u64>() * 2 + 100 * shuffled.len() as u64,
+        "the derived byte count follows the rows"
+    );
+    for ordinal in 0..2 {
+        let listed: Vec<String> = catalog
+            .revision_entries(record.id, ordinal)?
+            .into_iter()
+            .map(|entry| entry.rel_path)
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                "a.safetensors".to_owned(),
+                "b/c.safetensors".to_owned(),
+                "m.safetensors".to_owned(),
+                "z.safetensors".to_owned(),
+            ],
+            "revision {ordinal} reads back in path order whatever order it was written in"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+/// Writes bytes into a native_db primary table that native_db itself could never put
+/// there, so an old-format catalog can be built out of a current one: the rows keep the
+/// native_model header naming their record and carry a body this build cannot read,
+/// exactly as a genuinely older catalog's would.
+struct RawKey;
+
+impl redb::Value for RawKey {
+    type SelfType<'a> = Vec<u8>;
+    type AsBytes<'a>
+        = Vec<u8>
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Vec<u8>
+    where
+        Self: 'a,
+    {
+        data.to_vec()
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Vec<u8>) -> Vec<u8>
+    where
+        Self: 'a,
+        Self: 'b,
+    {
+        value.clone()
+    }
+
+    fn type_name() -> redb::TypeName {
+        redb::TypeName::new("DatabaseInnerKeyValue")
+    }
+}
+
+impl redb::Key for RawKey {
+    fn compare(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+        left.cmp(right)
+    }
+}
+
+fn overwrite_rows(path: &Path, table: &str, model: u32) -> Result<usize> {
+    use redb::ReadableTable;
+
+    let value = [
+        model.to_le_bytes().as_slice(),
+        1_u32.to_le_bytes().as_slice(),
+        b"not a body this build can read".as_slice(),
+    ]
+    .concat();
+    let definition = redb::TableDefinition::<RawKey, &[u8]>::new(table);
+    let database = redb::Database::open(path).map_err(super::redb_error)?;
+    let written;
+    {
+        let write = database.begin_write().map_err(super::redb_error)?;
+        {
+            let mut rows = write.open_table(definition).map_err(super::redb_error)?;
+            let keys: Vec<Vec<u8>> = rows
+                .iter()
+                .map_err(super::redb_error)?
+                .map(|row| row.map(|(key, _)| key.value()))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(super::redb_error)?;
+            written = keys.len();
+            for key in keys {
+                rows.insert(&key, value.as_slice())
+                    .map_err(super::redb_error)?;
+            }
+        }
+        write.commit().map_err(super::redb_error)?;
+    }
+    Ok(written)
+}
+
+#[test]
+fn compact_records_round_trip_without_changing_public_views() -> Result<()> {
+    use strum::IntoEnumIterator;
+
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let native = config.native_path();
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let sha = Sha256::from_bytes([0x5a; 32]);
+    let git = CommitSha::from_bytes([0x7b; 20]);
+    let commit = CommitSha::from_bytes([0x11; 20]);
+    let tensors = TensorSummary {
+        tensor_count: 4_294_967_295,
+        params: u64::MAX,
+        dtypes: BTreeMap::from([("F16".to_owned(), 12), ("BF16".to_owned(), 1)]),
+        key_prefixes: vec![("lora_unet".to_owned(), 8), ("text_model".to_owned(), 2)],
+        samples: vec![TensorSample {
+            name: "lora_unet.lora_down.weight".to_owned(),
+            dtype: "F16".to_owned(),
+            shape: vec![32, 640, u64::MAX],
+        }],
+        metadata: BTreeMap::from([("format".to_owned(), "pt".to_owned())]),
+    };
+    let evidence: Vec<Evidence> = [
+        EvidenceSource::Tensor,
+        EvidenceSource::Config,
+        EvidenceSource::Metadata,
+        EvidenceSource::Frontmatter,
+        EvidenceSource::FolderHint,
+        EvidenceSource::Filename,
+        EvidenceSource::Header,
+        EvidenceSource::User,
+    ]
+    .into_iter()
+    .map(|source| Evidence {
+        field: "role".to_owned(),
+        value: source.as_str().to_owned(),
+        source,
+        detail: match source {
+            EvidenceSource::User => None,
+            EvidenceSource::Tensor
+            | EvidenceSource::Config
+            | EvidenceSource::Metadata
+            | EvidenceSource::Frontmatter
+            | EvidenceSource::FolderHint
+            | EvidenceSource::Filename
+            | EvidenceSource::Header => Some("read from the header".to_owned()),
+        },
+        confidence: 0.5,
+    })
+    .collect();
+    let mut seeded = Vec::new();
+    for (index, (role, format)) in Role::iter().zip(ArtifactFormat::iter().cycle()).enumerate() {
+        for (offset, state) in State::iter().enumerate() {
+            let ordinal = (index * 16 + offset) as u64;
+            seeded.push((role, format, state, ordinal));
+        }
+    }
+    let sub_roles: Vec<Option<SubRole>> = std::iter::once(None)
+        .chain(SubRole::iter().map(Some))
+        .collect();
+    let entries: Vec<SeedEntry> = seeded
+        .iter()
+        .enumerate()
+        .map(|(index, (role, format, state, ordinal))| SeedEntry {
+            node: LOCAL_NODE,
+            rel_path: format!("w{index:04}.safetensors"),
+            abs_path: match state {
+                State::Remote => None,
+                _ => Some(format!("/vault/w{index:04}.safetensors")),
+            },
+            size: u64::MAX - ordinal,
+            state: *state,
+            is_symlink: index.is_multiple_of(3),
+            sha256: Some(sha),
+            git_sha1: Some(git),
+            artifact: Some(SeedArtifact {
+                identity: u128::MAX - u128::from(*ordinal),
+                artifact: Artifact {
+                    id: ArtifactId::new(0),
+                    blob: BlobId::new(0),
+                    sha256: Some(sha),
+                    size: u64::MAX - ordinal,
+                    format: *format,
+                    role: *role,
+                    sub_role: sub_roles[index % sub_roles.len()],
+                    role_confidence: 0.875,
+                    base: Base::new("sdxl 1.0"),
+                    base_label: Some("SDXL 1.0".to_owned()),
+                    base_confidence: 0.25,
+                    precision: Some(Precision::from_dtype("F16")),
+                    quant: Some("Q4_K_M".to_owned()),
+                    rank: Some(u32::MAX),
+                    alpha: Some(-1.5),
+                    params: Some(u64::MAX),
+                    context: Some(u32::MAX),
+                    trigger: Some("ohwx style".to_owned()),
+                    sniff_version: 3,
+                },
+                name: format!("w{index:04}.safetensors"),
+                org: Some("acme".to_owned()),
+                tensors: Some(tensors.clone()),
+                evidence: evidence.clone(),
+                card: Some("# card\n\nbody".to_owned()),
+                group_bytes: Some(u64::MAX),
+                shard_count: Some(u32::MAX),
+            }),
+        })
+        .collect();
+    let repo = RepoId::parse_ref(RepoType::Models, "acme/every-shape")?;
+    catalog.seed(&[SeedRepository {
+        repo: repo.clone(),
+        source: "cache".to_owned(),
+        kind: SourceKind::HfCache,
+        root_path: "/vault".into(),
+        git_dir: None,
+        revisions: vec![SeedRevision {
+            name: "main".to_owned(),
+            sha: Some(commit),
+            refs: vec![("main".to_owned(), RefKind::Branch)],
+            title: Some("a commit".to_owned()),
+            author: Some("someone".to_owned()),
+            committed: jiff::Timestamp::from_second(1_700_000_000).ok(),
+            entries,
+        }],
+    }])?;
+    catalog.rebuild_search(|_| {})?;
+    let before = search(&catalog, "")?;
+    let read = catalog.database.r_transaction()?;
+    let written: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    drop(read);
+    assert_eq!(written.len(), seeded.len(), "every seed became a row");
+    let states: BTreeMap<State, usize> =
+        written.iter().fold(BTreeMap::new(), |mut counted, entry| {
+            *counted.entry(entry.state).or_default() += 1;
+            counted
+        });
+    assert_eq!(
+        states.len(),
+        State::iter().count(),
+        "every state variant is on a row: {states:?}"
+    );
+    let present = seeded
+        .iter()
+        .filter(|(_, _, state, _)| *state != State::Remote)
+        .count();
+    assert_eq!(
+        before.total as usize, present,
+        "the sweep drops an artifact no present path reaches"
+    );
+    drop(catalog);
+
+    let reopened = Catalog::open(&native)?;
+    let after = search(&reopened, "")?;
+    assert_eq!(
+        after.rows, before.rows,
+        "every row reads back the way it was written"
+    );
+    let read = reopened.database.r_transaction()?;
+    let reread: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    drop(read);
+    assert_eq!(
+        reread, written,
+        "every field of every entry survives the compact form"
+    );
+    let row = after
+        .rows
+        .first()
+        .ok_or_else(|| IndexError::Catalog("a row".into()))?;
+    assert_eq!(row.blob_sha256, Some(sha), "a hash survives byte for byte");
+    assert_eq!(row.revision_sha, Some(commit));
+    assert_eq!(
+        row.params,
+        Some(u64::MAX),
+        "a large integer is not truncated"
+    );
+    assert_eq!(row.rank, Some(u32::MAX));
+    assert_eq!(row.alpha, Some(-1.5), "a negative float keeps its sign");
+    assert_eq!(row.size, u64::MAX, "the largest size survives");
+
+    let detail = reopened
+        .artifact_detail(row.artifact_id)?
+        .ok_or_else(|| IndexError::Catalog("a detail".into()))?;
+    assert_eq!(detail.tensors.as_ref(), Some(&tensors));
+    assert_eq!(detail.evidence, evidence);
+    let entry = reopened
+        .entries_of(row.artifact_id)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| IndexError::Catalog("a path".into()))?;
+    assert_eq!(entry.sha256, Some(sha));
+    assert_eq!(entry.git_sha1, Some(git));
+
+    let json = serde_json::to_value(row).map_err(|error| IndexError::Catalog(error.to_string()))?;
+    assert_eq!(
+        json.get("blob_sha256").and_then(serde_json::Value::as_str),
+        Some(sha.to_hex().as_str()),
+        "JSON still spells a hash in hex"
+    );
+    assert_eq!(
+        json.get("artifact_id").and_then(serde_json::Value::as_str),
+        Some(row.artifact_id.to_string().as_str()),
+        "JSON still spells a row id with its prefix"
+    );
+    let detail_json =
+        serde_json::to_value(&detail).map_err(|error| IndexError::Catalog(error.to_string()))?;
+    assert_eq!(
+        detail_json
+            .pointer("/tensors/samples/0/shape/2")
+            .and_then(serde_json::Value::as_u64),
+        Some(u64::MAX)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_catalog_of_another_format_is_rebuilt_before_a_changed_record_is_decoded() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (_input, mut config) = loose_fixture(directory.path())?;
+    config.data_dir = directory.path().join("data");
+    let native = config.native_path();
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let built = search(&catalog, "")?.total;
+    assert!(built > 0, "the fixture produced artifacts");
+    drop(catalog);
+
+    {
+        let database = builder().open(models()?, native.join("catalog.redb"))?;
+        let transaction = database.rw_transaction()?;
+        let manifest: Manifest = transaction
+            .get()
+            .primary(0_u8)?
+            .ok_or_else(|| IndexError::Catalog("a manifest".into()))?;
+        transaction.upsert(Manifest {
+            format_version: FORMAT_VERSION - 1,
+            ..manifest
+        })?;
+        transaction.commit()?;
+    }
+    let rewritten = overwrite_rows(&native.join("catalog.redb"), "7_1_id", 7)?;
+    assert!(rewritten > 0, "the entry rows were made undecodable");
+
+    let rebuilt = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    assert_eq!(
+        rebuilt.status()?.format_version,
+        FORMAT_VERSION,
+        "the catalog was scanned again rather than converted"
+    );
+    assert_eq!(
+        search(&rebuilt, "")?.total,
+        built,
+        "the rebuilt catalog holds what the source holds"
+    );
+    drop(rebuilt);
+
+    let broken = overwrite_rows(&native.join("catalog.redb"), "6_1_id", 6)?;
+    assert_eq!(broken, 1, "the manifest row was made undecodable");
+    let refused = Catalog::open_or_scan(&config, "workstation", |_, _| {});
+    assert!(
+        refused.is_err(),
+        "a catalog of this format that cannot be read is an error, not permission to \
+         recreate it"
+    );
+    assert!(
+        native.join("catalog.redb").exists(),
+        "nothing removed the catalog it could not read"
+    );
+    Ok(())
+}
+
+#[test]
+fn cold_records_read_back_through_the_inspector() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let native = config.native_path();
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let prose = "the same sentence over and over, which is what a card reads like. ".repeat(128);
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let noise: String = (0..4096)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            char::from(b'a' + (state >> 24) as u8 % 26)
+        })
+        .collect();
+    let cards = [String::new(), prose.clone(), noise.clone()];
+    let tensors = |index: usize| TensorSummary {
+        tensor_count: 256,
+        params: 12_345_678,
+        dtypes: BTreeMap::from([("F16".to_owned(), 250), ("F32".to_owned(), 6)]),
+        key_prefixes: (0..24)
+            .map(|block| (format!("lora_unet_down_blocks_{block}_attentions_0"), 8))
+            .collect(),
+        samples: (0..8)
+            .map(|slot| TensorSample {
+                name: format!("lora_unet_down_blocks_{slot}_attn1_to_q.lora_down.weight"),
+                dtype: "F16".to_owned(),
+                shape: vec![32, 640],
+            })
+            .collect(),
+        metadata: BTreeMap::from([
+            ("format".to_owned(), "pt".to_owned()),
+            ("ss_comment".to_owned(), format!("run {index}")),
+        ]),
+    };
+    let entries: Vec<SeedEntry> = cards
+        .iter()
+        .enumerate()
+        .map(|(index, card)| SeedEntry {
+            node: LOCAL_NODE,
+            rel_path: format!("w{index}.safetensors"),
+            abs_path: Some(format!("/vault/w{index}.safetensors")),
+            size: 1024 + index as u64,
+            state: State::Local,
+            is_symlink: false,
+            sha256: None,
+            git_sha1: None,
+            artifact: Some(SeedArtifact {
+                identity: 900 + index as u128,
+                artifact: Artifact {
+                    id: ArtifactId::new(0),
+                    blob: BlobId::new(0),
+                    sha256: None,
+                    size: 1024 + index as u64,
+                    format: ArtifactFormat::Safetensors,
+                    role: Role::Lora,
+                    sub_role: None,
+                    role_confidence: 0.9,
+                    base: Base::new("sdxl"),
+                    base_label: None,
+                    base_confidence: 0.9,
+                    precision: None,
+                    quant: None,
+                    rank: None,
+                    alpha: None,
+                    params: None,
+                    context: None,
+                    trigger: None,
+                    sniff_version: 1,
+                },
+                name: format!("w{index}.safetensors"),
+                org: None,
+                tensors: Some(tensors(index)),
+                evidence: vec![Evidence {
+                    field: "role".to_owned(),
+                    value: "lora".to_owned(),
+                    source: EvidenceSource::Tensor,
+                    detail: Some(card.clone()),
+                    confidence: 0.9,
+                }],
+                card: Some(card.clone()),
+                group_bytes: None,
+                shard_count: None,
+            }),
+        })
+        .collect();
+    let repo = RepoId::parse_ref(RepoType::Models, "acme/cold")?;
+    catalog.seed(&[SeedRepository {
+        repo,
+        source: "cache".to_owned(),
+        kind: SourceKind::HfCache,
+        root_path: "/vault".into(),
+        git_dir: None,
+        revisions: vec![SeedRevision {
+            name: "main".to_owned(),
+            sha: None,
+            refs: vec![("main".to_owned(), RefKind::Branch)],
+            title: None,
+            author: None,
+            committed: None,
+            entries,
+        }],
+    }])?;
+    catalog.rebuild_search(|_| {})?;
+    let ids: Vec<ArtifactId> = search(&catalog, "")?
+        .rows
+        .iter()
+        .map(|row| row.artifact_id)
+        .collect();
+    assert_eq!(ids.len(), cards.len());
+    let before: Vec<_> = ids
+        .iter()
+        .map(|id| catalog.artifact_detail(*id))
+        .collect::<Result<Vec<_>>>()?;
+    drop(catalog);
+
+    let reopened = Catalog::open(&native)?;
+    let after: Vec<_> = ids
+        .iter()
+        .map(|id| reopened.artifact_detail(*id))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(
+        after, before,
+        "an inspector view is the same whether the row was compressed or not"
+    );
+    for (index, detail) in after.iter().enumerate() {
+        let detail = detail
+            .as_ref()
+            .ok_or_else(|| IndexError::Catalog(format!("no detail for artifact {index}")))?;
+        assert_eq!(detail.tensors.as_ref(), Some(&tensors(index)));
+        assert_eq!(
+            detail
+                .evidence
+                .first()
+                .and_then(|item| item.detail.as_ref()),
+            Some(&cards[index]),
+            "no card is truncated, whatever it compresses to"
+        );
+    }
+    let found = search(&reopened, "sentence")?;
+    assert_eq!(
+        found.total, 1,
+        "a compressed card is still what the search index was built from"
+    );
+    Ok(())
+}
+
+#[test]
+fn lean_search_fields_preserve_filters_facets_and_sorting() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let sha = |byte: u8| Sha256::from_bytes([byte; 32]);
+    struct Shape {
+        name: &'static str,
+        role: Role,
+        sub_role: Option<SubRole>,
+        format: ArtifactFormat,
+        base: &'static str,
+        byte: u8,
+    }
+    let seeded = [
+        Shape {
+            name: "alpha",
+            role: Role::Lora,
+            sub_role: Some(SubRole::Ipa),
+            format: ArtifactFormat::Safetensors,
+            base: "sdxl 1.0",
+            byte: 0x11,
+        },
+        Shape {
+            name: "bravo",
+            role: Role::Ckpt,
+            sub_role: None,
+            format: ArtifactFormat::Gguf,
+            base: "flux",
+            byte: 0x22,
+        },
+        Shape {
+            name: "charlie",
+            role: Role::Lora,
+            sub_role: Some(SubRole::Tok),
+            format: ArtifactFormat::Safetensors,
+            base: "sd 1.5",
+            byte: 0x33,
+        },
+        Shape {
+            name: "delta",
+            role: Role::Vae,
+            sub_role: None,
+            format: ArtifactFormat::Safetensors,
+            base: "sdxl 1.0",
+            byte: 0x44,
+        },
+    ];
+    let entries: Vec<SeedEntry> = seeded
+        .iter()
+        .enumerate()
+        .map(|(index, shape)| SeedEntry {
+            node: LOCAL_NODE,
+            rel_path: format!("{}.safetensors", shape.name),
+            abs_path: Some(format!("/vault/{}.safetensors", shape.name)),
+            size: 4096,
+            state: State::Local,
+            is_symlink: false,
+            sha256: Some(sha(shape.byte)),
+            git_sha1: None,
+            artifact: Some(SeedArtifact {
+                identity: 500 + index as u128,
+                artifact: Artifact {
+                    id: ArtifactId::new(0),
+                    blob: BlobId::new(0),
+                    sha256: Some(sha(shape.byte)),
+                    size: 4096,
+                    format: shape.format,
+                    role: shape.role,
+                    sub_role: shape.sub_role,
+                    role_confidence: 0.99,
+                    base: Base::new(shape.base),
+                    base_label: Some(shape.base.to_uppercase()),
+                    base_confidence: 0.99,
+                    precision: Some(Precision::from_dtype("F16")),
+                    quant: None,
+                    rank: None,
+                    alpha: None,
+                    params: None,
+                    context: None,
+                    trigger: Some(format!("{} style, cinematic", shape.name)),
+                    sniff_version: 1,
+                },
+                name: format!("{}.safetensors", shape.name),
+                org: Some(format!("org-{}", shape.name)),
+                tensors: None,
+                evidence: Vec::new(),
+                card: Some(format!("the {} adapter", shape.name)),
+                group_bytes: None,
+                shard_count: None,
+            }),
+        })
+        .collect();
+    let repo = RepoId::parse_ref(RepoType::Models, "acme/lean")?;
+    catalog.seed(&[SeedRepository {
+        repo,
+        source: "cache".to_owned(),
+        kind: SourceKind::HfCache,
+        root_path: "/vault".into(),
+        git_dir: None,
+        revisions: vec![SeedRevision {
+            name: "main".to_owned(),
+            sha: Some(CommitSha::from_bytes([0x99; 20])),
+            refs: vec![("main".to_owned(), RefKind::Branch)],
+            title: None,
+            author: None,
+            committed: None,
+            entries,
+        }],
+    }])?;
+    catalog.rebuild_search(|_| {})?;
+
+    for (query, expected) in [
+        ("role:lora", 2),
+        ("role:ip-adapter", 1),
+        ("base:sdxl", 2),
+        ("fmt:gguf", 1),
+        ("prec:fp16", 4),
+        ("state:local", 4),
+        ("src:cache", 4),
+        ("repo:lean", 4),
+        ("rev:main", 4),
+        ("org:org-alpha", 1),
+        ("hash:1111111111111111", 1),
+        ("trigger:cinematic", 4),
+        ("trigger:alpha", 1),
+        ("node:self", 4),
+        ("dupe:false", 4),
+        ("adapter", 4),
+        ("~char", 1),
+        ("size:>1b", 4),
+    ] {
+        assert_eq!(
+            search(&catalog, query)?.total,
+            expected,
+            "{query} still matches what it matched"
+        );
+    }
+
+    let faceted = search(&catalog, "")?;
+    assert_eq!(faceted.facets.role.len(), 3, "role buckets are counted");
+    assert_eq!(faceted.facets.base.len(), 3, "base buckets are counted");
+    assert_eq!(faceted.facets.format.len(), 2);
+    assert_eq!(faceted.facets.precision.len(), 1);
+    assert_eq!(faceted.facets.node.len(), 1);
+
+    let context = catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?;
+    for key in [
+        SortKey::Role,
+        SortKey::Name,
+        SortKey::Base,
+        SortKey::Format,
+        SortKey::Precision,
+        SortKey::Size,
+        SortKey::Revision,
+        SortKey::Node,
+        SortKey::State,
+        SortKey::Used,
+        SortKey::Ident,
+    ] {
+        for desc in [false, true] {
+            let page = catalog.query(QueryRequest {
+                raw: "",
+                sort: SortSpec::new(key, desc),
+                limit: 50,
+                offset: 0,
+                context: &context,
+            })?;
+            assert_eq!(page.rows.len(), 4, "sorting by {key} keeps every row");
+            let ids: Vec<i64> = page.rows.iter().map(|row| row.artifact_id.get()).collect();
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), 4, "sorting by {key} repeats no row: {ids:?}");
+        }
+    }
+    let by_state = catalog.query(QueryRequest {
+        raw: "",
+        sort: SortSpec::new(SortKey::State, false),
+        limit: 50,
+        offset: 0,
+        context: &context,
+    })?;
+    let ids: Vec<i64> = by_state
+        .rows
+        .iter()
+        .map(|row| row.artifact_id.get())
+        .collect();
+    let mut ascending = ids.clone();
+    ascending.sort_unstable();
+    assert_eq!(
+        ids, ascending,
+        "rows that tie on the sort column fall back to artifact id"
+    );
+    let labels: Vec<Option<String>> = by_state
+        .rows
+        .iter()
+        .map(|row| row.base_label.clone())
+        .collect();
+    assert!(
+        labels.iter().all(Option::is_some),
+        "the base label is still read out of its column: {labels:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn prepared_scan_units_validate_files_before_storing() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("changing.safetensors");
+    fs::write(&path, lora_header())?;
+    let taken = crate::hash::stamp(&path)?;
+    assert!(
+        !super::scan::stamp_moved(Some(&path), Some(taken)),
+        "a file nobody touched did not change"
+    );
+    assert!(
+        !super::scan::stamp_moved(Some(&path), None),
+        "a path the walk never stamped is not a change"
+    );
+    assert!(
+        !super::scan::stamp_moved(None, Some(taken)),
+        "a row with no path is not a change"
+    );
+    let mut grown = lora_header();
+    grown.extend_from_slice(&[0; 64]);
+    fs::write(&path, &grown)?;
+    assert!(
+        super::scan::stamp_moved(Some(&path), Some(taken)),
+        "a file rewritten under the read is a change"
+    );
+    let after = crate::hash::stamp(&path)?;
+    assert_ne!(after.size, taken.size);
+    fs::remove_file(&path)?;
+    assert!(
+        !super::scan::stamp_moved(Some(&path), Some(taken)),
+        "a file that is gone takes the absent path, not the retry"
+    );
+
+    let input = directory.path().join("models");
+    fs::create_dir_all(&input)?;
+    let weight = input.join("w.safetensors");
+    fs::write(&weight, lora_header_named("first"))?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let native = directory.path().join("native");
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
+    let repo = only_repository(&catalog)?;
+    let first = catalog
+        .revision_entry(repo.id, 0, "w.safetensors")?
+        .ok_or_else(|| IndexError::Catalog("the scanned entry".into()))?;
+    let mut longer = lora_header_named("second");
+    longer.extend_from_slice(&[0; 128]);
+    fs::write(&weight, &longer)?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    let second = catalog
+        .revision_entry(repo.id, 0, "w.safetensors")?
+        .ok_or_else(|| IndexError::Catalog("the rescanned entry".into()))?;
+    assert_ne!(
+        second.size, first.size,
+        "the replacement row carries the bytes that are there, not the ones that were"
+    );
+    assert_eq!(
+        second.size,
+        longer.len() as u64,
+        "and it carries all of them"
+    );
+
+    let transaction = catalog.database.rw_transaction()?;
+    let stored: Entry = transaction
+        .get()
+        .primary(second.entry_id.get())?
+        .ok_or_else(|| IndexError::Catalog("the stored entry".into()))?;
+    transaction.update(
+        stored.clone(),
+        Entry {
+            size: 1,
+            ..stored.clone()
+        },
+    )?;
+    transaction.abort()?;
+    let kept = catalog
+        .revision_entry(repo.id, 0, "w.safetensors")?
+        .ok_or_else(|| IndexError::Catalog("the kept entry".into()))?;
+    assert_eq!(kept.size, second.size, "an aborted store keeps the old row");
+    Ok(())
+}
+
+#[test]
+fn new_and_existing_artifacts_keep_counts_and_search_changes() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("models");
+    fs::create_dir_all(&input)?;
+    fs::write(input.join("a.safetensors"), lora_header_named("a"))?;
+    fs::write(input.join("b.safetensors"), lora_header_named("b"))?;
+    fs::write(input.join("b-copy.safetensors"), lora_header_named("b"))?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let native = directory.path().join("native");
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+    let fresh = search(&catalog, "")?.total;
+    assert_eq!(fresh, 3, "three fresh artifacts, none shares an identity");
+
+    let unchanged = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    assert_eq!(unchanged.changed, 0, "nothing changed: {unchanged:?}");
+    assert_eq!(unchanged.added, 0);
+    assert_eq!(unchanged.absent, 0);
+    assert_eq!(
+        catalog.pending_changes()?,
+        0,
+        "a pass that wrote nothing logs nothing"
+    );
+    assert_eq!(search(&catalog, "")?.total, fresh);
+
+    fs::write(input.join("a.safetensors"), lora_header_named("changed"))?;
+    fs::write(input.join("c.safetensors"), lora_header_named("c"))?;
+    fs::remove_file(input.join("b-copy.safetensors"))?;
+    let moved = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    assert_eq!(moved.changed, 1, "a rewritten file: {moved:?}");
+    assert_eq!(moved.added, 1, "a new file: {moved:?}");
+    assert_eq!(moved.absent, 1, "a removed file: {moved:?}");
+    assert!(
+        catalog.pending_changes()? >= 3,
+        "every touched artifact is logged"
+    );
+    catalog.refresh_search(|_| {})?;
+    assert_eq!(
+        search(&catalog, "")?.total,
+        3,
+        "a, c and b survive; the copy of b was removed"
+    );
+    let totals = catalog.recount_summary()?;
+    assert_eq!(
+        totals.artifacts,
+        search(&catalog, "")?.total,
+        "the summary counts what the index holds"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_scan_before_the_first_publish_logs_nothing_and_logs_again_after_it() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("models");
+    fs::create_dir_all(&input)?;
+    for index in 0..8 {
+        fs::write(
+            input.join(format!("w{index}.safetensors")),
+            lora_header_named(&format!("t{index}")),
+        )?;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let native = directory.path().join("native");
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
+    let read = catalog.database.r_transaction()?;
+    assert_eq!(
+        read.len().primary::<SearchChange>()?,
+        0,
+        "a scan with no index to be a difference against logs nothing"
+    );
+    assert_eq!(read.len().primary::<ArtifactRecord>()?, 8);
+    drop(read);
+    assert_eq!(catalog.pending_changes()?, 0);
+    assert!(!catalog.status()?.search_built);
+
+    let ingested = catalog.ingest_served(&ServedFile {
+        repo: RepoId::parse_ref(RepoType::Models, "acme/served")?,
+        commit: CommitSha::from_bytes([0x21; 20]),
+        rel_path: "unet/model.safetensors".to_owned(),
+        size: 4096,
+        sha256: Sha256::from_bytes([0x51; 32]),
+        git_sha1: None,
+        cache_root: directory.path().join("repos"),
+    })?;
+    assert!(
+        ingested.artifact.is_some(),
+        "an ingest before the first publish still writes its rows"
+    );
+    let read = catalog.database.r_transaction()?;
+    assert_eq!(
+        read.len().primary::<SearchChange>()?,
+        0,
+        "so does every other writer that runs before the first publish"
+    );
+    drop(read);
+
+    catalog.rebuild_search(|_| {})?;
+    assert!(catalog.status()?.search_built);
+    let built = search(&catalog, "")?.total;
+    assert_eq!(
+        built, 9,
+        "the rebuild read the records, not the log: eight scanned and one served"
+    );
+
+    fs::write(input.join("w0.safetensors"), lora_header_named("changed"))?;
+    fs::write(input.join("w8.safetensors"), lora_header_named("t8"))?;
+    let report = catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    assert_eq!(report.changed, 1);
+    assert_eq!(report.added, 1);
+    let logged = catalog.pending_changes()?;
+    assert!(
+        logged >= 2,
+        "a pass after a publish logs every artifact it touched: {logged}"
+    );
+    let applied = catalog.refresh_search(|_| {})?;
+    assert_eq!(applied, logged, "and the refresh applies exactly those");
+    assert_eq!(catalog.pending_changes()?, 0);
+    assert_eq!(search(&catalog, "")?.total, 10);
     Ok(())
 }
 

@@ -15,7 +15,7 @@ use super::Catalog;
 use super::hashing::content_key;
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, Manifest, Ref, Repository,
-    RepositoryKey, Revision, SearchText, Source, location_key, placement_in, repository_key,
+    RepositoryKey, Revision, SearchText, Source, placement_in, repository_key,
 };
 use super::scan::{Counters, counts, log_changes, next_id, preference, tensor_keys};
 
@@ -239,7 +239,6 @@ impl Seeding<'_, '_> {
             repo_id,
             artifact_id,
             revision,
-            location: location_key(repo_id, revision, &seed.rel_path),
             rel_path: seed.rel_path.clone(),
             placed: placement_in(
                 self.transaction,

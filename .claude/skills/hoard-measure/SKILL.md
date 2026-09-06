@@ -154,12 +154,29 @@ Allocated disk is `du` over the output directory; apparent disk sums file length
 grows the file in regions, so the apparent number is quantised and the allocated one is what
 the disk actually loses.
 
+The one-artifact-per-file tree carries no cards, no hashes and no tensor metadata, so it
+cannot show what the cold-record codecs do. `supplemental_catalog_costs` in the same file
+seeds those through the catalog directly: 200 repositories of 3 revisions of 50 files with
+long paths, blob placements, sha256 and git shas, a card and a tensor summary per artifact.
+It prints per-table storage, record payload and inspector timings, and is not a gate:
+
+```sh
+HOARD_SCALE_REPOS=200 HOARD_SCALE_DIR=<scratch>/scale \
+  cargo test --release -p hoard-index --features fixtures --test scale supplemental \
+  -- --nocapture --ignored
+```
+
+`--features fixtures` is required: the module is behind that feature and `-p hoard-index`
+alone does not enable it, so without the flag the command runs zero tests and says `ok`. A
+whole-workspace build enables it through `hoard-server` and `hoard-mirror`, which is why
+`cargo test --workspace` counts it among the four ignored.
+
 ## The thresholds
 
 At 1M entries, absolute:
 
 - peak RSS growth during the scan under 2 GB
-- allocated disk under 1.5 GB
+- allocated disk under 1,500,000,000 bytes, reported in exact bytes and MiB
 - every query, including the collapse path, under 500 ms
 - rebuild no slower than the scan
 

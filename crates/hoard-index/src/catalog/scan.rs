@@ -22,8 +22,8 @@ use crate::sniff::{self, SniffResult};
 use super::hashing::content_key;
 use super::models::{
     Allocator, ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE,
-    Manifest, Node, Override, Placement, Ref, Repository, RepositoryKey, Revision, SearchChange,
-    SearchText, Source, Summary, location_key, repository_key,
+    LocationKey, Manifest, Node, Override, Placement, Ref, Repository, RepositoryKey, Revision,
+    SearchChange, SearchText, Source, Summary, repository_key,
 };
 use super::naming::{
     InferenceContext, Naming, artifact_name, content_hashes, disambiguate_labels, index_document,
@@ -193,11 +193,9 @@ impl Catalog {
                                 prepare
                             }
                         };
-                        let transaction = self.database.rw_transaction()?;
-                        replace_known(&transaction, walk, counters, &revision.entries, &prepare)?;
                         let narrowed = match unit {
                             Unit::Set(_) => None,
-                            Unit::Chunk(_) => Some(Unit::Chunk(prepare)),
+                            Unit::Chunk(_) => Some(Unit::Chunk(prepare.clone())),
                         };
                         let prepared = prepare_unit(
                             &context,
@@ -205,6 +203,12 @@ impl Catalog {
                             narrowed.as_ref().unwrap_or(unit),
                             label.as_deref(),
                         )?;
+                        if changed_while_prepared(&prepared) {
+                            mark_unchanged(walk, &revision.entries, &prepare);
+                            continue;
+                        }
+                        let transaction = self.database.rw_transaction()?;
+                        replace_known(&transaction, walk, counters, &revision.entries, &prepare)?;
                         store_unit(&transaction, &context, prepared, counters)?;
                         log_changes(&transaction, counters)?;
                         transaction.commit()?;
@@ -317,8 +321,8 @@ impl Catalog {
         {
             for entry in read
                 .scan()
-                .secondary::<Entry>(EntryKey::repo_id)?
-                .start_with(repository.id)?
+                .secondary::<Entry>(EntryKey::location)?
+                .start_with(LocationKey::repository(repository.id))?
             {
                 let entry: Entry = entry?;
                 let (Some(abs_path), Some(mtime), Some(inode)) = (
@@ -714,6 +718,34 @@ fn decide_unit(walk: &Walk, entries: &[DiscoveredEntry], unit: &Unit) -> UnitDec
     }
 }
 
+/// Whether a file of a prepared unit was rewritten while the unit was being read.
+///
+/// Preparation sniffs and hashes outside the write transaction, so between the walk's
+/// `stat` and the row that replaces it a file can change; writing the row anyway would
+/// attach the size and hashes of bytes that are gone. A file that has since disappeared is
+/// not a change here: preparation already saw it absent and the row it writes says so.
+///
+/// This narrows a window rather than closing one. It never was closed: redb locks the
+/// database, not the filesystem, so a file could always change between the `stat` that
+/// decided to read it and the commit that recorded what was read. The re-`stat` runs on the
+/// same pool the sniff either side of it runs on, so a unit's files are read once each in
+/// parallel rather than a thousand times in series.
+fn changed_while_prepared(prepared: &[PreparedEntry<'_>]) -> bool {
+    prepared
+        .par_iter()
+        .any(|entry| stamp_moved(entry.discovered.abs_path.as_deref(), entry.discovered.stamp))
+}
+
+/// Whether the file at `path` reads differently now from the stamp the walk took. A path
+/// with no stamp and a path that no longer stats both answer false: neither is a file that
+/// changed under a read of it.
+pub(super) fn stamp_moved(path: Option<&Path>, stamp: Option<FileStamp>) -> bool {
+    let (Some(path), Some(stamp)) = (path, stamp) else {
+        return false;
+    };
+    matches!(crate::hash::stamp(path), Ok(current) if current != stamp)
+}
+
 fn mark_unchanged(walk: &mut Walk, entries: &[DiscoveredEntry], positions: &[usize]) {
     for position in positions {
         if let Some(known) = known_of(walk, &entries[*position]) {
@@ -759,6 +791,12 @@ pub(super) struct Counters {
     pub(super) derived: DerivedShift,
     triage: f32,
     before: HashMap<i64, SummaryPart>,
+    /// Whether a published search index exists for the change log to be a log of.
+    ///
+    /// Read once, when the pass starts. A rebuild reads every artifact record rather than
+    /// the log, and cannot run beside a pass anyway: redb takes one writer at a time and
+    /// `open_or_scan` runs the scan to completion before it builds.
+    logging: bool,
 }
 
 /// What one artifact record contributes to the summary. A record that does not exist
@@ -952,7 +990,9 @@ fn shifted_u32(current: u32, by: i64) -> u32 {
 
 impl Counters {
     pub(super) fn load(database: &Database<'static>, triage: f32) -> Result<Self> {
-        let stored: Option<Allocator> = database.r_transaction()?.get().primary(0_u8)?;
+        let read = database.r_transaction()?;
+        let stored: Option<Allocator> = read.get().primary(0_u8)?;
+        let manifest: Option<Manifest> = read.get().primary(0_u8)?;
         let allocator = stored.unwrap_or(Allocator {
             id: 0,
             repos: 0,
@@ -968,6 +1008,7 @@ impl Counters {
             derived: DerivedShift::default(),
             triage,
             before: HashMap::new(),
+            logging: manifest.is_some_and(|manifest| manifest.search_directory.is_some()),
         })
     }
 
@@ -1005,7 +1046,16 @@ impl Counters {
 /// longer matches. The sequence continues past both the highest key the log still holds and
 /// the refresh cursor, because a drained log holds neither the numbers it has already spent
 /// nor any proof that a refresh has not already passed them.
+///
+/// A pass that runs before any index is published writes nothing. There is no index for the
+/// rows to be a difference against: the build that follows reads every artifact record, and
+/// publishing prunes the whole log unread. A fresh scan of a million artifacts logged and
+/// then deleted a million rows, and redb keeps the pages it grew the file by.
 pub(super) fn log_changes(transaction: &RwTransaction<'_>, counters: &mut Counters) -> Result<()> {
+    if !counters.logging {
+        counters.pending.clear();
+        return Ok(());
+    }
     if counters.pending.is_empty() {
         return Ok(());
     }
@@ -1659,11 +1709,6 @@ fn store_entry(
         repo_id: context.repo_id,
         artifact_id,
         revision: context.ordinal,
-        location: location_key(
-            context.repo_id,
-            context.ordinal,
-            &prepared.discovered.rel_path,
-        ),
         rel_path: prepared.discovered.rel_path.clone(),
         placed: Placement::of(
             prepared
@@ -1740,17 +1785,22 @@ fn store_artifact(
     if let Some(verdict) = &verdict {
         apply_override(&mut record, verdict);
     }
-    transaction.upsert(SearchText {
+    let text = SearchText {
         artifact_id: id,
         keys: tensor_keys(detail.tensors.as_ref()),
         card: draft.card.clone().unwrap_or_default(),
-    })?;
-    transaction.upsert(detail)?;
+    };
     match stored {
         Some(_) => {
+            transaction.upsert(text)?;
+            transaction.upsert(detail)?;
             transaction.upsert(record.clone())?;
         }
-        None => transaction.insert(record.clone())?,
+        None => {
+            transaction.insert(text)?;
+            transaction.insert(detail)?;
+            transaction.insert(record.clone())?;
+        }
     }
     counters.pending.push(id);
     Ok(record)

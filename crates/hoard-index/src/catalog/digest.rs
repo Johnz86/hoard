@@ -13,8 +13,8 @@ use crate::sniff::SNIFF_VERSION;
 use super::Catalog;
 use super::hashing::content_key;
 use super::models::{
-    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, Node,
-    Placement, Repository, RepositoryKey, Revision, SearchText, Source, entry_at, location_key,
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, LocationKey,
+    Node, Placement, Repository, RepositoryKey, Revision, SearchText, Source, entry_at,
     repository_key,
 };
 use super::nodes::PEER_SOURCE;
@@ -223,10 +223,10 @@ impl Catalog {
         let read = self.database.r_transaction()?;
         let rows: Vec<Entry> = read
             .scan()
-            .secondary::<Entry>(EntryKey::repo_id)?
-            .start_with(repo_id)?
+            .secondary::<Entry>(EntryKey::location)?
+            .start_with(LocationKey::repository(repo_id))?
             .collect::<native_db::db_type::Result<_>>()?;
-        Ok(rows
+        let mut stale: Vec<Entry> = rows
             .into_iter()
             .filter(|entry| {
                 entry.repo_id == repo_id
@@ -234,7 +234,9 @@ impl Catalog {
                     && entry.state == State::Remote
                     && entry.pass != pass
             })
-            .collect())
+            .collect();
+        stale.sort_unstable_by_key(|entry| entry.id);
+        Ok(stale)
     }
 
     pub fn peer_cursor(&self, peer: i64) -> Result<Option<String>> {
@@ -311,13 +313,15 @@ impl Catalog {
         let read = self.database.r_transaction()?;
         let rows: Vec<Entry> = read
             .scan()
-            .secondary::<Entry>(EntryKey::repo_id)?
-            .start_with(repo_id)?
+            .secondary::<Entry>(EntryKey::location)?
+            .start_with(LocationKey::repository(repo_id))?
             .collect::<native_db::db_type::Result<_>>()?;
-        Ok(rows
+        let mut matched: Vec<Entry> = rows
             .into_iter()
             .filter(|entry| entry.repo_id == repo_id && entry.state == state)
-            .collect())
+            .collect();
+        matched.sort_unstable_by_key(|entry| entry.id);
+        Ok(matched)
     }
 }
 
@@ -381,7 +385,6 @@ impl Applying<'_, '_> {
             repo_id,
             artifact_id: Some(artifact_id),
             revision: ordinal,
-            location: location_key(repo_id, ordinal, &row.path),
             rel_path: row.path.clone(),
             placed: Placement::Absent,
             size: row.size,

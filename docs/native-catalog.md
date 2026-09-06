@@ -36,6 +36,35 @@ nothing here restates it.
 The whole thing is recreatable from disk plus peers. redb takes an exclusive lock, so one
 process may open a catalog at a time; `hoard doctor` reports it when a second one tries.
 
+## How a record is encoded
+
+native_model writes an eight byte header naming the record and its version, then a body in
+whichever codec `#[native_model(with = ...)]` names. `catalog/codec.rs` holds two, and the
+records that do not name one keep native_model's own bincode default, which is what
+`Manifest` bootstraps from before any changed record is read.
+
+- `Compact` is bincode 1.3 with variable length integers, little endian, trailing bytes
+  refused. It is on `Entry` and `ArtifactRecord`. native_model's default spends eight bytes
+  on every string and vector length, four on every enum discriminant and eight on every
+  integer whatever it holds; nothing outside this process reads a row, so none of that is
+  paid for.
+- `Cold` wraps `Compact`'s bytes in a one byte tag and, when the whole envelope comes out
+  smaller, an LZ4 block with a checked four byte decoded length. It is on `ArtifactDetail`
+  and `SearchText`, the two largest tables and the two nothing scans: the inspector reads
+  one row and a rebuild reads one per artifact. Each row is compressed on its own, so a read
+  is still one primary lookup and one bounded decode, and a length claiming more than the
+  256 MiB maximum is refused before anything is allocated for it.
+
+Hashes and row ids serialize as bytes and integers to a binary format and as hex and
+prefixed strings to a human-readable one, so the catalog is compact and the JSON the API
+answers with is unchanged. `hoard-core`'s `id.rs` is where that branch lives.
+
+`Entry` carries no location text. The unique index over where a row sits is computed from
+the three fields that say so, as `repo_id` big endian, then `revision` big endian, then the
+relative path's own bytes. The first 8 bytes are exactly one repository and the first 12
+exactly one revision, so a repository listing and a revision listing are both one prefix
+scan of that index and `Entry` needs no repository index of its own.
+
 `hoard catalog` takes any directory with `--directory`. Every other command opens or creates
 the catalog at `<data_dir>/native`.
 
@@ -45,6 +74,7 @@ the catalog at `<data_dir>/native`.
 
 - `mod.rs` open, `open_or_scan`, status, integrity, `FORMAT_VERSION`, the per-table storage
   report, compact.
+- `codec.rs` the compact and cold record encodings, named by `#[native_model(with = ...)]`.
 - `models.rs` every `native_model` record: `Source`, `Repository`, `Revision`,
   `ArtifactRecord`, `ArtifactDetail`, `Entry`, `SearchText`, `SearchChange`, `Manifest`,
   `Summary`, `Allocator`, `Node`, and the user-data rows.
@@ -108,14 +138,21 @@ Every writer of an entry commits through `scan::Counters`:
   repository's present files and bytes, each source's owed hashes and each node's filed
   count, so a record above the entries is rewritten once per pass rather than once per entry.
 - `log_changes(transaction, counters)` writes one `SearchChange` row per touched artifact, in
-  the transaction that made the change. The sequence continues past both the highest key the
-  log holds and `Manifest.search_seq`.
+  the transaction that made the change, and writes nothing while no search directory is
+  published. The sequence continues past both the highest key the log holds and
+  `Manifest.search_seq`.
 - `Counters::save(transaction)` flushes the shift and writes the allocator back.
 
 **Every writer of an entry moves the derived counts.** A writer that skips `DerivedShift`
 leaves `Repository::present_files`, `Repository::present_bytes`, `Source::pending_hashes` and
 `Node::filed` behind; `hoard doctor`'s summary check is what catches it. A writer that skips
 `log_changes` leaves the search index stale with no record that it is.
+
+A pass that runs before any index is published writes no `SearchChange` rows at all. There is
+nothing for them to be a difference against: the build that follows reads every artifact
+record, and publishing prunes the whole log unread. `Counters::load` reads whether the
+manifest names a published directory and `log_changes` returns early while it does not, so a
+fresh scan of a million artifacts no longer writes and then deletes a million rows.
 
 `refresh_search` replays the log after the durable cursor, one Tantivy commit per batch,
 deleting an artifact's documents by term and re-adding its entries, then prunes what it
@@ -264,7 +301,9 @@ du -sh data/native
   block cache and the upstream.
 - Catalog on disk: 6.9 MB, of which `catalog.redb` is 6.3 MB and the published search
   directory 572 KB.
-- `catalog status` reports `format_version: 1` and names every table `<model id>_1_<key>`.
+- `catalog status` reported `format_version: 1` and named every table `<model id>_1_<key>`.
+  The format version is 2 from `969ebe4`; the native_model version of every record is still
+  1, so the table names are unchanged.
 - `ls 'role:lora'`: 35 artifacts. Every `hoard ls` query on this catalog is 15 to 17 ms,
   which is process start and opening two files rather than the query; on a running server,
   which holds the catalog and the Tantivy reader open, every route is 0.5 to 2.4 ms.
@@ -306,32 +345,93 @@ flight take 0.81 s.
 directory, one artifact per file, no hashing, release build, its own process. The catalog
 produced exactly one artifact per file at 1,000, at 100k and at 1M. The harness then rewrites
 1,000 of the headers, rescans and refreshes the search index from the change log, so the
-incremental path is measured beside the full one.
+incremental path is measured beside the full one. It puts those 1,000 headers back before it
+returns, so the next binary measured against the same tree reads exactly the same input.
 
-At 1M. The `7737aeb` column is performance wave 1 and the `64e11af` column is performance
-wave 2, which re-measured only the rows its own before/after needed; the two columns are from
-different sessions and the rows wave 2 did not take are marked. Wave 2's own like-for-like
-before column, `a4dd324`, is given where it differs from `7737aeb` by more than the effect.
+The harness closes the catalog three times, because redb's per-table statistics need the
+exclusive lock: after the scan, after the queries, which is the state the rebuild left, and
+after the incremental workload. Each close writes a JSON report beside the catalog and
+prints it. Reopening drops native_db's 256 MiB redb cache, so the rebuild and the rescan run
+against a cold record cache and a warm operating-system page cache; that is the same for
+every column taken with this harness and is not comparable to the columns above it.
 
-| measure | 7737aeb | 64e11af |
+It then rebuilds the search index a second time, over the published one, which is the only
+way to see what a rebuild costs in temporary disk: the fresh build has no superseded
+directory beside it.
+
+`supplemental_catalog_costs` in the same file is a second ignored test, behind the
+`fixtures` feature, for the costs the one-artifact-per-file gate cannot show. It seeds
+records rather than sniffing files: long relative paths, an hf-cache source whose entries
+carry an explicit blob path, populated sha256 and git blob shas, a full model card and
+tensor summary per artifact, three revisions per repository, and one artifact in ten reached
+by more than one path.
+
+```sh
+HOARD_SCALE_DIR=<scratch> cargo test --release -p hoard-index --features fixtures \
+  --test scale -- --nocapture --ignored supplemental
+```
+
+At 1M. `95cd3ad` is the base this wave started from and `1783f2b` is the wave as it landed;
+both were measured in one session on this workstation with the harness at `ef29745`, on an
+otherwise idle machine. Exact bytes, with MiB beside them.
+
+| measure | 95cd3ad | 1783f2b |
 | --- | --- | --- |
-| scan wall | 102.769339125s | 95.305741107s |
-| peak rss growth during scan | 731 MB | 838 MB |
-| peak rss growth during rescan and refresh | not measured | 359 MB |
-| rebuild wall | 13.936102691s | 12.781133799s |
-| on disk, apparent | 4175 MB | 4175 MB |
-| on disk, allocated | 2564 MB | 2276 MB |
-| query empty by name | 119.431554ms | not re-measured |
-| query deep offset | 119.874963ms | not re-measured |
-| query role:lora with facets | 147.175983ms | not re-measured |
-| query filtered | 234.181468ms | not re-measured |
-| query node:self with facets | 510.93955ms | 511.984273ms |
-| peak rss growth during the collapse query | 35 MB | not re-measured |
-| rescan wall (1,000 changed) | 6.983199391s | 5.314401519s |
-| refresh wall | 30.101233ms | 25.737863ms |
+| scan wall | 98.808 s | 76.395 s |
+| peak rss growth during scan | 879,169,536 (838.44 MiB) | 880,521,216 (839.73 MiB) |
+| rebuild wall | 13.634 s | 7.512 s |
+| peak rss growth during rebuild | 343,195,648 (327.30 MiB) | 351,121,408 (334.86 MiB) |
+| on disk after rebuild, allocated | 2,387,607,552 (2277.00 MiB) | 1,399,648,256 (1334.81 MiB) |
+| of which `catalog.redb` | 2,304,364,544 | 1,341,190,144 |
+| of which the search directory | 83,243,008 | 58,458,112 |
+| record payload after rebuild | 1,042,201,188 (993.92 MiB) | 563,971,405 (537.85 MiB) |
+| on disk after the churn, allocated | 2,387,750,912 | 1,403,404,288 |
+| query empty by name | 117.374 ms | 119.359 ms |
+| query deep offset | 118.702 ms | 118.851 ms |
+| query midpoint offset | 1.626 s | 1.529 s |
+| query role:lora with facets | 141.044 ms | 143.290 ms |
+| query filtered | 225.676 ms | 229.826 ms |
+| query node:self with facets | 474.983 ms | 408.324 ms |
+| inspector artifact_detail | 25.296 us | 25.424 us |
+| inspector entries_of | 34.144 us | 30.576 us |
+| inspector artifact_row | 9.104 us | 8.736 us |
+| rescan wall (1,000 changed) | 5.134 s | 5.151 s |
+| refresh wall | 26.137 ms | 27.493 ms |
+| rebuild wall over a published index | 9.434 s | 7.847 s |
+| peak allocated while an index was replaced | 2,476,257,280 | 1,463,869,440 |
 
-At 100k, commit `64e11af`: scan 6.88 s, allocated disk 232 MB, peak RSS growth 271 MB,
-`node:self` 32.6 ms. The four primary-path queries were 13 to 25 ms when last taken.
+The disk rows and the payload row are the change, and so are the scan and the two rebuilds.
+The scan is 22.7 per cent faster because there are fewer bytes to serialize and write, a
+million change-log rows are no longer among them, and a unit is prepared outside the write
+transaction. The first rebuild is 44.9 per cent faster because the artifact record it already
+holds is no longer looked up and decoded a second time, there are fewer search columns to
+write, and publishing no longer prunes a million log rows.
+
+`node:self` moved from 474.983 ms to 408.324 ms, and read 352.126 and 438.563 ms at
+`2c6bde6`. The direction is right and the mechanism is that six keyword columns no longer
+exist for the collapse to open, but a spread of 86 ms across the after runs means the size is
+not established.
+
+The four other queries, all three inspector rows, the rescan and the refresh moved by less
+than the spread of their own runs and are not results.
+
+`peak rss growth during rescan and refresh` is omitted. It is a high-water mark attributed to
+a phase by subtraction and read 65,220,608, 313,569,280, 95,752,192 and 72,101,888 bytes
+across four runs of two commits; a 4.8x spread measures the allocator, not the change.
+
+**What the change log cost.** At `2c6bde6` a fresh scan wrote one `SearchChange` row per
+artifact and the rebuild that followed deleted every one of them unread, because a build
+reads the artifact records rather than the log. At 1M the table was 32,000,000 stored bytes
+over 80,171,008 bytes of pages, and redb does not return freed pages to the operating system,
+so the file kept them. `1783f2b` writes none: allocated disk after the rebuild went from
+1,480,302,592 to 1,399,648,256 bytes, 80,654,336 less, and the residual `catalog.redb` holds
+beyond its tables fell from 87.68 MiB to 11.19 MiB. At 100k the same fix is worth 7,655,424
+bytes.
+
+At 100k, the same pair: the whole directory 243,363,840 to 143,675,392 bytes, `catalog.redb`
+235,188,224 to 137,908,224, the search directory 8,175,616 to 5,767,168, record payload
+103,123,417 to 55,512,438, scan 6.461 s to 5.019 s, rebuild 1.248 s to 0.836 s. The 100k
+queries and inspector rows all moved by less than a millisecond and are not results.
 
 Allocated disk is `du` over the output directory; apparent disk sums file lengths, and redb
 grows `catalog.redb` in regions, so the apparent number is quantised and the allocated one is
@@ -340,43 +440,174 @@ what the disk actually loses.
 ### Thresholds
 
 At 1M entries, absolute: peak RSS growth during the scan under 2 GB, allocated disk under
-1.5 GB, every query under 500 ms, rebuild no slower than the scan.
+1,500,000,000 bytes, every query under 500 ms, rebuild no slower than the scan. Measured at
+`1783f2b`; the disk rows are the same to within 37 KB across three runs, the rest is one run
+on an otherwise idle machine.
 
-Three of the four are met. Allocated disk is 2276 MB against 1.5 GB, and it is the one
-threshold missed by a wide margin. `node:self` at 512 ms is at the query threshold rather
-than under it, within its own run-to-run spread.
+| gate | measured | verdict |
+| --- | --- | --- |
+| allocated disk after the rebuild | 1,399,648,256 bytes | met, by 100.4 MB |
+| allocated disk after the incremental workload | 1,403,404,288 bytes | met, by 96.6 MB |
+| allocated disk at the peak of a rebuild that replaces a published index | 1,463,869,440 bytes | met, by 36.1 MB |
+| peak RSS growth during the scan | 880,521,216 bytes | met |
+| rebuild no slower than the scan | 7.51 s against 76.39 s | met |
+| every query on the original list under 500 ms | slowest is `node:self` at 474.98 ms before, 408.32 ms after | met |
+
+The first two rows are the catalog at rest. The third is not: `publish` writes the new
+`search-v1-<nanos>` directory in full and keeps the old one until the new one is committed
+and named in the manifest, so for the length of a rebuild the disk holds two search
+directories. That transient is one search directory, 58,458,112 bytes, above the resting
+figure, and it is the number to watch, because it was **over** the gate at 1,539,854,336 and
+1,541,668,864 bytes one commit earlier and only came under it when the change log stopped
+being written. Nothing here redesigns `publish`: an unpublished build leaving the previous
+one serving is what makes a failed rebuild harmless.
+
+The disk gate was missed by 887,607,552 bytes at `95cd3ad` and is met by 100.4 MB at
+`1783f2b`, a 41.4 per cent reduction.
+
+One query is not on the original list and misses: a page in the **middle** of the order is
+1.529 s at 1M, against 118.9 ms for the last page. The deferred collector cuts a page near
+the end out of the reversed order, and neither end helps the middle. The last-page benchmark
+does not represent the middle of a result, and this wave did not change the collector. At
+100k the same query is 107 ms.
+
+Standalone query-process resident memory over the five queries is 71.50 MiB, against zero
+high-water growth: a query allocates, the process had simply already been higher during the
+rebuild. Zero high-water growth after a scan is not proof that a query allocates nothing.
 
 ### Where the bytes are
 
-Storage by table at 100k, largest stored bytes first, as `catalog status` reports it, measured
-during the wave series. native_db names a table `{model id}_{version}_{key}`; every version
-here is 1.
+Measured with `crates/hoard-index/tests/scale.rs`, which closes the catalog and reads redb's
+own per-table statistics after the scan, after the rebuild and after the incremental
+workload, and writes each report to `storage-<entries>-<phase>.json` beside the catalog.
 
-- `8_1_artifact_id`, the `ArtifactDetail` primary table: 100,000 rows, 52,104,173 stored
-  bytes, 37,401,767 fragmented. One tensor summary and one evidence vector each.
-- `7_1_id`, the `Entry` primary table: 100,000 rows, 24,757,780 stored, 25,468,496 fragmented.
-- `3_1_id`, the `ArtifactRecord` primary table: 100,000 rows, 18,355,570 stored, 15,260,818
-  fragmented.
-- `5_1_artifact_id`, the `SearchText` primary table: 100,000 rows, 5,415,625 stored, 6,163,747
-  fragmented.
-- `3_1_identity`, the unique identity index on `ArtifactRecord`: 100,000 rows, 800,000 stored,
-  1,944,092 fragmented.
-- `10_1_seq`, the `SearchChange` log: 0 rows, because the refresh pruned every row it applied.
+Three numbers per table, and they mean different things:
 
-The 1M catalog keeps that order and those ratios: 500 MB stored against 354 MB fragmented for
-`ArtifactDetail`, 240 against 244 for `Entry`, 179 against 166 for `ArtifactRecord`, 52
-against 59 for `SearchText`, and 8 against 18 for the identity index.
+- **stored** is the key and value payload of the rows, which is what a record encoding
+  changes.
+- **metadata** is the branch keys and page headers around it. For a secondary index the
+  stored column is only the 8 byte primary keys it points at, so the index key itself is
+  counted here.
+- **pages** is `(leaf + branch) * 4096`, the space the file actually spends. Fragmentation
+  is the difference: unused room inside pages redb has already allocated, mostly ordinary
+  B-tree fill factor rather than garbage a compaction is promised to return. Every large
+  table sits near 45 per cent fragmented straight after a fresh scan, which compacts, and
+  that ratio did not move: halving a payload halves the pages, it does not pack them
+  tighter.
+
+At 1M entries, after the rebuild. `95cd3ad` is the base this wave started from, measured with
+the same harness; `1783f2b` is the wave. Both columns were taken in one session on this
+workstation.
+
+| table | rows | pages at `95cd3ad` | pages at `1783f2b` | stored at `1783f2b` | leaf fill |
+| --- | --- | --- | --- | --- | --- |
+| `8_1_artifact_id`, `ArtifactDetail` | 1,000,000 | 869.82 MiB | 497.00 MiB | 267.52 MiB | 54.8% |
+| `3_1_id`, `ArtifactRecord` | 1,000,000 | 424.43 MiB | 278.74 MiB | 136.11 MiB | 49.7% |
+| `7_1_id`, `Entry` | 1,000,000 | 397.49 MiB | 164.78 MiB | 75.00 MiB | 46.3% |
+| `7_1_location`, the unique location index | 1,000,000 | 156.39 MiB | 118.08 MiB | 7.63 MiB | 6.7% |
+| `5_1_artifact_id`, `SearchText` | 1,000,000 | 119.28 MiB | 88.23 MiB | 36.33 MiB | 41.9% |
+| `7_1_artifact_id`, the artifact index | 1,000,000 | 63.11 MiB | 63.11 MiB | 7.63 MiB | 12.3% |
+| `3_1_identity`, the identity index | 1,000,000 | 58.13 MiB | 57.89 MiB | 7.63 MiB | 13.4% |
+| `10_1_seq`, the change log, after the scan | 1,000,000 then 0 | 80,171,008 bytes | never written | | |
+| `7_1_repo_id`, the repository index | 1,000,000 | 23.25 MiB | gone | | |
+
+The seven surviving tables came to 2,214,522,880 bytes of pages and now come to
+1,329,451,008, against 1,341,190,144 bytes allocated for `catalog.redb`: the 11.19 MiB
+residual is redb's own allocator state, its freed-page tables and the region headers. That
+residual was 87.68 MiB while the change log was written and freed, because redb does not
+give a freed page back to the operating system. The published Tantivy directory is
+58,458,112 bytes, 55.75 MiB, down from 83,243,008.
+
+Per row, in payload bytes: `ArtifactDetail` 516 to 272, `ArtifactRecord` 218 to 135, `Entry`
+197 to 71, `SearchText` 46 to 30. The location index key averaged 76 bytes and now averages
+55: it lost 40 bytes of zero-padded decimal and gained the relative path unchanged.
+
+The largest remaining cost is `ArtifactDetail` at 497.00 MiB of pages, 37.1 per cent of
+`catalog.redb`, of which 267.52 MiB is payload and 217.01 MiB is fill factor. On this fixture
+each row is one tensor summary of a single tensor plus its evidence, and LZ4 takes 7 per cent
+off it; on a fixture with real cards and real tensor metadata it takes 75 per cent off. The
+second largest is `ArtifactRecord` at 278.74 MiB.
+
+**Intra-page slack is now the largest single term.** Across every table it is 608,835,673
+bytes, 45.4 per cent of `catalog.redb`, and the four record tables sit at 42 to 55 per cent
+leaf fill. That is ordinary B-tree occupancy after a pass of random-order inserts, and
+`Database::compact` does not reclaim it: compaction rewrites the file without its free pages
+and leaves the pages that hold rows exactly as full as they were. Halving a payload again
+would halve the pages again, but the fill factor would not move. See "Remaining work".
+
+At 100k the same order and ratios hold: the whole directory is 143,675,392 bytes,
+137.02 MiB, against 243,363,840 at `95cd3ad`.
+
+### What the one-artifact-per-file fixture cannot show
+
+`supplemental_catalog_costs` seeds 200 repositories of 3 revisions of 50 files: long relative
+paths, an hf-cache source whose entries carry an explicit blob path, populated sha256 and git
+blob shas, a full model card and tensor summary per artifact, and one artifact in ten reached
+by more than one path. 30,000 entries, 27,300 artifacts. It needs `--features fixtures`;
+`-p hoard-index` alone leaves the module out and the command reports success over zero tests.
+
+| measure | records compact, search untrimmed | `1783f2b` |
+| --- | --- | --- |
+| whole directory, allocated | 311,848,960 bytes | 134,791,168 bytes |
+| `catalog.redb`, allocated | 281,985,024 bytes | 109,887,488 bytes |
+| `SearchText` pages | 113.82 MiB | 28.50 MiB |
+| `ArtifactDetail` pages | 113.82 MiB | 28.50 MiB |
+| record payload | 193,738,011 bytes | 53,353,221 bytes |
+| inspector `artifact_detail` | 81.4 us | 45.1 us |
+| seed wall | 2.225 s | 1.606 s |
+
+Compressing the two cold tables is what does that: on a catalog whose artifacts carry cards
+and tensor metadata it takes 56 per cent off the whole directory and makes the inspector
+faster, because there is less to read. On the no-card gate fixture above it takes 7 per cent
+off `ArtifactDetail`'s payload, which is not enough to change its page count, and costs one
+tag byte per `SearchText` row. Both numbers are real; the second is what the gate measures
+and the first is what a catalog of real files would.
+
+### Units
+
+Runs before this one divided byte counts by 1024 squared and labelled the result MB. Every
+number here is exact bytes with its MiB conversion beside it. The disk gate this document
+tracks is stated in bytes: **1,500,000,000**. 1.5 GiB would be 1,610,612,736, so the two
+readings of the old threshold are 110 MB apart and the byte form is the one used.
 
 ## Remaining work
 
-- **Shrink the per-entry record.** Revision, repository, source and the location key are still
-  written out per entry, which is what the 1M catalog is mostly made of. Interning them per
-  revision and referencing them by id is the lever. Allocated disk at 1M is 2276 MB against
-  the 1.5 GB threshold.
+- **Bound a page in the middle of the order.** The deferred collector cuts a page near the
+  end out of the reversed order, so the last page of 1M artifacts is 118 ms and the middle
+  one is 1.52 s. This is the largest measured miss left, and no threshold currently names it.
 - **Bound the collapse the way the primary path is bounded.** A query naming `node:`,
   `state:`, `source:`, `repo:`, `rev:` or `hash:`, or sorting on revision, node or state,
   still keeps one row per matching artifact rather than one per page. At 1M `node:self` is
-  512 ms against the 500 ms threshold.
+  352 to 439 ms, under the 500 ms threshold rather than bounded by design.
+- **Shrink `ArtifactDetail` further.** It is 497.00 MiB of 1,421,844,480 bytes at 1M, 35.0
+  per cent of `catalog.redb` and the largest table by a wide margin, of which 217.01 MiB is
+  B-tree fill factor rather than payload. LZ4 takes 75 per cent off a row carrying a real
+  card and real tensor metadata and 7 per cent off this fixture's one-tensor summary, so
+  what is left is the summary itself: samples, key prefixes and verbatim metadata, per
+  artifact rather than per revision.
+- **Share a card between the artifacts of one revision.** `SearchText` holds the revision's
+  README per artifact. On the supplemental fixture that is 104,968,250 payload bytes
+  compressed to 17,335,378; sharing it would remove the copies rather than compress them.
+- **Pack the pages.** Intra-page slack is the largest single term left in `catalog.redb`:
+  608,835,673 bytes at 1M, 45.4 per cent of the file, with the four record tables at 42 to
+  55 per cent leaf fill. It is ordinary B-tree occupancy after a pass of inserts in primary
+  key order interleaved across tables, and `Database::compact` does not reclaim it: it
+  rewrites the file without its free pages and leaves the pages holding rows as full as they
+  were. The lever is a bulk load or a dense rewrite that fills leaves before it seals them,
+  not another codec. Another codec would halve the payload and halve the pages with it,
+  leaving the same 45 per cent slack in half the file.
+- **`sweep_artifact` decompresses a cold row to delete it.** native_db 0.8.2 has no
+  remove-by-primary-key: `remove` takes the value, so the sweep reads `ArtifactDetail` and
+  `SearchText` in full, LZ4 and bincode included, only to hand them straight back. Every
+  artifact a pass orphans pays a decode it does not use. A `remove_by_key` upstream, or a
+  cheaper path that reads the raw bytes, would take it off the rescan.
+- **Compact the remaining records.** `Compact` and `Cold` are on the four tables that carry
+  the bulk. `Repository`, `Source`, `Node`, `Usage`, `SearchChange` and the user-data rows
+  still take native_model's fixed-width default. None of them is large now that the change
+  log is not written before the first publish.
+- **`native_model::Model::native_model_decode` unwraps** a payload shorter than its eight
+  byte header rather than returning an error, so a truncated row panics. `codec.rs` cannot
+  see that byte range; it is reached before any codec is called.
 - **The USAGE tab reads a repository's whole log**, because the client count it shows is a
   claim about every pull the repository ever served. Bounding the chart alone would not bound
   the route: 20,000 rows cost 9.1 ms.
@@ -397,8 +628,8 @@ against 59 for `SearchText`, and 8 against 18 for the identity index.
   but can name them either way round.
 - **Preserve complete repository Git metadata** and add stable cross-scan identities.
 - **Add a read-only open** once redb offers one, so searches can run beside a rebuild.
-- **Benchmark realistic catalogs** and add process-kill and power-loss recovery tests. The
-  current tests check transaction abort and publication boundaries, not power loss.
+- **Add process-kill and power-loss recovery tests.** The current tests check transaction
+  abort and publication boundaries, not power loss.
 
 ## Dependency and serialization findings
 
@@ -407,6 +638,11 @@ native_db upgrade features are disabled. `tantivy 0.26.1` uses only mmap and LZ4
 These are intentional constraints, not latest-major assumptions.
 
 Hoard's row ids previously always used Serde's `deserialize_any`, which bincode cannot decode.
-Binary deserializers now read their existing serialized string representation explicitly;
-JSON keeps accepting both string and integer ids. The persistence and reopen tests exercise
-that binary path.
+A binary deserializer now reads a row id as an integer and a hash as bytes, and a
+human-readable one keeps reading and writing the prefixed string and the hex; JSON also keeps
+accepting an integer id. `bincode 1.3` and `lz4_flex 0.13` are direct dependencies of
+`hoard-index` for `catalog/codec.rs`: bincode is the major version native_model 0.4.20
+already resolves to, and lz4_flex is taken with `default-features = false` and the safe
+encode, decode and checked-decode features rather than through Tantivy's copy of it. The
+persistence and reopen tests exercise both codecs, and `codec.rs`'s own tests exercise what
+they refuse.

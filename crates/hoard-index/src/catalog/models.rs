@@ -82,7 +82,7 @@ pub(super) fn repository_key(source: &str, repo: &RepoId) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 3, version = 1)]
+#[native_model(id = 3, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct ArtifactRecord {
     #[primary_key]
@@ -151,20 +151,69 @@ impl Placement {
     }
 }
 
+/// The one path a revision of a repository holds, as a key a point lookup and a prefix scan
+/// can both use.
+///
+/// The repository id and the revision ordinal are written big endian ahead of the relative
+/// path's own bytes, so the first 8 bytes are exactly one repository and the first 12 are
+/// exactly one revision. Ids come from the allocator and are positive, which is what makes
+/// the big-endian order the numeric one. The path is not folded or canonicalized: two rows
+/// spelling a path differently are two locations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LocationKey(Vec<u8>);
+
+/// Everything a location key holds before the relative path.
+const LOCATION_PREFIX: usize = size_of::<i64>() + size_of::<u32>();
+
+impl LocationKey {
+    /// One entry of one revision of one repository.
+    pub(super) fn at(repo_id: i64, revision: u32, rel_path: &str) -> Self {
+        let mut key = Vec::with_capacity(LOCATION_PREFIX + rel_path.len());
+        key.extend_from_slice(&repo_id.to_be_bytes());
+        key.extend_from_slice(&revision.to_be_bytes());
+        key.extend_from_slice(rel_path.as_bytes());
+        Self(key)
+    }
+
+    /// What every entry of one repository shares, whichever revision holds it.
+    pub(super) fn repository(repo_id: i64) -> Self {
+        Self(repo_id.to_be_bytes().to_vec())
+    }
+
+    /// What every entry of one revision shares.
+    pub(super) fn revision(repo_id: i64, revision: u32) -> Self {
+        let mut key = Vec::with_capacity(LOCATION_PREFIX);
+        key.extend_from_slice(&repo_id.to_be_bytes());
+        key.extend_from_slice(&revision.to_be_bytes());
+        Self(key)
+    }
+}
+
+impl ToKey for LocationKey {
+    fn to_key(&self) -> native_db::db_type::Key {
+        native_db::db_type::Key::new(self.0.clone())
+    }
+
+    fn key_names() -> Vec<String> {
+        vec!["LocationKey".to_owned()]
+    }
+}
+
 /// One path, with the content hashes read from it and the node that holds it.
 ///
 /// `content` is the identity a sha256 makes, so a lookup by content hash is a secondary key
-/// read rather than a scan; `location` names the one path a revision of a repository holds,
-/// so finding it is one key read and reading a whole revision is one prefix scan. `node` is
-/// not indexed: every reader that used to scan by it is scoped by source or repository
-/// instead, and how many rows a node holds is on the node's own record.
+/// read rather than a scan. [`Entry::location`] is computed from the three fields that name
+/// where the row sits, so finding one path is one key read, reading a whole revision is one
+/// 12 byte prefix scan and reading a whole repository is one 8 byte prefix scan; no
+/// repository id is indexed separately and no location is written into the row. `node` is
+/// not indexed either: every reader that used to scan by it is scoped by source or
+/// repository instead, and how many rows a node holds is on the node's own record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 7, version = 1)]
-#[native_db]
+#[native_model(id = 7, version = 1, with = super::codec::Compact)]
+#[native_db(secondary_key(location -> LocationKey, unique))]
 pub(super) struct Entry {
     #[primary_key]
     pub(super) id: i64,
-    #[secondary_key]
     pub(super) repo_id: i64,
     #[secondary_key(optional)]
     pub(super) artifact_id: Option<i64>,
@@ -185,27 +234,17 @@ pub(super) struct Entry {
     pub(super) node: i64,
     pub(super) pass: u64,
     pub(super) pull_progress: Option<f32>,
-    /// [`location_key`] of this row's repository, revision and relative path. Every writer
-    /// that changes one of those three must write it again.
-    #[secondary_key(unique)]
-    pub(super) location: String,
     /// Where the bytes sit. Every writer that moves them must write it again.
     pub(super) placed: Placement,
 }
 
-/// The one path a revision of a repository holds, as a key a lookup and a prefix scan can
-/// both use. The two numbers are zero padded to a fixed width so a prefix of the first two
-/// fields never reaches a longer number.
-pub(super) fn location_key(repo_id: i64, revision: u32, rel_path: &str) -> String {
-    let mut key = revision_prefix(repo_id, revision);
-    key.push_str(rel_path);
-    key
-}
-
-/// Everything in a [`location_key`] before the relative path, which is what every entry of
-/// one revision shares.
-pub(super) fn revision_prefix(repo_id: i64, revision: u32) -> String {
-    format!("{repo_id:020}\u{1}{revision:010}\u{1}")
+impl Entry {
+    /// The unique index native_db maintains over this row, read from the three fields that
+    /// say where it sits. A writer that moves one of them moves the key with it, so there
+    /// is nothing to keep in step by hand.
+    pub(super) fn location(&self) -> LocationKey {
+        LocationKey::at(self.repo_id, self.revision, &self.rel_path)
+    }
 }
 
 /// Where a writer's absolute path sits, read against the repository the row belongs to. A
@@ -235,7 +274,7 @@ pub(super) fn entry_at(
 ) -> super::Result<Option<Entry>> {
     Ok(transaction.get().secondary(
         EntryKey::location,
-        location_key(repo_id, revision, rel_path),
+        LocationKey::at(repo_id, revision, rel_path),
     )?)
 }
 
@@ -254,7 +293,7 @@ pub(super) struct Override {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 8, version = 1)]
+#[native_model(id = 8, version = 1, with = super::codec::Cold)]
 #[native_db]
 pub(super) struct ArtifactDetail {
     #[primary_key]
@@ -264,7 +303,7 @@ pub(super) struct ArtifactDetail {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 5, version = 1)]
+#[native_model(id = 5, version = 1, with = super::codec::Cold)]
 #[native_db]
 pub(super) struct SearchText {
     #[primary_key]
