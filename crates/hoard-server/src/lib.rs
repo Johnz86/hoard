@@ -59,7 +59,10 @@ pub async fn start_gossip(state: &AppState) -> Option<hoard_net::GossipHandle> {
         .with_discovery(mode)
         .with_statics(config.peers.statics.clone())
         .with_token(token);
-    Some(hoard_net::spawn(state.store().clone(), gossip))
+    Some(hoard_net::spawn(
+        std::sync::Arc::clone(state.catalog()),
+        gossip,
+    ))
 }
 
 /// Builds the whole application.

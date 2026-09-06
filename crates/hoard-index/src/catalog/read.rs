@@ -631,7 +631,7 @@ impl<'a, 'db> Reader<'a, 'db> {
         Ok(self.snapshot.get().primary(id)?)
     }
 
-    fn entries_of_artifact(&self, id: i64) -> Result<Vec<Entry>> {
+    pub(super) fn entries_of_artifact(&self, id: i64) -> Result<Vec<Entry>> {
         Ok(self
             .snapshot
             .scan()
@@ -673,7 +673,7 @@ impl<'a, 'db> Reader<'a, 'db> {
         Ok(Some(self.row_of(record, &entry, last_used)?))
     }
 
-    fn row_of(
+    pub(super) fn row_of(
         &mut self,
         record: &ArtifactRecord,
         entry: &Entry,

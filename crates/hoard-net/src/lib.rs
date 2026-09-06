@@ -7,14 +7,14 @@
 //! A server starts the whole of it with one call:
 //!
 //! ```no_run
-//! # use std::time::Duration;
+//! # use std::sync::Arc;
 //! # use hoard_core::NodeId;
-//! # use hoard_index::store::Store;
+//! # use hoard_index::catalog::Catalog;
 //! # use hoard_net::{DiscoveryMode, GossipConfig, NodeIdentity, spawn};
-//! # fn wire(store: Store, id: NodeId) -> Result<(), hoard_net::NetError> {
+//! # fn wire(catalog: Arc<Catalog>, id: NodeId) -> Result<(), hoard_net::NetError> {
 //! let identity = NodeIdentity::new(id, "rig-02", "http://rig-02:7099")?;
 //! let handle = spawn(
-//!     store,
+//!     catalog,
 //!     GossipConfig::new(identity)
 //!         .with_discovery(DiscoveryMode::Mdns)
 //!         .with_statics(vec!["laptop.lan:7099".to_owned()]),

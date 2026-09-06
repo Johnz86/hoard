@@ -540,12 +540,10 @@ pub(super) struct SummaryV1 {
     pub(super) duplicate_artifacts: u64,
 }
 
-/// What the artifact sweep last measured, so the facet rail and the stats route read one
-/// record rather than scanning every artifact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 11, version = 2, from = SummaryV1)]
 #[native_db]
-pub(super) struct Summary {
+pub(super) struct SummaryV2 {
     #[primary_key]
     pub(super) id: u8,
     pub(super) reclaimable_bytes: u64,
@@ -557,7 +555,26 @@ pub(super) struct Summary {
     pub(super) repositories: u64,
 }
 
-impl From<SummaryV1> for Summary {
+/// What the artifact sweep last measured, so the facet rail and the stats route read one
+/// record rather than scanning every artifact. `advertised_artifacts` is what a peer's
+/// digest reports as its total: the hashed records this node holds a path to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 11, version = 3, from = SummaryV2)]
+#[native_db]
+pub(super) struct Summary {
+    #[primary_key]
+    pub(super) id: u8,
+    pub(super) reclaimable_bytes: u64,
+    pub(super) duplicate_artifacts: u64,
+    pub(super) artifacts: u64,
+    pub(super) present_artifacts: u64,
+    pub(super) triage_artifacts: u64,
+    pub(super) indexed_bytes: u64,
+    pub(super) repositories: u64,
+    pub(super) advertised_artifacts: u64,
+}
+
+impl From<SummaryV1> for SummaryV2 {
     fn from(summary: SummaryV1) -> Self {
         Self {
             id: summary.id,
@@ -572,12 +589,43 @@ impl From<SummaryV1> for Summary {
     }
 }
 
-impl From<Summary> for SummaryV1 {
+impl From<SummaryV2> for SummaryV1 {
+    fn from(summary: SummaryV2) -> Self {
+        Self {
+            id: summary.id,
+            reclaimable_bytes: summary.reclaimable_bytes,
+            duplicate_artifacts: summary.duplicate_artifacts,
+        }
+    }
+}
+
+impl From<SummaryV2> for Summary {
+    fn from(summary: SummaryV2) -> Self {
+        Self {
+            id: summary.id,
+            reclaimable_bytes: summary.reclaimable_bytes,
+            duplicate_artifacts: summary.duplicate_artifacts,
+            artifacts: summary.artifacts,
+            present_artifacts: summary.present_artifacts,
+            triage_artifacts: summary.triage_artifacts,
+            indexed_bytes: summary.indexed_bytes,
+            repositories: summary.repositories,
+            advertised_artifacts: 0,
+        }
+    }
+}
+
+impl From<Summary> for SummaryV2 {
     fn from(summary: Summary) -> Self {
         Self {
             id: summary.id,
             reclaimable_bytes: summary.reclaimable_bytes,
             duplicate_artifacts: summary.duplicate_artifacts,
+            artifacts: summary.artifacts,
+            present_artifacts: summary.present_artifacts,
+            triage_artifacts: summary.triage_artifacts,
+            indexed_bytes: summary.indexed_bytes,
+            repositories: summary.repositories,
         }
     }
 }
@@ -751,6 +799,7 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<ManifestV1>()?;
     models.define::<Manifest>()?;
     models.define::<SummaryV1>()?;
+    models.define::<SummaryV2>()?;
     models.define::<Summary>()?;
     models.define::<SourceV1>()?;
     models.define::<Source>()?;

@@ -322,9 +322,11 @@ impl Ingesting<'_, '_> {
             triage_artifacts: 0,
             indexed_bytes: 0,
             repositories: 0,
+            advertised_artifacts: 0,
         });
         summary.artifacts += 1;
         summary.present_artifacts += 1;
+        summary.advertised_artifacts += 1;
         summary.indexed_bytes = summary.indexed_bytes.saturating_add(size);
         if triage {
             summary.triage_artifacts += 1;

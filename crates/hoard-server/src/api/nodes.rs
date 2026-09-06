@@ -83,7 +83,7 @@ pub async fn digest(
 ) -> ApiResult<Json<DigestPage>> {
     let since = DigestCursor::from_param(params.since.as_deref()).map_err(net_error)?;
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let page = digest::collect(state.store(), since, limit)
+    let page = digest::collect(state.catalog(), since, limit)
         .await
         .map_err(net_error)?;
     Ok(Json(page))

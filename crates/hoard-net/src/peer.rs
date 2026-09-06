@@ -34,10 +34,9 @@ use hoard_index::store::artifact::{
 };
 use hoard_index::store::blob::{blob_by_sha256, set_sha256, upsert_blob};
 use hoard_index::store::entry::{NewEntry, upsert_entry};
-use hoard_index::store::node::{local_node, node};
+use hoard_index::store::node::local_node;
 use hoard_index::store::repo::{NewRepo, repo_by_qualified, upsert_repo};
 use hoard_index::store::revision::{NewRevision, revision_by_sha, upsert_revision};
-use hoard_index::store::search_exec::count_rows;
 use hoard_index::triage::needs_triage;
 use hoard_mirror::resolve::{FileRequest, Mirror, read_range};
 use hoard_mirror::upstream::UpstreamClient;
@@ -50,6 +49,19 @@ use crate::identity::{NodeIdentity, clean_name};
 
 /// The job kind a peer pull runs under, which is what the JOBS tab groups it by.
 pub const PULL_KIND: &str = "pull";
+
+/// Runs one catalog read or write off the reactor, since redb is file work.
+pub(crate) async fn on_catalog<T, F>(catalog: &Arc<Catalog>, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Catalog) -> hoard_index::Result<T> + Send + 'static,
+{
+    let catalog = Arc::clone(catalog);
+    tokio::task::spawn_blocking(move || work(&catalog))
+        .await
+        .map_err(|_| NetError::Config("the catalog task was cancelled".to_owned()))?
+        .map_err(NetError::Index)
+}
 
 /// How often the gossip loop polls every known peer when nothing else wakes it.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
@@ -396,17 +408,12 @@ impl Puller {
         })
     }
 
-    /// Runs one catalog write off the reactor, since redb is file work.
     async fn on_catalog<T, F>(&self, work: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce(&Catalog) -> hoard_index::Result<T> + Send + 'static,
     {
-        let catalog = Arc::clone(&self.catalog);
-        tokio::task::spawn_blocking(move || work(&catalog))
-            .await
-            .map_err(|_| NetError::Config("the catalog task was cancelled".to_owned()))?
-            .map_err(NetError::Index)
+        on_catalog(&self.catalog, work).await
     }
 
     /// Where a pulled file lands: readable, stable, unique per revision, and always inside
@@ -924,7 +931,7 @@ impl GossipHandle {
 ///
 /// Nothing in here can fail the server: a machine with no multicast route, no peers, or no
 /// network at all logs and carries on serving.
-pub fn spawn(store: Store, config: GossipConfig) -> GossipHandle {
+pub fn spawn(catalog: Arc<Catalog>, config: GossipConfig) -> GossipHandle {
     let (stop, mut stopped) = watch::channel(false);
     let task = tokio::spawn(async move {
         let (discovery, mut arrivals) =
@@ -945,13 +952,13 @@ pub fn spawn(store: Store, config: GossipConfig) -> GossipHandle {
                 changed = stopped.changed() => changed.is_err() || *stopped.borrow(),
                 event = arrivals.recv() => match event {
                     Some(event) => {
-                        unless_stopped(&mut cancel, on_event(&store, &config, &mut peers, event))
+                        unless_stopped(&mut cancel, on_event(&catalog, &config, &mut peers, event))
                             .await
                     }
                     None => true,
                 },
                 _ = ticker.tick() => {
-                    unless_stopped(&mut cancel, peers.poll_all(&store, &config)).await
+                    unless_stopped(&mut cancel, peers.poll_all(&catalog, &config)).await
                 }
             };
             if stop_now {
@@ -1082,13 +1089,13 @@ impl PeerSet {
         gone
     }
 
-    async fn poll_all(&mut self, store: &Store, config: &GossipConfig) {
+    async fn poll_all(&mut self, catalog: &Arc<Catalog>, config: &GossipConfig) {
         let now = Instant::now();
         let interval = config.interval;
         futures::stream::iter(self.peers.values_mut().filter(|peer| peer.is_due(now)))
             .for_each_concurrent(POLL_CONCURRENCY, |peer| async move {
                 let resync = peer.is_resync_due(now);
-                match poll(store, config, peer, resync).await {
+                match poll(catalog, config, peer, resync).await {
                     Ok(()) => {
                         peer.answered();
                         if resync {
@@ -1098,7 +1105,7 @@ impl PeerSet {
                     Err(error) => {
                         tracing::warn!(peer = %peer.client.name(), %error, "peer poll failed");
                         peer.failed(interval, Instant::now());
-                        if let Err(error) = forget_peer(store, peer.id()).await {
+                        if let Err(error) = forget_peer(catalog, peer.id()).await {
                             tracing::warn!(%error, "an unreachable peer could not be marked offline");
                         }
                     }
@@ -1108,13 +1115,18 @@ impl PeerSet {
     }
 }
 
-async fn on_event(store: &Store, config: &GossipConfig, peers: &mut PeerSet, event: PeerEvent) {
+async fn on_event(
+    catalog: &Arc<Catalog>,
+    config: &GossipConfig,
+    peers: &mut PeerSet,
+    event: PeerEvent,
+) {
     match event {
         PeerEvent::Arrived(identity) => {
             if !peers.contains(identity.id()) && peers.is_full() {
                 return;
             }
-            match record(store, config, identity).await {
+            match record(catalog, config, identity).await {
                 Ok(Some(peer)) => {
                     let name = peer.client.name().to_owned();
                     if peers.insert(peer) {
@@ -1127,7 +1139,7 @@ async fn on_event(store: &Store, config: &GossipConfig, peers: &mut PeerSet, eve
         }
         PeerEvent::Departed(id) => {
             for gone in peers.remove(&id) {
-                if let Err(error) = forget_peer(store, &gone).await {
+                if let Err(error) = forget_peer(catalog, &gone).await {
                     tracing::warn!(%error, "a departed peer could not be marked offline");
                 }
             }
@@ -1142,7 +1154,7 @@ async fn on_event(store: &Store, config: &GossipConfig, peers: &mut PeerSet, eve
 /// the same peer would own two node rows and two copies of everything it holds. A node that
 /// answers as this one is not a peer at all and is dropped.
 async fn record(
-    store: &Store,
+    catalog: &Arc<Catalog>,
     config: &GossipConfig,
     discovered: NodeIdentity,
 ) -> Result<Option<Peer>> {
@@ -1166,7 +1178,7 @@ async fn record(
         return Ok(None);
     }
     let identity = identity.disambiguated_from(config.identity.id())?;
-    let row = record_peer(store, &identity).await?;
+    let row = record_peer(catalog, &identity).await?;
     let client = PeerClient::new(identity, config.token.clone())?;
     Ok(Some(Peer::new(client, row, discovered.id().clone())))
 }
@@ -1183,27 +1195,33 @@ fn answers_as_this_node(local: &NodeIdentity, peer: &NodeIdentity) -> bool {
 ///
 /// `resync` reads the peer's whole digest instead, which is the only thing that retires a
 /// row: an incremental poll is told what a peer holds and never what it dropped.
-async fn poll(store: &Store, config: &GossipConfig, peer: &Peer, resync: bool) -> Result<()> {
+async fn poll(
+    catalog: &Arc<Catalog>,
+    config: &GossipConfig,
+    peer: &Peer,
+    resync: bool,
+) -> Result<()> {
     peer.client.health().await?;
     let indexed = peer.client.stats().await.map(|stats| stats.indexed_bytes)?;
-    touch_peer(store, peer.row, indexed).await?;
+    touch_peer(catalog, peer.row, indexed).await?;
     if resync {
-        return resync_digest(store, config, peer).await;
+        return resync_digest(catalog, config, peer).await;
     }
 
-    let mut cursor = digest::read_cursor(store, peer.row).await?;
+    let pass = digest::begin_pass(catalog, peer.row).await?;
+    let mut cursor = digest::read_cursor(catalog, peer.row).await?;
     let mut rewound = false;
     for _ in 0..PAGES_PER_POLL {
         let page = peer.client.digest(cursor, config.digest_limit).await?;
         if page.rows.is_empty() {
-            if rewound || !rewind(store, peer, &page, cursor).await? {
+            if rewound || !rewind(catalog, peer, &page, cursor).await? {
                 break;
             }
             rewound = true;
             cursor = None;
             continue;
         }
-        let applied = digest::apply(store, peer.client.name(), peer.row, &page).await?;
+        let applied = digest::apply(catalog, peer.client.name(), peer.row, &page, pass).await?;
         tracing::debug!(
             peer = %peer.client.name(),
             entries = applied.entries,
@@ -1223,7 +1241,7 @@ async fn poll(store: &Store, config: &GossipConfig, peer: &Peer, resync: bool) -
             break;
         }
         cursor = Some(next);
-        digest::write_cursor(store, peer.row, cursor).await?;
+        digest::write_cursor(catalog, peer.row, cursor).await?;
     }
     Ok(())
 }
@@ -1235,8 +1253,8 @@ async fn poll(store: &Store, config: &GossipConfig, peer: &Peer, resync: bool) -
 /// that cannot succeed. A pass re-times every row the peer still names, and what the pass did
 /// not touch is what it deleted. Retraction is skipped when the pass did not reach the end,
 /// because a partial pass cannot tell a dropped row from an unread one.
-async fn resync_digest(store: &Store, config: &GossipConfig, peer: &Peer) -> Result<()> {
-    let started = Timestamp::now();
+async fn resync_digest(catalog: &Arc<Catalog>, config: &GossipConfig, peer: &Peer) -> Result<()> {
+    let pass = digest::begin_pass(catalog, peer.row).await?;
     let mut cursor = None;
     let mut reached_end = false;
     for _ in 0..PAGES_PER_RESYNC {
@@ -1245,7 +1263,7 @@ async fn resync_digest(store: &Store, config: &GossipConfig, peer: &Peer) -> Res
             reached_end = true;
             break;
         }
-        digest::apply(store, peer.client.name(), peer.row, &page).await?;
+        digest::apply(catalog, peer.client.name(), peer.row, &page, pass).await?;
         let Some(next) = page
             .next_cursor
             .as_deref()
@@ -1268,8 +1286,8 @@ async fn resync_digest(store: &Store, config: &GossipConfig, peer: &Peer) -> Res
         );
         return Ok(());
     }
-    digest::write_cursor(store, peer.row, cursor).await?;
-    let dropped = digest::retract(store, peer.row, started).await?;
+    digest::write_cursor(catalog, peer.row, cursor).await?;
+    let dropped = digest::retract(catalog, peer.row, pass).await?;
     if dropped > 0 {
         tracing::info!(
             peer = %peer.client.name(),
@@ -1286,12 +1304,12 @@ async fn resync_digest(store: &Store, config: &GossipConfig, peer: &Peer) -> Res
 /// numbers them from one again, so everything it holds falls below the stored cursor and it
 /// would answer with an empty page for good; the row count it reports is what says so.
 async fn rewind(
-    store: &Store,
+    catalog: &Arc<Catalog>,
     peer: &Peer,
     page: &DigestPage,
     cursor: Option<DigestCursor>,
 ) -> Result<bool> {
-    if cursor.is_none() || page.total <= filed_for(store, peer.row).await? {
+    if cursor.is_none() || page.total <= digest::filed_for(catalog, peer.row).await? {
         return Ok(false);
     }
     tracing::info!(
@@ -1299,25 +1317,16 @@ async fn rewind(
         total = page.total,
         "a peer's digest restarted; reading it again from the beginning"
     );
-    digest::write_cursor(store, peer.row, None).await?;
+    digest::write_cursor(catalog, peer.row, None).await?;
     Ok(true)
-}
-
-async fn filed_for(store: &Store, row: i64) -> Result<u64> {
-    let filed = store
-        .call(move |conn| {
-            let name = node(conn, row)?.name;
-            count_rows(conn, "node = ?", &[name.into()])
-        })
-        .await?;
-    Ok(filed)
 }
 
 #[cfg(test)]
 mod tests {
     use hoard_core::{NodeId, RepoType};
+    use hoard_index::search::{SortKey, SortSpec};
     use hoard_index::store::entry::{EntryRow, entries_for_revision};
-    use hoard_index::store::node::{NewNode, list_nodes, upsert_node};
+    use hoard_index::store::node::{NewNode, upsert_node};
     use hoard_mirror::access::{AccessPolicy, AccessRule};
     use hoard_mirror::cache::BlockCache;
     use hoard_mirror::config::{Geometry, MirrorConfig};
@@ -1993,31 +2002,54 @@ mod tests {
         })
     }
 
-    async fn store_with_peer(cursor: Option<DigestCursor>) -> (Store, i64) {
-        let store = Store::open_in_memory().expect("store opens");
-        let row = store
-            .call_mut(|conn| {
-                upsert_node(
-                    conn,
-                    &NewNode::local(NodeId::new("workstation-1").expect("id"), "workstation"),
-                )?;
-                upsert_node(
-                    conn,
-                    &NewNode::peer(
-                        NodeId::new("laptop-1").expect("id"),
-                        "laptop",
-                        "http://laptop:7099",
-                    ),
-                )
-            })
-            .await
-            .expect("nodes record");
+    async fn catalog_with_peer(
+        root: &TempDir,
+        cursor: Option<DigestCursor>,
+    ) -> (Arc<Catalog>, i64) {
+        let catalog = catalog_with_local(root);
+        let row = catalog
+            .upsert_peer(
+                &NodeId::new("laptop-1").expect("id"),
+                "laptop",
+                Some("http://laptop:7099"),
+            )
+            .expect("peer records")
+            .id;
         if cursor.is_some() {
-            digest::write_cursor(&store, row, cursor)
+            digest::write_cursor(&catalog, row, cursor)
                 .await
                 .expect("cursor writes");
         }
-        (store, row)
+        (catalog, row)
+    }
+
+    /// A catalog with no configured sources, holding only this node's own row.
+    fn catalog_with_local(root: &TempDir) -> Arc<Catalog> {
+        let catalog = test_catalog(root.path());
+        catalog
+            .ensure_local_node(&NodeId::new("workstation-1").expect("id"), "workstation")
+            .expect("local node records");
+        catalog
+    }
+
+    /// The rows one query answers, with the search index caught up to what was just filed.
+    async fn rows_of(catalog: &Arc<Catalog>, raw: &str) -> Vec<hoard_index::store::SearchRow> {
+        let raw = raw.to_owned();
+        on_catalog(catalog, move |catalog| {
+            catalog.refresh_search(|_| {})?;
+            let context = catalog.compile_context(&raw, Timestamp::now(), Vec::new())?;
+            Ok(catalog
+                .query(hoard_index::catalog::QueryRequest {
+                    raw: &raw,
+                    sort: SortSpec::new(SortKey::default(), false),
+                    limit: 50,
+                    offset: 0,
+                    context: &context,
+                })?
+                .rows)
+        })
+        .await
+        .expect("rows read")
     }
 
     fn peer_of(server: &MockServer, row: i64) -> Peer {
@@ -2129,20 +2161,19 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (store, row) = store_with_peer(Some(DigestCursor::new(5))).await;
-        poll(&store, &gossip_config(), &peer_of(&server, row), false)
+        let root = TempDir::new().expect("temp dir");
+        let (catalog, row) = catalog_with_peer(&root, Some(DigestCursor::new(5))).await;
+        poll(&catalog, &gossip_config(), &peer_of(&server, row), false)
             .await
             .expect("the poll reads the peer again from the start");
 
-        let filed = store
-            .call(|conn| {
-                hoard_index::store::search_exec::count_rows(conn, "node = ?", &["laptop".into()])
-            })
-            .await
-            .expect("count reads");
-        assert_eq!(filed, 1, "a rebuilt peer becomes visible again");
         assert_eq!(
-            digest::read_cursor(&store, row)
+            digest::filed_for(&catalog, row).await.expect("count reads"),
+            1,
+            "a rebuilt peer becomes visible again"
+        );
+        assert_eq!(
+            digest::read_cursor(&catalog, row)
                 .await
                 .expect("cursor reads"),
             Some(DigestCursor::new(1))
@@ -2173,41 +2204,31 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (store, row) = store_with_peer(None).await;
+        let root = TempDir::new().expect("temp dir");
+        let (catalog, row) = catalog_with_peer(&root, None).await;
         let peer = peer_of(&server, row);
         let config = gossip_config();
-        poll(&store, &config, &peer, false)
+        poll(&catalog, &config, &peer, false)
             .await
             .expect("the first poll files both");
         assert_eq!(
-            filed_paths(&store).await,
+            filed_paths(&catalog).await,
             ["loras/gone.safetensors", "loras/kept.safetensors"]
         );
 
-        poll(&store, &config, &peer, true)
+        poll(&catalog, &config, &peer, true)
             .await
             .expect("the resync reads the digest again");
         assert_eq!(
-            filed_paths(&store).await,
+            filed_paths(&catalog).await,
             ["loras/kept.safetensors"],
             "a row the peer stopped naming cannot stay REMOTE and offer a pull that fails"
         );
     }
 
-    async fn filed_paths(store: &Store) -> Vec<String> {
-        let mut paths: Vec<String> = store
-            .call(|conn| {
-                hoard_index::store::search_exec::query_rows(
-                    conn,
-                    "node = ?",
-                    &["laptop".into()],
-                    "",
-                    50,
-                    0,
-                )
-            })
+    async fn filed_paths(catalog: &Arc<Catalog>) -> Vec<String> {
+        let mut paths: Vec<String> = rows_of(catalog, "node:laptop")
             .await
-            .expect("rows read")
             .into_iter()
             .map(|row| row.path)
             .collect();
@@ -2229,8 +2250,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (store, row) = store_with_peer(None).await;
-        poll(&store, &gossip_config(), &peer_of(&server, row), false)
+        let root = TempDir::new().expect("temp dir");
+        let (catalog, row) = catalog_with_peer(&root, None).await;
+        poll(&catalog, &gossip_config(), &peer_of(&server, row), false)
             .await
             .expect("a repeated cursor is not an error");
 
@@ -2254,7 +2276,8 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        let (store, _) = store_with_peer(None).await;
+        let root = TempDir::new().expect("temp dir");
+        let (catalog, _) = catalog_with_peer(&root, None).await;
         let config = GossipConfig::new(
             NodeIdentity::new(
                 NodeId::new("workstation-1").expect("id"),
@@ -2265,7 +2288,7 @@ mod tests {
         );
         let found = NodeIdentity::from_address(&server.uri()).expect("static peer");
         assert!(
-            record(&store, &config, found)
+            record(&catalog, &config, found)
                 .await
                 .expect("recording answers")
                 .is_none(),
@@ -2284,11 +2307,12 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let (store, _) = store_with_peer(None).await;
+        let root = TempDir::new().expect("temp dir");
+        let (catalog, _) = catalog_with_peer(&root, None).await;
         let config = gossip_config();
 
         let statically = record(
-            &store,
+            &catalog,
             &config,
             NodeIdentity::from_address(&server.uri()).expect("static peer"),
         )
@@ -2296,7 +2320,7 @@ mod tests {
         .expect("the static peer records")
         .expect("a peer");
         let advertised = record(
-            &store,
+            &catalog,
             &config,
             NodeIdentity::new(
                 NodeId::new("guessed-1").expect("id"),
@@ -2316,9 +2340,8 @@ mod tests {
         assert!(peers.insert(advertised));
         assert_eq!(peers.peers.len(), 1);
 
-        let mut names: Vec<String> = store
-            .call(list_nodes)
-            .await
+        let mut names: Vec<String> = catalog
+            .list_nodes()
             .expect("nodes read")
             .into_iter()
             .map(|node| node.name)
@@ -2374,21 +2397,12 @@ mod tests {
 
     #[tokio::test]
     async fn gossip_starts_and_stops_without_a_peer_in_sight() {
-        let store = Store::open_in_memory().expect("store opens");
-        store
-            .call_mut(|conn| {
-                upsert_node(
-                    conn,
-                    &NewNode::local(NodeId::new("workstation-1").expect("id"), "workstation"),
-                )?;
-                Ok(())
-            })
-            .await
-            .expect("local node records");
+        let root = TempDir::new().expect("temp dir");
+        let catalog = catalog_with_local(&root);
         let config = GossipConfig::new(identity("http://127.0.0.1:7099"))
             .with_discovery(DiscoveryMode::Static)
             .with_interval(Duration::from_millis(20));
-        let handle = spawn(store, config);
+        let handle = spawn(catalog, config);
         tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(!handle.is_finished());
         handle.shutdown().await;
@@ -2415,12 +2429,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (store, _) = store_with_peer(None).await;
+        let root = TempDir::new().expect("temp dir");
+        let (catalog, _) = catalog_with_peer(&root, None).await;
         let config = gossip_config()
             .with_discovery(DiscoveryMode::Static)
             .with_statics(vec![server.uri()])
             .with_interval(Duration::from_millis(20));
-        let handle = spawn(store, config);
+        let handle = spawn(catalog, config);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let asked = Instant::now();
@@ -2484,46 +2499,35 @@ mod tests {
             .mount(&server)
             .await;
 
-        let store = Store::open_in_memory().expect("store opens");
-        store
-            .call_mut(|conn| {
-                upsert_node(
-                    conn,
-                    &NewNode::local(NodeId::new("workstation-1").expect("id"), "workstation"),
-                )?;
-                Ok(())
-            })
-            .await
-            .expect("local node records");
+        let root = TempDir::new().expect("temp dir");
+        let catalog = catalog_with_local(&root);
         let config = GossipConfig::new(identity("http://127.0.0.1:7099"))
             .with_discovery(DiscoveryMode::Static)
             .with_statics(vec![server.uri()])
             .with_interval(Duration::from_millis(20));
-        let handle = spawn(store.clone(), config);
+        let handle = spawn(Arc::clone(&catalog), config);
 
-        let mut remote = 0;
+        let mut filed = 0;
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(40)).await;
-            remote = store
-                .call(|conn| {
-                    hoard_index::store::search_exec::count_rows(
-                        conn,
-                        "state = ?",
-                        &["remote".into()],
-                    )
-                })
-                .await
-                .expect("count reads");
-            if remote > 0 {
+            filed = on_catalog(&catalog, |catalog| {
+                match catalog.list_nodes()?.iter().find(|node| !node.is_self) {
+                    Some(peer) => catalog.filed_for(peer.id),
+                    None => Ok(0),
+                }
+            })
+            .await
+            .expect("rows read");
+            if filed > 0 {
                 break;
             }
         }
-        let peers = store
-            .call(hoard_index::store::node::list_nodes)
-            .await
-            .expect("nodes read");
+        let peers = catalog.list_nodes().expect("nodes read");
         handle.shutdown().await;
-        assert_eq!(remote, 1);
+        assert_eq!(filed, 1);
+        let remote = rows_of(&catalog, "state:remote").await;
+        assert_eq!(remote.len(), 1);
+        assert_eq!(remote[0].node, "alpha");
         assert_eq!(peers.len(), 2);
         assert_eq!(peers[1].name, "alpha", "a peer is named as it names itself");
         assert_eq!(peers[1].indexed_bytes, 512);

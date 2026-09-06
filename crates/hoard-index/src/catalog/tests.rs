@@ -21,13 +21,14 @@ use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, ArtifactRecordV1, Entry, EntryKey, EntryV1,
     LOCAL_NODE, Manifest, ManifestV1, Node, Override, Ref, Repository, RepositoryKey, RepositoryV1,
     RepositoryV2, Revision, RevisionV1, RevisionV2, SearchChange, SearchText, Source, SourceV1,
-    Summary, SummaryV1,
+    Summary, SummaryV1, SummaryV2,
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::{
-    Catalog, JobProgress, JobState, MIRROR_SOURCE, NewProjection, QueryPage, QueryRequest,
-    RepositoryFilter, RescanReport, ServedFile, UsageEvent, builder, models, query,
+    Catalog, DigestApplied, JobProgress, JobState, MIRROR_SOURCE, NewProjection, QueryPage,
+    QueryRequest, RemoteEntry, RepositoryFilter, RescanReport, ServedFile, UsageEvent, builder,
+    models, query,
 };
 
 fn running_as_root() -> bool {
@@ -893,6 +894,29 @@ fn lora_header() -> Vec<u8> {
         r#""lora_unet_down_blocks_0_attn.lora_up.weight":"#,
         r#"{"dtype":"F16","shape":[768,16],"data_offsets":[24576,49152]}}"#
     ))
+}
+
+fn lora_header_named(tensor: &str) -> Vec<u8> {
+    crate::sniff::tests::safetensors_fixture(&format!(
+        "{{\"__metadata__\":{{\"ss_network_dim\":\"16\",\"ss_network_alpha\":\"8\"}},\
+         \"lora_unet_{tensor}_attn.lora_down.weight\":\
+         {{\"dtype\":\"F16\",\"shape\":[16,768],\"data_offsets\":[0,24576]}},\
+         \"lora_unet_{tensor}_attn.lora_up.weight\":\
+         {{\"dtype\":\"F16\",\"shape\":[768,16],\"data_offsets\":[24576,49152]}}}}"
+    ))
+}
+
+fn remote_entry(sha256: Sha256, path: &str) -> RemoteEntry {
+    RemoteEntry {
+        sha256,
+        size: 12,
+        role: Role::Lora,
+        base: Base::new("sdxl"),
+        repo: RepoId::new(RepoType::Models, Some("kohya".to_owned()), "film-grain"),
+        revision_sha: CommitSha::from_bytes([0x22; 20]),
+        name: path.rsplit('/').next().unwrap_or(path).to_owned(),
+        path: path.to_owned(),
+    }
 }
 
 fn hf_cache_repo(root: &Path, org: &str, name: &str, files: &[(&str, Vec<u8>)]) -> Result<()> {
@@ -2789,6 +2813,103 @@ fn node_encoding_is_frozen() -> Result<()> {
 }
 
 #[test]
+fn a_digest_pages_hashed_local_artifacts_and_a_peers_rows_land_as_remote() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(&input)?;
+    for index in 0..3 {
+        fs::write(
+            input.join(format!("w{index}.safetensors")),
+            lora_header_named(&format!("t{index}")),
+        )?;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "workstation",
+        &config,
+        HashPolicy::Now,
+        |_, _| {},
+    )?;
+    let first = catalog.digest(None, 2)?;
+    assert_eq!(first.rows.len(), 2);
+    assert_eq!(first.total, 3);
+    let second = catalog.digest(first.next, 2)?;
+    assert_eq!(second.rows.len(), 1);
+    assert!(
+        second
+            .rows
+            .iter()
+            .all(|row| !first.rows.iter().any(|seen| seen.sha256 == row.sha256))
+    );
+    assert!(catalog.digest(second.next, 2)?.rows.is_empty());
+    let laptop = catalog.upsert_peer(
+        &NodeId::new("laptop-1")?,
+        "laptop",
+        Some("http://laptop:7099"),
+    )?;
+    let pass = catalog.begin_pass(laptop.id)?;
+    let known = first.rows[0].sha256;
+    let rows = vec![
+        remote_entry(known, "loras/shared.safetensors"),
+        remote_entry(
+            Sha256::from_bytes([0x77; 32]),
+            "loras/only-there.safetensors",
+        ),
+    ];
+    let applied = catalog.apply_digest(laptop.id, &rows, pass)?;
+    assert_eq!(
+        applied,
+        DigestApplied {
+            entries: 2,
+            artifacts: 1
+        },
+        "the shared hash reuses this node's record"
+    );
+    assert_eq!(catalog.filed_for(laptop.id)?, 2);
+    catalog.rebuild_search(|_| {})?;
+    let remote = search(&catalog, "node:laptop")?;
+    assert_eq!(remote.total, 2);
+    assert!(
+        remote
+            .rows
+            .iter()
+            .all(|row| row.state == State::Remote && row.node == "laptop")
+    );
+    let shared = search(&catalog, &format!("hash:{}", known.to_hex()))?;
+    assert_eq!(shared.total, 1);
+    assert_eq!(
+        shared.rows[0].node, "workstation",
+        "the local copy stays the preferred row"
+    );
+    assert_eq!(catalog.entries_of(shared.rows[0].artifact_id)?.len(), 2);
+    let next_pass = catalog.begin_pass(laptop.id)?;
+    catalog.apply_digest(laptop.id, &rows[..1], next_pass)?;
+    assert_eq!(catalog.retract_digest(laptop.id, next_pass)?, 1);
+    assert_eq!(catalog.filed_for(laptop.id)?, 1);
+    catalog.refresh_search(|_| {})?;
+    assert_eq!(search(&catalog, "node:laptop")?.total, 1);
+    assert!(
+        catalog
+            .artifact_by_sha256(&Sha256::from_bytes([0x77; 32]))?
+            .is_none(),
+        "an artifact only the peer held is gone with its row"
+    );
+    assert_eq!(
+        catalog.digest(None, 10)?.total,
+        3,
+        "remote rows are never offered"
+    );
+    catalog.write_peer_cursor(laptop.id, Some("d1-2a"), jiff::Timestamp::now())?;
+    catalog.write_peer_cursor(laptop.id, None, jiff::Timestamp::now())?;
+    assert_eq!(catalog.peer_cursor(laptop.id)?.as_deref(), Some("d1-2a"));
+    Ok(())
+}
+
+#[test]
 fn nodes_are_recorded_and_entries_name_their_node() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let catalog = Catalog::open_or_scan(
@@ -2856,6 +2977,23 @@ fn nodes_are_recorded_and_entries_name_their_node() -> Result<()> {
 #[test]
 fn summary_encoding_is_frozen() -> Result<()> {
     let value = Summary {
+        id: 0,
+        reclaimable_bytes: 4096,
+        duplicate_artifacts: 3,
+        artifacts: 11,
+        present_artifacts: 9,
+        triage_artifacts: 2,
+        indexed_bytes: 65_536,
+        repositories: 4,
+        advertised_artifacts: 7,
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn summary_v2_encoding_is_frozen() -> Result<()> {
+    let value = SummaryV2 {
         id: 0,
         reclaimable_bytes: 4096,
         duplicate_artifacts: 3,

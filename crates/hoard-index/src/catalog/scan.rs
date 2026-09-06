@@ -405,7 +405,7 @@ impl Catalog {
     /// Recounts what the facet rail reads as DISK PRESSURE and what the stats route prints
     /// as its totals. An artifact reached by more than one path wastes every copy but the
     /// first; an artifact no path reaches at all is not indexed bytes on this node.
-    fn summarise(&self, triage: f32) -> Result<()> {
+    pub(super) fn summarise(&self, triage: f32) -> Result<()> {
         let read = self.database.r_transaction()?;
         let mut summary = Summary {
             id: 0,
@@ -416,6 +416,7 @@ impl Catalog {
             triage_artifacts: 0,
             indexed_bytes: 0,
             repositories: read.len().primary::<Repository>()?,
+            advertised_artifacts: 0,
         };
         for record in read.scan().primary::<ArtifactRecord>()?.all()? {
             let record = record?;
@@ -427,6 +428,9 @@ impl Catalog {
             if record.path_count > 0 {
                 summary.present_artifacts += 1;
                 summary.indexed_bytes = summary.indexed_bytes.saturating_add(bytes);
+                if record.artifact.sha256.is_some() {
+                    summary.advertised_artifacts += 1;
+                }
             }
             let copies = u64::from(record.path_count.saturating_sub(1));
             if copies == 0 {
@@ -446,7 +450,7 @@ impl Catalog {
 }
 
 /// Whether the sweep changed what the search index should hold for this artifact.
-fn sweep_artifact(transaction: &RwTransaction<'_>, id: i64) -> Result<bool> {
+pub(super) fn sweep_artifact(transaction: &RwTransaction<'_>, id: i64) -> Result<bool> {
     let referencing: Vec<Entry> = transaction
         .scan()
         .secondary::<Entry>(EntryKey::artifact_id)?

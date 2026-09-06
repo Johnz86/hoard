@@ -1,3 +1,4 @@
+mod digest;
 mod hashing;
 mod ingest;
 mod jobs;
@@ -29,6 +30,7 @@ use crate::store::DiskPressure;
 
 use self::models::{ArtifactRecord, Entry, Manifest, Repository, Source, Summary, define_models};
 
+pub use self::digest::{DigestApplied, DigestEntry, DigestPage, RemoteEntry};
 pub use self::hashing::HashReport;
 pub use self::ingest::{IngestRecord, MIRROR_SOURCE, ServedFile};
 pub use self::jobs::JobRecord;
@@ -75,6 +77,7 @@ pub struct Totals {
     pub triage_artifacts: u64,
     pub indexed_bytes: u64,
     pub repositories: u64,
+    pub advertised_artifacts: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -246,6 +249,7 @@ impl Catalog {
             triage_artifacts: summary.triage_artifacts,
             indexed_bytes: summary.indexed_bytes,
             repositories: summary.repositories,
+            advertised_artifacts: summary.advertised_artifacts,
         }))
     }
 
