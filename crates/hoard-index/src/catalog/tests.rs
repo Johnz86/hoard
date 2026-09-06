@@ -3245,6 +3245,55 @@ fn search_total_after_refresh(catalog: &Catalog) -> Result<u64> {
 }
 
 #[test]
+fn a_refresh_beside_a_writer_returns() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let native = directory.path().join("native");
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
+    catalog.rebuild_search(|_| {})?;
+
+    fs::write(input.join("loras/first.safetensors"), lora_header())?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    let bounded = catalog.pending_changes()?;
+    assert!(bounded >= 1, "the first artifact is logged");
+
+    let mut filed = false;
+    let applied = catalog.refresh_search(|_| {
+        if filed {
+            return;
+        }
+        filed = true;
+        fs::write(input.join("loras/second.safetensors"), lora_header())
+            .expect("a writer files another artifact");
+        catalog
+            .rescan(&config, HashPolicy::Never, |_, _| {})
+            .expect("the writer's rescan logs a change");
+    })?;
+    assert!(filed, "the writer ran while the refresh was applying");
+    assert_eq!(
+        applied, bounded,
+        "the refresh drained only up to the bound it read"
+    );
+
+    let rest = catalog.pending_changes()?;
+    assert!(rest >= 1, "the writer's change is still pending");
+    assert_eq!(
+        catalog.refresh_search(|_| {})?,
+        rest,
+        "the next refresh takes the rest"
+    );
+    assert_eq!(catalog.pending_changes()?, 0);
+    assert!(
+        search(&catalog, "")?
+            .rows
+            .iter()
+            .any(|row| row.path.ends_with("second.safetensors")),
+        "the writer's artifact is searchable after the second refresh"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_duplicated_shard_set_counts_two_paths_and_a_missing_member_still_one() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let hub = directory.path().join("hub");

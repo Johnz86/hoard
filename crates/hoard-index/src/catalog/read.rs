@@ -22,7 +22,7 @@ use super::models::{
     ArtifactDetail, ArtifactRecord, Entry, EntryKey, Repository, RepositoryKey, Revision, Source,
     repository_key,
 };
-use super::nodes::NodeNames;
+use super::nodes::{NodeNames, PEER_SOURCE};
 use super::search::{EntryFacts, assemble_row, revision_of};
 use super::usage::last_used_in;
 use super::{Catalog, QueryRequest};
@@ -147,7 +147,7 @@ pub struct TriageItem {
 
 impl Catalog {
     /// Every nominated root this catalog holds, ordered by name, with the files each still
-    /// owes a content hash.
+    /// owes a content hash. A peer's namespace is not a root on this node, so it is left out.
     pub fn sources(&self) -> Result<Vec<SourceRecord>> {
         let pending = self.pending_by_source()?;
         let read = self.database.r_transaction()?;
@@ -157,6 +157,7 @@ impl Catalog {
             .all()?
             .collect::<native_db::db_type::Result<_>>()?;
         rows.into_iter()
+            .filter(|row| !row.name.starts_with(PEER_SOURCE))
             .map(|row| {
                 let owed = pending.get(&row.name).copied().unwrap_or_default();
                 SourceRecord::of(row, owed)

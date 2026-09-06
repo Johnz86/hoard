@@ -179,16 +179,21 @@ impl Catalog {
         self.prune_changes(drained)
     }
 
-    /// Applies every logged change after the manifest's cursor to the published index, one
+    /// Applies the logged changes after the manifest's cursor to the published index, one
     /// Tantivy commit per batch, then advances the cursor and prunes what it applied. Returns
     /// how many changes were applied. Needs a published index; a catalog without one must
     /// `rebuild_search` first.
+    ///
+    /// The drain is bounded by the highest sequence the log held when it started, so a
+    /// refresh running beside a writer returns rather than chasing the writer's new rows;
+    /// the next refresh takes the rest.
     pub fn refresh_search(&self, mut progress: impl FnMut(u64)) -> Result<u64> {
         let manifest = self.manifest()?;
         let directory = manifest
             .search_directory
             .ok_or_else(|| IndexError::Catalog("search index needs building".into()))?;
-        let mut batch = self.changes_after(manifest.search_seq)?;
+        let bound = self.highest_change_seq()?;
+        let mut batch = self.changes_up_to(manifest.search_seq, bound)?;
         if batch.is_empty() {
             return Ok(0);
         }
@@ -226,7 +231,7 @@ impl Catalog {
             self.prune_changes(cursor)?;
             applied += batch.len() as u64;
             progress(applied);
-            batch = self.changes_after(cursor)?;
+            batch = self.changes_up_to(cursor, bound)?;
         }
         writer.wait_merging_threads()?;
         Ok(applied)
@@ -251,15 +256,29 @@ impl Catalog {
         Ok(pending)
     }
 
-    fn changes_after(&self, cursor: u64) -> Result<Vec<SearchChange>> {
+    fn changes_up_to(&self, cursor: u64, bound: u64) -> Result<Vec<SearchChange>> {
+        if cursor >= bound {
+            return Ok(Vec::new());
+        }
         let read = self.database.r_transaction()?;
         let batch = read
             .scan()
             .primary::<SearchChange>()?
-            .range(cursor.saturating_add(1)..)?
+            .range(cursor.saturating_add(1)..=bound)?
             .take(REFRESH_BATCH)
             .collect::<native_db::db_type::Result<Vec<_>>>()?;
         Ok(batch)
+    }
+
+    fn highest_change_seq(&self) -> Result<u64> {
+        let read = self.database.r_transaction()?;
+        let highest: Option<SearchChange> = read
+            .scan()
+            .primary::<SearchChange>()?
+            .all()?
+            .next_back()
+            .transpose()?;
+        Ok(highest.map_or(0, |change| change.seq))
     }
 
     fn advance_cursor(&self, cursor: u64) -> Result<()> {

@@ -1587,10 +1587,9 @@ async fn sources_scans_and_jobs_are_listed() {
     let sources = get(&world.state, "/api/v1/sources").await;
     assert_eq!(
         sources.as_array().expect("sources").len(),
-        2,
-        "the laptop's rows sit under a namespace of their own"
+        1,
+        "a peer's namespace is not a root of files on this node"
     );
-    assert_eq!(sources[1]["name"], "peer:laptop-1");
     assert_eq!(sources[0]["kind"], "hf-cache");
     assert_eq!(sources[0]["path"], "/data/hub");
     assert_eq!(

@@ -6,23 +6,16 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use hoard_core::{
-    ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, Precision, RepoId, RepoRowId, RepoType,
-    Role, Sha256, State, SubRole, format_size,
+    ArtifactFormat, ArtifactId, Base, CommitSha, Precision, RepoId, RepoType, Role, Sha256, State,
+    SubRole, format_size,
 };
 use hoard_index::IndexError;
-use hoard_index::catalog::{Catalog, EntryDetail};
-use hoard_index::search::{
-    CompatTarget, CompileContext, ParsedQuery, SortKey, SortSpec, TokenKind, compile, quoted,
-};
-use hoard_index::store::row::{SearchRow, SqlValue};
-use hoard_index::store::search_exec;
+use hoard_index::catalog::EntryDetail;
+use hoard_index::search::{SortKey, SortSpec};
+use hoard_index::store::row::SearchRow;
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-
-/// The SQLite connection the store hands to a blocking closure, named through the store
-/// rather than by depending on rusqlite from the HTTP layer.
-pub type Conn = <hoard_index::store::Reader as std::ops::Deref>::Target;
 
 /// Rows returned when a request names no limit.
 pub const DEFAULT_LIMIT: u32 = 100;
@@ -172,109 +165,6 @@ pub fn sort_spec(sort: Option<&str>, dir: Option<&str>) -> ApiResult<SortSpec> {
 
 pub fn sort_key(sort: Option<&str>, dir: Option<&str>) -> String {
     format!("{}:{}", sort.unwrap_or_default(), dir.unwrap_or_default())
-}
-
-/// Everything compilation needs that the query text does not carry: the shelves a
-/// `shelf:` token expands to, this node's name and the resolved `compat:` target.
-pub fn compile_context(
-    conn: &Conn,
-    catalog: &Catalog,
-    node: &str,
-    query: &ParsedQuery,
-    now: Timestamp,
-) -> Result<CompileContext, IndexError> {
-    let shelves = catalog
-        .list_shelves()?
-        .into_iter()
-        .map(|shelf| (shelf.name, shelf.query))
-        .collect();
-    let mut context = CompileContext::new(now)
-        .with_local_node(node.to_owned())
-        .with_shelves(shelves);
-    if let Some(token) = query
-        .tokens
-        .iter()
-        .find(|token| token.kind == TokenKind::Compat)
-        && let Some(target) = resolve_compat_target(conn, &token.normalized, now)?
-    {
-        context = context.with_compat(target);
-    }
-    Ok(context)
-}
-
-/// Resolves what a `compat:` value names, because the rule reads a role and a base rather
-/// than a string. A repository reference wins over free text.
-pub fn resolve_compat_target(
-    conn: &Conn,
-    value: &str,
-    now: Timestamp,
-) -> Result<Option<CompatTarget>, IndexError> {
-    for probe in [format!("repo:{}", quoted(value)), quoted(value)] {
-        let query = hoard_index::search::parse(&probe);
-        let context = CompileContext::new(now);
-        let compiled = compile(&query, SortSpec::new(SortKey::Size, true), &context)?;
-        let rows = search_exec::query_rows(
-            conn,
-            &compiled.where_sql,
-            &compiled.params,
-            &compiled.order_sql,
-            32,
-            0,
-        )?;
-        if let Some(row) = rows
-            .iter()
-            .find(|row| row.role.is_host())
-            .or_else(|| rows.first())
-        {
-            return Ok(Some(CompatTarget::new(row.role, row.base.clone())));
-        }
-    }
-    Ok(None)
-}
-
-/// One artifact of the `search_row` view, read by its identity rather than by a query.
-pub fn row_by_artifact(conn: &Conn, id: ArtifactId) -> Result<Option<SearchRow>, IndexError> {
-    let rows = search_exec::query_rows(
-        conn,
-        "artifact_id = ?",
-        &[SqlValue::Int(id.get())],
-        "",
-        1,
-        0,
-    )?;
-    Ok(rows.into_iter().next())
-}
-
-pub fn require_row(conn: &Conn, id: ArtifactId) -> Result<SearchRow, IndexError> {
-    row_by_artifact(conn, id)?.ok_or_else(|| IndexError::not_found("artifact", id.to_string()))
-}
-
-/// Every artifact reachable through one repository, most bytes first.
-pub fn rows_for_repo(
-    conn: &Conn,
-    repo: RepoRowId,
-    limit: u32,
-) -> Result<Vec<SearchRow>, IndexError> {
-    search_exec::query_rows(
-        conn,
-        "repo_id = ?",
-        &[SqlValue::Int(repo.get())],
-        "size DESC, artifact_id ASC",
-        limit,
-        0,
-    )
-}
-
-/// Every artifact sharing one blob, which is what a duplicate is.
-pub fn rows_for_blob(conn: &Conn, blob: BlobId) -> Result<Vec<SearchRow>, IndexError> {
-    search_exec::query_rows(
-        conn,
-        "blob_id = ?",
-        &[SqlValue::Int(blob.get())],
-        "",
-        MAX_LIMIT,
-        0,
-    )
 }
 
 /// One row of the results table, the cards view and `hoard ls --json`.
