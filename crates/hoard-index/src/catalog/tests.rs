@@ -4201,6 +4201,59 @@ fn the_primary_path_answers_exactly_what_the_collapse_path_answers() -> Result<(
 }
 
 #[test]
+fn the_collapse_path_keeps_one_row_per_artifact() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    for name in ["styler", "styler-copy", "styler-third"] {
+        hf_cache_repo(
+            &hub,
+            "acme",
+            name,
+            &[("unet/adapter.safetensors", lora_header())],
+        )?;
+    }
+    hf_cache_repo(
+        &hub,
+        "data",
+        "rows",
+        &[("train.csv", b"x,y\n1,2\n".to_vec())],
+    )?;
+    let catalog = scan_hub(directory.path(), &hub)?;
+    let context = catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?;
+    for raw in ["node:self", "state:local"] {
+        let request = QueryRequest {
+            raw,
+            sort: SortSpec::default(),
+            limit: 50,
+            offset: 0,
+            context: &context,
+        };
+        let page = catalog.query_via(request, QueryPath::Collapse)?;
+        let mut seen: Vec<i64> = page.rows.iter().map(|row| row.artifact_id.get()).collect();
+        let listed = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), listed, "{raw} listed an artifact twice");
+        assert_eq!(page.total, listed as u64, "{raw} counted what it listed");
+        assert!(page.total > 0, "{raw} matched nothing");
+    }
+    let both = QueryRequest {
+        raw: "role:lora",
+        sort: SortSpec::default(),
+        limit: 50,
+        offset: 0,
+        context: &context,
+    };
+    let primary = catalog.query_via(both.clone(), QueryPath::Primary)?;
+    let collapsed = catalog.query_via(both, QueryPath::Collapse)?;
+    assert_eq!(primary.facets, collapsed.facets);
+    assert_eq!(primary.total, collapsed.total);
+    assert_eq!(primary.nodes, collapsed.nodes);
+    Ok(())
+}
+
+#[test]
 fn entry_level_tokens_and_sorts_take_the_collapse_path() -> Result<()> {
     let context = CompileContext::new(jiff::Timestamp::now()).with_shelves(vec![
         ("here".into(), "node:self".into()),

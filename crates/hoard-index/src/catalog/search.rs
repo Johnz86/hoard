@@ -509,9 +509,13 @@ impl Catalog {
                     },
                 )?
             }
-            QueryPath::Collapse => searcher
-                .search(compiled.as_ref(), &ArtifactCollector { sort: request.sort })?
-                .summary(),
+            QueryPath::Collapse => searcher.search(
+                compiled.as_ref(),
+                &ArtifactCollector {
+                    sort: request.sort,
+                    retain: true,
+                },
+            )?,
         };
         let total = summary.total;
         let nodes = distinct_nodes(&summary)?;
@@ -840,8 +844,11 @@ fn facet_sort() -> SortSpec {
     SortSpec::new(SortKey::Size, true)
 }
 
-fn collector() -> ArtifactCollector {
-    ArtifactCollector { sort: facet_sort() }
+fn collector(retain: bool) -> ArtifactCollector {
+    ArtifactCollector {
+        sort: facet_sort(),
+        retain,
+    }
 }
 
 /// The query restricted to the one document per artifact the build marked primary.
@@ -1257,23 +1264,48 @@ struct Hit {
     base_label: u64,
 }
 
-impl Hit {
-    fn retain(self, hits: &mut HashMap<i64, Self>) {
-        match hits.entry(self.artifact_id) {
-            std::collections::hash_map::Entry::Occupied(mut slot) => {
-                if self.preferred_over(slot.get()) {
-                    slot.insert(self);
-                }
-            }
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(self);
-            }
-        }
-    }
+/// One collapsed candidate as the smallest row a harvest needs: which artifact it belongs
+/// to, which entry the collapse prefers, where the sort puts it, and where the rest of it is
+/// read from when the page or the tallies want it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Retained {
+    artifact_id: i64,
+    entry_id: i64,
+    preference: i64,
+    sort: u64,
+    segment: SegmentOrdinal,
+    doc: DocId,
+}
 
-    fn preferred_over(&self, other: &Self) -> bool {
-        (self.preference, Reverse(self.entry_id)) > (other.preference, Reverse(other.entry_id))
-    }
+/// Keeps one row per artifact: the highest availability preference, and on a tie the lowest
+/// entry id, which is what the read API collapses to as well.
+fn collapse(rows: &mut Vec<Retained>) {
+    rows.sort_unstable_by(|left, right| {
+        left.artifact_id.cmp(&right.artifact_id).then_with(|| {
+            (right.preference, Reverse(right.entry_id))
+                .cmp(&(left.preference, Reverse(left.entry_id)))
+        })
+    });
+    rows.dedup_by_key(|row| row.artifact_id);
+}
+
+/// The full hit one retained row stands for, with its facet ordinals read back from the
+/// segment it was collected in.
+fn hit_of(row: Retained, segments: &[SegmentStrings]) -> tantivy::Result<Hit> {
+    let strings = segments.get(row.segment as usize).ok_or_else(|| {
+        tantivy::TantivyError::InvalidArgument(
+            "a collapsed row names a segment the search did not read".into(),
+        )
+    })?;
+    Ok(Hit {
+        artifact_id: row.artifact_id,
+        entry_id: row.entry_id,
+        preference: row.preference,
+        segment: row.segment,
+        sort: row.sort,
+        facets: std::array::from_fn(|dimension| strings.first_ord(dimension, row.doc)),
+        base_label: strings.first_ord(LABEL_COLUMN, row.doc),
+    })
 }
 
 /// The string columns of one segment, kept alive so an ordinal a hit carries can be spelled
@@ -1400,36 +1432,6 @@ struct Summary {
     segments: Vec<SegmentStrings>,
 }
 
-/// A whole collapsed collection: the hit retained per artifact and the segment columns their
-/// ordinals are spelled from.
-struct Collected {
-    hits: HashMap<i64, Hit>,
-    segments: Vec<SegmentStrings>,
-}
-
-impl Collected {
-    /// Tallies the collapsed hits the way a primary collection tallies them as it goes, so
-    /// both paths are counted and paged by the same code.
-    fn summary(self) -> Summary {
-        let Collected { hits, segments } = self;
-        let mut tallies = HashMap::new();
-        let mut nodes = HashSet::new();
-        let mut candidates = Vec::with_capacity(hits.len());
-        for hit in hits.into_values() {
-            tally(&mut tallies, &hit);
-            nodes.insert((hit.segment, hit.facets[NODE_DIMENSION]));
-            candidates.push(hit);
-        }
-        Summary {
-            total: candidates.len() as u64,
-            candidates,
-            tallies,
-            nodes,
-            segments,
-        }
-    }
-}
-
 /// Everything the facet rail needs to count a dimension the same way the page was answered.
 struct FacetPass<'a> {
     searcher: &'a Searcher,
@@ -1452,10 +1454,7 @@ impl FacetPass<'_> {
                     reversed: false,
                 },
             )?,
-            QueryPath::Collapse => self
-                .searcher
-                .search(excluded.as_ref(), &collector())?
-                .summary(),
+            QueryPath::Collapse => self.searcher.search(excluded.as_ref(), &collector(false))?,
         })
     }
 
@@ -1467,7 +1466,7 @@ impl FacetPass<'_> {
                 .searcher
                 .search(&only_primary(self.bound.fields, Box::new(scoped)), &Count)?
                 as u64,
-            QueryPath::Collapse => self.searcher.search(&scoped, &collector())?.hits.len() as u64,
+            QueryPath::Collapse => self.searcher.search(&scoped, &collector(true))?.total,
         })
     }
 }
@@ -1508,6 +1507,21 @@ impl HitColumns {
     }
 
     fn hit(&self, doc: DocId) -> Option<Hit> {
+        let row = self.retained(doc)?;
+        Some(Hit {
+            artifact_id: row.artifact_id,
+            entry_id: row.entry_id,
+            preference: row.preference,
+            segment: row.segment,
+            sort: row.sort,
+            facets: std::array::from_fn(|dimension| self.strings.first_ord(dimension, doc)),
+            base_label: self.strings.first_ord(LABEL_COLUMN, doc),
+        })
+    }
+
+    /// The numeric part of a hit, without spelling out a single facet ordinal, which is all
+    /// a collapse needs until it knows which row per artifact survives.
+    fn retained(&self, doc: DocId) -> Option<Retained> {
         let (Some(artifact_id), Some(entry_id), Some(preference), Some(size)) = (
             self.artifact.first(doc),
             self.entry.first(doc),
@@ -1526,14 +1540,13 @@ impl HitColumns {
                 .unwrap_or_default(),
             SortColumn::Text => self.strings.first_ord(SORT_COLUMN, doc),
         };
-        Some(Hit {
+        Some(Retained {
             artifact_id,
             entry_id,
             preference,
-            segment: self.ordinal,
             sort,
-            facets: std::array::from_fn(|dimension| self.strings.first_ord(dimension, doc)),
-            base_label: self.strings.first_ord(LABEL_COLUMN, doc),
+            segment: self.ordinal,
+            doc,
         })
     }
 }
@@ -1571,20 +1584,24 @@ fn missing_fast_fields() -> tantivy::TantivyError {
     )
 }
 
-/// What one segment harvests while collapsing: its ordinal, its retained hits and its string
-/// columns.
+/// What one segment harvests while collapsing: its ordinal, the row it kept per artifact and
+/// its string columns.
 struct SegmentHits {
     ordinal: SegmentOrdinal,
-    hits: HashMap<i64, Hit>,
+    retained: Vec<Retained>,
     strings: SegmentStrings,
 }
 
+/// The collapsed collection: one row per artifact, tallied once that row is settled, and
+/// the candidates for the page when the caller asked to keep them. A facet pass keeps none,
+/// because only the tallies are read from it.
 struct ArtifactCollector {
     sort: SortSpec,
+    retain: bool,
 }
 
 impl Collector for ArtifactCollector {
-    type Fruit = Collected;
+    type Fruit = Summary;
     type Child = ArtifactSegmentCollector;
 
     fn for_segment(
@@ -1594,7 +1611,7 @@ impl Collector for ArtifactCollector {
     ) -> tantivy::Result<Self::Child> {
         Ok(ArtifactSegmentCollector {
             columns: HitColumns::open(ordinal, segment, self.sort.key)?,
-            hits: HashMap::new(),
+            retained: Vec::new(),
             invalid: false,
         })
     }
@@ -1613,29 +1630,47 @@ impl Collector for ArtifactCollector {
             .map(|segment| segment.ordinal as usize + 1)
             .max()
             .unwrap_or(0);
-        let mut hits = HashMap::new();
+        let mut rows = Vec::with_capacity(harvested.iter().map(|hit| hit.retained.len()).sum());
         let mut columns = Vec::with_capacity(harvested.len());
         for segment in harvested {
             let SegmentHits {
                 ordinal,
-                hits: retained,
+                retained,
                 strings,
             } = segment;
-            for hit in retained.into_values() {
-                hit.retain(&mut hits);
-            }
+            rows.extend(retained);
             columns.push((ordinal, strings));
         }
-        Ok(Collected {
-            hits,
-            segments: segment_columns(columns, count)?,
+        collapse(&mut rows);
+        let segments = segment_columns(columns, count)?;
+        let total = rows.len() as u64;
+        let mut tallies = HashMap::new();
+        let mut nodes = HashSet::new();
+        let mut candidates = match self.retain {
+            true => Vec::with_capacity(rows.len()),
+            false => Vec::new(),
+        };
+        for row in rows {
+            let hit = hit_of(row, &segments)?;
+            tally(&mut tallies, &hit);
+            nodes.insert((hit.segment, hit.facets[NODE_DIMENSION]));
+            if self.retain {
+                candidates.push(hit);
+            }
+        }
+        Ok(Summary {
+            total,
+            candidates,
+            tallies,
+            nodes,
+            segments,
         })
     }
 }
 
 struct ArtifactSegmentCollector {
     columns: HitColumns,
-    hits: HashMap<i64, Hit>,
+    retained: Vec<Retained>,
     invalid: bool,
 }
 
@@ -1643,22 +1678,24 @@ impl SegmentCollector for ArtifactSegmentCollector {
     type Fruit = tantivy::Result<SegmentHits>;
 
     fn collect(&mut self, doc: DocId, _: Score) {
-        match self.columns.hit(doc) {
-            Some(hit) => hit.retain(&mut self.hits),
+        match self.columns.retained(doc) {
+            Some(row) => self.retained.push(row),
             None => self.invalid = true,
         }
     }
 
-    fn harvest(self) -> Self::Fruit {
+    fn harvest(mut self) -> Self::Fruit {
         if self.invalid {
             return Err(missing_fast_fields());
         }
+        collapse(&mut self.retained);
+        self.retained.shrink_to_fit();
         let HitColumns {
             ordinal, strings, ..
         } = self.columns;
         Ok(SegmentHits {
             ordinal,
-            hits: self.hits,
+            retained: self.retained,
             strings,
         })
     }
