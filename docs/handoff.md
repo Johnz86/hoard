@@ -126,11 +126,6 @@ Smaller things, each verified:
 - Two rustdoc warnings: `public documentation for retract_digest links to private item CHUNK`
   and the same for `reset_stale_pulls`, both in `crates/hoard-index/src/catalog/digest.rs`.
   Either stop linking `CHUNK` or make it public.
-- **`[index] hash_policy` is read by `Catalog::open_or_scan` alone**, the first open of a
-  catalog that does not exist yet. `hoard scan` takes its policy from `--hash`, which
-  defaults to `later`, so a configured `hash_policy = "never"` does not survive a rescan and
-  a measurement run has to pass `--hash never` as well. Either the flag should default to
-  the configured policy or the config key should say it applies to the first scan only.
 - `crates/hoard-net/Cargo.toml` declares `hex.workspace = true` and no code in the crate uses
   the `hex` crate (the only match is a local variable of that name in `digest.rs`).
 - `mockall` and `criterion` are declared in the root `[workspace.dependencies]` and no crate

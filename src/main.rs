@@ -18,7 +18,9 @@ async fn main() -> Result<()> {
         Command::Catalog { command } => cli::catalog::run(config_path, command).await,
         Command::Serve { bind } => cli::serve::run(cli::node::open(config_path).await?, bind).await,
         Command::Scan { source, hash } => {
-            cli::scan::run(cli::node::open(config_path).await?, source, hash.into()).await
+            let context = cli::node::open(config_path).await?;
+            let policy = cli::hash_policy(hash, context.config.index.hash_policy);
+            cli::scan::run(context, source, policy).await
         }
         Command::Ls {
             query,

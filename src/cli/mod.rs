@@ -13,6 +13,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use hoard_index::config::HashPolicy;
+
 /// Local HuggingFace-compatible mirror and artifact index.
 #[derive(Debug, Parser)]
 #[command(name = "hoard", version, about, long_about = None)]
@@ -44,9 +46,9 @@ pub enum Command {
         /// Only this source, by name.
         #[arg(long)]
         source: Option<String>,
-        /// When to compute sha256.
-        #[arg(long, value_enum, default_value_t = HashWhen::Later)]
-        hash: HashWhen,
+        /// When to compute sha256. Overrides `[index] hash_policy` for this run.
+        #[arg(long, value_enum)]
+        hash: Option<HashWhen>,
     },
     /// Search the index with the query grammar.
     #[command(alias = "search")]
@@ -107,20 +109,26 @@ pub enum Command {
 pub enum HashWhen {
     /// Hash during the scan, before it reports done.
     Now,
-    /// Hash afterwards in the background pool.
+    /// Hash afterwards in the background pool. The default `[index] hash_policy`.
     Later,
     /// Never hash; `resolve` of a loose file stays 404 because clients verify ETags.
     Never,
 }
 
-impl From<HashWhen> for hoard_index::config::HashPolicy {
+impl From<HashWhen> for HashPolicy {
     fn from(value: HashWhen) -> Self {
         match value {
-            HashWhen::Now => hoard_index::config::HashPolicy::Now,
-            HashWhen::Later => hoard_index::config::HashPolicy::Background,
-            HashWhen::Never => hoard_index::config::HashPolicy::Never,
+            HashWhen::Now => HashPolicy::Now,
+            HashWhen::Later => HashPolicy::Background,
+            HashWhen::Never => HashPolicy::Never,
         }
     }
+}
+
+/// The policy a scan runs under: the `--hash` flag when it was given, otherwise the
+/// `[index] hash_policy` the configuration carries.
+pub fn hash_policy(flag: Option<HashWhen>, configured: HashPolicy) -> HashPolicy {
+    flag.map_or(configured, HashPolicy::from)
 }
 
 #[cfg(test)]
@@ -158,8 +166,33 @@ mod tests {
     }
 
     #[test]
+    fn the_hash_flag_is_optional_and_wins_over_the_config() {
+        let bare = Cli::try_parse_from(["hoard", "scan"]).expect("a bare scan parses");
+        assert!(matches!(bare.command, Command::Scan { hash: None, .. }));
+
+        let flagged =
+            Cli::try_parse_from(["hoard", "scan", "--hash", "never"]).expect("--hash never parses");
+        assert!(matches!(
+            flagged.command,
+            Command::Scan {
+                hash: Some(HashWhen::Never),
+                ..
+            }
+        ));
+
+        assert_eq!(hash_policy(None, HashPolicy::Never), HashPolicy::Never);
+        assert_eq!(
+            hash_policy(None, HashPolicy::Background),
+            HashPolicy::Background
+        );
+        assert_eq!(
+            hash_policy(Some(HashWhen::Now), HashPolicy::Never),
+            HashPolicy::Now
+        );
+    }
+
+    #[test]
     fn hash_spellings_map_onto_the_index_policy() {
-        use hoard_index::config::HashPolicy;
         assert_eq!(HashPolicy::from(HashWhen::Now), HashPolicy::Now);
         assert_eq!(HashPolicy::from(HashWhen::Later), HashPolicy::Background);
         assert_eq!(HashPolicy::from(HashWhen::Never), HashPolicy::Never);
