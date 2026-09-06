@@ -9,6 +9,7 @@ use hoard_index::catalog::{Catalog, PullRow, UsageDay, UsageEvent};
 use jiff::Timestamp;
 use serde::Serialize;
 
+use crate::batch::Debounced;
 use crate::error::Result;
 use crate::local::index_repo::on_catalog;
 
@@ -102,17 +103,50 @@ impl ServedRequest {
     }
 }
 
-/// Appends one served response to the catalog's log and marks its artifact as used.
-pub async fn log_served(catalog: &Arc<Catalog>, request: &ServedRequest) -> Result<()> {
-    let event = request.event();
-    on_catalog(catalog, move |catalog| {
-        catalog.log_usage(&event)?;
-        if let Some(artifact) = event.artifact {
-            catalog.bump_artifact_use(artifact, event.at)?;
+/// How long a served response may wait before its row is written.
+pub const SINK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How many served responses wait before the sink writes without waiting for the interval.
+pub const SINK_CAPACITY: usize = 256;
+
+/// The usage log's writer: served responses accumulate here and are written in one
+/// transaction every [`SINK_INTERVAL`] or every [`SINK_CAPACITY`] responses.
+#[derive(Debug)]
+pub struct UsageSink {
+    sink: Debounced<ServedRequest>,
+}
+
+impl UsageSink {
+    /// Starts the writer. Outside a Tokio runtime nothing is timed and only `flush` writes.
+    pub fn spawn(catalog: Arc<Catalog>, interval: Duration, capacity: usize) -> Self {
+        Self {
+            sink: Debounced::spawn(interval, capacity, move |served: Vec<ServedRequest>| {
+                let events: Vec<UsageEvent> = served.iter().map(ServedRequest::event).collect();
+                catalog.log_usage_batch(&events)?;
+                Ok(())
+            }),
         }
-        Ok(())
-    })
-    .await
+    }
+
+    /// Records one served response, to be written with the ones beside it.
+    pub fn record(&self, request: ServedRequest) {
+        self.sink.record(request);
+    }
+
+    /// How many served responses are waiting to be written.
+    pub fn pending(&self) -> usize {
+        self.sink.pending()
+    }
+
+    /// Writes every response recorded so far, which is what a reader of the log waits on.
+    pub async fn flush(&self) -> Result<()> {
+        self.sink.flush().await
+    }
+
+    /// Stops the writer and writes what is left.
+    pub async fn shutdown(self) -> Result<()> {
+        self.sink.shutdown().await
+    }
 }
 
 /// Everything the USAGE tab draws for one repository.
@@ -221,15 +255,14 @@ mod tests {
         let catalog = catalog(directory.path());
         let repo = only_repo(&catalog);
 
-        log_served(
-            &catalog,
-            &ServedRequest::new("openai/whisper/resolve/main/model.bin", 200)
+        let sink = UsageSink::spawn(Arc::clone(&catalog), SINK_INTERVAL, SINK_CAPACITY);
+        sink.record(
+            ServedRequest::new("openai/whisper/resolve/main/model.bin", 200)
                 .from_client(Some("10.0.0.7".to_owned()))
                 .for_repo(Some(repo))
                 .served(2_000_000, Duration::from_secs(1)),
-        )
-        .await
-        .expect("logs");
+        );
+        sink.flush().await.expect("logs");
 
         let summary = usage_summary(&catalog, repo, USAGE_WINDOW_DAYS, RECENT_PULL_LIMIT)
             .await
@@ -242,6 +275,7 @@ mod tests {
         assert_eq!(pull.bytes, 2_000_000);
         assert_eq!(pull.rate_bps, Some(2_000_000));
         assert_eq!(pulls_on_lan(&catalog, repo).await.expect("count"), 1);
+        sink.shutdown().await.expect("sink stops");
     }
 
     #[tokio::test]
@@ -250,14 +284,13 @@ mod tests {
         let catalog = catalog(directory.path());
         let repo = only_repo(&catalog);
 
-        log_served(
-            &catalog,
-            &ServedRequest::new("unknown/repo/resolve/main/model.bin", 200)
+        let sink = UsageSink::spawn(Arc::clone(&catalog), SINK_INTERVAL, SINK_CAPACITY);
+        sink.record(
+            ServedRequest::new("unknown/repo/resolve/main/model.bin", 200)
                 .from_client(Some("10.0.0.9".to_owned()))
                 .served(1_000, Duration::from_secs(1)),
-        )
-        .await
-        .expect("logs");
+        );
+        sink.flush().await.expect("logs");
 
         let summary = usage_summary(&catalog, repo, USAGE_WINDOW_DAYS, RECENT_PULL_LIMIT)
             .await
@@ -269,5 +302,6 @@ mod tests {
         );
         assert!(summary.pulls.is_empty());
         assert_eq!(summary.clients, 0);
+        sink.shutdown().await.expect("sink stops");
     }
 }

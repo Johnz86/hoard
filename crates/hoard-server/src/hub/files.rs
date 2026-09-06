@@ -21,7 +21,7 @@ use hoard_index::catalog::Catalog;
 use hoard_mirror::MirrorError;
 use hoard_mirror::git::LfsLocation;
 use hoard_mirror::resolve::{FileAnswer, FileRequest, IngestTrigger, read_range, served_response};
-use hoard_mirror::usage::{ServedRequest, log_served};
+use hoard_mirror::usage::ServedRequest;
 
 use crate::error::{HubError, HubResult};
 use crate::hub::meta::REPO_COMMIT;
@@ -272,7 +272,7 @@ impl Meter {
     fn new(state: &AppState, served: &Served, answer: &FileAnswer, status: u16) -> Self {
         Self {
             inner: Some(Record {
-                catalog: Arc::clone(state.catalog()),
+                state: state.clone(),
                 repo: served.repo.clone(),
                 commit: answer.commit,
                 path: served.path.clone(),
@@ -306,7 +306,7 @@ impl Drop for Meter {
 }
 
 struct Record {
-    catalog: Arc<Catalog>,
+    state: AppState,
     repo: RepoId,
     commit: CommitSha,
     path: String,
@@ -324,15 +324,15 @@ impl Record {
         {
             tracing::warn!(repo = %self.repo, %error, "a cached file was not ingested");
         }
-        let (repo, artifact) = attribute(&self.catalog, &self.repo, &self.commit, &self.path).await;
-        let request = ServedRequest::new(self.path.clone(), self.status)
-            .from_client(self.client.clone())
-            .for_repo(repo)
-            .for_artifact(artifact)
-            .served(self.bytes, self.elapsed);
-        if let Err(error) = log_served(&self.catalog, &request).await {
-            tracing::warn!(repo = %self.repo, %error, "a served response was not logged");
-        }
+        let (repo, artifact) =
+            attribute(self.state.catalog(), &self.repo, &self.commit, &self.path).await;
+        self.state.usage().record(
+            ServedRequest::new(self.path.clone(), self.status)
+                .from_client(self.client.clone())
+                .for_repo(repo)
+                .for_artifact(artifact)
+                .served(self.bytes, self.elapsed),
+        );
     }
 }
 

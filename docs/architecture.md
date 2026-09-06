@@ -163,6 +163,7 @@ hoard/
       src/
         config.rs            MirrorConfig: upstreams, cache root, rules, offline, xet
         access.rs            proxy and cache rules
+        batch.rs             work a serving node accumulates instead of writing per response
         model/               Hub JSON shapes
         local/
           index_repo.rs      repo metadata and bytes from the index
@@ -182,7 +183,7 @@ hoard/
           lfs_batch.rs       LFS batch API pointing at resolve
         resolve.rs           revision -> sha, local first
         ingest.rs            completed cache entries into the index
-        usage.rs             served-request log
+        usage.rs             served-request log and the sink that batches it
     hoard-net/               node identity, mDNS discovery, digest gossip, peer pulls
       src/
         identity.rs          NodeId, name, advertised URL and the _hoard._tcp TXT record

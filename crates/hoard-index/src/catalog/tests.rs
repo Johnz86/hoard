@@ -4693,6 +4693,45 @@ fn usage_is_logged_summarised_and_reaches_the_used_token() -> Result<()> {
 }
 
 #[test]
+fn a_usage_batch_writes_every_row_and_one_change_per_artifact() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    catalog.refresh_search(|_| {})?;
+    assert_eq!(catalog.pending_changes()?, 0, "the log starts settled");
+    let lora = catalog
+        .artifact_row(ids.lora)?
+        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
+    let ckpt = catalog
+        .artifact_row(ids.ckpt)?
+        .ok_or_else(|| IndexError::Catalog("ckpt".into()))?;
+    let now = jiff::Timestamp::now();
+    let earlier = now - std::time::Duration::from_secs(60);
+    let event = |row: &SearchRow, at: jiff::Timestamp| UsageEvent {
+        client: Some("10.0.0.4".to_owned()),
+        repo: Some(row.repo_id),
+        artifact: Some(row.artifact_id),
+        bytes: 10,
+        ..UsageEvent::new(row.path.clone(), at)
+    };
+
+    let written =
+        catalog.log_usage_batch(&[event(&lora, earlier), event(&ckpt, now), event(&lora, now)])?;
+
+    assert_eq!(written, 3, "every event is one row");
+    assert_eq!(catalog.recent_pulls(lora.repo_id, 10)?.len(), 2);
+    assert_eq!(catalog.recent_pulls(ckpt.repo_id, 10)?.len(), 1);
+    let lora_usage = catalog.artifact_usage(ids.lora)?;
+    assert_eq!(lora_usage.pulls, 2, "one bump carries both uses");
+    assert_eq!(lora_usage.last_used, Some(now), "the latest time wins");
+    assert_eq!(catalog.artifact_usage(ids.ckpt)?.pulls, 1);
+    assert_eq!(
+        catalog.pending_changes()?,
+        2,
+        "one search change per distinct artifact"
+    );
+    Ok(())
+}
+
+#[test]
 fn hashing_gives_every_file_a_sha256_and_merges_two_copies_into_one_artifact() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("files");

@@ -4,6 +4,7 @@
 //! into axum responses; nothing in this crate knows what axum is.
 
 pub mod access;
+pub mod batch;
 pub mod cache;
 pub mod config;
 pub mod error;

@@ -163,19 +163,25 @@ pub async fn sweep_stale_pulls(state: &AppState) -> usize {
 /// pulled a file, which is what the USAGE tab's `who` column shows.
 ///
 /// Graceful shutdown is not a nicety here: a block download interrupted mid-write would
-/// leave a partial block in the cache, so in-flight writes are allowed to finish.
+/// leave a partial block in the cache, so in-flight writes are allowed to finish, and the
+/// responses the usage sink is still holding are written before the node stops.
 pub async fn serve<F>(listener: TcpListener, state: AppState, shutdown: F) -> std::io::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
     sweep_stale_runs(&state).await;
     sweep_stale_pulls(&state).await;
-    axum::serve(
+    let closing = state.clone();
+    let served = axum::serve(
         listener,
         app(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown)
-    .await
+    .await;
+    if let Err(error) = closing.usage().flush().await {
+        tracing::warn!(%error, "the last served responses were not logged");
+    }
+    served
 }
 
 #[cfg(test)]

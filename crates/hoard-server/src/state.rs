@@ -11,6 +11,7 @@ use hoard_mirror::cache::BlockCache;
 use hoard_mirror::config::MirrorConfig;
 use hoard_mirror::resolve::Mirror;
 use hoard_mirror::upstream::{Hub, UpstreamClient};
+use hoard_mirror::usage::{SINK_CAPACITY, SINK_INTERVAL, UsageSink};
 
 use crate::config::HoardConfig;
 use crate::error::ApiError;
@@ -73,6 +74,7 @@ struct Inner {
     cache: Arc<BlockCache>,
     access: Arc<AccessPolicy>,
     mirror: Arc<Mirror>,
+    usage: UsageSink,
     upstream_health: AtomicU8,
     local_node_name: String,
     public_url: String,
@@ -127,6 +129,7 @@ impl AppState {
             inner: Arc::new(Inner {
                 config,
                 mirror_config,
+                usage: UsageSink::spawn(Arc::clone(&catalog), SINK_INTERVAL, SINK_CAPACITY),
                 catalog,
                 cache,
                 access,
@@ -171,6 +174,12 @@ impl AppState {
     /// proxy behind one handle.
     pub fn mirror(&self) -> &Arc<Mirror> {
         &self.inner.mirror
+    }
+
+    /// The usage log's writer. Every served response is recorded here rather than written
+    /// on its own, so a reader of the log flushes it first.
+    pub fn usage(&self) -> &UsageSink {
+        &self.inner.usage
     }
 
     pub fn node_name(&self) -> &str {

@@ -808,28 +808,33 @@ async fn a_served_response_is_written_to_the_usage_log() {
     assert_eq!(pulls, 1, "one served response is one pull");
 }
 
-/// The usage row is written once the body has left the node, so a test reads it back with
-/// a bounded wait rather than assuming the response and the row are the same instant.
+/// A response is recorded once its body has left the node, which is a task of its own, so
+/// this waits for that task to hand the sink its row and then writes the sink out rather
+/// than waiting on the sink's own interval.
 async fn pulls_logged(state: &AppState) -> u64 {
     for _ in 0..200 {
-        let catalog = std::sync::Arc::clone(state.catalog());
-        let days: Vec<UsageDay> = tokio::task::spawn_blocking(move || {
-            let repo = catalog
-                .repository(&RepoId::parse_ref(RepoType::Models, LORA_REPO)?)?
-                .expect("the seeded repository")
-                .id;
-            catalog.usage_days(repo, 7)
-        })
-        .await
-        .expect("join")
-        .expect("usage days");
-        let pulls: u64 = days.iter().map(|day| day.pulls).sum();
-        if pulls > 0 {
-            return pulls;
+        if state.usage().pending() > 0 {
+            break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    0
+    state
+        .usage()
+        .flush()
+        .await
+        .expect("the sink writes what it holds");
+    let catalog = std::sync::Arc::clone(state.catalog());
+    let days: Vec<UsageDay> = tokio::task::spawn_blocking(move || {
+        let repo = catalog
+            .repository(&RepoId::parse_ref(RepoType::Models, LORA_REPO)?)?
+            .expect("the seeded repository")
+            .id;
+        catalog.usage_days(repo, 7)
+    })
+    .await
+    .expect("join")
+    .expect("usage days");
+    days.iter().map(|day| day.pulls).sum()
 }
 
 #[tokio::test]

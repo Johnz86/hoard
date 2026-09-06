@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use jiff::{Span, Timestamp, tz::TimeZone};
 use serde::Serialize;
@@ -89,6 +89,57 @@ impl Catalog {
         })?;
         transaction.commit()?;
         Ok(seq)
+    }
+
+    /// Records many served responses in one transaction: every usage row, one use bump per
+    /// artifact carrying that artifact's count and latest time, and one search change per
+    /// distinct artifact. Returns how many rows were appended.
+    pub fn log_usage_batch(&self, events: &[UsageEvent]) -> Result<u64> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let mut counters =
+            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
+        let transaction = self.database.rw_transaction()?;
+        let first = next_key::<Usage>(&transaction)?;
+        let mut bumps: BTreeMap<i64, (u64, Timestamp)> = BTreeMap::new();
+        for (seq, event) in (first..).zip(events) {
+            transaction.insert(Usage {
+                seq,
+                repo_id: event.repo.map(RepoRowId::get),
+                at: event.at.to_string(),
+                client: event.client.clone(),
+                artifact_id: event.artifact.map(ArtifactId::get),
+                path: event.path.clone(),
+                bytes: event.bytes,
+                rate_bps: event.rate_bps,
+                status: event.status,
+            })?;
+            if let Some(artifact) = event.artifact {
+                let slot = bumps.entry(artifact.get()).or_insert((0, event.at));
+                slot.0 += 1;
+                slot.1 = slot.1.max(event.at);
+            }
+        }
+        for (artifact_id, (count, last_used)) in bumps {
+            let stored: Option<ArtifactUse> = transaction.get().primary(artifact_id)?;
+            let latest = match &stored {
+                Some(stored) => stored
+                    .last_used
+                    .parse::<Timestamp>()
+                    .map_or(last_used, |seen| seen.max(last_used)),
+                None => last_used,
+            };
+            transaction.upsert(ArtifactUse {
+                artifact_id,
+                count: stored.map_or(0, |stored| stored.count) + count,
+                last_used: latest.to_string(),
+            })?;
+            counters.pending.push(artifact_id);
+        }
+        log_changes(&transaction, &mut counters)?;
+        transaction.commit()?;
+        Ok(events.len() as u64)
     }
 
     /// Counts one use and logs the artifact for the search index; the index picks the
