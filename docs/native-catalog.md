@@ -548,6 +548,94 @@ writer that moves an entry into or out of presence moves the counts above it, an
 `hoard doctor` gained a `summary` check that counts every artifact record again and reports
 any drift.
 
+### Performance wave 2
+
+Commit `64e11af`, release build, the same workstation. The tree is the wave 1 tree, 100
+loose repositories of 1,000 valid safetensors headers each, with one git clone source added
+beside it: a loose repository has no revision sha, so `resolve` of a loose file answers 404
+whatever it holds, and a served response needs a repository a commit names. The usage log
+was seeded with 2,000 events on one repository before the routes were timed. The before
+column is `a4dd324`.
+
+Three runs per route, median reported, whole request including the response body.
+
+| route | before | after |
+| --- | --- | --- |
+| `GET /api/v1/repos?limit=1` | 0.66 ms | 0.90 ms |
+| `GET /api/v1/repos?limit=100` | 0.92 ms | 0.67 ms |
+| `GET /api/models?limit=1` | 0.40 ms | 0.54 ms |
+| `GET /api/models/org0/repo000` | 3.60 ms | 3.38 ms |
+| `HEAD /org0/repo000/resolve/main/w0.safetensors` | 0.37 ms | 0.78 ms |
+| `GET /api/v1/sources` | 0.50 ms | 0.64 ms |
+| `GET /api/v1/search?q=` | 14.6 ms | 13.7 ms |
+| `GET /api/v1/search?q=node:self` | 41.8 ms | 41.6 ms |
+| `GET /api/v1/search?q=role:lora` | 16.7 ms | 16.1 ms |
+| `GET /api/v1/triage?limit=20` | 92.1 ms | 9.35 ms |
+| `GET /api/v1/repos/models/org0/repo000/usage` | 3.37 ms | 1.39 ms |
+
+Two rows are the wave. The triage queue read every artifact record into memory before
+keeping the first twenty of them; it is now a `state:triage` page of the search index in
+artifact id order, and only that page is measured against its records. The usage tab read
+one repository's whole log three times, once per view, and the bar chart then walked what it
+had read once per day it draws; one read answers all three. Everything else moved by less
+than the spread of its own three runs.
+
+The resolve loop did not move: 200 sequential requests take 0.98 s before and 0.99 s after,
+and 400 requests with 20 in flight take 0.81 s either way. A streamed response costs about
+40 ms in HTTP framing whatever the catalog does, which hides a write of one small row
+entirely. What the wave actually removed is measurable at the catalog: 2,000 served
+responses cost 1.29 s through `log_usage` plus `bump_artifact_use`, two transactions and a
+search change each, and 23.8 ms through `log_usage_batch`, which is one transaction, one use
+bump per artifact and one change per distinct artifact.
+
+Hashing, page cache warm, three runs each: 100,002 files under 1 KB take 13.58 s against
+16.00 s, and 64 files of 64 MiB with the LFS threshold raised so both digests run take
+0.290 s against 0.301 s. A file under the threshold owes a sha256 and a git blob sha1 and
+was read once for each; it is read once and both hashers are fed from the same buffer. The
+big-file row barely moves because those bytes were already resident and only the second copy
+out of the page cache was saved. The pass also no longer waits for the slowest of sixty-four
+files before committing any of them: digests go down a bounded channel to one writer.
+
+The scale harness at 1M, the same tree measured in one session against `a4dd324` rather than
+against the doc's earlier column, which was taken on a differently loaded machine:
+
+| measure | a4dd324 | wave 2 |
+| --- | --- | --- |
+| scan wall | 110.320466364s | 95.305741107s |
+| peak rss growth during scan | 892 MB | 838 MB |
+| peak rss growth during rescan and refresh | 528 MB | 359 MB |
+| on disk, apparent | 4175 MB | 4175 MB |
+| on disk, allocated | 2564 MB | 2276 MB |
+| rebuild wall | 13.693414648s | 12.781133799s |
+| rescan wall (1,000 changed) | 6.222543417s | 5.314401519s |
+| refresh wall | 28.489599ms | 25.737863ms |
+| query node:self with facets | 500.723837ms | 511.984273ms |
+
+At 100k the same shape: the scan is 6.88 s against wave 1's 7.42 s, allocated disk 232 MB
+against 260 MB, peak RSS 271 MB against 285 MB, and `node:self` 32.6 ms against 32.9 ms.
+
+Allocated disk at 1M falls 2564 to 2276 MB. That is the `node` secondary key on every entry
+and the absolute path every row used to carry: `Entry` reaches version 4, drops the index,
+and stores a path only when the bytes do not sit at the repository's root joined with the
+relative path. The 1.5 GB threshold is still missed. The rescan's memory falls 528 to
+359 MB: the stamp map is keyed by the xxh3 of the path rather than by the path, and a
+repository's rows are read one at a time rather than collected first.
+
+The entry table is `7_4_id` after this wave's migration. Migrating in place inflates the
+file: the 100,000 file catalog is 297 MB after a fresh scan and 1,705 MB after the same
+catalog is migrated by a rescan, of which `catalog status` reports 128 MB actually stored.
+redb does not return freed pages and no command compacts a catalog in place, so a large
+catalog is better rescanned fresh than migrated until one does.
+
+`Entry` v4 is the only record version this wave added, with `entry_v3_encoding_is_frozen`
+holding v3's encoding byte for byte. `Catalog::open` folds every migrated path that sits
+under its repository's root, which is the only place a root is in reach, and does it once.
+
+Three writers that used to leave the totals behind no longer do. Retiring a path recounts
+what its artifact still holds, from that artifact's own paths; a verdict measures the record
+before and after, because settling a role at full confidence takes it out of the triage
+total. `hoard doctor`'s summary check is what proves it.
+
 ## Remaining work
 
 - Path identities hash the text to_string_lossy renders; discovery currently never yields
@@ -556,14 +644,22 @@ any drift.
 - Bound the collapse the way the primary path is bounded. A query naming `node:`, `state:`,
   `source:`, `repo:`, `rev:` or `hash:`, or sorting on revision, node or state, still keeps
   one row per matching artifact rather than one per page: measured at 1M, `node:self` is
-  511 ms and adds 35 MB, against 1.08 s and 300 MB before wave 1. What remains is holding
-  nothing that grows with the catalog at all.
-- Shrink the per-entry record further: revision, repository, source, absolute path and now
-  the location key are written out per entry, which is what the 1M catalog is mostly made
-  of. Intern them per revision and reference them by id. Allocated disk at 1M is 2564 MB
-  against a 1.5 GB threshold.
-- The `node` secondary key on every entry costs a whole index to answer a question the node
-  record now answers directly; drop it once nothing scans by node.
+  512 ms, against 1.08 s and 300 MB before wave 1. What remains is holding nothing that
+  grows with the catalog at all.
+- Shrink the per-entry record further: revision, repository, source and the location key are
+  still written out per entry, which is what the 1M catalog is mostly made of. Intern them
+  per revision and reference them by id. Allocated disk at 1M is 2276 MB against a 1.5 GB
+  threshold.
+- Compact a catalog in place. A migrating rescan of a 100,000 file catalog leaves a 1,705 MB
+  file holding 128 MB of rows, because redb does not return freed pages and `Catalog::compact`
+  is not reachable from any command. Until it is, a migrated catalog of any size is better
+  rescanned fresh.
+- The USAGE tab still reads a repository's whole log, because the client count it shows is a
+  claim about every pull the repository ever served. Bounding the chart alone would not
+  bound the route: 20,000 rows cost 9.1 ms.
+- `Catalog::triage_queue` now needs a search index rather than only tolerating a stale one.
+  Every catalog a command or the server opens has one, but a catalog built by
+  `scan_sources` alone answers the queue with an error until it is built.
 - Preserve complete repository Git metadata and add stable cross-scan identities.
 - A rescan re-reads every revision's documents (README, configs, index files) before
   deciding units; measure this on the workstation cache and skip when every document's
