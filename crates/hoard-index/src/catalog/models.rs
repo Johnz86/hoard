@@ -7,6 +7,7 @@ use hoard_core::{
 };
 
 use crate::config::{SourceConfig, SourceKind};
+use crate::store::job::JobState;
 use crate::store::revision::RefKind;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -489,6 +490,26 @@ pub(super) struct LoadoutDoc {
     pub(super) updated_at: String,
 }
 
+/// A scan, hash run, pull or apply as the JOBS tab shows it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 20, version = 1)]
+#[native_db]
+pub(super) struct Job {
+    #[primary_key]
+    pub(super) id: i64,
+    pub(super) kind: String,
+    pub(super) state: JobState,
+    pub(super) phase: Option<String>,
+    pub(super) subject: Option<String>,
+    pub(super) progress: f32,
+    pub(super) bytes: u64,
+    pub(super) total: Option<u64>,
+    pub(super) rate_bps: Option<u64>,
+    pub(super) error: Option<String>,
+    pub(super) started: String,
+    pub(super) finished: Option<String>,
+}
+
 /// Registers every record type. `native_db` compares each definition against every model
 /// already registered rather than only against the other versions of the same model, so a
 /// version 1 model must be defined last: it is what leaves each migrated model marked
@@ -517,5 +538,6 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<Usage>()?;
     models.define::<ArtifactUse>()?;
     models.define::<LoadoutDoc>()?;
+    models.define::<Job>()?;
     Ok(models)
 }

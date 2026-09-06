@@ -1,3 +1,4 @@
+mod jobs;
 mod loadouts;
 mod models;
 mod query;
@@ -25,6 +26,7 @@ use crate::store::DiskPressure;
 
 use self::models::{ArtifactRecord, Manifest, Repository, Summary, define_models};
 
+pub use self::jobs::JobRecord;
 pub use self::loadouts::LoadoutRecord;
 pub use self::read::{
     ArtifactDetailView, EntryDetail, RefDetail, RepositoryDetail, RepositoryFilter, RepositoryPage,
@@ -37,6 +39,7 @@ pub use self::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 pub use self::usage::ArtifactUsage;
 pub use self::userdata::{NoiseRecord, ProjectionRecord, ShelfRecord};
 pub use self::verdict::OverrideRecord;
+pub use crate::store::job::{JobProgress, JobState};
 pub use crate::store::projection::NewProjection;
 pub use crate::store::usage::{PullRow, UsageDay, UsageEvent};
 

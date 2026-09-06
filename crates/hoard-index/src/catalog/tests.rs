@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 use hoard_core::{
-    Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, Evidence, EvidenceSource,
+    Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, Evidence, EvidenceSource, JobId,
     Loadout, LoadoutPin, Precision, RepoId, RepoType, Role, Sha256, State, SubRole, TensorSample,
     TensorSummary,
 };
@@ -25,8 +25,8 @@ use super::models::{
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::{
-    Catalog, NewProjection, QueryPage, QueryRequest, RepositoryFilter, RescanReport, UsageEvent,
-    builder, models, query,
+    Catalog, JobProgress, JobState, NewProjection, QueryPage, QueryRequest, RepositoryFilter,
+    RescanReport, UsageEvent, builder, models, query,
 };
 
 fn running_as_root() -> bool {
@@ -1783,6 +1783,71 @@ fn loadouts_are_stored_by_name_and_pins_resolve_through_the_catalog() -> Result<
     assert_eq!(by_path[0].artifact_id, ids.lora);
     assert!(catalog.delete_loadout(id)?);
     assert!(catalog.loadout(id)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn jobs_run_settle_cancel_and_are_swept() -> Result<()> {
+    let (_directory, catalog) = fixture()?;
+    let scan = catalog.create_job("scan", Some("cache"))?;
+    catalog.update_job(
+        scan,
+        &JobProgress {
+            phase: Some("reading".into()),
+            progress: 0.5,
+            bytes: 10,
+            total: Some(20),
+            rate_bps: None,
+        },
+    )?;
+    let running = catalog.list_jobs(Some(JobState::Running))?;
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0].phase.as_deref(), Some("reading"));
+
+    catalog.finish_job(scan)?;
+    let done = catalog
+        .job(scan)?
+        .ok_or_else(|| IndexError::Catalog("job".into()))?;
+    assert_eq!(done.state, JobState::Done);
+    assert_eq!(done.progress, 1.0);
+    assert!(done.finished.is_some());
+    catalog.update_job(
+        scan,
+        &JobProgress {
+            phase: None,
+            progress: 0.1,
+            bytes: 0,
+            total: None,
+            rate_bps: None,
+        },
+    )?;
+    assert_eq!(
+        catalog.job(scan)?.map(|job| job.progress),
+        Some(1.0),
+        "a finished job ignores progress"
+    );
+
+    let pull = catalog.create_job("pull", Some("film-grain"))?;
+    catalog.cancel_job(pull)?;
+    assert_eq!(
+        catalog.job(pull)?.map(|job| job.state),
+        Some(JobState::Cancelled)
+    );
+
+    let stuck = catalog.create_job("apply", None)?;
+    assert_eq!(catalog.sweep_running_jobs("killed")?, 1);
+    assert_eq!(
+        catalog.job(stuck)?.and_then(|job| job.error),
+        Some("killed".into())
+    );
+    assert!(catalog.job(JobId::new(9_999))?.is_none());
+
+    let newest_first: Vec<_> = catalog
+        .list_jobs(None)?
+        .into_iter()
+        .map(|job| job.id)
+        .collect();
+    assert_eq!(newest_first, vec![stuck, pull, scan]);
     Ok(())
 }
 

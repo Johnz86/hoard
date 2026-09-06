@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use jiff::Timestamp;
 use rusqlite::{Connection, Row, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use hoard_core::JobId;
 
@@ -16,7 +16,7 @@ use crate::store::convert::{
 const JOB_COLUMNS: &str = "id, kind, state, phase, subject, progress, bytes, total, rate_bps, \
      error, started, finished";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobState {
     Running,

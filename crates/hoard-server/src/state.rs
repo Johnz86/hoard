@@ -76,7 +76,6 @@ struct Inner {
     access: Arc<AccessPolicy>,
     mirror: Arc<Mirror>,
     upstream_health: AtomicU8,
-    scan_handoff: tokio::sync::Mutex<()>,
     local_node_name: String,
     public_url: String,
 }
@@ -136,7 +135,6 @@ impl AppState {
                 access,
                 mirror,
                 upstream_health: AtomicU8::new(health.code()),
-                scan_handoff: tokio::sync::Mutex::new(()),
                 local_node_name,
                 public_url,
             }),
@@ -194,12 +192,6 @@ impl AppState {
 
     pub fn offline(&self) -> bool {
         self.inner.mirror_config.offline
-    }
-
-    /// Held across the window in which a scan request watches for the job row the scanner
-    /// opens, so two requests cannot each be handed the other's job.
-    pub fn scan_handoff(&self) -> &tokio::sync::Mutex<()> {
-        &self.inner.scan_handoff
     }
 
     /// The root every projection is written under: `data_dir/profiles`.

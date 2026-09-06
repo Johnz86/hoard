@@ -96,19 +96,10 @@ const KILLED: &str = "the process running this job was stopped";
 /// running when this one starts is a run that was killed: the JOBS tab would otherwise show
 /// it at whatever percentage it died at, forever.
 pub async fn sweep_stale_runs(state: &AppState) -> usize {
-    let swept = state
-        .store()
-        .call_mut(|conn| {
-            let running = hoard_index::store::job::list_jobs(
-                conn,
-                Some(hoard_index::store::job::JobState::Running),
-            )?;
-            for row in &running {
-                hoard_index::store::job::fail_job(conn, row.id, KILLED)?;
-            }
-            Ok(running.len())
-        })
-        .await;
+    let catalog = std::sync::Arc::clone(state.catalog());
+    let swept = tokio::task::spawn_blocking(move || catalog.sweep_running_jobs(KILLED))
+        .await
+        .unwrap_or_else(|error| Err(hoard_index::IndexError::Catalog(error.to_string())));
     match swept {
         Ok(0) => 0,
         Ok(count) => {
@@ -174,10 +165,10 @@ mod tests {
     use axum::body::Body;
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};
     use hoard_core::{CommitSha, NodeId, RepoId, RepoType, State};
+    use hoard_index::catalog::JobState;
     use hoard_index::config::SourceKind;
     use hoard_index::store::Store;
     use hoard_index::store::entry::{NewEntry, entry, upsert_entry};
-    use hoard_index::store::job::{JobState, create_job, job, list_jobs};
     use hoard_index::store::node::{NewNode, upsert_node};
     use hoard_index::store::repo::{NewRepo, upsert_repo};
     use hoard_index::store::revision::{NewRevision, upsert_revision};
@@ -344,25 +335,23 @@ mod tests {
     async fn a_job_left_running_by_a_stopped_process_is_failed_at_startup() {
         let (_dir, state) = state();
         let id = state
-            .store()
-            .call_mut(|conn| create_job(conn, "scan", Some("cache")))
-            .await
+            .catalog()
+            .create_job("scan", Some("cache"))
             .expect("a job starts");
 
         assert_eq!(sweep_stale_runs(&state).await, 1);
         let settled = state
-            .store()
-            .call(move |conn| job(conn, id))
-            .await
-            .expect("the job reads back");
+            .catalog()
+            .job(id)
+            .expect("the job reads back")
+            .expect("the job survives the sweep");
         assert_eq!(settled.state, JobState::Failed);
         assert_eq!(settled.error.as_deref(), Some(KILLED));
 
         assert_eq!(sweep_stale_runs(&state).await, 0, "the sweep is idempotent");
         let running = state
-            .store()
-            .call(|conn| list_jobs(conn, Some(JobState::Running)))
-            .await
+            .catalog()
+            .list_jobs(Some(JobState::Running))
             .expect("jobs read back");
         assert!(running.is_empty());
     }

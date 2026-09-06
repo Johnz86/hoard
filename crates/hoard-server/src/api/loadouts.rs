@@ -12,11 +12,11 @@ use hoard_core::{
     PinResolution, RepoId, Role, State as ArtifactState, format_size,
 };
 use hoard_index::IndexError;
-use hoard_index::catalog::{Catalog, LoadoutRecord, NewProjection};
+use hoard_index::catalog::{Catalog, JobProgress, LoadoutRecord, NewProjection};
+use hoard_index::store::node;
 use hoard_index::store::row::SearchRow;
-use hoard_index::store::{job, node};
 use hoard_net::identity::NodeIdentity;
-use hoard_net::{PullRequest, Puller};
+use hoard_net::{PullRequest, Puller, PullerConfig};
 
 use crate::api::artifacts::artifact_id;
 use crate::api::common::{Conn, authorize, blocking};
@@ -293,10 +293,8 @@ pub async fn apply(
         .await?;
     let view = view_for(&state, id, &node_name).await?;
     let subject = format!("{} \u{2192} {node_name}", view.name);
-    let job_id = state
-        .store()
-        .call_mut(move |conn| job::create_job(conn, APPLY_KIND, Some(&subject)))
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let job_id = blocking(move || catalog.create_job(APPLY_KIND, Some(&subject))).await?;
 
     let preview = view.apply_preview.clone();
     let dir = link::projection_dir(&state, profile, None)?;
@@ -335,30 +333,26 @@ async fn report_only(
     );
     let bytes = preview.bytes;
     let missing = preview.missing;
-    state
-        .store()
-        .call_mut(move |conn| {
-            job::update_job(
-                conn,
-                job,
-                &job::JobProgress {
-                    phase: Some(phase),
-                    progress: 1.0,
-                    bytes,
-                    total: Some(bytes),
-                    rate_bps: None,
-                },
-            )?;
-            match missing {
-                0 => job::finish_job(conn, job),
-                missing => job::fail_job(
-                    conn,
-                    job,
-                    &format!("{missing} pinned lines are not on this LAN"),
-                ),
+    let catalog = Arc::clone(state.catalog());
+    blocking(move || {
+        catalog.update_job(
+            job,
+            &JobProgress {
+                phase: Some(phase),
+                progress: 1.0,
+                bytes,
+                total: Some(bytes),
+                rate_bps: None,
+            },
+        )?;
+        match missing {
+            0 => catalog.finish_job(job),
+            missing => {
+                catalog.fail_job(job, &format!("{missing} pinned lines are not on this LAN"))
             }
-        })
-        .await?;
+        }
+    })
+    .await?;
     Ok(())
 }
 
@@ -380,22 +374,20 @@ async fn run_apply(
         let phase = format!("{} ({})", line.name, profile.as_str());
         let progress = index as f32 / total;
         let pulled = bytes;
-        state
-            .store()
-            .call_mut(move |conn| {
-                job::update_job(
-                    conn,
-                    job,
-                    &job::JobProgress {
-                        phase: Some(phase),
-                        progress,
-                        bytes: pulled,
-                        total: None,
-                        rate_bps: None,
-                    },
-                )
-            })
-            .await?;
+        let catalog = Arc::clone(state.catalog());
+        blocking(move || {
+            catalog.update_job(
+                job,
+                &JobProgress {
+                    phase: Some(phase),
+                    progress,
+                    bytes: pulled,
+                    total: None,
+                    rate_bps: None,
+                },
+            )
+        })
+        .await?;
         match line.source.clone() {
             LineSource::Held(path) => ready.push(ReadyLine {
                 artifact: line.artifact,
@@ -424,45 +416,43 @@ async fn run_apply(
 
     let written = write_links(state, profile, dir, &ready).await?;
     let phase = format!("{written} links written to {}", dir.display());
-    state
-        .store()
-        .call_mut(move |conn| {
-            job::update_job(
-                conn,
+    let catalog = Arc::clone(state.catalog());
+    blocking(move || {
+        catalog.update_job(
+            job,
+            &JobProgress {
+                phase: Some(phase),
+                progress: 1.0,
+                bytes,
+                total: Some(bytes),
+                rate_bps: None,
+            },
+        )?;
+        match missing.is_empty() {
+            true => catalog.finish_job(job),
+            false => catalog.fail_job(
                 job,
-                &job::JobProgress {
-                    phase: Some(phase),
-                    progress: 1.0,
-                    bytes,
-                    total: Some(bytes),
-                    rate_bps: None,
-                },
-            )?;
-            match missing.is_empty() {
-                true => job::finish_job(conn, job),
-                false => job::fail_job(
-                    conn,
-                    job,
-                    &format!("{} pinned lines are not on this LAN", missing.len()),
-                ),
-            }
-        })
-        .await?;
+                &format!("{} pinned lines are not on this LAN", missing.len()),
+            ),
+        }
+    })
+    .await?;
     Ok(())
 }
 
 fn puller(state: &AppState) -> ApiResult<Puller> {
-    Puller::new(
-        state.store().clone(),
-        Arc::clone(state.mirror()),
-        state
+    Puller::new(PullerConfig {
+        store: state.store().clone(),
+        catalog: Arc::clone(state.catalog()),
+        mirror: Arc::clone(state.mirror()),
+        root: state
             .config()
             .server
             .data_dir
             .join(hoard_net::peer::PULL_DIR),
-        state.config().node.serve,
-        state.config().index.triage_confidence,
-    )
+        serve: state.config().node.serve,
+        triage_confidence: state.config().index.triage_confidence,
+    })
     .map_err(|error| ApiError::internal(error.to_string()))
 }
 

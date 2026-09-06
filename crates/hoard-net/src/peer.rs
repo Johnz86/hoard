@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 use hoard_core::{
     ArtifactId, BlobId, CommitSha, EntryId, JobId, NodeId, RepoId, RevisionId, Sha256, State,
 };
+use hoard_index::catalog::{Catalog, JobProgress};
 use hoard_index::config::SourceKind;
 use hoard_index::hash::git_blob_sha1;
 use hoard_index::infer::{InferInput, infer};
@@ -33,7 +34,6 @@ use hoard_index::store::artifact::{
 };
 use hoard_index::store::blob::{blob_by_sha256, set_sha256, upsert_blob};
 use hoard_index::store::entry::{NewEntry, upsert_entry};
-use hoard_index::store::job::{JobProgress, create_job, fail_job, finish_job, update_job};
 use hoard_index::store::node::{local_node, node};
 use hoard_index::store::repo::{NewRepo, repo_by_qualified, upsert_repo};
 use hoard_index::store::revision::{NewRevision, revision_by_sha, upsert_revision};
@@ -353,10 +353,24 @@ pub struct PullOutcome {
     pub entry: EntryId,
 }
 
+/// What a [`Puller`] is built from: the index it files pulled entries in, the catalog its
+/// job rows live in, the mirror it fetches through, where bytes land, whether this node
+/// serves them, and the confidence below which a pulled artifact is queued for triage.
+#[derive(Debug, Clone)]
+pub struct PullerConfig {
+    pub store: Store,
+    pub catalog: Arc<Catalog>,
+    pub mirror: Arc<Mirror>,
+    pub root: PathBuf,
+    pub serve: bool,
+    pub triage_confidence: f32,
+}
+
 /// Fetches files from peers through the block-cached proxy path and files them locally.
 #[derive(Debug, Clone)]
 pub struct Puller {
     store: Store,
+    catalog: Arc<Catalog>,
     mirror: Arc<Mirror>,
     client: UpstreamClient,
     root: PathBuf,
@@ -370,21 +384,29 @@ impl Puller {
     ///
     /// The client is built with the network enabled even when the mirror is offline: a peer
     /// is the LAN, and refusing to cross the LAN is not what offline mode means.
-    pub fn new(
-        store: Store,
-        mirror: Arc<Mirror>,
-        root: impl Into<PathBuf>,
-        serve: bool,
-        triage_confidence: f32,
-    ) -> Result<Self> {
+    pub fn new(config: PullerConfig) -> Result<Self> {
         Ok(Self {
-            store,
-            mirror,
+            store: config.store,
+            catalog: config.catalog,
+            mirror: config.mirror,
             client: UpstreamClient::new(false).map_err(NetError::Mirror)?,
-            root: root.into(),
-            serve,
-            triage_confidence,
+            root: config.root,
+            serve: config.serve,
+            triage_confidence: config.triage_confidence,
         })
+    }
+
+    /// Runs one catalog write off the reactor, since redb is file work.
+    async fn on_catalog<T, F>(&self, work: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Catalog) -> hoard_index::Result<T> + Send + 'static,
+    {
+        let catalog = Arc::clone(&self.catalog);
+        tokio::task::spawn_blocking(move || work(&catalog))
+            .await
+            .map_err(|_| NetError::Config("the catalog task was cancelled".to_owned()))?
+            .map_err(NetError::Index)
     }
 
     /// Where a pulled file lands: readable, stable, unique per revision, and always inside
@@ -410,23 +432,20 @@ impl Puller {
         let job = match job {
             Some(id) => id,
             None => {
-                self.store
-                    .call_mut(move |conn| create_job(conn, PULL_KIND, Some(&subject)))
+                self.on_catalog(move |catalog| catalog.create_job(PULL_KIND, Some(&subject)))
                     .await?
             }
         };
         match self.run(request, job).await {
             Ok(outcome) => {
-                self.store
-                    .call_mut(move |conn| finish_job(conn, job))
+                self.on_catalog(move |catalog| catalog.finish_job(job))
                     .await?;
                 Ok(outcome)
             }
             Err(error) => {
                 let message = error.to_string();
                 let settled = self
-                    .store
-                    .call_mut(move |conn| fail_job(conn, job, &message))
+                    .on_catalog(move |catalog| catalog.fail_job(job, &message))
                     .await;
                 if let Err(settling) = settled {
                     tracing::error!(error = %settling, "the failed pull job could not be settled");
@@ -569,8 +588,7 @@ impl Puller {
             rate_bps: (elapsed > 0.0).then(|| (written as f64 / elapsed) as u64),
         };
         let job = transfer.job;
-        self.store
-            .call_mut(move |conn| update_job(conn, job, &progress))
+        self.on_catalog(move |catalog| catalog.update_job(job, &progress))
             .await?;
         self.mark(transfer, State::Pulling, Some(fraction)).await
     }
@@ -1344,8 +1362,19 @@ mod tests {
 
     struct World {
         store: Store,
+        catalog: Arc<Catalog>,
         cache: Arc<BlockCache>,
         puller: Puller,
+    }
+
+    /// A native catalog with no configured sources, for the job rows a pull writes.
+    fn test_catalog(root: &Path) -> Arc<Catalog> {
+        let config = hoard_index::config::IndexConfig {
+            data_dir: root.join("native-data"),
+            sources: Vec::new(),
+            ..hoard_index::config::IndexConfig::default()
+        };
+        Arc::new(Catalog::open_or_scan(&config, "workstation", |_, _| {}).expect("catalog opens"))
     }
 
     async fn world(root: &TempDir) -> World {
@@ -1382,16 +1411,19 @@ mod tests {
             access,
             upstream,
         ));
-        let puller = Puller::new(
-            store.clone(),
+        let catalog = test_catalog(root.path());
+        let puller = Puller::new(PullerConfig {
+            store: store.clone(),
+            catalog: Arc::clone(&catalog),
             mirror,
-            root.path().join(PULL_DIR),
-            true,
-            0.85,
-        )
+            root: root.path().join(PULL_DIR),
+            serve: true,
+            triage_confidence: 0.85,
+        })
         .expect("puller builds");
         World {
             store,
+            catalog,
             cache,
             puller,
         }
@@ -1574,8 +1606,15 @@ mod tests {
         )
         .expect("hub builds");
         let mirror = Arc::new(Mirror::new(store, cache, access, upstream));
-        let puller = Puller::new(mirror.store().clone(), mirror, "/srv/pulled", true, 0.85)
-            .expect("puller builds");
+        let puller = Puller::new(PullerConfig {
+            store: mirror.store().clone(),
+            catalog: test_catalog(dir.path()),
+            mirror,
+            root: PathBuf::from("/srv/pulled"),
+            serve: true,
+            triage_confidence: 0.85,
+        })
+        .expect("puller builds");
         let request = PullRequest::new(
             identity("http://laptop:7099"),
             repo(),
@@ -1713,10 +1752,10 @@ mod tests {
             .expect("the refused pull leaves an entry");
         assert_eq!(entry.state, State::Remote);
 
-        let jobs = world
-            .store
-            .call(|conn| hoard_index::store::job::list_jobs(conn, None))
+        let catalog = Arc::clone(&world.catalog);
+        let jobs = tokio::task::spawn_blocking(move || catalog.list_jobs(None))
             .await
+            .expect("join")
             .expect("jobs read");
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].kind, PULL_KIND);
@@ -1825,8 +1864,15 @@ mod tests {
             Arc::new(AccessPolicy::default()),
             upstream,
         ));
-        let puller = Puller::new(mirror.store().clone(), mirror, "/srv/pulled", true, 0.85)
-            .expect("puller builds");
+        let puller = Puller::new(PullerConfig {
+            store: mirror.store().clone(),
+            catalog: test_catalog(dir.path()),
+            mirror,
+            root: PathBuf::from("/srv/pulled"),
+            serve: true,
+            triage_confidence: 0.85,
+        })
+        .expect("puller builds");
         let request = PullRequest::new(
             identity("http://laptop:7099"),
             RepoId::new(RepoType::Models, Some("..".to_owned()), ".."),

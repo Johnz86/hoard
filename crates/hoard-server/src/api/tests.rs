@@ -1979,9 +1979,8 @@ async fn a_running_job_is_cancelled_once_and_then_conflicts() {
     let world = seeded();
     let running = world
         .state
-        .store()
-        .call_mut(|conn| hoard_index::store::job::create_job(conn, "pull", Some("film-grain")))
-        .await
+        .catalog()
+        .create_job("pull", Some("film-grain"))
         .expect("a job starts");
 
     let listed = get(&world.state, "/api/v1/jobs?state=running").await;

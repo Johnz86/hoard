@@ -36,5 +36,5 @@ pub use error::{NetError, Result};
 pub use identity::{NodeIdentity, SERVICE_TYPE};
 pub use peer::{
     GossipConfig, GossipHandle, PULL_KIND, PeerClient, PullOutcome, PullRequest, Puller,
-    StateFacts, derive_state, pin_is_stale, spawn,
+    PullerConfig, StateFacts, derive_state, pin_is_stale, spawn,
 };

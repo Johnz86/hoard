@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -6,19 +8,16 @@ use serde::{Deserialize, Serialize};
 
 use hoard_core::{JobId, SourceId, format_size};
 use hoard_index::IndexError;
-use hoard_index::catalog::RescanReport;
+use hoard_index::catalog::{Catalog, JobProgress, JobRecord, JobState, RescanReport};
 use hoard_index::config::HashPolicy;
 use hoard_index::scan::ScanOptions;
-use hoard_index::store::job::{JobRow, JobState};
-use hoard_index::store::{blob, job, node, source};
+use hoard_index::store::{blob, node, source};
 
-use crate::api::common::authorize;
+use crate::api::common::{authorize, blocking};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 const SCAN_KIND: &str = hoard_index::scan::SCAN_JOB;
-const JOB_ATTEMPTS: u32 = 200;
-const JOB_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// One nominated root and what the last scan of it counted.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -94,12 +93,11 @@ pub async fn sources(State(state): State<AppState>) -> ApiResult<Json<Vec<Source
     Ok(Json(rows))
 }
 
-/// Starts a scan and answers with the job the scanner opened for it.
+/// Starts a scan and answers with the job it runs under.
 ///
-/// The scanner owns its job row, so this watches for the row that appears rather than
-/// opening a second one beside it. The window between reading what was there and seeing
-/// the new row is held one request at a time, so two scans started at once are never handed
-/// each other's job.
+/// One native job covers the whole run: the SQLite scan the Hub and git faces still read
+/// from, then the catalog rescan and the search refresh. The SQLite scanner opens a job row
+/// of its own, which stays where it is until that scan goes.
 pub async fn scan(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -118,32 +116,75 @@ pub async fn scan(
         None => None,
     };
 
-    let handoff = state.scan_handoff().lock().await;
-    let previous = newest_scan_job(&state).await?;
+    let subject = source.clone();
+    let catalog = Arc::clone(state.catalog());
+    let job_id = blocking(move || catalog.create_job(SCAN_KIND, subject.as_deref())).await?;
     let background = state.clone();
     let options = ScanOptions { source, hash };
     tokio::spawn(async move {
-        if let Err(error) = hand_off_to_scanner(&background, options).await {
+        if let Err(error) = hand_off_to_scanner(&background, options, job_id).await {
             tracing::error!(%error, "the scan failed");
         }
     });
-    let job_id = await_scan_job(&state, previous).await?;
-    drop(handoff);
     Ok(Json(ScanStarted { job_id }))
 }
 
-async fn hand_off_to_scanner(state: &AppState, options: ScanOptions) -> Result<(), IndexError> {
+async fn hand_off_to_scanner(
+    state: &AppState,
+    options: ScanOptions,
+    job: JobId,
+) -> Result<(), IndexError> {
+    match run_scan(state, options, job).await {
+        Ok(report) => {
+            tracing::info!(
+                unchanged = report.unchanged,
+                changed = report.changed,
+                added = report.added,
+                absent = report.absent,
+                "native catalog rescanned"
+            );
+            settle_scan(state, job, None).await
+        }
+        Err(error) => {
+            let message = error.to_string();
+            settle_scan(state, job, Some(message)).await?;
+            Err(error)
+        }
+    }
+}
+
+async fn run_scan(
+    state: &AppState,
+    options: ScanOptions,
+    job: JobId,
+) -> Result<RescanReport, IndexError> {
     let config = state.config().index.clone();
+    phase(state, job, "scanning the sources").await?;
     hoard_index::scan::scan(state.store(), &config, options, &|_| {}).await?;
-    let report = refresh_catalog(state, config).await?;
-    tracing::info!(
-        unchanged = report.unchanged,
-        changed = report.changed,
-        added = report.added,
-        absent = report.absent,
-        "native catalog rescanned"
-    );
-    Ok(())
+    phase(state, job, "rescanning the native catalog").await?;
+    refresh_catalog(state, config).await
+}
+
+async fn phase(state: &AppState, job: JobId, phase: &str) -> Result<(), IndexError> {
+    let catalog = Arc::clone(state.catalog());
+    let progress = JobProgress {
+        phase: Some(phase.to_owned()),
+        ..JobProgress::default()
+    };
+    tokio::task::spawn_blocking(move || catalog.update_job(job, &progress)).await?
+}
+
+async fn settle_scan(
+    state: &AppState,
+    job: JobId,
+    error: Option<String>,
+) -> Result<(), IndexError> {
+    let catalog = Arc::clone(state.catalog());
+    tokio::task::spawn_blocking(move || match error {
+        Some(error) => catalog.fail_job(job, &error),
+        None => catalog.finish_job(job),
+    })
+    .await?
 }
 
 /// Walks the sources again into the native catalog and applies what changed to its search
@@ -159,29 +200,6 @@ async fn refresh_catalog(
         Ok(report)
     })
     .await?
-}
-
-async fn newest_scan_job(state: &AppState) -> Result<Option<JobId>, IndexError> {
-    state
-        .store()
-        .call(|conn| {
-            Ok(job::list_jobs(conn, None)?
-                .into_iter()
-                .find(|row| row.kind == SCAN_KIND)
-                .map(|row| row.id))
-        })
-        .await
-}
-
-async fn await_scan_job(state: &AppState, previous: Option<JobId>) -> ApiResult<JobId> {
-    let after = previous.map_or(0, JobId::get);
-    for _ in 0..JOB_ATTEMPTS {
-        match newest_scan_job(state).await? {
-            Some(job) if job.get() > after => return Ok(job),
-            Some(_) | None => tokio::time::sleep(JOB_POLL).await,
-        }
-    }
-    Err(ApiError::internal("the scan did not start"))
 }
 
 /// Reads what a scan request named: a configured source name, or the name, id or path of a
@@ -210,7 +228,7 @@ async fn resolve_source(state: &AppState, wanted: &str) -> ApiResult<String> {
 pub async fn list(
     State(state): State<AppState>,
     Query(filter): Query<JobFilter>,
-) -> ApiResult<Json<Vec<JobRow>>> {
+) -> ApiResult<Json<Vec<JobRecord>>> {
     let wanted = filter
         .state
         .as_deref()
@@ -219,19 +237,18 @@ pub async fn list(
         .map(str::parse::<JobState>)
         .transpose()
         .map_err(ApiError::from)?;
-    let rows = state
-        .store()
-        .call(move |conn| job::list_jobs(conn, wanted))
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let rows = blocking(move || catalog.list_jobs(wanted)).await?;
     Ok(Json(rows))
 }
 
 pub async fn detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> ApiResult<Json<JobRow>> {
+) -> ApiResult<Json<JobRecord>> {
     let id = job_id(&id)?;
-    let row = state.store().call(move |conn| job::job(conn, id)).await?;
+    let catalog = Arc::clone(state.catalog());
+    let row = blocking(move || required_job(&catalog, id)).await?;
     Ok(Json(row))
 }
 
@@ -239,25 +256,31 @@ pub async fn cancel(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-) -> ApiResult<Json<JobRow>> {
+) -> ApiResult<Json<JobRecord>> {
     authorize(&state, &headers)?;
     let id = job_id(&id)?;
-    let row = state
-        .store()
-        .call_mut(move |conn| {
-            let existing = job::job(conn, id)?;
-            if existing.state.is_final() {
-                return Err(IndexError::Query(format!(
-                    "job {id} already finished as {}",
-                    existing.state
-                )));
-            }
-            job::cancel_job(conn, id)?;
-            job::job(conn, id)
-        })
-        .await
-        .map_err(finished_conflict)?;
+    let catalog = Arc::clone(state.catalog());
+    let row = tokio::task::spawn_blocking(move || {
+        let existing = required_job(&catalog, id)?;
+        if existing.state.is_final() {
+            return Err(IndexError::Query(format!(
+                "job {id} already finished as {}",
+                existing.state
+            )));
+        }
+        catalog.cancel_job(id)?;
+        required_job(&catalog, id)
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(finished_conflict)?;
     Ok(Json(row))
+}
+
+fn required_job(catalog: &Catalog, id: JobId) -> Result<JobRecord, IndexError> {
+    catalog
+        .job(id)?
+        .ok_or_else(|| IndexError::not_found("job", id.to_string()))
 }
 
 /// Cancelling a job that has already stopped is a conflict with its state, not a bad
