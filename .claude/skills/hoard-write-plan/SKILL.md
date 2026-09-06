@@ -87,8 +87,9 @@ bullets carry only what changes per wave.
    ordering or contract. Every existing test keeps its assertions unless it asserted the cost
    being removed; say which."
 
-5. **The commit trailers.** The two lines, verbatim, in a fenced block. The dispatcher
-   supplies them; the implementer never invents them.
+5. **The commit trailers.** The two lines, verbatim, in a fenced block: the `Co-Authored-By:`
+   and `Claude-Session:` lines this session was given for attribution. The dispatcher copies
+   them from its own instructions; the implementer never invents them.
 
 6. **Verified facts.** See below.
 

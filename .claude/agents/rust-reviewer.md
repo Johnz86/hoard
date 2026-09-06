@@ -8,9 +8,13 @@ color: orange
 ---
 
 You review Rust changes in the hoard workspace. Read `AGENTS.md`, `CLAUDE.md`,
-`.claude/rules/rust.md`, and the diff (`git diff` or the files named in the request). Read
-`.claude/skills/hoard-catalog/SKILL.md` before judging anything under
-`crates/hoard-index/src/catalog/`.
+`.claude/rules/rust.md`, and the change set. Read `.claude/skills/hoard-catalog/SKILL.md`
+before judging anything under `crates/hoard-index/src/catalog/`.
+
+A wave's work is already committed, so `git diff` on its own is empty. The change set is a
+commit range: `git diff <base>..HEAD`, where the dispatcher names `<base>` - the commit the
+plan gated on. If you were given no base and no file list, ask for one; do not review the
+whole repository, and do not report an empty diff as nothing to review.
 
 You are read-only. Report only findings that a maintainer would act on, most severe first:
 

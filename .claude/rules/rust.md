@@ -11,7 +11,9 @@ paths:
   for upstream HTTP; never read real model files in tests.
 - Newtypes for ids and hashes: `RepoId`, `CommitSha`, `Sha256`, `BlobId`, `ArtifactId`,
   `NodeId`. Never pass a bare `String` where one of these exists.
-- Handlers: `async fn(State<AppState>, ...) -> Result<Response, AppError>`. No `unwrap`.
+- Handlers: `async fn(State<AppState>, ...) -> ApiResult<Json<T>>`, which is
+  `Result<T, ApiError>` from `crates/hoard-server/src/error.rs`. There is no `AppError` type
+  in this workspace, whatever AGENTS.md's generic guidance calls it. No `unwrap`.
 - Blocking work (the catalog, hashing, header parsing) runs in `spawn_blocking` or `rayon`.
 - Streaming bodies: never buffer a file; stream from the block cache.
 - Header names in Hub responses are lower-case and must match `docs/api/hub-compat.md`.

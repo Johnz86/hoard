@@ -28,20 +28,23 @@ one branch. The plan file is committed with the first task.
 
 ## 2. The standing rules
 
-From `AGENTS.md`, restated because they are the ones that get broken:
+`AGENTS.md` is the whole style contract and you have read it. These are the clauses that get
+broken here, plus the lints that turn a style rule into a build failure:
 
 - No `//` or `/* */` comments in `.rs` files. Doc comments (`///`, `//!`) only where they
   document a public contract; never to narrate implementation or restate the code.
-- No `.unwrap()` outside tests. `.expect()` only for an invariant violation, with a message.
-- No emoji, and no unicode anywhere - source, tests, docs, commit messages. ASCII only.
+- The workspace lints in the root `Cargo.toml` are enforced by `-D warnings`:
+  `unsafe_code` forbidden, `unwrap_used` and `dbg_macro` denied, `expect_used` a warning and
+  therefore an error outside tests, `print_stdout` and `print_stderr` denied so the CLI
+  reports through `tracing`. `clippy.toml` allows `unwrap` and `expect` in tests only.
 - Exhaustive matches; no catch-all `_` arm where the variants can be named.
-- At most five parameters per function; beyond that, a config struct.
 - Workspace dependencies are declared once in the root `[workspace.dependencies]` with a
-  version and referenced with `.workspace = true`.
-- One `thiserror` enum per crate.
-- Never `unsafe`; the workspace forbids it. Redesign in safe Rust.
+  version and referenced with `.workspace = true`. One `thiserror` enum per crate.
 - Fixtures are synthetic headers generated in the test. Never a real weight file.
 - Blocking work goes through `spawn_blocking` or `rayon`, never on the reactor.
+- ASCII in source, docs and commit messages. The exception is the glyphs
+  `docs/design/ui-spec.md` specifies for the UI, which `web/` already uses; do not go
+  "fixing" existing non-ASCII you did not introduce.
 
 Read `.claude/rules/rust.md` and `.claude/rules/web.md` for the path-scoped rules.
 
@@ -62,6 +65,8 @@ Plus:
   `crates/hoard-server/` or `web/`. `web/` is read from disk in a debug build and embedded in
   the binary in a release one, so the four checks above never touch what a shipped binary runs.
 - `cargo doc --workspace --no-deps` once, at the end of the wave.
+- the Hub contract smoke test when a Hub route changed, in the form
+  `.claude/skills/hoard-verify/SKILL.md` gives, server and client in one command.
 
 `/hoard-verify` runs the suite and is the shortest way to do this.
 
@@ -72,15 +77,18 @@ report. A commit that does not build is worse than a wide one.
 ## 4. Process hygiene
 
 - **Every command in the foreground.** Never start a background process, never leave one
-  running. If something needs a long time, raise the Bash timeout.
+  running, and never wait on one by polling. If something needs a long time, raise the Bash
+  timeout and let the one command finish.
 - A server under test runs under `timeout` **in the same shell command** as the curls that hit
   it. Confirm with `pgrep -af 'target/release/hoard'` afterwards and report the result.
-- Benchmarks and the scale harness run one at a time, never with `RUSTFLAGS` and never with
-  `target-cpu=native`.
-- Temporary files, synthetic trees and scratch catalogs go under the session scratchpad
-  directory, never inside the repository. Delete large trees when you are done with them.
-- Leave nothing behind: `git status` clean, no `.snap.new`, no scratch file, no stray
-  directory under `data/`.
+- Benchmarks and the scale harness run one at a time with nothing else running beside them,
+  never with `RUSTFLAGS` and never with `target-cpu=native`.
+- Temporary files, synthetic trees and scratch catalogs go under the scratchpad directory the
+  harness names in your system prompt, never inside the repository. Delete large trees when
+  you are done with them.
+- There are no snapshot tests in this workspace and `cargo insta` is not installed. An
+  assertion is written out in the test; do not reach for a snapshot crate.
+- Leave nothing behind: `git status` clean, no scratch file, no stray directory under `data/`.
 
 ## 5. Verified facts go stale
 
@@ -110,7 +118,13 @@ Co-Authored-By: ...
 Claude-Session: ..."
 ```
 
-Never `git add -A`. The plan file is committed with the first task.
+Never `git add -A`. The plan file is committed with the first task and is **not** deleted by
+you; the dispatcher deletes it when the wave lands.
+
+If you have to stop before the last task - a deviation that makes a task's outcome wrong, a
+check you cannot get green, a decision that is not yours - stop after a commit that builds,
+and say so in the first line of the report with the task number you stopped at and what the
+next agent must decide. Do not leave the tree half-edited and do not idle.
 
 ## 7. The report
 

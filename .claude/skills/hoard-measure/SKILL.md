@@ -12,8 +12,8 @@ is not a comparison.
 
 **Measure before and after in one session, on one machine, over one tree.** A reviewer or an
 implementer who needs a "before" number rebuilds the previous commit in a scratch clone under
-the session scratchpad and measures both runs back to back. Never compare a fresh run against
-a number already written in `docs/native-catalog.md`; quote that number as history and say
+the scratchpad and measures both runs back to back. Never compare a fresh run against a
+number already written in `docs/native-catalog.md`; quote that number as history and say
 which machine and commit it came from.
 
 State the commit for every column. A table without commits is not reproducible.
@@ -22,13 +22,17 @@ State the commit for every column. A table without commits is not reproducible.
 
 - Every command in the foreground. Never start or leave a background process.
 - A server under test runs under `timeout` **in the same shell command** as the curls that
-  hit it, so it cannot outlive the measurement. Confirm with `pgrep -f 'hoard.*serve'`
-  afterwards and report that it found nothing.
-- Benchmarks and the scale harness run **one at a time**. Concurrent runs compete for the
-  disk and the page cache and the results are void.
+  hit it, so it cannot outlive the measurement. Confirm with
+  `pgrep -af 'target/release/hoard'` afterwards and report that it found nothing.
+- Benchmarks and the scale harness run **one at a time, and nothing else runs beside them**.
+  A `cargo build`, a `cargo test` or a second harness competing for the disk and the page
+  cache voids the numbers. If you are reviewing while someone else measures, wait; if you are
+  measuring, do every build before the first timed run.
 - Never set `RUSTFLAGS` and never `target-cpu=native`.
-- Everything temporary goes under the session scratchpad directory, and a large tree is
-  deleted afterwards. `git status` must be clean when you are done.
+- Everything temporary - synthetic trees, scratch clones, the before and after files - goes
+  under the scratchpad directory the harness names in your system prompt, never inside the
+  repository. Delete a large tree when you are done with it. `git status` must be clean when
+  you are done.
 
 ## The synthetic tree
 
@@ -37,6 +41,16 @@ artifact per file. The generator in `crates/hoard-index/tests/scale.rs::header` 
 for a header - a little-endian u64 length, then a JSON object with `__metadata__` and one
 tensor entry. Vary the key family and the shape across files so inference has something to
 do.
+
+Two things belong beside the tree because the fixed route list below needs them, and the
+numbers in `docs/native-catalog.md` were taken with them:
+
+- **A git clone source**, one small repository with a commit, added as a second
+  `[[index.sources]]` with `kind = "git"`. A loose repository has no revision sha, so
+  `resolve` of a loose file answers 404 whatever the catalog holds and its row would measure
+  the 404 path.
+- **A seeded usage log**, about 2,000 served responses on one repository, before the usage
+  route is timed. An empty log measures nothing.
 
 Write a `hoard.toml` beside the tree:
 
@@ -66,11 +80,16 @@ offline = true
 `hash_policy = "never"` keeps the run from measuring the disk instead of the catalog, and
 `offline = true` keeps it from reaching `huggingface.co`.
 
+`[index] hash_policy` is read by `Catalog::open_or_scan` alone, which is the first open of a
+catalog that does not exist yet. `hoard scan` takes its policy from `--hash`, whose default is
+`later`, so **the scan must also be given `--hash never`** or it hashes 100,000 files and the
+number is the disk.
+
 ## The run
 
 ```sh
 cargo build --release
-time ./target/release/hoard --config <tree>/hoard.toml scan
+time ./target/release/hoard --config <tree>/hoard.toml scan --hash never
 ```
 
 Then the server and the curls in **one foreground shell command**, wrapped in `timeout`, so
@@ -88,11 +107,11 @@ timeout 300 sh -c '
   done
   kill $server
 '
-pgrep -f "hoard .*serve" || echo "no server left"
+pgrep -af "target/release/hoard" || echo "no server left"
 ```
 
-The fixed route list, every one of them, three runs each, median reported, whole request
-including the response body:
+The fixed route list, all eleven, three runs each, median reported, whole request including
+the response body. The `HEAD` row is taken with `curl -I`; every other row is a GET:
 
 | route |
 | --- |
@@ -106,11 +125,11 @@ including the response body:
 | `GET /api/v1/search?q=node:self` |
 | `GET /api/v1/search?q=role:lora` |
 | `GET /api/v1/triage?limit=20` |
+| `GET /api/v1/repos/models/org0/repo000/usage` |
 
-Add a route when the change touches one the list does not cover, and say you added it. A
-`resolve` of a loose file answers 404 whatever the catalog holds, because a loose repository
-has no revision sha; add a git clone source beside the tree when `resolve` is what the change
-is about. Seed the usage log before timing the usage route.
+The `resolve` row names the git clone source, not the loose tree, and the usage row names the
+repository whose log was seeded. Add a route when the change touches one the list does not
+cover, and say you added it.
 
 Write a **before file** and an **after file** under the scratchpad, one line per route per
 run, and derive the medians from them rather than from memory.
@@ -147,6 +166,9 @@ At 1M entries, absolute:
 Say which thresholds the run meets and which it misses, with the number.
 
 ## Writing the numbers down
+
+Only a wave that is allowed to write does this. A read-only reviewer reports its numbers and
+touches no file in the repository; the before and after files stay in the scratchpad.
 
 Add or replace a section in `docs/native-catalog.md` under "Measured" or "Scale". One table
 per scale. Every column names the commit it was measured at. Prose after the table says

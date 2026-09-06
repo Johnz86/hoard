@@ -54,8 +54,9 @@ cargo doc --workspace --no-deps
 cargo run -- serve --config hoard.toml
 ```
 
-The first four must pass before a task is reported done. A `PostToolUse` hook runs `rustfmt`
-on every edited `.rs` file, so `cargo fmt --check` should already be clean.
+The first four must pass before a task is reported done; the doc build runs once at the end
+of a wave. A `PostToolUse` hook runs `rustfmt` on every edited `.rs` file, so
+`cargo fmt --check` should already be clean.
 
 `web/` is read from disk in a debug build and embedded in the binary in a release one, so the
 debug checks never touch the code a shipped binary runs. The release asset test is the only
@@ -66,6 +67,11 @@ thing that does; run it after any change under `crates/hoard-server/` or `web/`.
 - Dependencies are declared once in the root `[workspace.dependencies]` with a version and
   referenced with `.workspace = true`. Check crates.io for the current version before adding.
 - Errors: one `thiserror` enum per crate; `hoard-server` maps them to HTTP in `error.rs`.
+- The workspace lints in the root `Cargo.toml` are enforced by `-D warnings`: `unsafe_code`
+  forbidden, `unwrap_used` and `dbg_macro` denied, `expect_used` a warning and so an error
+  outside tests, `print_stdout` and `print_stderr` denied, so the CLI reports through
+  `tracing`. `clippy.toml` allows `unwrap` and `expect` in tests only.
+- There are no snapshot tests; `cargo insta` is not installed. Assertions are written out.
 - Catalog access only through `hoard_index::catalog::Catalog`, always inside `spawn_blocking`
   when it is reached from an async path. Nothing outside `hoard-index` names a native_db or
   Tantivy type.
@@ -107,5 +113,7 @@ Agents, in `.claude/agents/`:
 
 The loop: `hoard-write-plan` to `docs/superpowers/plans/YYYY-MM-DD-<name>.md`, dispatch
 `wave-implementer` with the plan path and the two commit trailer lines, run `hoard-verify`,
-then dispatch `perf-reviewer` or `rust-reviewer`. Delete the plan file when the wave lands;
-git keeps it.
+then dispatch `perf-reviewer` or `rust-reviewer`. The plan file is committed with the wave's
+first task and deleted by the dispatcher when the wave lands; git keeps it.
+`docs/handoff.md` describes the loop in full, including what to do with an implementer that
+stops early.

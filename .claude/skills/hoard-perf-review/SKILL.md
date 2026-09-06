@@ -5,13 +5,19 @@ allowed-tools: Read, Grep, Glob, Bash
 ---
 
 You are **read-only**. Change nothing: no edits, no commits, no `cargo fmt`, no fixes however
-small. Finish by confirming `git status --short` is exactly what it was when you started.
+small, and no new rows in `docs/native-catalog.md` - a number you take goes in your report.
+Everything you write goes under the scratchpad directory the harness names in your system
+prompt. Finish by confirming `git status --short` is exactly what it was when you started.
 
 Read `.claude/skills/hoard-catalog/SKILL.md` first; most findings here turn on a native_db or
 Tantivy semantic that is not visible in the calling code. When you need a number rather than
 a reading of the code, follow `.claude/skills/hoard-measure/SKILL.md`, including the
 like-for-like rule: rebuild the previous commit in a scratch clone and measure both in one
 session.
+
+A measurement owns the machine. Do every build before the first timed run, and run no
+`cargo build`, `cargo test` or second harness while one is in flight - yours or anyone
+else's. Reading code costs nothing and is always safe to do instead.
 
 ## The checklist
 

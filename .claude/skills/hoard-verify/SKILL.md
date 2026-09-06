@@ -36,13 +36,32 @@ Additionally:
 For each failure: read the diagnostic, fix the root cause (never silence a lint with `allow`
 unless AGENTS.md permits it), and rerun from the failing step.
 
-If a Hub route changed, also run the contract smoke test when a server is reachable, with the
-server and the client in one foreground command under `timeout`:
+If a Hub route changed, also run the contract smoke test, with the server and the client in
+one foreground command under `timeout` so the server cannot outlive it:
 
 ```sh
-HF_ENDPOINT=http://127.0.0.1:7099 hf download <repo-in-index> --local-dir <scratchpad>/smoke
+cargo build --release
+timeout 120 sh -c '
+  ./target/release/hoard --config hoard.toml serve &
+  server=$!
+  sleep 3
+  HF_ENDPOINT=http://127.0.0.1:7099 HF_HOME=<scratchpad>/hf \
+    hf download <repo-in-index> --local-dir <scratchpad>/smoke
+  kill $server
+'
+pgrep -af "target/release/hoard" || echo "no server left"
 ```
 
-When every step passes, report the final output line of each: the test counts, the clippy
-line, and any warnings from `cargo doc`. Never mark a task complete with a failing or skipped
-step; say which step failed and why.
+`<scratchpad>` is the scratchpad directory the harness names in your system prompt; nothing
+temporary goes inside the repository. `HF_HOME` points there too, so the client answers from
+the server rather than from its own cache. Skip this step and say so if no repository in the
+index has a revision sha.
+
+Three tests are ignored on purpose and stay ignored: the scale harness in
+`crates/hoard-index/tests/scale.rs`, the mDNS test that needs a multicast route, and the
+sniffer test that reads the local model caches. An ignored count other than three means a
+test was added or lost, not that something is being skipped.
+
+When every step passes, report the final output line of each: the test counts including the
+ignored, the clippy line, and any warnings from `cargo doc`. Never mark a task complete with
+a failing or skipped step; say which step failed and why.

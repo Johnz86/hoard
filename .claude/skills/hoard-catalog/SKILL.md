@@ -24,7 +24,7 @@ One line per file in `crates/hoard-index/src/catalog/`:
 - `mod.rs` open, `open_or_scan`, status, integrity, `FORMAT_VERSION`, storage report, compact.
 - `models.rs` every `native_model` record: `Source`, `Repository`, `Revision`,
   `ArtifactRecord`, `ArtifactDetail`, `Entry`, `SearchText`, `SearchChange`, `Manifest`,
-  `Summary`, `Allocator`, and the user-data rows.
+  `Summary`, `Allocator`, `Node`, and the user-data rows.
 - `scan.rs` discovery to sniff to infer to one transaction per unit; `Counters`,
   `DerivedShift`, `log_changes`, the artifact sweep, `CHUNK`.
 - `naming.rs` the config and card a revision carries, artifact names, per-file hashes.

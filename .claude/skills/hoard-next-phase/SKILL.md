@@ -15,10 +15,12 @@ allowed-tools: Read, Grep, Glob, Bash, Write, Edit
    to `docs/superpowers/plans/YYYY-MM-DD-<name>.md`. The phase's acceptance criterion is the
    plan's goal; its bullets are the tasks.
 6. Dispatch the `wave-implementer` agent with the plan path and the two commit trailer lines,
-   or execute the plan yourself following
-   `.claude/skills/hoard-implement-plan/SKILL.md`. Run `/hoard-verify` after each task.
-7. When the phase's acceptance check passes, tick its status in the table at the top of
-   `docs/feature-plan.md`, add any new module to `docs/architecture.md`, and delete the plan
-   file - git keeps it.
+   or execute the plan yourself following `.claude/skills/hoard-implement-plan/SKILL.md`. The
+   implementer runs the checks itself per task; run `/hoard-verify` once when the wave
+   returns, before you believe its report.
+7. When the phase's acceptance check passes, set its status to `done` in the table at the top
+   of `docs/feature-plan.md` - `partial` if some bullets are still open, with the reason in
+   the prose under the table - add any new module to `docs/architecture.md`, and delete the
+   plan file. Git keeps it; a stale plan in the tree is a trap for the next agent.
 
 Do not start a later phase's work early, and do not widen scope beyond the phase's bullets.
