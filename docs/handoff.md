@@ -28,18 +28,23 @@ first; this document assumes it.
 
 ## Running the loop
 
-Work runs as waves. Each wave is one plan file, one fresh implementer agent, a verification
-pass, and a review. The skills carry the contracts so no prompt has to repeat them.
+Work runs as waves. Each wave is one worktree, one branch, one plan file, one fresh
+implementer agent, a verification pass, a review, and **one squashed commit on `master`**.
+The implementer's per-task commits are checkpoints on the branch and never reach `master`;
+the plan file is never committed. The skills carry the contracts so no prompt has to repeat
+them.
 
-1. **Write the plan.** Follow `.claude/skills/hoard-write-plan/SKILL.md`. It goes to
-   `docs/superpowers/plans/YYYY-MM-DD-<name>.md`, is committed with the wave's first task,
-   and is deleted by you when the wave lands - not by the implementer. Anchor its Verified
-   facts to a named commit and grep every symbol it mentions before you hand it over.
-2. **Dispatch the implementer.** The `wave-implementer` agent, given the plan path and the
-   two commit trailer lines, and nothing else. It follows
-   `.claude/skills/hoard-implement-plan/SKILL.md`: preflight, the AGENTS.md rules, the
-   checks, foreground-only process hygiene, a record of every deviation from the plan, one
-   commit per task, and a report.
+1. **Open the wave.** From the main checkout:
+   `git worktree add ../hoard-<name> -b wave/<name>`. Then write the plan following
+   `.claude/skills/hoard-write-plan/SKILL.md` to
+   `../hoard-<name>/docs/superpowers/plans/<name>.md`, untracked. Anchor its Verified facts to
+   the commit the branch starts from and grep every symbol it mentions before you hand it
+   over. The plan carries the subject and body of the wave commit `master` will receive.
+2. **Dispatch the implementer.** The `wave-implementer` agent, given the worktree path and
+   the plan path, and nothing else. It follows
+   `.claude/skills/hoard-implement-plan/SKILL.md`: preflight in the worktree, the AGENTS.md
+   rules, the checks, foreground-only process hygiene, a record of every deviation from the
+   plan, one checkpoint commit per task, and a report.
 
    The report is written so you can verify without reading the transcript, and section 7 of
    that skill fixes what it contains: the commit hashes and subjects in order, every
@@ -50,23 +55,28 @@ pass, and a review. The skills carry the contracts so no prompt has to repeat th
    report to send back.
 
    An implementer that stops early - a deviation that makes a task's outcome wrong, a check
-   it cannot get green, a decision that is not its to take - stops after a commit that
+   it cannot get green, a decision that is not its to take - stops after a checkpoint that
    builds and says so in its first line. Read its reasoning, take the decision yourself, and
    resume it with a message naming the next task; a fresh agent would re-derive the whole
    plan. An implementer that appears to be waiting on a long command is waiting on a
    foreground command, which is what the skill requires: let it finish, or raise the
    timeout and resume it. Never ask it to poll, and never start a background process on its
    behalf.
-3. **Verify.** `/hoard-verify`: `cargo fmt --check`, clippy with `-D warnings`,
-   `cargo test --workspace`, `cargo build --workspace`, plus
+3. **Verify and review, in the worktree.** `/hoard-verify` there: `cargo fmt --check`, clippy
+   with `-D warnings`, `cargo test --workspace`, `cargo build --workspace`, plus
    `cargo test --release -p hoard-server --lib assets::` after any change under
-   `crates/hoard-server/` or `web/`, and `cargo doc --workspace --no-deps` once at the end.
-4. **Review.** `perf-reviewer` for a performance wave, following
+   `crates/hoard-server/` or `web/`, and `cargo doc --workspace --no-deps` once. Then
+   `perf-reviewer` for a performance wave, following
    `.claude/skills/hoard-perf-review/SKILL.md`; `rust-reviewer` otherwise. Both are
-   read-only. Give the reviewer the commit the plan gated on: the wave's work is already
-   committed, so `git diff` on its own is empty and the change set is `<base>..HEAD`. Do not
-   run a build while a reviewer is measuring, or dispatch a measuring reviewer beside
-   anything else that uses the disk.
+   read-only and review `master..HEAD` in the worktree. Do not run a build while a reviewer
+   is measuring, or dispatch a measuring reviewer beside anything else that uses the disk.
+   Fixes from the review go on the same branch, as more checkpoints, before landing.
+4. **Land the wave.** From the main checkout on `master`:
+   `git merge --squash wave/<name>`, then one commit whose subject and body are the plan's
+   wave commit, ending with the two attribution trailer lines this session was given. Then
+   `git worktree remove ../hoard-<name> && git branch -D wave/<name>`. The plan file goes
+   with the worktree. Update this handoff inside the wave (a task of the plan) so it lands in
+   the same commit, never as a commit of its own.
 
 For anything touching `crates/hoard-index/src/catalog/`, read
 `.claude/skills/hoard-catalog/SKILL.md` first: the module map, the write path, and the

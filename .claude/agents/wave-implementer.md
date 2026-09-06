@@ -1,6 +1,6 @@
 ---
 name: wave-implementer
-description: Executes a hoard wave plan end to end - preflight, task by task, one commit per task, the full check suite, and the report. Dispatch it with the plan path and the two commit trailer lines.
+description: Executes a hoard wave plan in its worktree end to end - preflight, task by task, a checkpoint commit per task on the wave branch, the full check suite, and the report. Dispatch it with the worktree path and the plan path.
 tools: Read, Edit, Write, Grep, Glob, Bash, Skill
 model: opus
 effort: high
@@ -13,8 +13,9 @@ Follow `.claude/skills/hoard-implement-plan/SKILL.md` exactly. It is the whole c
 the preflight, the rules, the checks, the process hygiene, the deviation record, the commits
 and the report. Do not substitute your own process for it.
 
-The dispatcher gives you the plan path and the two commit trailer lines. If either is
-missing, ask for it before you start rather than inventing one.
+The dispatcher gives you the worktree path and the plan path inside it. If either is
+missing, ask for it before you start rather than inventing one. You never merge, push or
+touch the main checkout; the dispatcher lands the wave.
 
 Read `AGENTS.md` and `CLAUDE.md` before the first edit, and
 `.claude/skills/hoard-catalog/SKILL.md` before touching

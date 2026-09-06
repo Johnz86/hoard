@@ -111,9 +111,18 @@ Agents, in `.claude/agents/`:
 - `rust-reviewer` reviews a change set against AGENTS.md, the crate boundaries and the Hub
   contract; read-only.
 
-The loop: `hoard-write-plan` to `docs/superpowers/plans/YYYY-MM-DD-<name>.md`, dispatch
-`wave-implementer` with the plan path and the two commit trailer lines, run `hoard-verify`,
-then dispatch `perf-reviewer` or `rust-reviewer`. The plan file is committed with the wave's
-first task and deleted by the dispatcher when the wave lands; git keeps it.
-`docs/handoff.md` describes the loop in full, including what to do with an implementer that
-stops early.
+The loop, one wave at a time, each landing on `master` as exactly one commit:
+
+```sh
+git worktree add ../hoard-<name> -b wave/<name>        # the dispatcher, from this checkout
+# write the plan, untracked, to ../hoard-<name>/docs/superpowers/plans/<name>.md
+# dispatch wave-implementer with the worktree path and the plan path
+# run hoard-verify in the worktree; dispatch perf-reviewer or rust-reviewer on master..HEAD
+git merge --squash wave/<name>                          # back on master
+git commit -m "<the plan's wave commit, with the trailer lines>"
+git worktree remove ../hoard-<name> && git branch -D wave/<name>
+```
+
+The implementer's per-task commits are checkpoints on the branch; they never reach `master`.
+The plan file is never committed; it goes with the worktree. `docs/handoff.md` describes the
+loop in full, including what to do with an implementer that stops early.

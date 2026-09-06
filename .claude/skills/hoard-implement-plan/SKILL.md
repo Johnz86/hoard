@@ -1,12 +1,13 @@
 ---
 name: hoard-implement-plan
-description: The contract for executing a hoard wave plan - preflight, the standing rules, the checks, process hygiene, the deviation record, one commit per task, and the report. Follow it without needing anything else from the dispatcher but the plan path and the commit trailers.
+description: The contract for executing a hoard wave plan in its worktree - preflight, the standing rules, the checks, process hygiene, the deviation record, a checkpoint commit per task on the wave branch, and the report. Follow it without needing anything else from the dispatcher but the worktree path and the plan path.
 allowed-tools: Read, Edit, Write, Grep, Glob, Bash, Skill
 ---
 
-You are executing one wave plan in `/home/johnz86/GIT/hoard`. The dispatcher gives you two
-things and nothing else is implied: **the plan path** and **the two commit trailer lines**. If
-either is missing, ask for it rather than inventing one.
+You are executing one wave plan in a git worktree of hoard. The dispatcher gives you two
+things and nothing else is implied: **the worktree path** and **the plan path** inside it. If
+either is missing, ask for it rather than inventing one. Every command runs with the
+worktree as its working directory; the main checkout on `master` is not yours to touch.
 
 Read the plan in full before the first edit. Read `AGENTS.md` and `CLAUDE.md`. Read
 `.claude/skills/hoard-catalog/SKILL.md` before touching `crates/hoard-index/src/catalog/`.
@@ -16,15 +17,16 @@ Read the plan in full before the first edit. Read `AGENTS.md` and `CLAUDE.md`. R
 First command, before anything else:
 
 ```sh
-git status --short && git log --oneline -1
+cd <worktree> && git status --short && git branch --show-current && git log --oneline -1
 ```
 
-Proceed only if the tree is clean apart from untracked plan files under
-`docs/superpowers/plans/`, **and** the top commit is the one the plan's gate names. If either
-fails, stop and say what you found. Do not "fix" the tree to make the gate pass.
+Proceed only if the tree is clean apart from the untracked plan file, the branch is the
+`wave/<name>` branch the plan names, **and** the top commit is the one the plan's gate names.
+If any of these fails, stop and say what you found. Do not "fix" the tree to make the gate
+pass.
 
-Then: **never push. Never rebase. Never touch another checkout.** There is one checkout and
-one branch. The plan file is committed with the first task.
+Then: **never push. Never rebase. Never merge. Never touch another checkout.** The plan file
+is never committed: it lives untracked in the worktree and goes with it.
 
 ## 2. The standing rules
 
@@ -107,19 +109,17 @@ stop and report rather than improvising a new design.
 
 ## 6. Commits
 
-One commit per task, with the subject the plan gives, ending with the two trailer lines the
-dispatcher supplied:
+One checkpoint commit per task on the wave branch, with the subject the plan gives:
 
 ```sh
 git add <exactly the paths this task touched>
-git commit -m "<the plan's subject for this task>
-
-Co-Authored-By: ...
-Claude-Session: ..."
+git commit -m "<the plan's subject for this task>"
 ```
 
-Never `git add -A`. The plan file is committed with the first task and is **not** deleted by
-you; the dispatcher deletes it when the wave lands.
+These commits never reach `master` as they are: the dispatcher squashes the branch into one
+commit per wave, so a checkpoint needs no trailer and no body. What matters is that each one
+builds and passes on its own, because that is how a stopped wave is resumed and how a
+reviewer bisects. Never `git add -A`; never add the plan file.
 
 If you have to stop before the last task - a deviation that makes a task's outcome wrong, a
 check you cannot get green, a decision that is not yours - stop after a commit that builds,

@@ -8,10 +8,16 @@ A wave plan is the whole brief for one implementer session. It is written by a d
 has read the code, and executed by an agent that has not. Everything the implementer would
 otherwise have to ask for is in the file.
 
-Write it to `docs/superpowers/plans/YYYY-MM-DD-<name>.md`. It is committed with the first
-task and **deleted when the wave lands** - git keeps the history, and a stale plan file in the
-tree is a trap for the next agent. The dispatcher deletes it, never the implementer: do not
-write a task that removes the plan file. Say in the handoff that you deleted it.
+A wave runs in its own worktree on its own branch, and lands on `master` as one squashed
+commit. The dispatcher creates both before writing the plan:
+
+```sh
+git -C /home/johnz86/GIT/hoard worktree add ../hoard-<name> -b wave/<name>
+```
+
+Write the plan to `<worktree>/docs/superpowers/plans/<name>.md`. It is **never committed**:
+it stays untracked in the worktree and is deleted with it when the wave lands. Do not write a
+task that commits or removes the plan file.
 
 ## The skeleton
 
@@ -67,10 +73,10 @@ bullets carry only what changes per wave.
 
 1. **The gate.** Where to work, which branch, the preflight command, and the stop condition:
 
-   > Work in `/home/johnz86/GIT/hoard` on `master`. First command:
-   > `git status --short && git log --oneline -1`; proceed only if the tree is clean apart
-   > from this plan file and the top commit is `<hash>` "<its subject>". Commit this plan
-   > file with Task 1. Never push.
+   > Work in `/home/johnz86/GIT/hoard-<name>` on branch `wave/<name>`. First command:
+   > `cd /home/johnz86/GIT/hoard-<name> && git status --short && git branch --show-current && git log --oneline -1`;
+   > proceed only if the tree is clean apart from this plan file, the branch is `wave/<name>`
+   > and the top commit is `<hash>` "<its subject>". Never push, merge or rebase.
 
    Give the commit as hash **and** subject. Gating on the subject alone is acceptable when the
    hash is not yet known at writing time; gating on nothing is not.
@@ -88,9 +94,11 @@ bullets carry only what changes per wave.
    ordering or contract. Every existing test keeps its assertions unless it asserted the cost
    being removed; say which."
 
-5. **The commit trailers.** The two lines, verbatim, in a fenced block: the `Co-Authored-By:`
-   and `Claude-Session:` lines this session was given for attribution. The dispatcher copies
-   them from its own instructions; the implementer never invents them.
+5. **The wave commit.** The subject and a three-to-six-line body of the one commit `master`
+   receives when the dispatcher squashes the branch: what the code now does, what was
+   measured if anything, what was deliberately left. The implementer's per-task commits are
+   checkpoints on the branch and carry only their subjects; the trailer lines are added by
+   the dispatcher at the squash, never by the implementer.
 
 6. **Verified facts.** See below.
 
@@ -142,7 +150,7 @@ test body as a compilable `rust` block when the setup is not obvious. When the t
 delicate, use the longer TDD form: write the failing test, run it and state the expected
 failure verbatim, implement, run, commit.
 
-**Every task ends with a commit**, one commit per task, with the subject given in the plan:
+**Every task ends with a checkpoint commit** on the wave branch, with the subject given in the plan:
 imperative, sentence case, no prefix, no trailing period, saying what the code now does rather
 than what the author did. "Answer the triage queue from the search index", not "Fix triage
 performance".
@@ -154,7 +162,7 @@ performance".
 with grep and skip what is already done", "simplest acceptable outcome: ...". An implementer
 that hits an unauthorised fork in the road either guesses or stalls.
 
-The first task is often bookkeeping - commit the plan file, take the before measurement. The
+The first task is often bookkeeping - take the before measurement. The
 last is verification and recording, never new behaviour.
 
 ## Measurement tasks
