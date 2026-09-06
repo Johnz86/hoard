@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
@@ -46,6 +47,7 @@ pub struct Watcher {
     watcher: Option<RecommendedWatcher>,
     roots: Vec<PathBuf>,
     task: JoinHandle<()>,
+    rescans: Arc<AtomicU64>,
 }
 
 impl Watcher {
@@ -67,11 +69,19 @@ impl Watcher {
             roots.push(source.path.clone());
         }
 
-        let task = tokio::spawn(pump(catalog, config.clone(), debounce, receiver));
+        let rescans = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn(pump(
+            catalog,
+            config.clone(),
+            debounce,
+            receiver,
+            Arc::clone(&rescans),
+        ));
         Ok(Self {
             watcher: Some(watcher),
             roots,
             task,
+            rescans,
         })
     }
 
@@ -94,6 +104,13 @@ impl Watcher {
     /// True once the pump has drained the rescans it was asked for and exited.
     pub fn is_finished(&self) -> bool {
         self.task.is_finished()
+    }
+
+    /// How many bursts this watcher has finished rescanning, counting the hashing and the
+    /// search refresh each of them runs. Something waiting for a change to be indexed waits
+    /// for this to move rather than for a row to appear part way through a pass.
+    pub fn rescans(&self) -> u64 {
+        self.rescans.load(Ordering::Relaxed)
     }
 }
 
@@ -132,6 +149,7 @@ async fn pump(
     config: IndexConfig,
     debounce: Duration,
     mut events: Receiver<PathBuf>,
+    rescans: Arc<AtomicU64>,
 ) {
     let window = debounce.saturating_mul(MAX_DEBOUNCE_WINDOWS);
     while let Some(first) = events.recv().await {
@@ -150,6 +168,7 @@ async fn pump(
             Ok(Err(error)) => tracing::warn!(sources = named, %error, "watched rescan failed"),
             Err(error) => tracing::warn!(sources = named, %error, "watched rescan was lost"),
         }
+        rescans.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -368,23 +387,22 @@ mod tests {
             .expect("the watcher starts");
         fs::write(root.join("loras/new.safetensors"), safetensors()).expect("fixture is writable");
 
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let totals = catalog.totals().expect("the catalog reads");
-            if totals.artifacts > 0 {
-                assert_eq!(
-                    catalog.pending_hashes().expect("the catalog reads"),
-                    0,
-                    "the watched rescan hashes what it indexed"
-                );
-                break;
-            }
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while watcher.rescans() == 0 {
             assert!(
                 Instant::now() < deadline,
-                "the watcher never indexed the file"
+                "the watcher never rescanned the source"
             );
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+
+        let totals = catalog.totals().expect("the catalog reads");
+        assert!(totals.artifacts > 0, "the rescan indexed the new file");
+        assert_eq!(
+            catalog.pending_hashes().expect("the catalog reads"),
+            0,
+            "the watched rescan hashes what it indexed"
+        );
         watcher.stop();
     }
 }
