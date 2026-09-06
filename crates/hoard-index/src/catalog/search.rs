@@ -7,6 +7,7 @@ use serde::Serialize;
 use tantivy::collector::{Collector, Count, SegmentCollector};
 use tantivy::columnar::StrColumn;
 use tantivy::fastfield::Column;
+use tantivy::indexer::UserOperation;
 use tantivy::query::{BooleanQuery, Query, QueryClone, TermQuery, Weight};
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, Schema, TEXT, TantivyDocument, TextFieldIndexing,
@@ -43,6 +44,10 @@ const PAGE_LIMIT: u32 = 1000;
 /// How many rows a `compat:` probe reads before choosing a target.
 const COMPAT_PROBE: u32 = 32;
 const BASE_DIMENSION: usize = 1;
+/// How many base buckets the rail carries. The tally orders them, the prefix rule then
+/// counts each one with a query of its own, so this bounds the searches a query pays for
+/// the rail by a constant rather than by how many bases the catalog holds.
+const BASE_RAIL: usize = 32;
 const NODE_DIMENSION: usize = 4;
 const BASE_LABEL_COLUMN: &str = "base_label";
 /// The column `used:` filters on and `sort=used` orders by, as epoch seconds.
@@ -142,6 +147,8 @@ impl Catalog {
         Ok(self.highest_change_seq()?.max(self.manifest()?.search_seq))
     }
 
+    /// Writes every artifact's documents as one writer group, so they land in one segment
+    /// as consecutive doc ids. [`Collapsing`] folds that run and depends on it.
     pub(super) fn build_index(
         &self,
         directory: &Path,
@@ -160,14 +167,20 @@ impl Catalog {
             repository: None,
         };
         let mut indexed = 0_u64;
+        let mut reported = 0_u64;
+        let mut operations: Vec<UserOperation> = Vec::new();
         for artifact in snapshot.scan().primary::<ArtifactRecord>()?.all()? {
             let artifact = artifact?;
-            for document in documents_of(&mut indexing, &artifact)? {
-                writer.add_document(document)?;
-                indexed += 1;
-                if indexed.is_multiple_of(512) {
-                    progress(indexed);
-                }
+            operations.extend(
+                documents_of(&mut indexing, &artifact)?
+                    .into_iter()
+                    .map(UserOperation::Add),
+            );
+            indexed += operations.len() as u64;
+            writer.run(operations.drain(..))?;
+            if indexed - reported >= 512 {
+                reported = indexed;
+                progress(indexed);
             }
         }
         writer.commit()?;
@@ -204,6 +217,10 @@ impl Catalog {
     /// The drain is bounded by the highest sequence the log held when it started, so a
     /// refresh running beside a writer returns rather than chasing the writer's new rows;
     /// the next refresh takes the rest.
+    ///
+    /// An artifact's delete and its new documents are one writer group, so the documents it
+    /// leaves alive are one run of consecutive doc ids in one segment, which is what the
+    /// collapsed query path folds.
     pub fn refresh_search(&self, mut progress: impl FnMut(u64)) -> Result<u64> {
         let _lane = self.search_lane.lock();
         let manifest = self.manifest()?;
@@ -234,11 +251,18 @@ impl Catalog {
                 names: &names,
                 repository: None,
             };
+            let mut operations: Vec<UserOperation> = Vec::new();
             for id in ids {
-                writer.delete_term(Term::from_field_i64(fields.artifact, id));
-                for document in documents_of_artifact(&mut indexing, id)? {
-                    writer.add_document(document)?;
-                }
+                operations.push(UserOperation::Delete(Term::from_field_i64(
+                    fields.artifact,
+                    id,
+                )));
+                operations.extend(
+                    documents_of_artifact(&mut indexing, id)?
+                        .into_iter()
+                        .map(UserOperation::Add),
+                );
+                writer.run(operations.drain(..))?;
             }
             drop(indexing);
             drop(names);
@@ -487,7 +511,7 @@ impl Catalog {
         &self,
         request: QueryRequest<'_>,
         paging: Paging,
-    ) -> Result<(QueryPage, usize)> {
+    ) -> Result<(QueryPage, Cost)> {
         let parsed = parse(request.raw);
         let path = match query::needs_collapse(&parsed.tokens, request.context, request.sort.key)? {
             true => QueryPath::Collapse,
@@ -496,15 +520,15 @@ impl Catalog {
         self.answer(request, parsed, path, paging)
     }
 
-    /// The page, beside how many rows the selection kept to cut it from: the memory one
-    /// query holds above its own page, which the paging tests bound.
+    /// The page, beside what finding it cost above the page itself: the rows the selection
+    /// held and the passes it made, both of which the paging tests bound.
     fn answer(
         &self,
         request: QueryRequest<'_>,
         parsed: ParsedQuery,
         path: QueryPath,
         paging: Paging,
-    ) -> Result<(QueryPage, usize)> {
+    ) -> Result<(QueryPage, Cost)> {
         if request.limit > PAGE_LIMIT {
             return Err(IndexError::Query(format!(
                 "page limit must be at most {PAGE_LIMIT}"
@@ -532,23 +556,12 @@ impl Catalog {
         };
         let searcher = open.reader.searcher();
         let compiled = query::compile(&parsed.tokens, None, &bound)?;
-        let (mut summary, window) = match path {
-            QueryPath::Primary => {
-                let restricted = only_primary(&fields, compiled);
-                Selecting::of(&searcher, &restricted, &request, paging)?.rows()?
-            }
-            QueryPath::Collapse => {
-                let summary = searcher.search(
-                    compiled.as_ref(),
-                    &ArtifactCollector {
-                        sort: request.sort,
-                        retain: true,
-                    },
-                )?;
-                let counted = usize::try_from(summary.total).unwrap_or(usize::MAX);
-                (summary, Window::of(&request, counted))
-            }
-        };
+        let restricted = path.restrict(&fields, compiled);
+        let Selected {
+            mut summary,
+            window,
+            passes,
+        } = Selecting::of(&searcher, restricted.as_ref(), path, &request, paging).rows()?;
         let candidates = std::mem::take(&mut summary.candidates);
         let kept = candidates.len();
         let total = summary.total;
@@ -571,12 +584,16 @@ impl Catalog {
                 facets,
                 stale,
             },
-            kept,
+            Cost { kept, passes },
         ))
     }
 
     /// Each dimension counted over the set its own key does not narrow, which is what keeps
     /// a facet click from reducing the rail it was clicked in to one bucket.
+    ///
+    /// The base rail is [`base_candidates`] counted by the prefix rule, each with a query of
+    /// its own, and then cut to the [`BASE_RAIL`] largest by that count, so the searches one
+    /// query pays for the rail do not grow with the number of bases the catalog holds.
     fn facets(&self, pass: &FacetPass<'_>) -> Result<Facets> {
         let mut dimensions: [Vec<FacetBucket>; FACET_DIMENSIONS.len()] =
             std::array::from_fn(|_| Vec::new());
@@ -588,6 +605,7 @@ impl Catalog {
             };
             let mut buckets = count_buckets(narrowed.as_ref().unwrap_or(pass.summary), index)?;
             if index == BASE_DIMENSION {
+                buckets = base_candidates(buckets);
                 for bucket in &mut buckets {
                     let scoped = BooleanQuery::intersection(vec![
                         excluded.box_clone(),
@@ -596,6 +614,7 @@ impl Catalog {
                     bucket.count = pass.count(scoped)?;
                 }
                 order_buckets(&mut buckets);
+                buckets.truncate(BASE_RAIL);
             }
             dimensions[index] = buckets;
         }
@@ -718,6 +737,46 @@ impl Catalog {
             .collect()
     }
 
+    /// Both ways of counting the artifacts a query matches on the collapse path: the
+    /// collection that also keeps candidates and tallies every facet dimension, and the fold
+    /// that reads the artifact id alone. A base bucket is counted the second way, so the two
+    /// have to agree.
+    #[cfg(test)]
+    pub(super) fn collapsed_counts(
+        &self,
+        raw: &str,
+        context: &CompileContext,
+    ) -> Result<(u64, u64)> {
+        let directory = self
+            .manifest()?
+            .search_directory
+            .ok_or_else(|| IndexError::Catalog("search index needs building".into()))?;
+        let guard = self.open_index(&directory)?;
+        let open = guard
+            .as_ref()
+            .ok_or_else(|| IndexError::Catalog("search index was closed".into()))?;
+        let (_, fields) = Fields::build();
+        let bound = QueryFields {
+            fields: &fields,
+            context,
+        };
+        let compiled = query::compile(&parse(raw).tokens, None, &bound)?;
+        let searcher = open.reader.searcher();
+        let folded = searcher.search(compiled.as_ref(), &CollapsedCount)?;
+        let tallied = searcher
+            .search(
+                compiled.as_ref(),
+                &PrimaryCollector {
+                    path: QueryPath::Collapse,
+                    sort: facet_sort(),
+                    keep: 0,
+                    reversed: false,
+                },
+            )?
+            .total;
+        Ok((folded, tallied))
+    }
+
     /// How many documents of the published index carry `value` in the u64 field `field`.
     #[cfg(test)]
     pub(super) fn count_documents(&self, field: &str, value: u64) -> Result<u64> {
@@ -835,21 +894,28 @@ struct Window {
 }
 
 impl Window {
-    fn of(request: &QueryRequest<'_>, total: usize) -> Self {
+    /// The slice as it is cut from the front of the order, which is what a heap of the rows
+    /// the request reaches holds.
+    fn front(request: &QueryRequest<'_>, total: usize) -> Self {
         let wanted = u64::from(request.offset).saturating_add(u64::from(request.limit));
         let keep = usize::try_from(wanted).unwrap_or(usize::MAX).min(total);
-        let skip = (request.offset as usize).min(keep);
-        match total - keep < skip {
+        Self {
+            skip: (request.offset as usize).min(keep),
+            keep,
+            reversed: false,
+        }
+    }
+
+    /// The same slice, cut from whichever end of the order is nearer.
+    fn of(request: &QueryRequest<'_>, total: usize) -> Self {
+        let front = Self::front(request, total);
+        match total - front.keep < front.skip {
             true => Self {
-                skip: total - keep,
-                keep: total - skip,
+                skip: total - front.keep,
+                keep: total - front.skip,
                 reversed: true,
             },
-            false => Self {
-                skip,
-                keep,
-                reversed: false,
-            },
+            false => front,
         }
     }
 
@@ -953,16 +1019,22 @@ impl Paging {
         (counted / self.boundaries(counted)).max(1) | 1
     }
 
-    /// A sample of no fewer documents than it has boundaries would keep the whole match, so
-    /// a small result set stays with the heap however deep the window is.
-    fn selection(self, sort: SortColumn, window: Window, counted: usize) -> Selection {
-        let shallow = match sort {
+    /// How deep a window of this sort key keeps the heap. A term key spells a term for every
+    /// row the heap holds and a numeric key only compares integers, so the two cross over an
+    /// order of magnitude apart.
+    fn shallow_bound(self, sort: SortColumn) -> usize {
+        match sort {
             SortColumn::Text => self.shallow,
             SortColumn::Size | SortColumn::Used | SortColumn::Ident => {
                 self.shallow.saturating_mul(NUMERIC_SHALLOW)
             }
-        };
-        match window.keep > shallow && counted >= self.boundaries(counted) {
+        }
+    }
+
+    /// A sample of no fewer documents than it has boundaries would keep the whole match, so
+    /// a small result set stays with the heap however deep the window is.
+    fn selection(self, sort: SortColumn, window: Window, counted: usize) -> Selection {
+        match window.keep > self.shallow_bound(sort) && counted >= self.boundaries(counted) {
             true => Selection::Sampled,
             false => Selection::Heap,
         }
@@ -1091,81 +1163,153 @@ fn bucket_of(counts: &[u64], rank: u64) -> (usize, u64) {
     (last, before)
 }
 
-/// One window of the primary path being selected: the search that matched it, the order it
-/// is asked for in, and the sizes that decide how it is found.
+/// What answering one query cost above the page it returned: how many rows the selection
+/// held to cut that page from, and how many passes over the match it took to find them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Cost {
+    pub(super) kept: usize,
+    pub(super) passes: usize,
+}
+
+/// What one selection produced: the rows the page is cut from, the window that cuts them,
+/// and how many passes over the match it took.
+struct Selected {
+    summary: Summary,
+    window: Window,
+    passes: usize,
+}
+
+/// One window being selected: the search that matched it, the order it is asked for in, and
+/// the sizes that decide how it is found. Nothing here counts the match in a pass of its
+/// own; the first pass that runs reports the total.
 struct Selecting<'a> {
     searcher: &'a Searcher,
-    restricted: &'a BooleanQuery,
-    sort: SortSpec,
-    window: Window,
-    counted: usize,
+    restricted: &'a dyn Query,
+    path: QueryPath,
+    request: &'a QueryRequest<'a>,
     paging: Paging,
 }
 
 impl<'a> Selecting<'a> {
-    /// Counts the match, which is both the total the page reports and what decides which
-    /// slice of the order the request is asking for.
     fn of(
         searcher: &'a Searcher,
-        restricted: &'a BooleanQuery,
-        request: &QueryRequest<'_>,
+        restricted: &'a dyn Query,
+        path: QueryPath,
+        request: &'a QueryRequest<'a>,
         paging: Paging,
-    ) -> Result<Self> {
-        let counted = searcher.search(restricted, &Count)?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             searcher,
             restricted,
-            sort: request.sort,
-            window: Window::of(request, counted),
-            counted,
+            path,
+            request,
             paging,
-        })
-    }
-
-    /// The rows the page is cut from and the window that cuts them.
-    fn rows(self) -> Result<(Summary, Window)> {
-        let selection =
-            self.paging
-                .selection(SortColumn::of(self.sort.key), self.window, self.counted);
-        let sampled = match selection {
-            Selection::Heap => None,
-            Selection::Sampled => self.sampled()?,
-        };
-        match sampled {
-            Some(found) => Ok(found),
-            None => Ok((self.heaped()?, self.window)),
         }
     }
 
-    /// Today's one pass, keeping a heap of everything that can reach the window.
-    fn heaped(&self) -> Result<Summary> {
+    /// How many rows of the order the request asks the selection to reach.
+    fn wanted(&self) -> usize {
+        let wanted = u64::from(self.request.offset).saturating_add(u64::from(self.request.limit));
+        usize::try_from(wanted).unwrap_or(usize::MAX)
+    }
+
+    /// The rows the page is cut from, the window that cuts them, and what it cost.
+    ///
+    /// A window inside the sort's shallow bound is one heap pass over the front of the
+    /// order, and the total its summary carries is what the window is then cut by. A deeper
+    /// one runs the sampling pass first, which counts the match as well, and the total then
+    /// decides between a heap of the rows nearer the far end and the bucket and window
+    /// passes that find the middle by rank. An offset at or past the total leaves no window
+    /// to find, so that pass is the only one: the page is empty and the total is already
+    /// known.
+    fn rows(self) -> Result<Selected> {
+        let column = SortColumn::of(self.request.sort.key);
+        let wanted = self.wanted();
+        if wanted <= self.paging.shallow_bound(column) {
+            let summary = self.heaped(Window {
+                skip: 0,
+                keep: wanted,
+                reversed: false,
+            })?;
+            let window = Window::front(self.request, counted_in(&summary));
+            return Ok(Selected {
+                summary,
+                window,
+                passes: 1,
+            });
+        }
+        let (summary, sample) = self.sampled()?;
+        let counted = counted_in(&summary);
+        let window = Window::of(self.request, counted);
+        if window.keep == 0 {
+            return Ok(Selected {
+                summary,
+                window,
+                passes: 1,
+            });
+        }
+        match self.paging.selection(column, window, counted) {
+            Selection::Heap => Ok(Selected {
+                summary: self.heaped(window)?,
+                window,
+                passes: 2,
+            }),
+            Selection::Sampled => match self.ranked(summary, sample, window)? {
+                Some(selected) => Ok(selected),
+                None => Ok(Selected {
+                    summary: self.heaped(window)?,
+                    window,
+                    passes: 3,
+                }),
+            },
+        }
+    }
+
+    /// One pass, keeping a heap of everything that can reach the window.
+    fn heaped(&self, window: Window) -> Result<Summary> {
         Ok(self.searcher.search(
             self.restricted,
             &PrimaryCollector {
-                sort: self.sort,
-                keep: self.window.keep,
-                reversed: self.window.reversed,
+                path: self.path,
+                sort: self.request.sort,
+                keep: window.keep,
+                reversed: window.reversed,
             },
         )?)
     }
 
-    /// Three passes that find the window by rank: one samples the order and counts the
-    /// match, one counts the documents between consecutive samples, and one keeps the
-    /// bucket the requested rank falls in plus a page beyond it. A bucket over the cap
-    /// costs more to hold than the heap does, so the heap answers instead and nothing
-    /// about the answer depends on the sample.
-    fn sampled(&self) -> Result<Option<(Summary, Window)>> {
-        let order = order_of(self.sort, self.window.reversed);
-        let every = self.paging.stride(self.counted);
+    /// The first pass of a rank selection: it counts and tallies the match and keeps every
+    /// stride-th row of it, which it hands back as the sample rather than as candidates, so
+    /// the summary it returns carries the total and the tallies and no rows at all. The stride comes from the size of the index
+    /// rather than the size of the match, which nothing has counted yet, so a bucket holds
+    /// about one stride of rows whatever the query selects.
+    fn sampled(&self) -> Result<(Summary, Vec<Retained>)> {
+        let indexed = usize::try_from(self.searcher.num_docs()).unwrap_or(usize::MAX);
         let mut summary = self.searcher.search(
             self.restricted,
             &SamplingCollector {
-                sort: self.sort,
-                every,
+                path: self.path,
+                sort: self.request.sort,
+                every: self.paging.stride(indexed),
             },
         )?;
         let sample = std::mem::take(&mut summary.candidates);
-        let boundaries = match (SortColumn::of(self.sort.key), summary.segments.len()) {
+        Ok((summary, sample))
+    }
+
+    /// The two passes that follow the sample: one counts the rows between consecutive
+    /// boundaries, and one keeps the bucket the requested rank falls in plus a page beyond
+    /// it. A bucket over the cap costs more to hold than the heap does, so the heap answers
+    /// instead and nothing about the answer depends on the sample.
+    fn ranked(
+        &self,
+        mut summary: Summary,
+        sample: Vec<Retained>,
+        window: Window,
+    ) -> Result<Option<Selected>> {
+        let sort = self.request.sort;
+        let order = order_of(sort, window.reversed);
+        let boundaries = match (SortColumn::of(sort.key), summary.segments.len()) {
             (SortColumn::Size | SortColumn::Used | SortColumn::Ident, _)
             | (SortColumn::Text, 0 | 1) => ranked_boundaries(sample, order),
             (SortColumn::Text, _) => spelled_boundaries(sample, &summary.segments, order)?,
@@ -1174,12 +1318,13 @@ impl<'a> Selecting<'a> {
         let counts = self.searcher.search(
             self.restricted,
             &BucketCollector {
-                sort: self.sort,
+                path: self.path,
+                sort,
                 boundaries: Arc::clone(&boundaries),
-                reversed: self.window.reversed,
+                reversed: window.reversed,
             },
         )?;
-        let (chosen, before) = bucket_of(&counts, self.window.skip as u64);
+        let (chosen, before) = bucket_of(&counts, window.skip as u64);
         if counts
             .get(chosen)
             .is_none_or(|held| *held > self.paging.bucket_cap as u64)
@@ -1190,25 +1335,32 @@ impl<'a> Selecting<'a> {
         summary.candidates = self.searcher.search(
             self.restricted,
             &WindowCollector {
-                sort: self.sort,
+                path: self.path,
+                sort,
                 from: chosen
                     .checked_sub(1)
                     .and_then(|index| boundaries.get(index))
                     .cloned(),
                 to: boundaries.get(chosen).cloned(),
-                keep: self.window.keep - self.window.skip,
-                reversed: self.window.reversed,
+                keep: window.keep - window.skip,
+                reversed: window.reversed,
             },
         )?;
-        Ok(Some((
+        Ok(Some(Selected {
             summary,
-            Window {
-                skip: self.window.skip - before,
-                keep: self.window.keep - before,
-                reversed: self.window.reversed,
+            window: Window {
+                skip: window.skip - before,
+                keep: window.keep - before,
+                reversed: window.reversed,
             },
-        )))
+            passes: 3,
+        }))
     }
+}
+
+/// The total one pass counted, as the number of rows a window is cut from.
+fn counted_in(summary: &Summary) -> usize {
+    usize::try_from(summary.total).unwrap_or(usize::MAX)
 }
 
 /// The page of a text key spread over several segments: each segment is bounded on its own
@@ -1266,13 +1418,6 @@ fn unknown_segment(segment: SegmentOrdinal) -> IndexError {
 /// The order a facet recount collects in. It never pages, so any total order will do.
 fn facet_sort() -> SortSpec {
     SortSpec::new(SortKey::Size, true)
-}
-
-fn collector(retain: bool) -> ArtifactCollector {
-    ArtifactCollector {
-        sort: facet_sort(),
-        retain,
-    }
 }
 
 /// The query restricted to the one document per artifact the build marked primary.
@@ -1383,7 +1528,8 @@ impl SegmentTallies {
 }
 
 /// Spells one dimension's ordinal tallies out and merges the segments that spelled the same
-/// string. The counting itself happened once, while the set was collected.
+/// string, most populous first. The counting itself happened once, while the set was
+/// collected.
 ///
 /// Only the base dimension carries labels, and [`SegmentTallies::labels`] is indexed by base
 /// ordinal, so whether a bucket may carry one is the dimension itself and not the caller's
@@ -1428,6 +1574,41 @@ fn count_buckets(summary: &Summary, dimension: usize) -> Result<Vec<FacetBucket>
         .collect();
     order_buckets(&mut buckets);
     Ok(buckets)
+}
+
+/// Which base buckets the rail counts before it ranks them: the most populous by exact
+/// term, and every family root among the rest that one of those extends.
+///
+/// A bucket is shown with the prefix rule's count, not the tally's, so a root carried by
+/// few artifacts but prefixing many is a larger bucket than its own tally says. Ranking on
+/// the tally alone would cut such a root before it was ever counted. Only a base the tally
+/// already holds is a candidate, so capping the rail can drop a bucket and never invent one.
+/// The extra candidates are themselves capped, so the searches a rail costs stay bounded by
+/// a constant.
+fn base_candidates(buckets: Vec<FacetBucket>) -> Vec<FacetBucket> {
+    if buckets.len() <= BASE_RAIL {
+        return buckets;
+    }
+    let mut kept = buckets;
+    let rest = kept.split_off(BASE_RAIL);
+    let mut extra = {
+        let roots: HashSet<&str> = kept
+            .iter()
+            .flat_map(|bucket| {
+                bucket
+                    .value
+                    .char_indices()
+                    .skip(1)
+                    .map(|(end, _)| &bucket.value[..end])
+            })
+            .collect();
+        rest.into_iter()
+            .filter(|bucket| roots.contains(bucket.value.as_str()))
+            .collect::<Vec<FacetBucket>>()
+    };
+    extra.truncate(BASE_RAIL);
+    kept.extend(extra);
+    kept
 }
 
 fn order_buckets(buckets: &mut [FacetBucket]) {
@@ -1780,13 +1961,12 @@ pub(super) fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
     }
 }
 
-/// What one matched document contributes to the counts: the five facet ordinals and the
-/// base label ordinal of the segment it sits in, so every dimension is tallied without
-/// spelling a term or reading the database. Nothing keeps one; a page is cut from
-/// [`Retained`] rows instead.
+/// What one row a pass kept contributes to the counts: the five facet ordinals and the base
+/// label ordinal of the segment it sits in, so every dimension is tallied without spelling a
+/// term or reading the database. Nothing keeps one; a page is cut from [`Retained`] rows
+/// instead, and the segment a hit was read in is the segment that tallies it.
 #[derive(Debug, Clone, Copy)]
 struct Hit {
-    segment: SegmentOrdinal,
     facets: [u64; FACET_COLUMNS.len()],
     base_label: u64,
 }
@@ -1804,31 +1984,108 @@ struct Retained {
     doc: DocId,
 }
 
-/// Keeps one row per artifact: the highest availability preference, and on a tie the lowest
-/// entry id, which is what the read API collapses to as well.
-fn collapse(rows: &mut Vec<Retained>) {
-    rows.sort_unstable_by(|left, right| {
-        left.artifact_id.cmp(&right.artifact_id).then_with(|| {
-            (right.preference, Reverse(right.entry_id))
-                .cmp(&(left.preference, Reverse(left.entry_id)))
-        })
-    });
-    rows.dedup_by_key(|row| row.artifact_id);
+/// Whether one entry of an artifact is the one a collapse keeps over another: the higher
+/// availability preference, and on a tie the lower entry id, which is what the read API and
+/// the `primary` mark both collapse to.
+#[inline]
+fn prefers(row: &Retained, over: &Retained) -> bool {
+    (row.preference, Reverse(row.entry_id)) > (over.preference, Reverse(over.entry_id))
 }
 
-/// The ordinals one retained row contributes to the counts, read back from the segment it
-/// was collected in.
-fn hit_of(row: Retained, segments: &[SegmentStrings]) -> tantivy::Result<Hit> {
-    let strings = segments.get(row.segment as usize).ok_or_else(|| {
-        tantivy::TantivyError::InvalidArgument(
-            "a collapsed row names a segment the search did not read".into(),
-        )
-    })?;
-    Ok(Hit {
-        segment: row.segment,
-        facets: std::array::from_fn(|dimension| strings.first_ord(dimension, row.doc)),
-        base_label: strings.first_ord(LABEL_COLUMN, row.doc),
-    })
+/// Where one segment's walk is inside the run it is folding.
+///
+/// The documents of one artifact are written as one writer group and stacked in order by a
+/// merge, so inside a segment they are a run of consecutive doc ids. A run closes when the
+/// artifact id changes and once more when the segment ends.
+#[derive(Default)]
+struct Run {
+    open: Option<i64>,
+    #[cfg(test)]
+    closed: HashSet<i64>,
+}
+
+impl Run {
+    /// Whether this document starts a run, which is to say that the one before it, if there
+    /// was one, has just closed.
+    #[inline]
+    fn opens(&mut self, artifact_id: i64) -> bool {
+        if self.open == Some(artifact_id) {
+            return false;
+        }
+        if let Some(closed) = self.open.replace(artifact_id) {
+            self.record(closed);
+        }
+        true
+    }
+
+    /// Closes the run the end of the segment ends.
+    fn close(&mut self) {
+        if let Some(closed) = self.open.take() {
+            self.record(closed);
+        }
+    }
+
+    /// Holds the run invariant, in unit tests only. An artifact whose documents are not one
+    /// run would be counted and tallied twice, which nothing downstream would show. A
+    /// `debug_assert` would not do: the scale harness is an integration test, compiled
+    /// against the library without `cfg(test)`, so this guard does not run there.
+    #[cfg(test)]
+    fn record(&mut self, artifact_id: i64) {
+        assert!(
+            self.closed.insert(artifact_id),
+            "artifact {artifact_id} closed twice; its documents are not one run"
+        );
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn record(&mut self, _artifact_id: i64) {}
+}
+
+/// Turns the documents one segment matched into the rows a pass counts and keeps.
+///
+/// On the primary path each matched document is already the one row its artifact
+/// contributes. On the collapsed path a pass matches every entry document, and folds each
+/// artifact's [`Run`] of them to the entry the page would show, so a pass holds one row
+/// rather than one row per matched entry.
+struct Collapsing {
+    path: QueryPath,
+    run: Run,
+    open: Option<Retained>,
+}
+
+impl Collapsing {
+    fn of(path: QueryPath) -> Self {
+        Self {
+            path,
+            run: Run::default(),
+            open: None,
+        }
+    }
+
+    /// The row this document yields now: itself on the primary path, and on the collapsed
+    /// path the artifact whose run it just ended, if it ended one.
+    #[inline]
+    fn offer(&mut self, row: Retained) -> Option<Retained> {
+        match self.path {
+            QueryPath::Primary => Some(row),
+            QueryPath::Collapse => match self.run.opens(row.artifact_id) {
+                true => self.open.replace(row),
+                false => {
+                    if self.open.as_ref().is_none_or(|open| prefers(&row, open)) {
+                        self.open = Some(row);
+                    }
+                    None
+                }
+            },
+        }
+    }
+
+    /// The artifact whose run the end of the segment closes.
+    fn close(&mut self) -> Option<Retained> {
+        self.run.close();
+        self.open.take()
+    }
 }
 
 /// The string columns of one segment, kept alive so an ordinal a hit carries can be spelled
@@ -2009,6 +2266,17 @@ pub(super) enum QueryPath {
     Collapse,
 }
 
+impl QueryPath {
+    /// The documents this path walks: the one document per artifact the build marked
+    /// primary, or every entry document the query matched.
+    fn restrict(self, fields: &Fields, query: Box<dyn Query>) -> Box<dyn Query> {
+        match self {
+            QueryPath::Primary => Box::new(only_primary(fields, query)),
+            QueryPath::Collapse => query,
+        }
+    }
+}
+
 /// What both collections hand to the facet, node and paging code, so each of those is
 /// written once: the total, the candidates that can reach the requested window, every
 /// segment's ordinal tallies, and the columns to spell them from. `tallies` is indexed by
@@ -2033,29 +2301,111 @@ impl FacetPass<'_> {
     /// The same collection over the query with one dimension's own key excluded. It keeps no
     /// candidates, because only the tallies are read from it.
     fn narrowed(&self, excluded: Box<dyn Query>) -> Result<Summary> {
-        Ok(match self.path {
-            QueryPath::Primary => self.searcher.search(
-                &only_primary(self.bound.fields, excluded),
-                &PrimaryCollector {
-                    sort: facet_sort(),
-                    keep: 0,
-                    reversed: false,
-                },
-            )?,
-            QueryPath::Collapse => self.searcher.search(excluded.as_ref(), &collector(false))?,
-        })
+        let restricted = self.path.restrict(self.bound.fields, excluded);
+        Ok(self.searcher.search(
+            restricted.as_ref(),
+            &PrimaryCollector {
+                path: self.path,
+                sort: facet_sort(),
+                keep: 0,
+                reversed: false,
+            },
+        )?)
     }
 
     /// How many artifacts one base bucket holds, which the prefix rule can settle only by
-    /// running that bucket's own query.
+    /// running that bucket's own query. A primary document stands for its artifact, so that
+    /// path counts documents; a collapsed one counts the runs, reading nothing but the
+    /// artifact id, because a count needs neither the tallies nor the row.
     fn count(&self, scoped: BooleanQuery) -> Result<u64> {
         Ok(match self.path {
             QueryPath::Primary => self
                 .searcher
                 .search(&only_primary(self.bound.fields, Box::new(scoped)), &Count)?
                 as u64,
-            QueryPath::Collapse => self.searcher.search(&scoped, &collector(true))?.total,
+            QueryPath::Collapse => self.searcher.search(&scoped, &CollapsedCount)?,
         })
+    }
+}
+
+/// How many artifacts a collapsed query matched, and nothing else.
+///
+/// [`PrimaryCollector`] answers the same number, but to do it it sizes a tally per facet
+/// column per segment, reads four fast fields for every matched entry document and six
+/// ordinals for every artifact it closes, and a bucket count reads none of that. The base
+/// rail runs one of these per bucket, so this reads the artifact id alone and counts the
+/// runs it opens.
+struct CollapsedCount;
+
+impl Collector for CollapsedCount {
+    type Fruit = u64;
+    type Child = CollapsedCountSegment;
+
+    fn for_segment(
+        &self,
+        _: SegmentOrdinal,
+        segment: &SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        Ok(CollapsedCountSegment {
+            artifact: segment.fast_fields().i64("artifact_id")?,
+            artifacts: Vec::new(),
+            run: Run::default(),
+            counted: 0,
+            invalid: false,
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn collect_segment(
+        &self,
+        weight: &dyn Weight,
+        ordinal: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> tantivy::Result<<Self::Child as SegmentCollector>::Fruit> {
+        blocked_segment(self, weight, ordinal, reader)
+    }
+
+    fn merge_fruits(&self, fruits: Vec<tantivy::Result<u64>>) -> tantivy::Result<Self::Fruit> {
+        fruits.into_iter().sum()
+    }
+}
+
+struct CollapsedCountSegment {
+    artifact: Column<i64>,
+    artifacts: Vec<Option<i64>>,
+    run: Run,
+    counted: u64,
+    invalid: bool,
+}
+
+impl SegmentCollector for CollapsedCountSegment {
+    type Fruit = tantivy::Result<u64>;
+
+    fn collect(&mut self, doc: DocId, _: Score) {
+        self.collect_block(&[doc]);
+    }
+
+    fn collect_block(&mut self, docs: &[DocId]) {
+        refill(&mut self.artifacts, docs.len());
+        self.artifact.first_vals(docs, &mut self.artifacts);
+        for index in 0..docs.len() {
+            let Some(artifact_id) = self.artifacts.get(index).copied().flatten() else {
+                self.invalid = true;
+                continue;
+            };
+            self.counted += u64::from(self.run.opens(artifact_id));
+        }
+    }
+
+    fn harvest(mut self) -> Self::Fruit {
+        self.run.close();
+        match self.invalid {
+            true => Err(missing_fast_fields()),
+            false => Ok(self.counted),
+        }
     }
 }
 
@@ -2195,11 +2545,29 @@ impl HitColumns {
         self.read_facets(docs, into);
     }
 
+    /// Reads one block for a pass that tallies the rows it keeps. A collapsed pass reads
+    /// the facets of the entry it chose out of the columns instead, once per artifact
+    /// rather than once per matched entry.
+    fn read_kept(&self, path: QueryPath, docs: &[DocId], into: &mut Block) {
+        match path {
+            QueryPath::Primary => self.read_block(docs, into),
+            QueryPath::Collapse => self.read_rows(docs, into),
+        }
+    }
+
     fn hit_at(&self, block: &Block, index: usize) -> Hit {
         Hit {
-            segment: self.ordinal,
             facets: std::array::from_fn(|dimension| ordinal_at(&block.facets[dimension], index)),
             base_label: ordinal_at(&block.base_label, index),
+        }
+    }
+
+    /// The ordinals of a row a collapsed run chose, which may sit in a block already read
+    /// past, so they are read out of the columns rather than out of the block.
+    fn hit_of(&self, row: &Retained) -> Hit {
+        Hit {
+            facets: std::array::from_fn(|dimension| self.strings.first_ord(dimension, row.doc)),
+            base_label: self.strings.first_ord(LABEL_COLUMN, row.doc),
         }
     }
 
@@ -2294,141 +2662,6 @@ fn missing_fast_fields() -> tantivy::TantivyError {
     tantivy::TantivyError::InvalidArgument(
         "search entry is missing required fast fields; rebuild the index".into(),
     )
-}
-
-/// What one segment harvests while collapsing: its ordinal, the row it kept per artifact and
-/// its string columns.
-struct SegmentHits {
-    ordinal: SegmentOrdinal,
-    retained: Vec<Retained>,
-    strings: SegmentStrings,
-}
-
-/// The collapsed collection: one row per artifact, tallied once that row is settled, and
-/// the candidates for the page when the caller asked to keep them. A facet pass keeps none,
-/// because only the tallies are read from it.
-struct ArtifactCollector {
-    sort: SortSpec,
-    retain: bool,
-}
-
-impl Collector for ArtifactCollector {
-    type Fruit = Summary;
-    type Child = ArtifactSegmentCollector;
-
-    fn for_segment(
-        &self,
-        ordinal: SegmentOrdinal,
-        segment: &SegmentReader,
-    ) -> tantivy::Result<Self::Child> {
-        Ok(ArtifactSegmentCollector {
-            columns: HitColumns::open(ordinal, segment, self.sort.key)?,
-            block: Block::default(),
-            retained: Vec::new(),
-            invalid: false,
-        })
-    }
-
-    fn requires_scoring(&self) -> bool {
-        false
-    }
-
-    fn collect_segment(
-        &self,
-        weight: &dyn Weight,
-        ordinal: SegmentOrdinal,
-        reader: &SegmentReader,
-    ) -> tantivy::Result<<Self::Child as SegmentCollector>::Fruit> {
-        blocked_segment(self, weight, ordinal, reader)
-    }
-
-    fn merge_fruits(
-        &self,
-        fruits: Vec<tantivy::Result<SegmentHits>>,
-    ) -> tantivy::Result<Self::Fruit> {
-        let harvested = fruits.into_iter().collect::<tantivy::Result<Vec<_>>>()?;
-        let count = harvested
-            .iter()
-            .map(|segment| segment.ordinal as usize + 1)
-            .max()
-            .unwrap_or(0);
-        let mut rows = Vec::with_capacity(harvested.iter().map(|hit| hit.retained.len()).sum());
-        let mut columns = Vec::with_capacity(harvested.len());
-        for segment in harvested {
-            let SegmentHits {
-                ordinal,
-                retained,
-                strings,
-            } = segment;
-            rows.extend(retained);
-            columns.push((ordinal, strings));
-        }
-        collapse(&mut rows);
-        let segments = segment_columns(columns, count)?;
-        let total = rows.len() as u64;
-        let mut tallies: Vec<SegmentTallies> =
-            segments.iter().map(SegmentTallies::sized_for).collect();
-        for row in &rows {
-            let hit = hit_of(*row, &segments)?;
-            let counted = tallies
-                .get_mut(hit.segment as usize)
-                .ok_or_else(missing_fast_fields)?;
-            if !counted.observe(&hit) {
-                return Err(missing_fast_fields());
-            }
-        }
-        let candidates = match self.retain {
-            true => rows,
-            false => Vec::new(),
-        };
-        Ok(Summary {
-            total,
-            candidates,
-            tallies,
-            segments,
-        })
-    }
-}
-
-struct ArtifactSegmentCollector {
-    columns: HitColumns,
-    block: Block,
-    retained: Vec<Retained>,
-    invalid: bool,
-}
-
-impl SegmentCollector for ArtifactSegmentCollector {
-    type Fruit = tantivy::Result<SegmentHits>;
-
-    fn collect(&mut self, doc: DocId, _: Score) {
-        self.collect_block(&[doc]);
-    }
-
-    fn collect_block(&mut self, docs: &[DocId]) {
-        self.columns.read_rows(docs, &mut self.block);
-        for index in 0..docs.len() {
-            match self.columns.retained_at(&self.block, index) {
-                Some(row) => self.retained.push(row),
-                None => self.invalid = true,
-            }
-        }
-    }
-
-    fn harvest(mut self) -> Self::Fruit {
-        if self.invalid {
-            return Err(missing_fast_fields());
-        }
-        collapse(&mut self.retained);
-        self.retained.shrink_to_fit();
-        let HitColumns {
-            ordinal, strings, ..
-        } = self.columns;
-        Ok(SegmentHits {
-            ordinal,
-            retained: self.retained,
-            strings,
-        })
-    }
 }
 
 /// One candidate while a segment keeps only the `keep` that come first. It orders by the
@@ -2546,6 +2779,7 @@ fn offer(heap: &mut BinaryHeap<Candidate>, keep: usize, order: Order, row: Retai
 /// requested window, the facet tallies and the node ordinals, none of which grows with the
 /// number of documents matched.
 struct PrimaryCollector {
+    path: QueryPath,
     sort: SortSpec,
     keep: usize,
     reversed: bool,
@@ -2566,6 +2800,7 @@ impl Collector for PrimaryCollector {
             keep: self.keep,
             counting: Counting::sized_for(&columns.strings),
             candidates: BinaryHeap::new(),
+            collapsing: Collapsing::of(self.path),
             invalid: false,
             block: Block::default(),
             columns,
@@ -2600,7 +2835,18 @@ struct PrimarySegmentCollector {
     keep: usize,
     counting: Counting,
     candidates: BinaryHeap<Candidate>,
+    collapsing: Collapsing,
     invalid: bool,
+}
+
+impl PrimarySegmentCollector {
+    #[inline]
+    fn tally(&mut self, row: Retained, hit: Hit) {
+        if !self.counting.observe(&hit) {
+            self.invalid = true;
+        }
+        offer(&mut self.candidates, self.keep, self.order, row);
+    }
 }
 
 impl SegmentCollector for PrimarySegmentCollector {
@@ -2611,23 +2857,29 @@ impl SegmentCollector for PrimarySegmentCollector {
     }
 
     fn collect_block(&mut self, docs: &[DocId]) {
-        self.columns.read_block(docs, &mut self.block);
+        let path = self.collapsing.path;
+        self.columns.read_kept(path, docs, &mut self.block);
         for index in 0..docs.len() {
             let Some(row) = self.columns.retained_at(&self.block, index) else {
                 self.invalid = true;
                 continue;
             };
-            if !self
-                .counting
-                .observe(&self.columns.hit_at(&self.block, index))
-            {
-                self.invalid = true;
-            }
-            offer(&mut self.candidates, self.keep, self.order, row);
+            let Some(kept) = self.collapsing.offer(row) else {
+                continue;
+            };
+            let hit = match path {
+                QueryPath::Primary => self.columns.hit_at(&self.block, index),
+                QueryPath::Collapse => self.columns.hit_of(&kept),
+            };
+            self.tally(kept, hit);
         }
     }
 
-    fn harvest(self) -> Self::Fruit {
+    fn harvest(mut self) -> Self::Fruit {
+        if let Some(kept) = self.collapsing.close() {
+            let hit = self.columns.hit_of(&kept);
+            self.tally(kept, hit);
+        }
         if self.invalid {
             return Err(missing_fast_fields());
         }
@@ -2652,6 +2904,7 @@ impl SegmentCollector for PrimarySegmentCollector {
 /// exactly as the bounded collection does, and keeps every `every`-th row as a boundary of
 /// the rank selection that follows.
 struct SamplingCollector {
+    path: QueryPath,
     sort: SortSpec,
     every: usize,
 }
@@ -2671,6 +2924,7 @@ impl Collector for SamplingCollector {
             seen: 0,
             counting: Counting::sized_for(&columns.strings),
             sample: Vec::new(),
+            collapsing: Collapsing::of(self.path),
             invalid: false,
             block: Block::default(),
             columns,
@@ -2705,7 +2959,21 @@ struct SamplingSegmentCollector {
     seen: usize,
     counting: Counting,
     sample: Vec<Retained>,
+    collapsing: Collapsing,
     invalid: bool,
+}
+
+impl SamplingSegmentCollector {
+    #[inline]
+    fn tally(&mut self, row: Retained, hit: Hit) {
+        if !self.counting.observe(&hit) {
+            self.invalid = true;
+        }
+        if self.seen.is_multiple_of(self.every) {
+            self.sample.push(row);
+        }
+        self.seen += 1;
+    }
 }
 
 impl SegmentCollector for SamplingSegmentCollector {
@@ -2716,26 +2984,29 @@ impl SegmentCollector for SamplingSegmentCollector {
     }
 
     fn collect_block(&mut self, docs: &[DocId]) {
-        self.columns.read_block(docs, &mut self.block);
+        let path = self.collapsing.path;
+        self.columns.read_kept(path, docs, &mut self.block);
         for index in 0..docs.len() {
             let Some(row) = self.columns.retained_at(&self.block, index) else {
                 self.invalid = true;
                 continue;
             };
-            if !self
-                .counting
-                .observe(&self.columns.hit_at(&self.block, index))
-            {
-                self.invalid = true;
-            }
-            if self.seen.is_multiple_of(self.every) {
-                self.sample.push(row);
-            }
-            self.seen += 1;
+            let Some(kept) = self.collapsing.offer(row) else {
+                continue;
+            };
+            let hit = match path {
+                QueryPath::Primary => self.columns.hit_at(&self.block, index),
+                QueryPath::Collapse => self.columns.hit_of(&kept),
+            };
+            self.tally(kept, hit);
         }
     }
 
-    fn harvest(self) -> Self::Fruit {
+    fn harvest(mut self) -> Self::Fruit {
+        if let Some(kept) = self.collapsing.close() {
+            let hit = self.columns.hit_of(&kept);
+            self.tally(kept, hit);
+        }
         if self.invalid {
             return Err(missing_fast_fields());
         }
@@ -2755,6 +3026,7 @@ impl SegmentCollector for SamplingSegmentCollector {
 /// the last boundary not after it, so the rank the window asks for is known without
 /// ordering anything but the sample.
 struct BucketCollector {
+    path: QueryPath,
     sort: SortSpec,
     boundaries: Arc<Vec<Boundary>>,
     reversed: bool,
@@ -2776,6 +3048,7 @@ impl Collector for BucketCollector {
             order,
             counts: vec![0; self.boundaries.len() + 1],
             boundaries: in_segment(&self.boundaries, ordinal, order),
+            collapsing: Collapsing::of(self.path),
             invalid: false,
         })
     }
@@ -2810,7 +3083,47 @@ struct BucketSegmentCollector {
     order: Order,
     boundaries: Vec<SegmentBoundary>,
     counts: Vec<u64>,
+    collapsing: Collapsing,
     invalid: bool,
+}
+
+impl BucketSegmentCollector {
+    #[inline]
+    fn place(&mut self, sort: u64, artifact_id: i64) {
+        let key = self.order.key(sort);
+        let bucket = self.boundaries.partition_point(|boundary| {
+            boundary.compare(self.order, key, artifact_id) != Ordering::Greater
+        });
+        if let Some(slot) = self.counts.get_mut(bucket) {
+            *slot += 1;
+        }
+    }
+
+    /// A ranked read is two fast fields per document; a collapsed pass needs the entry and
+    /// the preference the fold chooses by as well.
+    fn collect_ranked(&mut self, docs: &[DocId]) {
+        self.columns.read_ranked(docs, &mut self.block);
+        for index in 0..docs.len() {
+            let Some((sort, artifact_id)) = self.columns.ranked_at(&self.block, index) else {
+                self.invalid = true;
+                continue;
+            };
+            self.place(sort, artifact_id);
+        }
+    }
+
+    fn collect_collapsed(&mut self, docs: &[DocId]) {
+        self.columns.read_rows(docs, &mut self.block);
+        for index in 0..docs.len() {
+            let Some(row) = self.columns.retained_at(&self.block, index) else {
+                self.invalid = true;
+                continue;
+            };
+            if let Some(kept) = self.collapsing.offer(row) {
+                self.place(kept.sort, kept.artifact_id);
+            }
+        }
+    }
 }
 
 impl SegmentCollector for BucketSegmentCollector {
@@ -2821,23 +3134,16 @@ impl SegmentCollector for BucketSegmentCollector {
     }
 
     fn collect_block(&mut self, docs: &[DocId]) {
-        self.columns.read_ranked(docs, &mut self.block);
-        for index in 0..docs.len() {
-            let Some((sort, artifact_id)) = self.columns.ranked_at(&self.block, index) else {
-                self.invalid = true;
-                continue;
-            };
-            let key = self.order.key(sort);
-            let bucket = self.boundaries.partition_point(|boundary| {
-                boundary.compare(self.order, key, artifact_id) != Ordering::Greater
-            });
-            if let Some(slot) = self.counts.get_mut(bucket) {
-                *slot += 1;
-            }
+        match self.collapsing.path {
+            QueryPath::Primary => self.collect_ranked(docs),
+            QueryPath::Collapse => self.collect_collapsed(docs),
         }
     }
 
-    fn harvest(self) -> Self::Fruit {
+    fn harvest(mut self) -> Self::Fruit {
+        if let Some(kept) = self.collapsing.close() {
+            self.place(kept.sort, kept.artifact_id);
+        }
         match self.invalid {
             true => Err(missing_fast_fields()),
             false => Ok(self.counts),
@@ -2849,6 +3155,7 @@ impl SegmentCollector for BucketSegmentCollector {
 /// counted and found small enough to hold, plus a heap of at most one page beyond it. Those
 /// two together are everything the page can be cut from.
 struct WindowCollector {
+    path: QueryPath,
     sort: SortSpec,
     from: Option<Boundary>,
     to: Option<Boundary>,
@@ -2878,6 +3185,7 @@ impl Collector for WindowCollector {
             keep: self.keep,
             inside: Vec::new(),
             beyond: BinaryHeap::new(),
+            collapsing: Collapsing::of(self.path),
             invalid: false,
         })
     }
@@ -2917,7 +3225,29 @@ struct WindowSegmentCollector {
     keep: usize,
     inside: Vec<Retained>,
     beyond: BinaryHeap<Candidate>,
+    collapsing: Collapsing,
     invalid: bool,
+}
+
+impl WindowSegmentCollector {
+    #[inline]
+    fn place(&mut self, row: Retained) {
+        let key = self.order.key(row.sort);
+        let before = self.from.as_ref().is_some_and(|from| {
+            from.compare(self.order, key, row.artifact_id) == Ordering::Greater
+        });
+        if before {
+            return;
+        }
+        match self
+            .to
+            .as_ref()
+            .is_some_and(|to| to.compare(self.order, key, row.artifact_id) != Ordering::Greater)
+        {
+            true => offer(&mut self.beyond, self.keep, self.order, row),
+            false => self.inside.push(row),
+        }
+    }
 }
 
 impl SegmentCollector for WindowSegmentCollector {
@@ -2934,25 +3264,16 @@ impl SegmentCollector for WindowSegmentCollector {
                 self.invalid = true;
                 continue;
             };
-            let key = self.order.key(row.sort);
-            let before = self.from.as_ref().is_some_and(|from| {
-                from.compare(self.order, key, row.artifact_id) == Ordering::Greater
-            });
-            if before {
-                continue;
-            }
-            match self
-                .to
-                .as_ref()
-                .is_some_and(|to| to.compare(self.order, key, row.artifact_id) != Ordering::Greater)
-            {
-                true => offer(&mut self.beyond, self.keep, self.order, row),
-                false => self.inside.push(row),
+            if let Some(kept) = self.collapsing.offer(row) {
+                self.place(kept);
             }
         }
     }
 
     fn harvest(mut self) -> Self::Fruit {
+        if let Some(kept) = self.collapsing.close() {
+            self.place(kept);
+        }
         if self.invalid {
             return Err(missing_fast_fields());
         }
@@ -2979,9 +3300,9 @@ mod tests {
     use crate::search::{SortKey, SortSpec};
 
     use super::{
-        ArtifactSegmentCollector, BASE_FIELD, Block, Counting, FACET_COLUMNS, FORMAT_FIELD, Fields,
-        HASH_FIELD, HitColumns, KEYWORD_FIELDS, LABEL_COLUMN, NO_TERM, NODE_FIELD, ORG_FIELD,
-        Order, PRECISION_FIELD, Paging, PrimaryCollector, PrimarySegmentCollector, REPO_FIELD,
+        BASE_FIELD, Block, Collapsing, Counting, FACET_COLUMNS, FORMAT_FIELD, Fields, HASH_FIELD,
+        HitColumns, KEYWORD_FIELDS, LABEL_COLUMN, NO_TERM, NODE_FIELD, ORG_FIELD, Order,
+        PRECISION_FIELD, Paging, PrimaryCollector, PrimarySegmentCollector, QueryPath, REPO_FIELD,
         REVISION_FIELD, ROLE_FIELD, Retained, SAMPLE_FLOOR, SOURCE_FIELD, STATE_FIELD,
         SUB_ROLE_FIELD, SegmentBoundary, Selection, SortColumn, TRIGGER_FIELD, WRITER_BUDGET,
         Window, bucket_of, order_of, ordinal_key,
@@ -3032,7 +3353,7 @@ mod tests {
         index
     }
 
-    fn tallying(segment: &SegmentReader, keep: usize) -> PrimarySegmentCollector {
+    fn walking(segment: &SegmentReader, path: QueryPath, keep: usize) -> PrimarySegmentCollector {
         let columns =
             HitColumns::open(0, segment, SortKey::Size).expect("the segment opens its columns");
         PrimarySegmentCollector {
@@ -3040,26 +3361,21 @@ mod tests {
             keep,
             counting: Counting::sized_for(&columns.strings),
             candidates: BinaryHeap::new(),
+            collapsing: Collapsing::of(path),
             invalid: false,
             block: Block::default(),
             columns,
         }
     }
 
+    fn tallying(segment: &SegmentReader, keep: usize) -> PrimarySegmentCollector {
+        walking(segment, QueryPath::Primary, keep)
+    }
+
     /// The sort every collector in these tests is built with, so a collector driven by hand
     /// and one driven through `collect_segment` are comparable.
     fn by_size() -> SortSpec {
         SortSpec::new(SortKey::Size, true)
-    }
-
-    fn collapsing(segment: &SegmentReader) -> ArtifactSegmentCollector {
-        ArtifactSegmentCollector {
-            columns: HitColumns::open(0, segment, SortKey::Size)
-                .expect("the segment opens its columns"),
-            block: Block::default(),
-            retained: Vec::new(),
-            invalid: false,
-        }
     }
 
     fn delete_artifact(index: &Index, artifact_id: i64) {
@@ -3135,19 +3451,69 @@ mod tests {
         let segment = searcher.segment_reader(0);
         let docs: Vec<DocId> = (0..rows.len() as DocId).collect();
 
-        let mut single = collapsing(segment);
+        let mut single = walking(segment, QueryPath::Collapse, rows.len());
         for doc in &docs {
             single.collect(*doc, 0.0);
         }
-        let mut blocked = collapsing(segment);
+        let mut blocked = walking(segment, QueryPath::Collapse, rows.len());
         for block in docs.chunks(3) {
             blocked.collect_block(block);
         }
 
         let single = single.harvest().expect("the per-document harvest succeeds");
         let blocked = blocked.harvest().expect("the per-block harvest succeeds");
-        assert_eq!(single.retained.len(), rows.len());
-        assert_eq!(ordered(blocked.retained), ordered(single.retained));
+        assert_eq!(
+            single.counting.count,
+            rows.len() as u64,
+            "every row of the fixture is an artifact of its own"
+        );
+        assert_eq!(blocked.counting.count, single.counting.count);
+        assert_eq!(blocked.counting.tallies, single.counting.tallies);
+        assert_eq!(ordered(blocked.candidates), ordered(single.candidates));
+    }
+
+    fn retained(artifact_id: i64, entry_id: i64, preference: i64) -> Retained {
+        Retained {
+            artifact_id,
+            entry_id,
+            preference,
+            sort: 0,
+            segment: 0,
+            doc: entry_id as DocId,
+        }
+    }
+
+    #[test]
+    fn a_collapsed_fold_emits_one_row_per_run_with_the_preferred_entry() {
+        let mut fold = Collapsing::of(QueryPath::Collapse);
+        assert_eq!(fold.offer(retained(1, 9, 1)), None);
+        assert_eq!(fold.offer(retained(1, 5, 3)), None);
+        assert_eq!(
+            fold.offer(retained(1, 7, 3)),
+            None,
+            "an equal preference does not displace the lower entry id"
+        );
+        assert_eq!(
+            fold.offer(retained(2, 4, 0)),
+            Some(retained(1, 5, 3)),
+            "the run closes on the artifact that follows it"
+        );
+        assert_eq!(fold.offer(retained(3, 8, 2)), Some(retained(2, 4, 0)));
+        assert_eq!(fold.offer(retained(3, 2, 2)), None);
+        assert_eq!(
+            fold.close(),
+            Some(retained(3, 2, 2)),
+            "the last run closes with the segment"
+        );
+        assert_eq!(fold.close(), None);
+    }
+
+    #[test]
+    fn a_primary_fold_holds_nothing_and_emits_every_document() {
+        let mut fold = Collapsing::of(QueryPath::Primary);
+        assert_eq!(fold.offer(retained(1, 9, 1)), Some(retained(1, 9, 1)));
+        assert_eq!(fold.offer(retained(1, 5, 3)), Some(retained(1, 5, 3)));
+        assert_eq!(fold.close(), None);
     }
 
     #[test]
@@ -3175,6 +3541,7 @@ mod tests {
             .weight(EnableScoring::disabled_from_searcher(&searcher))
             .expect("an unscored weight opens");
         let driven = PrimaryCollector {
+            path: QueryPath::Primary,
             sort: by_size(),
             keep: 3,
             reversed: false,

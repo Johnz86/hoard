@@ -325,6 +325,11 @@ fn native_catalog_at_scale() {
     let (_, collapse_time) = timed(|| run("node:self", 0));
     let rss_after_collapse = peak_rss_kb();
     let resident_over_queries = current_rss_kb();
+    let rss_at_collapse_pages = current_rss_kb();
+    let (_, collapse_middle_time) = timed(|| run("node:self", midpoint));
+    let (_, collapse_deep_time) = timed(|| run("node:self", deep_offset));
+    let resident_over_collapse = current_rss_kb();
+    let rss_after_collapse_pages = peak_rss_kb();
 
     let subject = first
         .rows
@@ -435,6 +440,14 @@ fn native_catalog_at_scale() {
         ("query role:lora with facets", format!("{lora_time:?}")),
         ("query filtered", format!("{filtered_time:?}")),
         ("query node:self with facets", format!("{collapse_time:?}")),
+        (
+            "query node:self midpoint offset",
+            format!("{collapse_middle_time:?}"),
+        ),
+        (
+            "query node:self deep offset",
+            format!("{collapse_deep_time:?}"),
+        ),
         ("role:lora artifacts", loras.total.to_string()),
         ("facet dimensions counted", facet_summary(&loras.facets)),
         ("inspector artifact_detail", format!("{detail_time:?}")),
@@ -456,6 +469,10 @@ fn native_catalog_at_scale() {
             "resident rss over the midpoint queries",
             kb_between(rss_at_midpoints, resident_over_midpoints),
         ),
+        (
+            "resident rss over the collapse queries",
+            kb_between(rss_at_collapse_pages, resident_over_collapse),
+        ),
         ("rescan wall (1,000 changed)", format!("{rescan_time:?}")),
         ("rescan report", format!("{rescanned:?}")),
         ("refresh wall", format!("{refresh_time:?}")),
@@ -467,7 +484,7 @@ fn native_catalog_at_scale() {
         ),
         (
             "peak rss growth during rescan and refresh",
-            kb_between(rss_after_collapse, rss_after_refresh),
+            kb_between(rss_after_collapse_pages, rss_after_refresh),
         ),
         ("on disk after churn, apparent", bytes(churned_apparent)),
         ("on disk after churn, allocated", bytes(churned_allocated)),

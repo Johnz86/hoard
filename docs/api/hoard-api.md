@@ -40,6 +40,13 @@ parquet arrow jsonl csv readme config unknown`.
 }
 ```
 
+`facets.base` carries at most 32 buckets. A bucket's `count` is the prefix-rule count,
+which is how many artifacts the query the bucket opens answers, so a family bucket counts
+the versions under it. The 32 are the largest by that count among the most populous bases by
+exact term together with the family roots those bases extend, so a root that few artifacts
+carry exactly but many extend is on the rail. A base outside the 32 is not shown and is not
+marked active, and a query naming it still answers.
+
 `shard_count` is how many files the model spans: a checkpoint split into
 `model-00001-of-00040.safetensors` and its siblings is one row whose `size` is the whole
 model, not forty unclassifiable rows. `path_count` stays per file, because deduplication

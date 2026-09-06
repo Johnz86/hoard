@@ -183,39 +183,58 @@ matched rather than fixed before filtering.
 One document per artifact carries a `primary` mark: the entry a row would be assembled from,
 which is the highest availability preference and on a tie the lowest entry id. A query that
 filters and sorts only on fields every entry of an artifact agrees on is intersected with
-that mark and needs no collapse. That path selects its window one of two ways, and both
-count every matched document once and tally it into every facet dimension once.
+that mark and needs no collapse.
 
-For M matched documents and K equal to offset plus limit, a window with K at most 16,384 for
-a term key, or 131,072 for a numeric one, is answered by one pass that keeps a heap of the K
-rows that can reach it: O(M) time and O(K) memory per segment, plus one tally slot per term
-of each facet column's dictionary in each segment, and page selection O(K log K). Both
+A query that does collapse walks every matching entry document instead, and folds them as it
+goes. The documents of one artifact are added as one writer group, which tantivy flushes into
+one segment, and a merge stacks each segment's live documents in order, so inside a segment
+an artifact's documents are a run of consecutive doc ids. `Collapsing` holds the best entry
+of the open run and emits one row when the artifact id changes, and once more when the
+segment ends, so every collector downstream sees one row per artifact and none of them holds
+a row per matched entry. `QueryPath` names which of the two a collector walks and the
+fold is the other arm of every one of them, so both paths select, sample, bucket, tally and
+page through the same code, and both count every artifact once and tally it into every facet
+dimension once.
+
+The window is decided by the pass that counts it; nothing counts the match in a pass of its
+own.
+
+For A matched artifacts and K equal to offset plus limit, a window with K at most 16,384 for
+a term key, or 131,072 for a numeric one, is **one pass**: it keeps a heap of the K rows at
+the front of the order and reports the total, which is what the window is then cut by. That
+is O(M) time over M matched documents and O(K) memory per segment, plus one tally slot per
+term of each facet column's dictionary in each segment, and page selection O(K log K). Both
 constants are measured, in "Thresholds" below; they differ because the heap of a term key
 spells a term for every row it holds and a numeric key only compares integers.
 
-A deeper window is found by rank instead, in three passes. The first counts and tallies the
-match and keeps every S-th matched row's sort key, for a sample S of about the square root of
-M, floored at 64 and capped at 4,096; the second counts the matched documents between
-consecutive sampled keys; the third keeps the documents of the one bucket that holds the
-requested rank, plus a heap of one page beyond it. That is O(M log S) time and
-O(S + B + limit) memory for a bucket B capped at 65,536. The square root is where the two
-costs meet: mapping a boundary into a segment costs a dictionary seek, so the second pass
-starts at O(S x segments), and the bucket the third pass reads holds about M/S rows. The
-stride is forced odd, because a stride sharing a factor with a period in the order documents
-were written samples only some residues of that period and leaves whole runs of equal keys
-with no boundary between them.
+A deeper window starts with the sampling pass, which counts and tallies the match and keeps
+every S-th row's sort key. With the total in hand the window is placed: one nearer either end
+than the shallow bound is answered by a second pass keeping a heap of the reversed order, and
+one in the middle by two more, the first counting the rows between consecutive sampled keys
+and the second keeping the rows of the one bucket that holds the requested rank plus a heap
+of one page beyond it. That is two or three passes, O(M log S) time and O(S + B + limit)
+memory for a bucket B capped at 65,536.
+
+The stride S is about the square root of the number of documents the index holds, floored at
+64 boundaries and capped at 4,096. It comes from the index rather than from the match because
+nothing has counted the match when the sampling pass starts, and it bounds what matters
+either way: a bucket holds about one stride of rows however selective the query is, and the
+boundaries a document is placed against are the match divided by the stride, so never more
+than the square root of the index. The square root is where the two costs meet: mapping a
+boundary into a segment costs a dictionary seek, so the counting pass starts at
+O(S x segments). The stride is forced odd, because a stride sharing a factor with a period in
+the order documents were written samples only some residues of that period and leaves whole
+runs of equal keys with no boundary between them.
 
 A bucket over the cap costs more to hold than the heap does, so the heap answers the request
 instead and nothing about the answer depends on the sample. Either way, a window nearer the
-far end is cut from the reversed order, so the deepest window either selection sees is half
+far end is cut from the reversed order, so the deepest window a rank selection sees is half
 the match.
 
 A query naming `node`, `state`, `source`, `repo`, `rev` or `hash`, or sorting on revision,
 node or state, still collapses, because those fields differ between the entries of one
-artifact. Collapse retains one small candidate per matching artifact per segment and then
-combines segment results: O(M) time and O(A) memory per segment for A matched artifacts, with
-page selection O(A + K log K). Deep pagination and broad queries on that path still require
-memory proportional to matching artifacts.
+artifact. It runs the same selections over folded rows, so its memory is the page and the
+sample exactly as the primary path's is; the fold costs one open row per segment.
 
 Keyword columns are string fast fields and the collectors keep **term ordinals**, not terms.
 Ordinals are lexicographic inside a segment and meaningless across segments, so a page
@@ -241,9 +260,11 @@ Documents are read **a block at a time**. A collector that takes no score is dri
 `for_each_no_score`, which hands `collect_block` up to 64 documents at once, so each column
 is asked once per block through `Column::first_vals` into a buffer the segment collector
 reuses, rather than once per document per column. `collect` is one block of one document, so
-there is one path. All five collectors read this way: the two that tally read the facet
-ordinals and the base label as well as the row, the collapse and window collectors read the
-row alone, and the bucket collector reads only the sort key and the artifact id.
+there is one path. All four collectors read this way: the two that tally read the facet
+ordinals and the base label as well as the row on the primary path, and on the collapsed one
+read the row alone and take the chosen entry's ordinals out of the columns once the run
+closes; the window collector reads the row alone, and the bucket collector reads only the
+sort key and the artifact id where it does not have to fold.
 
 Every collector overrides `Collector::collect_segment`, because tantivy's own
 `default_collect_segment_impl` drops to one `collect` per document as soon as a segment has a
@@ -255,8 +276,15 @@ accumulates, and slower than what it replaced.
 `Catalog::query` answers a whole index screen: the page in any of the ten sort orders, the
 distinct artifact and node totals, and the five facet dimensions. Each dimension is counted
 over the query with its own key excluded, so clicking a bucket never collapses the rail it
-was clicked in; `base` buckets are counted by running each bucket's own query, because the
-prefix rule does not group.
+was clicked in. The `base` rail is at most 32 buckets, each counted by running its own query,
+because the prefix rule that groups base labels cannot be answered from the tally. The
+candidates are the most populous bases by exact term plus every family root among the rest
+that one of them extends, since a root carried by few artifacts but prefixing many is a
+larger bucket than its tally says; the whole candidate set is counted and then cut to 32 by
+that count. Only a base the tally already holds is a candidate, so the cap drops buckets and
+never invents one, and the candidate set is bounded, so the searches one query pays for the
+rail do not grow with the number of bases the catalog holds. A collapsed query counts a
+bucket by folding the artifact id alone, with no tallies and no row.
 
 Free text indexes names, organizations, bases, triggers, tensor key prefixes and the body of
 the shallowest README in each revision. Tantivy uses one writer thread with a 32 MiB indexing
@@ -874,23 +902,31 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
 
 ## Remaining work
 
-- **A primary query counts its match twice.** `Selecting::of` runs a `Count` search to learn
-  the total before `Window::of` can say which slice of the order was asked for, and the
-  tallying pass that follows counts the same documents again in `Counting::count`. Now that a
-  tallying pass costs about what a counting pass costs, that first pass is about half of what
-  a shallow primary query spends: 21.1 ms at 1M for the two passes over a match of a million
-  documents. A sampled selection pays it as one of four passes. Removing it means the window
-  deciding what it needs after the collection rather than before, which is a change to
-  `Selecting` and `Window`, not to the collectors. This is the largest cost left on the
-  primary path.
-- **`Catalog::facets` runs one `Count` search per distinct base value in the answer**, with
-  no cap. The prefix rule that groups base labels means the exact-term count the tally holds
-  is not the count a click on that bucket produces, so each bucket is counted by running its
-  own query. `Base` is open ended, so the number of buckets is bounded by what the catalog
-  holds and not by its size: at 200 distinct bases that is 200 extra searches per request. The
-  synthetic tree carries three bases, so nothing measured here exercises it. The two ways out
-  are named under "Decisions someone has to take" in `docs/handoff.md`; neither is an
-  implementation detail.
+- **A shallow window is never cut from the far end.** The pass that counts a shallow window
+  is the pass that keeps it, and nothing knows the total before it runs, so the heap holds
+  the `offset + limit` rows at the front of the order where the count-first selection held
+  the `total - offset` rows at the back. A page just inside the shallow bound and past the
+  middle of a small result therefore holds more than it did: at most the shallow constant,
+  16,384 rows for a term key and 131,072 for a numeric one, against the two dozen a reversed
+  heap would have held. The UI's cursor advances by `offset + limit`, so reaching such an
+  offset means paging there or forging a cursor. Accepted as the price of dropping the
+  `Count` pass, which every query paid. The fix, if a measurement ever asks for it, is to run
+  the `Count` only when the offset is above some fraction of the shallow bound, so the
+  common page keeps its one pass and the deep one buys its reversal.
+- **The index writer's pipeline is bounded in artifacts, not documents.** `build_index` and
+  `refresh_search` send one `IndexWriter::run` group per artifact, which is what puts an
+  artifact's documents in one segment and lets the query path fold them as a run. tantivy's
+  operation channel is `bounded(PIPELINE_MAX_SIZE_IN_DOCS)`, 10,000 items, and an item was
+  one document and is now one artifact's whole set, so the documents in flight ahead of the
+  indexing thread scale with entries per artifact times the size of a document, which the
+  revision card dominates. The synthetic tree has few entries per artifact and a small card,
+  so the harness cannot show this; read the rebuild RSS row with it in mind.
+- **A collapsed pass reads a chosen row's facet ordinals one document at a time.** The
+  primary path reads the five facet columns and the base label per block through
+  `first_vals`; `HitColumns::hit_of` reads them per artifact through `first_ord` instead,
+  because the entry a run chose may sit in a block already read past. It is six column reads
+  per artifact rather than per matched entry, which is what the collapse cost before the
+  fold, so it is not a regression. Left as it is.
 - **A tally holds a slot per term of the column, not per term the match used.**
   `SegmentTallies::sized_for` allocates `num_terms()` slots per facet dimension per segment,
   which is eight bytes per base value per segment whether the query matched it or not. The
@@ -899,20 +935,12 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
   allocated per value matched, and the review put the zeroing alone at about 12 ms per
   request at that cardinality. It is below the noise at any plausible base count today; it is
   the trade the vector makes and the number to watch if base cardinality ever grows.
-- **The base facet runs one query per distinct base value.** The prefix rule that groups base
-  labels cannot be answered from ordinals, so `facets` re-runs each bucket's own query to
-  count it. The synthetic tree carries three bases, so no measurement here exercises it; a
-  catalog with hundreds of bases pays hundreds of searches per query.
 - **The cap's fallback recollects rather than reusing the sampling pass.** When the chosen
   bucket is over 65,536 rows the heap answers the whole request, and the tallies and node set
   the sampling pass already computed are dropped and computed again. It is accepted as it
   stands: reaching it needs a bucket that dodged every sample slot, which the odd stride
   makes improbable, and the alternative is a second way to assemble a `Summary` for a path
   that should not run.
-- **Bound the collapse the way the primary path is bounded.** A query naming `node:`,
-  `state:`, `source:`, `repo:`, `rev:` or `hash:`, or sorting on revision, node or state,
-  still keeps one row per matching artifact rather than one per page. At 1M `node:self` is
-  352 to 439 ms, under the 500 ms threshold rather than bounded by design.
 - **Shrink `ArtifactDetail` further.** It is 497.00 MiB of 1,421,844,480 bytes at 1M, 35.0
   per cent of `catalog.redb` and the largest table by a wide margin, of which 217.01 MiB is
   B-tree fill factor rather than payload. LZ4 takes 75 per cent off a row carrying a real

@@ -25,8 +25,8 @@ first; this document assumes it.
 - Phases 0 to 11 are done. `docs/feature-plan.md` holds the table. The TREE and DISK views
   are not an unfinished phase: they wait on a design decision and are recorded under that
   document's "Risks and open decisions".
-- At the head of `master` after the live-rescan wave all four checks pass:
-  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 816 passed,
+- At the head of `master` after the query-bounds wave all four checks pass:
+  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 823 passed,
   0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness
   and its supplemental fixture, the mDNS test that needs a multicast route and the sniffer
   test that reads the local model caches. `cargo doc --workspace --no-deps` emits no warning.
@@ -134,19 +134,24 @@ Performance, with the numbers from `docs/native-catalog.md`:
   bitset themselves. Before that override the midpoint after a refresh sat 24.2 ms above the
   plain midpoint at 1M against 4.6 ms before the wave; with it, 4.7 ms. A new collector in
   this file must override `collect_segment` the same way or it silently falls back.
-- **A primary query still counts its match twice.** `Selecting::of` runs a `Count` search so
-  `Window::of` can say which slice of the order was asked for, and the tallying pass that
-  follows counts the same documents again. That first pass is now about half of what a
-  shallow primary query spends, and it is the largest cost left on the primary path. Removing
-  it means the window deciding what it needs after the collection rather than before, which
-  is a change to `Selecting` and `Window`, not to the collectors.
-- **The collapse-path queries are under the 500 ms target without being bounded.**
-  `node:self` is 352 to 439 ms at 1M; any query naming `node:`, `state:`, `source:`,
-  `repo:`, `rev:` or `hash:`, or sorting on revision, node or state, takes the same path and
-  still keeps one row per matching artifact rather than one per page. The primary path is
-  bounded above the window caps and is the model to follow; below them the sampled selection
-  falls back to the heap on purpose, so "paging is bounded" is a claim about the deep pages
-  the caps cover, not about every page.
+- **Every query path is bounded by the page and the sample as of wave 4, and the numbers are
+  not in yet.** The collapse path folds each artifact's run of entry documents inside the
+  segment collectors instead of retaining a row per matching artifact, a primary query no
+  longer counts its match in a pass of its own, and the base rail is capped. The final
+  measurement of the run is what says what that bought. The harness carries the rows for it:
+  `query node:self midpoint offset`, `query node:self deep offset` and `resident rss over the
+  collapse queries` were added in wave 4 and have never been run, so wave 8 reports them
+  against nothing. The first, last and middle primary pages are the rows that should move for
+  the pass count.
+- **Two things wave 4 traded, both recorded in `docs/native-catalog.md` under "Remaining
+  work".** A shallow window is no longer cut from the far end, because the pass that counts
+  it is the pass that keeps it, so a page just inside the shallow bound and past the middle
+  of a small result holds `offset + limit` rows rather than `total - offset`; it is bounded
+  by the shallow constant and the fix is named there. And the index writer now sends one
+  operation group per artifact rather than per document, which is what makes an artifact's
+  documents one run in one segment, so tantivy's 10,000-item pipeline now buffers 10,000
+  artifacts' documents rather than 10,000 documents; the synthetic tree cannot show it, and
+  wave 8 should read the rebuild RSS row knowing it.
 - **The usage views are O(rows of the repository).** The client count the USAGE tab shows is
   a claim about every pull the repository ever served, so bounding the chart alone would not
   bound the route: 20,000 rows cost 9.1 ms. It needs a maintained count, not a bound.
@@ -206,14 +211,14 @@ Decisions taken on 2026-09-06, by the project owner:
   before either can be implemented and are a risk rather than a phase. Phase 11's storage replacement is complete; the optimisation
   that continues is a list of follow-ups with their own acceptance criteria under `### Phase
   11`. **Done in this wave.**
-- **How should the base facet be counted?** Still open, and still not an implementer's call.
-  `Catalog::facets` runs one `Count` search per distinct base value in the answer, uncapped,
-  because the prefix rule that groups base labels means the exact-term count the tally already
-  holds is not what a click on that bucket produces. `Base` is open ended, so the bucket count
-  is bounded by what the catalog holds rather than by its size: at 200 distinct bases that is
-  200 extra searches per request. Either the rail is truncated to the top N buckets by tally
-  before the per-bucket count is run, which changes what the UI shows, or the prefix rule is
-  answered from ordinals, which changes what a base bucket means.
+- **How should the base facet be counted?** Taken by default in wave 4: the rail is
+  truncated to the 32 most populous bases by tally before the per-bucket count runs, so the
+  searches a query pays for the rail are bounded by a constant rather than by how many bases
+  the catalog holds. The prefix rule is unchanged, so a bucket's count is still what a click
+  on it answers; a base outside the 32 is not shown and is not marked active, and a query
+  naming it still answers. `docs/api/hoard-api.md` says so. Answering the prefix rule from
+  ordinals, which would change what a base bucket means, remains the other way out and is
+  still not an implementer's call. **Taken in wave 4.**
 
 Smaller things, each verified:
 

@@ -367,6 +367,8 @@ store that already works, not the remainder of the phase.
 
 - Bounded collapse. Accept: every query that takes the collapse path answers under 500 ms at
   1M with memory bounded by the page and the sample, as the primary path already is.
+  Implemented in wave 4, which folds each artifact's run of entry documents inside the
+  segment collectors; the acceptance is the final measurement's job in wave 8.
 - Power-loss and process-kill recovery tests. Accept: a catalog killed mid-scan reopens and
   rescans to the same counts a clean run gives.
 - Byte-exact path identities, so an identity is the path's bytes rather than its lossy string.

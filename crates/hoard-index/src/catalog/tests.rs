@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,12 +22,13 @@ use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, LocationKey,
     Manifest, Node, Placement, Repository, RepositoryKey, SearchChange, Shelf, Source,
 };
-use super::search::{Paging, QueryPath};
+use super::scan::preference;
+use super::search::{Cost, Paging, QueryPath};
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::{
-    Catalog, DigestApplied, FORMAT_VERSION, JobProgress, JobState, MIRROR_SOURCE, NewProjection,
-    PullMark, PulledFile, QueryPage, QueryRequest, RemoteEntry, RepositoryDetail, RepositoryFilter,
-    RescanReport, ServedFile, UsageEvent, builder, models, query,
+    Catalog, DigestApplied, EntryDetail, FORMAT_VERSION, JobProgress, JobState, MIRROR_SOURCE,
+    NewProjection, PullMark, PulledFile, QueryPage, QueryRequest, RemoteEntry, RepositoryDetail,
+    RepositoryFilter, RescanReport, ServedFile, UsageEvent, builder, models, query,
 };
 
 fn running_as_root() -> bool {
@@ -2271,6 +2273,123 @@ fn an_any_base_answers_only_its_own_bucket() -> Result<()> {
         .find(|bucket| bucket.value == "any")
         .ok_or_else(|| IndexError::Catalog("the rail offers an any bucket".into()))?;
     assert_eq!(bucket.count, 1, "the bucket counts the query it opens");
+    Ok(())
+}
+
+#[test]
+fn the_base_rail_holds_at_most_the_capped_buckets_and_counts_them_by_prefix() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "n", |_, _| {})?;
+    let mut populations: Vec<(String, usize)> = vec![
+        ("fam".to_owned(), 3),
+        ("fam 2.0".to_owned(), 3),
+        ("sd 1.5".to_owned(), 2),
+        ("sd 2.1".to_owned(), 2),
+        ("sdxl".to_owned(), 2),
+        ("sd".to_owned(), 1),
+    ];
+    populations.extend((0..27).map(|index| (format!("base-{index:02}"), 2)));
+    populations.extend((27..40).map(|index| (format!("base-{index:02}"), 1)));
+    let mut entries = Vec::new();
+    let mut identity = 0x4000_u128;
+    for (base, held) in &populations {
+        for copy in 0..*held {
+            identity += 1;
+            let name = format!("{}-{copy}", Base::new(base).as_str());
+            entries.push(seeded_entry(
+                &format!("rail/{name}.safetensors"),
+                1_024,
+                Some(seeded_artifact(
+                    identity,
+                    &name,
+                    Some("acme"),
+                    Artifact {
+                        base: Base::new(base),
+                        base_label: Some(base.clone()),
+                        ..seeded_facts()
+                    },
+                )),
+            ));
+        }
+    }
+    let seeded = entries.len();
+    catalog.seed(&[seeded_revision(
+        seeded_repo("acme/rail", RepoType::Models),
+        0x44,
+        entries,
+    )])?;
+    catalog.rebuild_search(|_| {})?;
+
+    let page = search(&catalog, "")?;
+    assert_eq!(
+        page.total, seeded as u64,
+        "every seeded artifact is indexed"
+    );
+    assert_eq!(
+        page.facets.base.len(),
+        32,
+        "the rail is capped: {:?}",
+        page.facets.base
+    );
+    let mut shown: Vec<&str> = page
+        .facets
+        .base
+        .iter()
+        .map(|bucket| bucket.value.as_str())
+        .collect();
+    shown.sort_unstable();
+    let mut expected: Vec<String> = ["fam", "fam20", "sd", "sd15", "sd21", "sdxl"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    expected.extend((0..26).map(|index| Base::new(format!("base-{index:02}")).as_str().to_owned()));
+    expected.sort_unstable();
+    assert_eq!(
+        shown, expected,
+        "the rail holds the bases the prefix rule makes largest"
+    );
+
+    let root = page
+        .facets
+        .base
+        .first()
+        .ok_or_else(|| IndexError::Catalog("the rail is empty".into()))?;
+    assert_eq!(
+        (root.value.as_str(), root.count),
+        ("sd", 7),
+        "a root one artifact carries exactly, and six more extend, leads the rail"
+    );
+    assert_eq!(
+        search(&catalog, "base:sd")?.total,
+        7,
+        "the bucket counts the query it opens"
+    );
+
+    let family = page
+        .facets
+        .base
+        .iter()
+        .find(|bucket| bucket.value == "fam")
+        .ok_or_else(|| IndexError::Catalog("the rail lost the family bucket".into()))?;
+    assert_eq!(
+        family.count, 6,
+        "a family bucket counts by the prefix rule, not by its own term"
+    );
+    assert_eq!(
+        search(&catalog, "base:fam")?.total,
+        6,
+        "the bucket counts the query it opens"
+    );
+    assert_eq!(
+        search(&catalog, "base:base35")?.total,
+        1,
+        "a base the rail does not show still answers its own query"
+    );
     Ok(())
 }
 
@@ -5372,17 +5491,68 @@ fn a_sampled_page_reads_no_more_than_the_bucket_and_a_page() -> Result<()> {
         offset: 30,
         context: &context,
     };
-    let (sampled, kept) = catalog.query_paged(request.clone(), Paging::new(0, 8, 1000))?;
+    let (sampled, cut) = catalog.query_paged(request.clone(), Paging::new(0, 16, 1000))?;
     let (heaped, held) = catalog.query_paged(request, Paging::new(usize::MAX, 8, 1000))?;
     assert_eq!(identified(&sampled), identified(&heaped));
     assert_eq!(
-        held, 30,
-        "the heap holds every row between the nearer end and the window"
+        held.kept, 37,
+        "the pass that counts is the pass that keeps, so the heap holds the whole front"
+    );
+    assert_eq!(
+        cut.passes, 3,
+        "the deep window is sampled, bucketed and cut"
     );
     assert!(
-        kept <= 12,
-        "a sampled window holds its bucket of five and one page of seven, not {kept}"
+        cut.kept <= 12,
+        "a sampled window holds its bucket of five and one page of seven, not {}",
+        cut.kept
     );
+    Ok(())
+}
+
+#[test]
+fn a_shallow_window_is_answered_in_one_pass_and_a_deep_one_in_three() -> Result<()> {
+    let (_directory, catalog) = paging_fixture(60)?;
+    let context = catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?;
+    let paging = Paging::new(4, 8, 1000);
+    let answered = |offset: u32| -> Result<(QueryPage, Cost)> {
+        catalog.query_paged(
+            QueryRequest {
+                raw: "",
+                sort: SortSpec::new(SortKey::Name, false),
+                limit: 4,
+                offset,
+                context: &context,
+            },
+            paging,
+        )
+    };
+    let passes = |offset: u32| -> Result<usize> { Ok(answered(offset)?.1.passes) };
+    assert_eq!(
+        passes(0)?,
+        1,
+        "a window inside the shallow bound is one heap"
+    );
+    assert_eq!(
+        passes(56)?,
+        2,
+        "the last page is the sampling pass and a heap of the far end"
+    );
+    assert_eq!(
+        passes(28)?,
+        3,
+        "the middle is the sampling pass, the buckets and the window"
+    );
+    for offset in [60, 200] {
+        let (page, cost) = answered(offset)?;
+        assert_eq!(
+            cost.passes, 1,
+            "an offset past the total leaves nothing for a second pass to keep"
+        );
+        assert_eq!(cost.kept, 0, "and nothing is kept");
+        assert!(page.rows.is_empty(), "offset {offset} is past the total");
+        assert_eq!(page.total, 60, "the sampling pass still counted the match");
+    }
     Ok(())
 }
 
@@ -6037,6 +6207,363 @@ fn the_collapse_path_keeps_one_row_per_artifact() -> Result<()> {
     assert_eq!(primary.facets, collapsed.facets);
     assert_eq!(primary.total, collapsed.total);
     assert_eq!(primary.nodes, collapsed.nodes);
+    Ok(())
+}
+
+/// A seeded catalog whose artifacts own runs of entry documents: the base repository holds
+/// two revisions and every fifth artifact carries a second entry on the peer node, and three
+/// later repositories are refreshed in rather than rebuilt, so the runs are spread over
+/// several segments.
+fn collapse_fixture() -> Result<(TempDir, Catalog)> {
+    let (directory, catalog) = paging_fixture(24)?;
+    for round in 0..3_u8 {
+        let size = 2_048 + u64::from(round);
+        let artifact = seeded_artifact(
+            0x9000 + u128::from(round),
+            &format!("late-{round}"),
+            Some("acme"),
+            Artifact {
+                size,
+                role: Role::Lora,
+                base: Base::new("flux"),
+                format: ArtifactFormat::Safetensors,
+                precision: Some(Precision::new("fp16")),
+                ..seeded_facts()
+            },
+        );
+        catalog.seed(&[seeded_revision(
+            seeded_repo(&format!("acme/late-{round}"), RepoType::Models),
+            0x7a + round,
+            vec![
+                seeded_entry(
+                    &format!("late-{round}/a.safetensors"),
+                    size,
+                    Some(artifact.clone()),
+                ),
+                seeded_entry(&format!("late-{round}/b.safetensors"), size, Some(artifact)),
+            ],
+        )])?;
+        catalog.refresh_search(|_| {})?;
+    }
+    Ok((directory, catalog))
+}
+
+/// The entry of each artifact a collapse would keep among the entries a query admits,
+/// computed from the records the index was built from rather than from the index.
+fn preferred_by(
+    catalog: &Catalog,
+    admits: &dyn Fn(&EntryDetail) -> bool,
+) -> Result<Vec<(ArtifactId, EntryDetail)>> {
+    let ranked = |detail: &EntryDetail| {
+        (
+            preference(detail.state, detail.present),
+            Reverse(detail.entry_id.get()),
+        )
+    };
+    let repositories = catalog.repositories(&RepositoryFilter::default(), None, 1_000)?;
+    let mut seen: Vec<ArtifactId> = Vec::new();
+    let mut preferred: Vec<(ArtifactId, EntryDetail)> = Vec::new();
+    for repository in &repositories.rows {
+        for row in catalog.repository_rows(repository.id, 1_000)? {
+            if seen.contains(&row.artifact_id) {
+                continue;
+            }
+            seen.push(row.artifact_id);
+            let mut best: Option<EntryDetail> = None;
+            for entry in catalog.entries_of(row.artifact_id)? {
+                if !admits(&entry) {
+                    continue;
+                }
+                if best
+                    .as_ref()
+                    .is_none_or(|held| ranked(&entry) > ranked(held))
+                {
+                    best = Some(entry);
+                }
+            }
+            if let Some(best) = best {
+                preferred.push((row.artifact_id, best));
+            }
+        }
+    }
+    Ok(preferred)
+}
+
+/// Where the node rail sits in the five the facets carry, which is the one dimension a
+/// query in these cases names its own key in.
+const NODE_RAIL: usize = 4;
+
+/// One query the collapse path takes: the entries it admits, and the rail it names its own
+/// key in, which the facets count over the set that key does not narrow.
+struct CollapseCase {
+    raw: String,
+    admits: Box<dyn Fn(&EntryDetail) -> bool>,
+    own_rail: Option<usize>,
+}
+
+/// The five facet rails the preferred entries spell, as the counts the rail would show.
+fn expected_facets(
+    catalog: &Catalog,
+    preferred: &[(ArtifactId, EntryDetail)],
+) -> Result<[BTreeMap<String, u64>; 5]> {
+    let mut counted: [BTreeMap<String, u64>; 5] = std::array::from_fn(|_| BTreeMap::new());
+    for (artifact_id, entry) in preferred {
+        let row = catalog.artifact_row(*artifact_id)?.ok_or_else(|| {
+            IndexError::Catalog(format!("the fixture lost artifact {artifact_id:?}"))
+        })?;
+        let values = [
+            row.role.as_str().to_owned(),
+            row.base.as_str().to_owned(),
+            row.format.as_str().to_owned(),
+            row.precision
+                .as_ref()
+                .map_or(String::new(), |precision| precision.as_str().to_owned()),
+            entry.node.clone(),
+        ];
+        for (slot, value) in counted.iter_mut().zip(values) {
+            if value.is_empty() {
+                continue;
+            }
+            *slot.entry(value).or_default() += 1;
+        }
+    }
+    Ok(counted)
+}
+
+fn counted_rail(buckets: &[crate::row::FacetBucket]) -> BTreeMap<String, u64> {
+    buckets
+        .iter()
+        .map(|bucket| (bucket.value.clone(), bucket.count))
+        .collect()
+}
+
+#[test]
+fn the_collapse_path_answers_the_same_page_facets_and_totals_as_before() -> Result<()> {
+    let (_directory, catalog) = collapse_fixture()?;
+    assert!(
+        catalog.search_segments()? > 1,
+        "the refreshes leave the entry documents spread over several segments"
+    );
+    let base = catalog
+        .repositories(&RepositoryFilter::default(), None, 1_000)?
+        .rows
+        .iter()
+        .map(|repository| repository.repo.qualified())
+        .find(|qualified| qualified.ends_with("/paging"))
+        .ok_or_else(|| IndexError::Catalog("the fixture lost acme/paging".into()))?;
+    let by_repo = base.clone();
+    let cases = [
+        CollapseCase {
+            raw: "node:self".to_owned(),
+            admits: Box::new(|entry: &EntryDetail| entry.node == "workstation"),
+            own_rail: Some(NODE_RAIL),
+        },
+        CollapseCase {
+            raw: "state:local".to_owned(),
+            admits: Box::new(|entry: &EntryDetail| entry.state == State::Local),
+            own_rail: None,
+        },
+        CollapseCase {
+            raw: format!("repo:{base}"),
+            admits: Box::new(move |entry: &EntryDetail| entry.repo == by_repo),
+            own_rail: None,
+        },
+    ];
+    let unnarrowed = expected_facets(&catalog, &preferred_by(&catalog, &|_| true)?)?;
+    for CollapseCase {
+        raw,
+        admits,
+        own_rail,
+    } in &cases
+    {
+        let preferred = preferred_by(&catalog, admits.as_ref())?;
+        assert!(!preferred.is_empty(), "{raw} admits no entry at all");
+        let mut nodes: Vec<&str> = preferred
+            .iter()
+            .map(|(_, entry)| entry.node.as_str())
+            .collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        let mut rails = expected_facets(&catalog, &preferred)?;
+        if let Some(dimension) = own_rail {
+            rails[*dimension] = unnarrowed[*dimension].clone();
+        }
+        let context = catalog.compile_context(raw, jiff::Timestamp::now(), Vec::new())?;
+        for descending in [false, true] {
+            for offset in (0..12).step_by(3) {
+                let request = QueryRequest {
+                    raw,
+                    sort: SortSpec::new(SortKey::Revision, descending),
+                    limit: 4,
+                    offset,
+                    context: &context,
+                };
+                let page = catalog.query(request.clone())?;
+                let (sampled, _) = catalog.query_paged(request, Paging::new(0, 8, 1_000))?;
+                let where_ = format!("{raw} desc={descending} offset={offset}");
+                assert_eq!(identified(&page), identified(&sampled), "{where_}");
+                assert_eq!(sampled.total, page.total, "{where_}");
+                assert_eq!(sampled.facets, page.facets, "{where_}");
+                assert_eq!(page.total, preferred.len() as u64, "{where_}");
+                assert_eq!(page.nodes, nodes.len() as u64, "{where_}");
+                let shown = [
+                    counted_rail(&page.facets.role),
+                    counted_rail(&page.facets.base),
+                    counted_rail(&page.facets.format),
+                    counted_rail(&page.facets.precision),
+                    counted_rail(&page.facets.node),
+                ];
+                assert_eq!(shown, rails, "{where_}");
+                let listed: Vec<ArtifactId> = page.rows.iter().map(|row| row.artifact_id).collect();
+                let mut deduped = listed.clone();
+                deduped.sort_unstable();
+                deduped.dedup();
+                assert_eq!(deduped.len(), listed.len(), "{where_} listed one twice");
+                for row in &page.rows {
+                    let expected = preferred
+                        .iter()
+                        .find(|(id, _)| *id == row.artifact_id)
+                        .map(|(_, entry)| entry.entry_id);
+                    assert_eq!(Some(row.entry_id), expected, "{where_}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn the_collapsed_count_agrees_with_the_collection_that_tallies() -> Result<()> {
+    let (_directory, catalog) = collapse_fixture()?;
+    assert!(
+        catalog.search_segments()? > 1,
+        "the refreshes leave the runs spread over several segments"
+    );
+    for raw in [
+        "node:self",
+        "state:local",
+        "rev:main",
+        "state:local role:lora",
+        "state:local size:>1kb",
+        "state:local base:flux",
+    ] {
+        let context = catalog.compile_context(raw, jiff::Timestamp::now(), Vec::new())?;
+        let (folded, tallied) = catalog.collapsed_counts(raw, &context)?;
+        assert_eq!(folded, tallied, "{raw}");
+        assert!(folded > 0, "{raw} matched nothing, so it proves nothing");
+    }
+    let context = catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?;
+    let (folded, tallied) = catalog.collapsed_counts("state:pulling", &context)?;
+    assert_eq!(
+        (folded, tallied),
+        (0, 0),
+        "a query matching nothing counts 0"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_sampled_collapse_page_matches_the_heap_page_everywhere_in_the_order() -> Result<()> {
+    let (_directory, catalog) = paging_fixture(60)?;
+    let context = catalog.compile_context("state:local", jiff::Timestamp::now(), Vec::new())?;
+    let paging = Paging::new(0, 8, 1000);
+    for key in PAGED_KEYS {
+        for descending in [false, true] {
+            for offset in (0..=60).step_by(5) {
+                let request = QueryRequest {
+                    raw: "state:local",
+                    sort: SortSpec::new(key, descending),
+                    limit: 7,
+                    offset,
+                    context: &context,
+                };
+                let (sampled, _) = catalog.query_paged(request.clone(), paging)?;
+                let heaped = catalog.query(request)?;
+                let where_ = format!("{key:?} desc={descending} offset={offset}");
+                assert_eq!(heaped.total, 60, "{where_}");
+                assert_eq!(identified(&sampled), identified(&heaped), "{where_}");
+                assert_eq!(sampled.total, heaped.total, "{where_}");
+                assert_eq!(sampled.nodes, heaped.nodes, "{where_}");
+                assert_eq!(sampled.facets, heaped.facets, "{where_}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_run_straddling_a_block_boundary_collapses_once() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let wide = seeded_artifact(
+        0x7000,
+        "wide",
+        Some("acme"),
+        Artifact {
+            size: 4_096,
+            role: Role::Lora,
+            base: Base::new("sdxl"),
+            format: ArtifactFormat::Safetensors,
+            ..seeded_facts()
+        },
+    );
+    let narrow = seeded_artifact(
+        0x7001,
+        "narrow",
+        Some("acme"),
+        Artifact {
+            size: 2_048,
+            role: Role::Vae,
+            base: Base::new("flux"),
+            format: ArtifactFormat::Safetensors,
+            ..seeded_facts()
+        },
+    );
+    let mut entries: Vec<SeedEntry> = (0..70)
+        .map(|index| {
+            seeded_entry(
+                &format!("wide/copy-{index:03}.safetensors"),
+                4_096,
+                Some(wide.clone()),
+            )
+        })
+        .collect();
+    entries.push(seeded_entry("narrow/one.safetensors", 2_048, Some(narrow)));
+    catalog.seed(&[seeded_revision(
+        seeded_repo("acme/wide", RepoType::Models),
+        0x31,
+        entries,
+    )])?;
+    catalog.rebuild_search(|_| {})?;
+
+    let page = search(&catalog, "state:local")?;
+    assert_eq!(
+        page.total, 2,
+        "a run of 70 entry documents crossing the block is one artifact"
+    );
+    assert_eq!(page.rows.len(), 2);
+    let roles: u64 = page.facets.role.iter().map(|bucket| bucket.count).sum();
+    assert_eq!(roles, 2, "the run is tallied once: {:?}", page.facets.role);
+    let shown = page
+        .rows
+        .iter()
+        .find(|row| row.name == "wide")
+        .ok_or_else(|| IndexError::Catalog("the wide artifact is not on the page".into()))?;
+    let lowest = catalog
+        .entries_of(shown.artifact_id)?
+        .into_iter()
+        .map(|entry| entry.entry_id)
+        .min()
+        .ok_or_else(|| IndexError::Catalog("the wide artifact lost its entries".into()))?;
+    assert_eq!(
+        shown.entry_id, lowest,
+        "the run collapses to the entry the page would show"
+    );
     Ok(())
 }
 
