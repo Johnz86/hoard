@@ -27,8 +27,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Build and query the experimental native_db/Tantivy catalog. One process at a time
-    /// may hold a catalog directory open.
+    /// Maintain the native catalog: scan into a directory, search it, report status,
+    /// rebuild its search index or compact it. One process at a time.
     Catalog {
         #[command(subcommand)]
         command: catalog::CatalogCommand,

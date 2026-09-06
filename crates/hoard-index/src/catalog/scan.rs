@@ -35,8 +35,8 @@ use crate::error::{IndexError, Result};
 use super::{Catalog, builder, models};
 
 impl Catalog {
-    /// Creates a fresh native catalog directly from configured sources, without opening SQLite.
-    /// Existing output directories are refused. Discovery supports the existing source layouts;
+    /// Creates a fresh catalog directly from configured sources. Existing output
+    /// directories are refused. Discovery supports the existing source layouts;
     /// a model split across shard files is one artifact anchored on its lowest shard.
     pub fn scan_sources(
         directory: &Path,
@@ -1178,8 +1178,8 @@ fn unit_roles(
 }
 
 /// Sniffs one unit in parallel and prepares its files against the revision's documents, so
-/// a README or config beside the weights describes them the way it does in the SQLite
-/// scanner. Nothing larger than a unit is read at once.
+/// a README or config beside the weights describes them. Nothing larger than a unit is read
+/// at once.
 fn prepare_unit<'a>(
     context: &EntryContext<'a>,
     plan: &RevisionPlan<'_>,
@@ -1513,8 +1513,8 @@ fn entry_state(prepared: &PreparedEntry<'_>, triage: bool) -> State {
     }
 }
 
-/// The SQLite index scores a candidate row the same way in `schema_v2.sql`: a node is always
-/// itself here and an entry's blob is always its artifact's blob, so both constants are fixed.
+/// How an entry ranks when several hold the same artifact: served bytes outrank local ones,
+/// and a path this disk holds outranks one it does not.
 pub(super) fn preference(state: State, present: bool) -> i64 {
     let weight = match state {
         State::Served => 3,

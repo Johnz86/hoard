@@ -8,19 +8,27 @@ transactions and secondary indexes on redb, so Hoard does not have to own an ind
 maintenance layer. Tantivy replaces FTS5 as a disposable search index that is rebuilt from
 the native records alone.
 
-This branch implements an executable native_db/Tantivy filesystem catalog. It is an
-experimental vertical slice, not a complete replacement of Hoard's existing persistent
-layer. The regular `serve`, `scan`, `ls`, mirror and gossip paths still use SQLite.
+The native_db/Tantivy catalog is Hoard's index. `serve`, `scan`, `ls`, the mirror and
+gossip all read and write it, and nothing else persists what Hoard knows about a file.
 
-There is no SQLite import, migration or compatibility path. Create a fresh native
-catalog by scanning sources. No existing data needs to be retained.
+There is no import, migration or compatibility path from the SQLite index it replaced.
+Create a fresh catalog by scanning sources. No existing data needs to be retained.
 
 ## Running it
 
-The parent of the output directory must already exist. A new directory is scanned fresh; an
-existing catalog directory is rescanned in place: unchanged files are not opened, changed
-files are read again, missing files keep their row as absent, and the search index is
-refreshed from the change log afterwards, or built when there is none yet.
+Every command opens or creates the catalog at `<data_dir>/native`:
+
+```sh
+cargo run -- --config hoard.toml scan
+cargo run -- --config hoard.toml serve
+cargo run -- --config hoard.toml ls 'role:lora size:<400mb'
+```
+
+The `hoard catalog` commands maintain a catalog directly, on any directory. The parent of
+the output directory must already exist. A new directory is scanned fresh; an existing
+catalog directory is rescanned in place: unchanged files are not opened, changed files are
+read again, missing files keep their row as absent, and the search index is refreshed from
+the change log afterwards, or built when there is none yet.
 
 ```sh
 cargo run -- catalog scan --directory /existing/path/native-catalog
@@ -95,7 +103,7 @@ of the shallowest README in each revision.
   shard count, and an incomplete set is triage.
 - An unreadable file keeps its path and is recorded as an absent entry without an artifact;
   a git-lfs pointer stub is recorded as absent with the pointer's size and hash; a fetched
-  LFS weight is an ordinary artifact. This is what the SQLite scanner does.
+  LFS weight is an ordinary artifact.
 - Entries whose inference needs triage carry state `triage`.
 - Artifact names and orgs follow the scanner's rules: a single-artifact repository is named
   by its repository.
@@ -112,8 +120,8 @@ of the shallowest README in each revision.
   list, detail, files, card and compat, and the triage queue with its confirm and reject
   read and write the native catalog. A user's verdict is a native record applied to the
   artifact and re-applied after a rescan.
-- Native records survive process reopen. Tantivy can be rebuilt without source
-  model files or a SQLite database.
+- Native records survive process reopen. Tantivy can be rebuilt from the native records
+  alone, without re-reading a single source file.
 - A completion manifest is published after all scan batches commit. An interrupted
   scan remains unusable instead of exposing a partially built catalog.
 - A search rebuild uses a fresh directory and publishes its name in a redb
@@ -155,9 +163,8 @@ of the shallowest README in each revision.
 - Storage is reported per redb table, and `hoard catalog scan` compacts the database after
   every scan. A rescan itself does not, so a catalog shared by the server can be walked
   again without an exclusive borrow.
-- Every command that opens the index also opens or creates the native catalog at
-  `<data_dir>/native`; `hoard scan` and the scan job rescan and refresh it after the SQLite
-  scan; the server holds it as shared state.
+- Every command that opens the index opens or creates the catalog at `<data_dir>/native`;
+  `hoard scan` and the scan job rescan and refresh it; the server holds it as shared state.
 - `GET /api/v1/search`, `GET /api/v1/stats` and `hoard ls` read the native catalog.
 - Shelves (with the six builtin ones seeded on open), settings, the noise list, projections
   and the usage log are catalog records; the scan honours noise; the Hub logs every served
@@ -234,31 +241,10 @@ hoard catalog search --directory <out> 'state:triage'
 - Manifest counts: 1 source, 69 repositories, 28 artifacts, 477 entries.
 - Native `state:triage` returns 10 artifacts.
 
-The same source in the SQLite index (`data/hoard.db`) holds 477 entries, 67 repositories,
-28 artifacts and 10 triage artifacts. Entries, artifacts and triage now agree exactly; the
-ungrouped shard divergence measured before this change (134 artifacts and 80 triage) is
-gone.
-
-The two catalogs also agree on every shard set's size and count, including the two
-overlapping sets in `nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4` that both label `model/model`
-and both mark triage: a `*.index.json` claims two of the ten declared files and the naming
-convention takes the remaining eight.
-
-Two of the 28 names still differ on each side, neither for a grouping reason:
-
-- Native `text_encoder/model.fp16.safetensors`, SQLite `clip_l.safetensors`. The same bytes
-  are in the `comfy` source too. A SQLite artifact row holds one name and `comfy` wrote it;
-  this scan covered `hf-cache` alone.
-- Native `model` and `Ministral-3-14B-Instruct-2512`, SQLite `Ministral-3-14B-Instruct-2512`
-  and `consolidated.safetensors`. The repository has two snapshots: one holds
-  `consolidated.safetensors` alone, the other holds it beside a four shard set. Both
-  catalogs keep the same two artifacts with the same sizes; the names are swapped because a
-  revision names its artifacts by how many artifact units it holds, and the two scanners
-  count the second snapshot's already-seen `consolidated.safetensors` differently.
-
-The repository count still differs by two (69 native, 67 SQLite). The SQLite index was last
-written hours before this scan, so the two runs did not see the same disk. Not
-investigated further.
+The catalog also groups every shard set the same way whichever run produces it, including
+the two overlapping sets in `nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4` that both label
+`model/model` and both mark triage: a `*.index.json` claims two of the ten declared files
+and the naming convention takes the remaining eight.
 
 ## Scale
 
@@ -272,10 +258,10 @@ log, so the incremental path is measured beside the full one.
 Baseline, measured on 2026-09-05 before bounded units and narrow records landed. Native:
 100k scanned in 3.65 s with 958 MB of peak RSS growth and 518 MB on disk; 1M scanned in
 37.9 s with 8533 MB of peak RSS growth and 4138 MB on disk (2739 MB allocated), searching
-in 124 to 145 ms. SQLite: 100k scanned in 1832 s with 356 MB of peak RSS growth and 136 MB
-on disk, searching in 215 to 336 ms; the 1M scan was killed after 52 minutes roughly one
-eighth of the way in. The SQLite measurement was run once to establish this baseline and
-its harness was removed; SQLite is the store being replaced, not a peer to keep measuring.
+in 124 to 145 ms. As history: the SQLite index this replaced scanned 100k in 1832 s with
+356 MB of peak RSS growth and 136 MB on disk, searching in 215 to 336 ms, and its 1M scan
+was killed after 52 minutes roughly one eighth of the way in. That measurement was run once
+to establish the baseline and its harness was removed.
 
 Waves 1 to 3 measured `search`, which spoke Tantivy's syntax and returned a page and a
 total. Wave 4 removed it; the rows below it measure `query`, which also counts five facet
@@ -393,12 +379,8 @@ way is the work left. The catalogs actually measured on this workstation hold 47
 where every query here is under a millisecond, so that remainder is a scale limit rather
 than a correctness one.
 
-## Remaining replacement work
+## Remaining work
 
-- Move what is still on SQLite to the catalog: the SQLite scan and its hashing, and
-  `hoard doctor`'s source check; then remove SQLite.
-- Convert the existing Store/Connection API and the live scanner, cache eviction and watch
-  callers to native transactions.
 - Path identities hash the text to_string_lossy renders; discovery currently never yields
   two distinct non-UTF-8 paths, and a byte-exact identity must land with the identity
   redesign.
@@ -411,15 +393,15 @@ than a correctness one.
   written out per entry, which is what the 1M catalog is mostly made of. Intern them per
   revision and reference them by id.
 - Preserve complete repository Git metadata and add stable cross-scan identities.
-- Port the missing-file policies from the existing scan pipeline.
 - A rescan re-reads every revision's documents (README, configs, index files) before
   deciding units; measure this on the workstation cache and skip when every document's
   stamp is unchanged.
 - Revision ordinals are recomputed from discovery on every rescan; a source that reorders
   revisions leaves stale ordinals on existing entries.
-- Count a revision's artifact units the way the legacy scanner does for a file whose
-  content another revision already claimed. The two scanners disagree on one repository of
-  this workstation's cache, which swaps the names of its two artifacts.
+- Count a revision's artifact units consistently for a file whose content another revision
+  already claimed. A repository with two snapshots, one holding `consolidated.safetensors`
+  alone and one holding it beside a four shard set, keeps both artifacts at the right sizes
+  but can name them either way round.
 - Add a read-only open once redb offers one, so searches can run beside a rebuild.
 - Benchmark realistic catalogs and add process-kill/power-loss recovery tests.
   Current tests check transaction abort and publication boundaries, not power loss.
@@ -439,7 +421,5 @@ native persistence/reopen tests exercise this required binary serialization path
 
 The worktree started at `647cd99`. Commit `c0d877e` subsequently added scheduled
 cache eviction on the main branch. It was inspected through Git objects only and
-was not applied here. Its changed files do not overlap this slice's changed files.
-Its entry retraction/cache reconciliation behavior must be included when the live
-store is converted; the independent native commands do not currently serve or evict
-mirror data.
+was not applied here. Its entry retraction and cache reconciliation behaviour must be
+carried across when this branch is integrated.

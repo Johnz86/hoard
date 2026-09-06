@@ -119,8 +119,8 @@ Converting `serve` and the live store is not scheduled.
   action.
 - A10 Incremental rescans with `notify` and mtime/size short-circuit; missing files mark
   entries absent rather than deleting rows.
-- A11 Store: SQLite WAL, `user_version` migrations, FTS5 over names, keys, trigger words,
-  README; one writer, pooled readers, all through `spawn_blocking`.
+- A11 Store: a native_db (redb) catalog with a Tantivy search index; one process per
+  catalog, every write one transaction, all through `spawn_blocking`.
 - A12 Enrich (offline-safe): when a Hub cache or clone names the upstream repo, recover
   card, license and revisions from the local README and refs; never a network call
   during scan.
@@ -344,5 +344,5 @@ docs, Claude Code project configuration.
   Hub `resolve` for a loose file returns 404 until its sha256 exists, since clients verify
   ETags.
 - mDNS may be blocked on some networks; the manual `[peers]` list is the fallback.
-- SQLite is single-writer; scan batches commit every N rows, gossip and ingest writes are
-  small and queued.
+- The catalog takes an exclusive lock: one process at a time, which `hoard doctor` reports
+  when a second one tries.

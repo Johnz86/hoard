@@ -15,7 +15,7 @@ Report only findings that a maintainer would act on, most severe first:
 1. Correctness against `docs/api/hub-compat.md` (status codes, header names, ETag
    quoting, Range semantics) and `docs/api/hoard-api.md`.
 2. Crate boundary violations (a lower crate depending upward, axum types below
-   `hoard-server`, SQLite access outside `hoard-index::store`).
+   `hoard-server`, catalog access outside `hoard_index::catalog`).
 3. AGENTS.md violations: `unwrap` in non-test code, `unsafe`, inline comments, wildcard
    imports, hidden clones, blocking IO on the reactor, missing tests for new functions.
 4. Performance: full-file reads where a header read suffices, allocation in hot loops,

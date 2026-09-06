@@ -1,6 +1,6 @@
 [package]
 name = "hoard-index"
-description = "Filesystem discovery, artifact sniffing, role inference, search grammar and the SQLite index"
+description = "Filesystem discovery, artifact sniffing, role inference, search grammar and the native catalog"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

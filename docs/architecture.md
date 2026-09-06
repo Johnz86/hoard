@@ -33,8 +33,7 @@ Toolchain: Rust 1.95 stable, edition 2024, workspace resolver 3.
 | Errors | `thiserror`, `anyhow` | 2.0, 1.0 | Typed errors per crate, `anyhow` only in the binary. |
 | Logging | `tracing`, `tracing-subscriber` | 0.1, 0.3 | Structured logs, `RUST_LOG` filtering. |
 | Progress | `indicatif` | 0.18 | Scan, hash and pull progress in the CLI. |
-| Index store | `rusqlite` (bundled), `r2d2_sqlite`, `rusqlite_migration` | 0.40, 0.35, 2.6 | SQLite WAL with FTS5; one writer, pooled readers, versioned migrations. |
-| Native catalog (experimental) | `native_db`, `native_model`, `redb`, `tantivy` | 0.8.2, =0.4.20, 2.6, 0.26 | Typed records with automatic secondary indexes on a single redb file; Tantivy is a rebuildable search index. Only the `hoard catalog` commands use it. |
+| Index store | `native_db`, `native_model`, `redb`, `tantivy` | 0.8.2, =0.4.20, 2.6, 0.26 | Typed records with secondary indexes in one file; a rebuildable full-text index beside it; every write is one transaction. |
 | Discovery walk | `ignore`, `globset`, `notify` | 0.4, 0.4, 8.2 | Parallel walker with `.hoardignore`, include/exclude globs, live re-index. |
 | Parallel CPU work | `rayon` | 1.12 | Hashing, header sniffing, inference. |
 | Artifact formats | none (hand-written header readers) | | safetensors and GGUF headers are read directly; see "Not chosen and why". |
@@ -52,12 +51,14 @@ Toolchain: Rust 1.95 stable, edition 2024, workspace resolver 3.
 
 Not chosen and why:
 
-- `sqlx`: async SQLite goes through a thread pool anyway; `rusqlite` behind `spawn_blocking`
-  is smaller and gives FTS5 and `user_version` migrations directly.
+- `rusqlite`: SQLite was the first index and was replaced. It takes one writer per file,
+  its schema lives in SQL beside the types rather than in them, and its FTS5 index cannot be
+  rebuilt without rewriting the rows it indexes; see
+  `docs/superpowers/specs/2026-09-05-native-catalog-decision.md`.
 - `git2`: links libgit2; `gix` is pure Rust and read paths are all the index needs.
-- `tantivy` alone: it is a search index, not a store. It is used beside `native_db` in the
-  experimental catalog; see `docs/superpowers/specs/2026-09-05-native-catalog-decision.md`
-  for why that pairing was chosen over SQLite FTS5 and over Fjall.
+- `tantivy` alone: it is a search index, not a store. It is used beside `native_db`; see
+  `docs/superpowers/specs/2026-09-05-native-catalog-decision.md` for why that pairing was
+  chosen over SQLite FTS5 and over Fjall.
 - `gguf-rs`: pulls `clap`, `comfy-table` and a logger into a library.
 - `memmap2`: every mapping constructor is `unsafe`, and the workspace sets
   `unsafe_code = "forbid"`. Headers are read with bounded `File` reads instead, which costs
@@ -111,7 +112,7 @@ hoard/
         compat.rs            directional compatibility rule
         loadout.rs           Loadout document, TOML (de)serialization
         error.rs             HoardError
-    hoard-index/             discovery, sniffing, inference, storage, search
+    hoard-index/             discovery, sniffing, inference, the native catalog, search
       src/
         config.rs            IndexConfig: sources, globs, hashing policy, layouts
         discover/
@@ -130,32 +131,33 @@ hoard/
           role.rs  base.rs  lora.rs  precision.rs  trigger.rs
         triage.rs            queue, confirm, reject, noise list
         hash/                fingerprint, sha256, git blob sha1
-        store/
-          schema.sql  migrations.rs  pool.rs  convert.rs  fixture.rs
-          node.rs  source.rs  blob.rs  artifact.rs  repo.rs  revision.rs  entry.rs
-          shelf.rs  loadout.rs  job.rs  usage.rs  overrides.rs  setting.rs
-          projection.rs  search_exec.rs  row.rs  digest.rs
-        catalog/             experimental native_db + Tantivy catalog behind `hoard catalog`
-          mod.rs             Catalog open/status/integrity, format version
-          models.rs          native_model records: Source, Repository, ArtifactRecord, Entry, SearchEntry, SearchText, Manifest
+        catalog/             the native_db + Tantivy catalog: the index
+          mod.rs             Catalog open/status/integrity, format version, storage report
+          models.rs          native_model records: Source, Repository, ArtifactRecord, Entry, SearchChange, SearchText, Manifest
           scan.rs            discovery -> sniff -> infer -> one transaction per source
-          hashing.rs         sha256 and git blob sha1 per file, content identities, merges
+          naming.rs          the config and card a revision carries, artifact names, file hashes
           search.rs          Tantivy schema, rebuild, per-entry documents collapsed per artifact
-          read.rs            inspector, repository screens, triage queue, sources
           query.rs           the grammar compiled against the Tantivy index
+          read.rs            inspector, repository screens, triage queue, sources
+          verdict.rs         a user's override of what an artifact is
+          seed.rs            synthetic records for tests, behind `fixtures`
           userdata.rs        shelves, settings, the noise list, projections
           usage.rs           the served-response log and per-artifact use counts
-          verdict.rs         a user's override of what an artifact is
           loadouts.rs        loadout documents and pin resolution
           jobs.rs            scan, apply and pull job rows
-          seed.rs            synthetic records for tests, behind `fixtures`
+          hashing.rs         sha256 and git blob sha1 per file, content identities, merges
+          ingest.rs          a file the mirror fetched, filed as a served entry
+          nodes.rs           this machine and every peer it knows
+          digest.rs          the rows this node offers and the rows a peer advertises
+          pulls.rs           a pull in flight and the file it lands
+        row.rs               SearchRow, FacetBucket, DiskPressure: what a search answers with
+        time.rs              reading and writing the instants the catalog stores
         search/
           grammar.rs         winnow parser
           token.rs           token kinds and the parsed strip
-          sql.rs             Query -> WHERE and ORDER
+          context.rs         sort keys, compat targets, the context a query compiles against
           facets.rs          per-dimension counts excluding own key, disk pressure
         shard.rs             groups a model split across files into one artifact
-        scan.rs              discover -> sniff -> hash -> infer -> store
         watch.rs             notify-driven incremental rescans
     hoard-mirror/            serving faces and upstreams, transport-agnostic
       src/
@@ -214,7 +216,8 @@ Scan:
 
 ```
 sources -> discover -> sniff (headers only) -> fingerprint -> infer (role, base, rank,
-precision, trigger, confidence) -> store; sha256 in a background job; low confidence -> triage
+precision, trigger, confidence) -> catalog; sha256 in a background job; low confidence
+-> triage; the search index is refreshed from the change log the same run wrote
 ```
 
 Serve, local hit on the Hub face:
@@ -259,31 +262,31 @@ catalog hashes its own files, inline when the scan asks for it and by a backgrou
 otherwise. The Hub and git faces read it too, and the mirror holds it rather than the store:
 a file it fetches from upstream is filed there as a served entry. `hoard-net` holds the
 catalog as well: every node, the digest it offers, the rows a peer advertises and the bytes
-a pull lands are catalog records. The SQLite scan and its hashing and `hoard doctor`'s
-source check still read SQLite.
+a pull lands are catalog records.
 
 Nodes:
 
 ```
 mDNS _hoard._tcp -> node records -> periodic GET /api/v1/peers/digest?since=cursor
-  -> REMOTE entries owned by the peer -> `hoard apply` pulls via the proxy path
+  -> remote entries in the catalog -> `hoard apply` pulls via the proxy path
   -> hourly full re-read retires the rows a peer stopped naming
 ```
 
 ## Storage
 
-- Index: `<data-dir>/hoard.db` (SQLite WAL), recreatable from disk plus peers. What is left
-  in it: the rows the SQLite scan and `hoard doctor`'s source check still read.
-- Native catalog: `<data-dir>/native/`, holding `catalog.redb` plus `search-v1-<nanos>/`
-  Tantivy directories. Beside the scanned sources, repositories, artifacts, entries and
-  search text it holds the user data those screens read: shelves (the six builtin ones
-  seeded on every open), the shell's settings, the noise list a rejection writes and the
-  scan walks past, the projections a link records, the usage log every served response
-  appends to with the per-artifact use count `used:` and the last-used column read, the
-  loadout documents the drawer edits, and the job rows a scan, apply or pull writes. Every
-  command that opens the index opens or creates it there, and `hoard scan` and the
-  `/api/v1/scan` job rescan and refresh it after the SQLite scan; the server holds it as
-  shared state. `hoard catalog` still takes any directory with `--directory`.
+- Index: `<data-dir>/native/`, recreatable from disk plus peers. It holds `catalog.redb`,
+  the one file every record lives in, plus one `search-v1-<nanos>/` directory holding the
+  published Tantivy index; a rebuild writes a new directory and the old ones are removed
+  once the manifest names the new one. Beside the scanned sources, repositories, artifacts,
+  entries and search text the redb file holds the user data those screens read: shelves (the
+  six builtin ones seeded on every open), the shell's settings, the noise list a rejection
+  writes and the scan walks past, the projections a link records, the usage log every served
+  response appends to with the per-artifact use count `used:` and the last-used column read,
+  the loadout documents the drawer edits, and the job rows a scan, apply or pull writes.
+  Every command that opens the index opens or creates it there, and `hoard scan` and the
+  `/api/v1/scan` job rescan and refresh it; the server holds it as shared state. `hoard
+  catalog` still takes any directory with `--directory`. A `hoard.db` left by an earlier
+  version is not read; `hoard doctor` reports it as removable.
 - Mirror cache: `<data-dir>/repos/` in the olah layout (`docs/api/hub-compat.md`).
 - Projections: symlinks written by `hoard link` and `hoard apply`, tracked in the native
   catalog so PATHS ON DISK can show `laptop · symlink`.

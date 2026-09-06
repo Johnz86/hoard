@@ -2,7 +2,8 @@
 
 Local HuggingFace-compatible mirror and artifact index. Hoard discovers model, dataset and
 repository files across local disks, identifies them from their tensor headers, and indexes
-them in SQLite. It serves that index through the HuggingFace Hub API, git over HTTP, and a
+them in a native catalog (a redb database with a Tantivy search index). It serves that
+index through the HuggingFace Hub API, git over HTTP, and a
 dense web UI, proxying and block-caching `huggingface.co` for repos it doesn't hold
 locally. Nodes find each other on the LAN, gossip their index and pull artifacts peer to
 peer; loadouts pin a checkpoint plus its adapters and auxiliaries as a portable text file,

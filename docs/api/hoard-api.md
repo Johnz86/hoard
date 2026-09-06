@@ -129,7 +129,9 @@ no `dir` at all and always uses the configured root.
 
 ## Sources, scans, jobs
 
-- `GET /api/v1/sources`: kind, files, blobs, bytes, last scan, pending hashes.
+- `GET /api/v1/sources`: kind, files, bytes, last scan, pending hashes; `blobs` is kept for
+  the shape and always reads zero, the catalog counts content by artifact rather than by
+  blob.
 - `POST /api/v1/scan { "source" | null, "hash": "now" | "later" | "never" }` returns
   `{ "job_id" }`. `"background"` is accepted as an alias for `"later"`; omitting `hash`
   also means `"later"`.

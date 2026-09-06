@@ -91,7 +91,7 @@ fn paged(catalog: &Catalog, limit: u32, offset: u32) -> Result<QueryPage> {
 }
 
 #[test]
-fn sources_scan_into_typed_native_records_and_reopen_without_sqlite() -> Result<()> {
+fn sources_scan_into_typed_records_that_survive_a_reopen() -> Result<()> {
     let (directory, catalog) = fixture()?;
     let status = catalog.status()?;
     assert_eq!(status.node, "test-node");
@@ -131,7 +131,6 @@ fn sources_scan_into_typed_native_records_and_reopen_without_sqlite() -> Result<
     assert!(reopened.check_integrity()?);
     assert!(reopened.status()?.search_ready);
     assert_eq!(search(&reopened, "")?.total, 2);
-    assert!(!directory.path().join("native/hoard.db").exists());
     Ok(())
 }
 
@@ -814,7 +813,7 @@ fn an_lfs_pointer_is_an_absent_entry_without_an_artifact() -> Result<()> {
     assert!(entry.abs_path.is_none());
     assert!(
         entry.artifact_id.is_none(),
-        "the SQLite scanner writes no blob and no artifact for a pointer"
+        "a pointer stub is a path, not an artifact"
     );
     assert_eq!(read.len().primary::<ArtifactRecord>()?, 0);
     Ok(())
