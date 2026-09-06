@@ -32,7 +32,8 @@ pub struct HashReport {
 }
 
 /// The content identity a sha256 makes, the same text an artifact identity is hashed from.
-pub(super) fn content_key(sha: &Sha256) -> u128 {
+/// Two copies of one file share a record because they hash to this same key.
+pub fn content_key(sha: &Sha256) -> u128 {
     xxhash_rust::xxh3::xxh3_128(format!("sha256:{sha}").as_bytes())
 }
 

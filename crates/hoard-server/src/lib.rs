@@ -28,12 +28,16 @@ pub use state::AppState;
 /// no network at all logs and serves on, because the Hub and git faces are useful alone.
 pub async fn start_gossip(state: &AppState) -> Option<hoard_net::GossipHandle> {
     let config = state.config();
-    let local = match state
-        .store()
-        .call(hoard_index::store::node::local_node)
+    let catalog = std::sync::Arc::clone(state.catalog());
+    let listed = tokio::task::spawn_blocking(move || catalog.list_nodes())
         .await
-    {
-        Ok(row) => row,
+        .unwrap_or_else(|error| Err(hoard_index::IndexError::Catalog(error.to_string())));
+    let local = match listed.map(|nodes| nodes.into_iter().find(|node| node.is_self)) {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            tracing::warn!("this node is not recorded yet; federation is off");
+            return None;
+        }
         Err(error) => {
             tracing::warn!(%error, "this node is not recorded yet; federation is off");
             return None;

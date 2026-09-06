@@ -2,8 +2,9 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use std::sync::Arc;
+
 use hoard_core::format_size;
-use hoard_index::store::node::list_nodes;
 
 use super::node::Context;
 
@@ -33,16 +34,15 @@ impl Check {
 
 pub async fn run(context: Context) -> Result<()> {
     let Context {
-        config,
-        store,
-        catalog,
+        config, catalog, ..
     } = context;
     let mut checks = Vec::new();
 
     checks.push(git_binary());
     checks.push(data_dir(&config.server.data_dir));
 
-    let nodes = store.call(list_nodes).await?;
+    let listing = Arc::clone(&catalog);
+    let nodes = tokio::task::spawn_blocking(move || listing.list_nodes()).await??;
     let this = nodes.iter().find(|node| node.is_self);
     checks.push(match this {
         Some(node) => Check::pass("node", format!("{} ({})", node.name, node.node_id)),

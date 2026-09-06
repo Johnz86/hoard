@@ -32,7 +32,7 @@ use crate::store::DiskPressure;
 use self::models::{ArtifactRecord, Entry, Manifest, Repository, Source, Summary, define_models};
 
 pub use self::digest::{DigestApplied, DigestEntry, DigestPage, RemoteEntry};
-pub use self::hashing::HashReport;
+pub use self::hashing::{HashReport, content_key};
 pub use self::ingest::{IngestRecord, MIRROR_SOURCE, ServedFile};
 pub use self::jobs::JobRecord;
 pub use self::loadouts::LoadoutRecord;

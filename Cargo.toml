@@ -140,6 +140,9 @@ toml.workspace = true
 jiff.workspace = true
 humansize.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
 

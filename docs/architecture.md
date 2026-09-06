@@ -257,21 +257,23 @@ the usage the Hub logs and the USAGE tab reads, the loadouts every loadout route
 sources listing with the counts its last scan wrote and the files it still owes a hash. The
 catalog hashes its own files, inline when the scan asks for it and by a background pass
 otherwise. The Hub and git faces read it too, and the mirror holds it rather than the store:
-a file it fetches from upstream is filed there as a served entry. The SQLite scan and its
-hashing, nodes and peers, the pull path and gossip still read SQLite.
+a file it fetches from upstream is filed there as a served entry. `hoard-net` holds the
+catalog as well: every node, the digest it offers, the rows a peer advertises and the bytes
+a pull lands are catalog records. The SQLite scan and its hashing and `hoard doctor`'s
+source check still read SQLite.
 
 Nodes:
 
 ```
-mDNS _hoard._tcp -> peers table -> periodic GET /api/v1/peers/digest?since=cursor
-  -> REMOTE entries in the local index -> `hoard apply` pulls via the proxy path
+mDNS _hoard._tcp -> node records -> periodic GET /api/v1/peers/digest?since=cursor
+  -> REMOTE entries owned by the peer -> `hoard apply` pulls via the proxy path
   -> hourly full re-read retires the rows a peer stopped naming
 ```
 
 ## Storage
 
 - Index: `<data-dir>/hoard.db` (SQLite WAL), recreatable from disk plus peers. What is left
-  in it: nodes and peers, and the rows the SQLite scan, the pull path and gossip still read.
+  in it: the rows the SQLite scan and `hoard doctor`'s source check still read.
 - Native catalog: `<data-dir>/native/`, holding `catalog.redb` plus `search-v1-<nanos>/`
   Tantivy directories. Beside the scanned sources, repositories, artifacts, entries and
   search text it holds the user data those screens read: shelves (the six builtin ones

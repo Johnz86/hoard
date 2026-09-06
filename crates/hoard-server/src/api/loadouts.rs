@@ -13,13 +13,12 @@ use hoard_core::{
 };
 use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, JobProgress, LoadoutRecord, NewProjection};
-use hoard_index::store::node;
 use hoard_index::store::row::SearchRow;
 use hoard_net::identity::NodeIdentity;
 use hoard_net::{PullRequest, Puller, PullerConfig};
 
 use crate::api::artifacts::artifact_id;
-use crate::api::common::{Conn, authorize, blocking};
+use crate::api::common::{authorize, blocking};
 use crate::api::link::{self, Profile};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -284,13 +283,12 @@ pub async fn apply(
     };
     let node_name = target.clone();
     let known = node_name.clone();
-    state
-        .store()
-        .call(move |conn| match node::node_by_name(conn, &known)? {
-            Some(_) => Ok(()),
-            None => Err(IndexError::not_found("node", known.clone())),
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    blocking(move || match catalog.node_by_name(&known)? {
+        Some(_) => Ok(()),
+        None => Err(IndexError::not_found("node", known.clone())),
+    })
+    .await?;
     let view = view_for(&state, id, &node_name).await?;
     let subject = format!("{} \u{2192} {node_name}", view.name);
     let catalog = Arc::clone(state.catalog());
@@ -490,21 +488,20 @@ async fn plan_of(state: &AppState, id: LoadoutId) -> ApiResult<Vec<PlannedLine>>
     })
     .await?;
     let local = state.node_name().to_owned();
-    let plan = state
-        .store()
-        .call(move |conn| {
-            let mut lines = Vec::with_capacity(resolved.len());
-            for (pin, candidates) in &resolved {
-                lines.push(plan_line(conn, pin, candidates, &local)?);
-            }
-            Ok(lines)
-        })
-        .await?;
+    let catalog = Arc::clone(state.catalog());
+    let plan = blocking(move || {
+        let mut lines = Vec::with_capacity(resolved.len());
+        for (pin, candidates) in &resolved {
+            lines.push(plan_line(&catalog, pin, candidates, &local)?);
+        }
+        Ok(lines)
+    })
+    .await?;
     Ok(plan)
 }
 
 fn plan_line(
-    conn: &Conn,
+    catalog: &Catalog,
     pin: &LoadoutPin,
     candidates: &[SearchRow],
     local: &str,
@@ -522,7 +519,7 @@ fn plan_line(
     );
     let source = match (held, elsewhere) {
         (Some(row), _) => LineSource::Held(row.abs_path.clone().unwrap_or_default()),
-        (None, Some(row)) => match pull_request(conn, row)? {
+        (None, Some(row)) => match pull_request(catalog, row)? {
             Some(request) => LineSource::Peer(Box::new(request)),
             None => LineSource::Nowhere,
         },
@@ -536,11 +533,11 @@ fn plan_line(
     })
 }
 
-fn pull_request(conn: &Conn, row: &SearchRow) -> Result<Option<PullRequest>, IndexError> {
+fn pull_request(catalog: &Catalog, row: &SearchRow) -> Result<Option<PullRequest>, IndexError> {
     let Some(sha256) = row.blob_sha256 else {
         return Ok(None);
     };
-    let Some(owner) = node::node_by_name(conn, &row.node)? else {
+    let Some(owner) = catalog.node_by_name(&row.node)? else {
         return Ok(None);
     };
     let Some(url) = owner.url.as_deref() else {
@@ -841,9 +838,8 @@ fn loadout_id(raw: &str) -> ApiResult<LoadoutId> {
 #[cfg(test)]
 mod tests {
     use hoard_core::{CommitSha, NodeId, RepoType, Sha256};
-    use hoard_index::store::Store;
-    use hoard_index::store::node::{NewNode, upsert_node};
     use serde_json::json;
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -867,26 +863,16 @@ mod tests {
         .expect("a search row parses")
     }
 
-    fn store_with_peer(url: Option<&str>) -> Store {
-        let store = Store::open_in_memory().expect("store opens");
-        let conn = store.write().expect("writer");
-        upsert_node(
-            &conn,
-            &NewNode::local(NodeId::new("workstation-1").expect("id"), "workstation"),
-        )
-        .expect("local node");
-        upsert_node(
-            &conn,
-            &NewNode {
-                node_id: NodeId::new("laptop-1").expect("id"),
-                name: "laptop".to_owned(),
-                url: url.map(str::to_owned),
-                is_self: false,
-            },
-        )
-        .expect("peer node");
-        drop(conn);
-        store
+    /// A catalog knowing only this node and one peer, reachable or not.
+    fn catalog_with_peer(dir: &TempDir, url: Option<&str>) -> Arc<Catalog> {
+        let catalog = crate::testing::empty_catalog(dir.path(), "workstation");
+        catalog
+            .ensure_local_node(&NodeId::new("workstation-1").expect("id"), "workstation")
+            .expect("local node");
+        catalog
+            .upsert_peer(&NodeId::new("laptop-1").expect("id"), "laptop", url)
+            .expect("peer node");
+        catalog
     }
 
     #[test]
@@ -913,10 +899,10 @@ mod tests {
 
     #[test]
     fn a_row_on_a_reachable_peer_becomes_a_pull() {
-        let store = store_with_peer(Some("http://laptop.lan:7099"));
-        let conn = store.read().expect("reader");
+        let dir = TempDir::new().expect("temp dir");
+        let catalog = catalog_with_peer(&dir, Some("http://laptop.lan:7099"));
         let sha256 = Sha256::from_bytes([9u8; 32]);
-        let request = pull_request(&conn, &row("laptop", Some(sha256)))
+        let request = pull_request(&catalog, &row("laptop", Some(sha256)))
             .expect("resolution runs")
             .expect("a reachable peer is pullable");
         assert_eq!(request.sha256, sha256);
@@ -931,21 +917,23 @@ mod tests {
 
     #[test]
     fn a_row_without_a_hash_or_an_address_is_not_pullable() {
-        let store = store_with_peer(Some("http://laptop.lan:7099"));
-        let conn = store.read().expect("reader");
+        let dir = TempDir::new().expect("temp dir");
+        let reachable = catalog_with_peer(&dir, Some("http://laptop.lan:7099"));
         assert!(
-            pull_request(&conn, &row("laptop", None))
+            pull_request(&reachable, &row("laptop", None))
                 .expect("resolution runs")
                 .is_none()
         );
-        drop(conn);
 
-        let store = store_with_peer(None);
-        let conn = store.read().expect("reader");
+        let other = TempDir::new().expect("temp dir");
+        let addressless = catalog_with_peer(&other, None);
         assert!(
-            pull_request(&conn, &row("laptop", Some(Sha256::from_bytes([9u8; 32]))))
-                .expect("resolution runs")
-                .is_none()
+            pull_request(
+                &addressless,
+                &row("laptop", Some(Sha256::from_bytes([9u8; 32])))
+            )
+            .expect("resolution runs")
+            .is_none()
         );
     }
 }

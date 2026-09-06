@@ -183,8 +183,13 @@ of the shallowest README in each revision.
   applied. A rescan followed by a refresh updates search without a rebuild.
 - Artifact identities are 128-bit hashes of the identity text, so the unique index holds
   fixed-width keys.
-- The manifest is at model version 2 and a source at version 2; version 1 rows of both are
-  migrated on open.
+- Nodes are catalog records and every entry names the node holding it. The peer digest is
+  offered from artifact records in id order and filed as remote entries owned by the peer,
+  under a source named after it; a resync pass stamps what the peer still names and drops
+  the rest. A pull is marked while it moves and filed with its hashes and classification
+  when it verifies, so `hoard-net` and the nodes, peers and apply routes hold the catalog.
+- The manifest is at model version 2, a source at version 2 and the summary at version 3;
+  earlier rows of each are migrated on open.
 - CLI operations run on blocking threads and report scan/index progress with indicatif.
 
 ## Search document shape
@@ -390,13 +395,10 @@ than a correctness one.
 
 ## Remaining replacement work
 
-- Move what is still on SQLite to the catalog: the SQLite scan and its hashing, nodes, peers
-  and gossip, and `hoard doctor`'s node check; then remove SQLite.
-- A peer pull still records its repository and revision in SQLite before it fetches, so the
-  mirror no longer finds them in the index and probes the peer for the commit it already
-  knows. Moving the pull path to the catalog removes both round trips.
-- Convert the existing Store/Connection API and live scanner, mirror, cache eviction,
-  gossip, watch and CLI callers to native transactions.
+- Move what is still on SQLite to the catalog: the SQLite scan and its hashing, and
+  `hoard doctor`'s source check; then remove SQLite.
+- Convert the existing Store/Connection API and the live scanner, cache eviction and watch
+  callers to native transactions.
 - Path identities hash the text to_string_lossy renders; discovery currently never yields
   two distinct non-UTF-8 paths, and a byte-exact identity must land with the identity
   redesign.
@@ -408,8 +410,6 @@ than a correctness one.
 - Shrink the per-entry record further: revision, repository, source and absolute path are
   written out per entry, which is what the 1M catalog is mostly made of. Intern them per
   revision and reference them by id.
-- Implement peer cursors and the associated graph constraints/cascades. An entry carries a
-  node, a resync pass and a pull fraction, but every row names this node until peers land.
 - Preserve complete repository Git metadata and add stable cross-scan identities.
 - Port the missing-file policies from the existing scan pipeline.
 - A rescan re-reads every revision's documents (README, configs, index files) before

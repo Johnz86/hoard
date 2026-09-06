@@ -11,7 +11,6 @@ use hoard_core::format_size;
 use hoard_index::IndexError;
 use hoard_index::catalog::{QueryPage, QueryRequest, Totals};
 use hoard_index::search::SortSpec;
-use hoard_index::store::node;
 use hoard_index::store::row::FacetBucket;
 
 use crate::api::common::{authorize, blocking};
@@ -142,15 +141,16 @@ impl SettingsView {
 /// degraded, because a health route that returns an error tells a watchdog nothing about
 /// which half of the node is down.
 pub async fn healthz(State(state): State<AppState>) -> ApiResult<Json<HealthView>> {
-    let probe = state
-        .store()
-        .call(|conn| {
-            Ok(node::list_nodes(conn)?
-                .into_iter()
-                .filter(|row| !row.is_self)
-                .count() as u64)
-        })
-        .await;
+    let catalog = Arc::clone(state.catalog());
+    let probe = tokio::task::spawn_blocking(move || {
+        Ok(catalog
+            .list_nodes()?
+            .into_iter()
+            .filter(|row| !row.is_self)
+            .count() as u64)
+    })
+    .await
+    .unwrap_or_else(|error| Err(IndexError::Catalog(error.to_string())));
     let (status, index, peers) = match probe {
         Ok(peers) => ("ok", "ok", peers),
         Err(error) => {
