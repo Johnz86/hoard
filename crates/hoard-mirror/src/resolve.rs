@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 use url::Url;
 
 use crate::access::AccessPolicy;
+use crate::batch::{REFRESH_INTERVAL, SearchRefresher};
 use crate::cache::meta::{
     CACHEABLE_STATUS, MetaEnvelope, fresh, read_meta_array, read_meta_document, write_meta_document,
 };
@@ -182,6 +183,7 @@ impl RemoteBytes {
 pub struct IngestTrigger {
     catalog: Arc<Catalog>,
     cache: Arc<BlockCache>,
+    refresh: Arc<SearchRefresher>,
     entry: SharedEntry,
     repo: RepoId,
     commit: CommitSha,
@@ -203,6 +205,7 @@ impl IngestTrigger {
                 path: &self.path,
                 expected: self.expected,
             },
+            &self.refresh,
         )
         .await
     }
@@ -364,6 +367,7 @@ pub struct Mirror {
     cache: Arc<BlockCache>,
     access: Arc<AccessPolicy>,
     upstream: Hub,
+    refresh: Arc<SearchRefresher>,
     revisions: moka::future::Cache<String, CommitSha>,
 }
 
@@ -374,12 +378,27 @@ impl Mirror {
         access: Arc<AccessPolicy>,
         upstream: Hub,
     ) -> Self {
+        let refresh = Arc::new(SearchRefresher::spawn(
+            Arc::clone(&catalog),
+            REFRESH_INTERVAL,
+        ));
+        Self::sharing(catalog, cache, access, upstream, refresh)
+    }
+
+    fn sharing(
+        catalog: Arc<Catalog>,
+        cache: Arc<BlockCache>,
+        access: Arc<AccessPolicy>,
+        upstream: Hub,
+        refresh: Arc<SearchRefresher>,
+    ) -> Self {
         let cache = Arc::new(cache.scoped(&upstream.cache_scope()));
         Self {
             catalog,
             cache,
             access,
             upstream,
+            refresh,
             revisions: moka::future::Cache::builder()
                 .max_capacity(REVISION_CACHE_CAPACITY)
                 .time_to_live(REVISION_TTL)
@@ -387,16 +406,23 @@ impl Mirror {
         }
     }
 
+    /// The search index's refresh, shared by everything on this node that leaves changes in
+    /// the catalog's log.
+    pub fn refresher(&self) -> &Arc<SearchRefresher> {
+        &self.refresh
+    }
+
     /// The same node against a different upstream, which is how a peer pull reuses the
     /// proxy: a peer speaks the Hub API, so pulling from one is this code path with the
     /// peer's base URL. The cache is re-keyed for that upstream, so the two never write
     /// each other's entries.
     pub fn with_upstream(&self, upstream: Hub) -> Self {
-        Self::new(
+        Self::sharing(
             Arc::clone(&self.catalog),
             Arc::clone(&self.cache),
             Arc::clone(&self.access),
             upstream,
+            Arc::clone(&self.refresh),
         )
     }
 
@@ -901,6 +927,7 @@ impl Mirror {
         let ingest = entry.as_ref().map(|entry| IngestTrigger {
             catalog: Arc::clone(&self.catalog),
             cache: Arc::clone(&self.cache),
+            refresh: Arc::clone(&self.refresh),
             entry: Arc::clone(entry),
             repo: repo.clone(),
             commit: *sha,

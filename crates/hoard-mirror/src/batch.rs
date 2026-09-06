@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use hoard_index::catalog::Catalog;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -151,6 +152,58 @@ async fn run<T: Send + 'static>(batch: Arc<Batch<T>>, stop: Arc<Notify>, interva
             tracing::warn!(%error, "a batch of accumulated work was not written");
         }
     }
+}
+
+/// How long changes wait before the search index is brought up to date.
+pub const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The search index's refresh, run at most once per interval however many writers ask for
+/// it. A rescan, an ingest, a retirement and a batch of usage rows all leave changes in the
+/// catalog's log; applying them once for all of them is one Tantivy commit rather than one
+/// per writer.
+#[derive(Debug)]
+pub struct SearchRefresher {
+    sink: Debounced<()>,
+}
+
+impl SearchRefresher {
+    /// Starts the timer. Outside a Tokio runtime nothing is timed and only `flush` refreshes.
+    pub fn spawn(catalog: Arc<Catalog>, interval: Duration) -> Self {
+        Self {
+            sink: Debounced::spawn(interval, usize::MAX, move |_: Vec<()>| {
+                catalog.refresh_search(|_| {})?;
+                Ok(())
+            }),
+        }
+    }
+
+    /// Says the catalog has changes the index has not seen. The refresh itself happens on
+    /// the timer, so a writer never waits for one.
+    pub fn poke(&self) {
+        self.sink.record(());
+    }
+
+    /// Whether anyone has asked for a refresh that has not run yet.
+    pub fn poked(&self) -> bool {
+        self.sink.pending() > 0
+    }
+
+    /// Refreshes now if anyone asked, which is what a reader of search results waits on.
+    pub async fn flush(&self) -> Result<()> {
+        self.sink.flush().await
+    }
+
+    /// Stops the timer and refreshes if anyone asked.
+    pub async fn shutdown(self) -> Result<()> {
+        self.sink.shutdown().await
+    }
+}
+
+/// A refresher for a test: its interval is long enough that only an explicit `flush` ever
+/// refreshes, so a test never races the timer.
+#[cfg(test)]
+pub(crate) fn test_refresher(catalog: &Arc<Catalog>) -> SearchRefresher {
+    SearchRefresher::spawn(Arc::clone(catalog), Duration::from_secs(3600))
 }
 
 #[cfg(test)]

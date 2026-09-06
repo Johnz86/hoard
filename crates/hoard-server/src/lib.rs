@@ -75,6 +75,7 @@ pub fn start_eviction(state: &AppState) -> Option<hoard_mirror::cache::EvictionH
     Some(hoard_mirror::cache::spawn_eviction(
         std::sync::Arc::clone(state.catalog()),
         state.cache().as_ref().clone(),
+        std::sync::Arc::clone(state.mirror().refresher()),
         hoard_mirror::cache::EvictionConfig::default(),
     ))
 }
@@ -180,6 +181,9 @@ where
     .await;
     if let Err(error) = closing.usage().flush().await {
         tracing::warn!(%error, "the last served responses were not logged");
+    }
+    if let Err(error) = closing.mirror().refresher().flush().await {
+        tracing::warn!(%error, "the search index was left behind the catalog");
     }
     served
 }

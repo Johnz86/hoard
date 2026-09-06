@@ -6,13 +6,18 @@ use hoard_core::{EntryId, RepoId};
 use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, EntryDetail};
 
+use crate::batch::SearchRefresher;
 use crate::cache::layout::{CacheLayout, CacheScope, PEERS_DIR};
 use crate::error::{MirrorError, Result};
 use crate::local::index_repo::on_catalog;
 
 /// Retires every SERVED row whose entry directory is gone from every upstream slot, and
 /// reports how many.
-pub async fn reconcile_index(catalog: &Arc<Catalog>, layout: &CacheLayout) -> Result<usize> {
+pub async fn reconcile_index(
+    catalog: &Arc<Catalog>,
+    layout: &CacheLayout,
+    refresh: &SearchRefresher,
+) -> Result<usize> {
     let rows = on_catalog(catalog, |catalog| Ok(catalog.served_cache_entries()?)).await?;
     if rows.is_empty() {
         return Ok(0);
@@ -21,12 +26,9 @@ pub async fn reconcile_index(catalog: &Arc<Catalog>, layout: &CacheLayout) -> Re
     if gone.is_empty() {
         return Ok(0);
     }
-    on_catalog(catalog, move |catalog| {
-        let retired = catalog.retire_entries(&gone)?;
-        catalog.refresh_search(|_| {})?;
-        Ok(retired)
-    })
-    .await
+    let retired = on_catalog(catalog, move |catalog| Ok(catalog.retire_entries(&gone)?)).await?;
+    refresh.poke();
+    Ok(retired)
 }
 
 async fn missing_entries(layout: CacheLayout, rows: Vec<EntryDetail>) -> Result<Vec<EntryId>> {
@@ -79,6 +81,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::batch::test_refresher;
 
     const SHA: &str = "9f1a2b3c4d5e6f708192a3b4c5d6e7f809a1b2c3";
 
@@ -165,7 +168,7 @@ mod tests {
         );
         cached(&layout, "kept.safetensors");
 
-        let retired = reconcile_index(&catalog, &layout)
+        let retired = reconcile_index(&catalog, &layout, &test_refresher(&catalog))
             .await
             .expect("reconciliation runs");
 
@@ -191,7 +194,7 @@ mod tests {
             "from-a-peer.safetensors",
         );
 
-        let retired = reconcile_index(&catalog, &layout)
+        let retired = reconcile_index(&catalog, &layout, &test_refresher(&catalog))
             .await
             .expect("reconciliation runs");
 
@@ -205,14 +208,15 @@ mod tests {
         let layout = CacheLayout::new(root.path().join("repos"));
         let catalog = catalog(&root.path().join("native"), &["evicted.safetensors"]);
 
+        let refresh = test_refresher(&catalog);
         assert_eq!(
-            reconcile_index(&catalog, &layout)
+            reconcile_index(&catalog, &layout, &refresh)
                 .await
                 .expect("first pass"),
             1
         );
         assert_eq!(
-            reconcile_index(&catalog, &layout)
+            reconcile_index(&catalog, &layout, &refresh)
                 .await
                 .expect("second pass"),
             0,
@@ -227,11 +231,14 @@ mod tests {
         let catalog = catalog(&root.path().join("native"), &["kept.safetensors"]);
         cached(&layout, "kept.safetensors");
 
-        let retired =
-            tokio::time::timeout(Duration::from_secs(5), reconcile_index(&catalog, &layout))
-                .await
-                .expect("walking the cache tree must not wait on the catalog")
-                .expect("reconciliation runs");
+        let refresh = test_refresher(&catalog);
+        let retired = tokio::time::timeout(
+            Duration::from_secs(5),
+            reconcile_index(&catalog, &layout, &refresh),
+        )
+        .await
+        .expect("walking the cache tree must not wait on the catalog")
+        .expect("reconciliation runs");
 
         assert_eq!(retired, 0);
         assert!(rows(&catalog).iter().all(|row| row.present));

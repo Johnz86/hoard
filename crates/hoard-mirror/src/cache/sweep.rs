@@ -8,6 +8,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
+use crate::batch::SearchRefresher;
 use crate::cache::BlockCache;
 use crate::cache::policy::EvictionReport;
 use crate::cache::reconcile::reconcile_index;
@@ -74,9 +75,13 @@ impl EvictionHandle {
 
 /// One eviction pass followed by index reconciliation, which runs even when nothing was
 /// evicted.
-pub async fn sweep(catalog: &Arc<Catalog>, cache: &BlockCache) -> Result<SweepReport> {
+pub async fn sweep(
+    catalog: &Arc<Catalog>,
+    cache: &BlockCache,
+    refresh: &SearchRefresher,
+) -> Result<SweepReport> {
     let eviction = cache.run_eviction().await?;
-    let retired = reconcile_index(catalog, cache.layout()).await?;
+    let retired = reconcile_index(catalog, cache.layout(), refresh).await?;
     Ok(SweepReport { eviction, retired })
 }
 
@@ -85,6 +90,7 @@ pub async fn sweep(catalog: &Arc<Catalog>, cache: &BlockCache) -> Result<SweepRe
 pub fn spawn_eviction(
     catalog: Arc<Catalog>,
     cache: BlockCache,
+    refresh: Arc<SearchRefresher>,
     config: EvictionConfig,
 ) -> EvictionHandle {
     let (stop, mut stopped) = watch::channel(false);
@@ -98,7 +104,7 @@ pub fn spawn_eviction(
                         break;
                     }
                 }
-                _ = ticker.tick() => sweep_once(&catalog, &cache).await,
+                _ = ticker.tick() => sweep_once(&catalog, &cache, &refresh).await,
             }
         }
         tracing::debug!("the cache sweep stopped");
@@ -106,8 +112,8 @@ pub fn spawn_eviction(
     EvictionHandle { stop, task }
 }
 
-async fn sweep_once(catalog: &Arc<Catalog>, cache: &BlockCache) {
-    match sweep(catalog, cache).await {
+async fn sweep_once(catalog: &Arc<Catalog>, cache: &BlockCache, refresh: &SearchRefresher) {
+    match sweep(catalog, cache, refresh).await {
         Ok(report) if report.changed() => tracing::info!(
             units = report.eviction.units,
             pinned = report.eviction.pinned,
@@ -136,6 +142,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::batch::test_refresher;
     use crate::cache::CacheEntry;
     use crate::config::{Geometry, MirrorConfig};
     use crate::ingest::{CachedFile, ingest_cached_file};
@@ -194,9 +201,12 @@ mod tests {
         let cache = cache(root.path(), 1);
         let dir = filled(&cache).await.dir().to_path_buf();
 
+        let indexed = catalog(&root.path().join("native"));
+        let refresh = Arc::new(test_refresher(&indexed));
         let handle = spawn_eviction(
-            catalog(&root.path().join("native")),
+            indexed,
             cache,
+            refresh,
             EvictionConfig::default().with_interval(Duration::from_millis(5)),
         );
         for _ in 0..100 {
@@ -220,7 +230,8 @@ mod tests {
         let cache = cache(root.path(), u64::MAX);
         let dir = filled(&cache).await.dir().to_path_buf();
 
-        let report = sweep(&catalog(&root.path().join("native")), &cache)
+        let indexed = catalog(&root.path().join("native"));
+        let report = sweep(&indexed, &cache, &test_refresher(&indexed))
             .await
             .expect("the sweep runs");
 
@@ -236,6 +247,7 @@ mod tests {
         let root = TempDir::new().expect("temp dir");
         let cache = cache(root.path(), 1);
         let catalog = catalog(&root.path().join("native"));
+        let refresh = test_refresher(&catalog);
         let mut cached = filled(&cache).await;
         let outcome = ingest_cached_file(
             &catalog,
@@ -247,13 +259,16 @@ mod tests {
                 path: "model.safetensors",
                 expected: None,
             },
+            &refresh,
         )
         .await
         .expect("ingest runs")
         .expect("the entry is complete");
         drop(cached);
 
-        let report = sweep(&catalog, &cache).await.expect("the sweep runs");
+        let report = sweep(&catalog, &cache, &refresh)
+            .await
+            .expect("the sweep runs");
 
         assert_eq!(report.eviction.removed, 1);
         assert_eq!(report.retired, 1);

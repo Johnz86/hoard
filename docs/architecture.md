@@ -163,7 +163,7 @@ hoard/
       src/
         config.rs            MirrorConfig: upstreams, cache root, rules, offline, xet
         access.rs            proxy and cache rules
-        batch.rs             work a serving node accumulates instead of writing per response
+        batch.rs             batched writes and the shared search refresh a node debounces
         model/               Hub JSON shapes
         local/
           index_repo.rs      repo metadata and bytes from the index

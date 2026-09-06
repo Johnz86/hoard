@@ -129,7 +129,12 @@ impl AppState {
             inner: Arc::new(Inner {
                 config,
                 mirror_config,
-                usage: UsageSink::spawn(Arc::clone(&catalog), SINK_INTERVAL, SINK_CAPACITY),
+                usage: UsageSink::spawn(
+                    Arc::clone(&catalog),
+                    Arc::clone(mirror.refresher()),
+                    SINK_INTERVAL,
+                    SINK_CAPACITY,
+                ),
                 catalog,
                 cache,
                 access,

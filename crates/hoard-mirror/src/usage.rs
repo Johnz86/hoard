@@ -9,7 +9,7 @@ use hoard_index::catalog::{Catalog, PullRow, UsageDay, UsageEvent};
 use jiff::Timestamp;
 use serde::Serialize;
 
-use crate::batch::Debounced;
+use crate::batch::{Debounced, SearchRefresher};
 use crate::error::Result;
 use crate::local::index_repo::on_catalog;
 
@@ -118,11 +118,19 @@ pub struct UsageSink {
 
 impl UsageSink {
     /// Starts the writer. Outside a Tokio runtime nothing is timed and only `flush` writes.
-    pub fn spawn(catalog: Arc<Catalog>, interval: Duration, capacity: usize) -> Self {
+    /// A batch leaves one search change per artifact it counted, so the refresher is poked
+    /// rather than the index rebuilt here.
+    pub fn spawn(
+        catalog: Arc<Catalog>,
+        refresh: Arc<SearchRefresher>,
+        interval: Duration,
+        capacity: usize,
+    ) -> Self {
         Self {
             sink: Debounced::spawn(interval, capacity, move |served: Vec<ServedRequest>| {
                 let events: Vec<UsageEvent> = served.iter().map(ServedRequest::event).collect();
                 catalog.log_usage_batch(&events)?;
+                refresh.poke();
                 Ok(())
             }),
         }
@@ -198,6 +206,7 @@ mod tests {
     use hoard_index::config::{IndexConfig, SourceConfig, SourceKind};
 
     use super::*;
+    use crate::batch::test_refresher;
 
     /// A catalog over one loose file, which is the smallest world that has a repository
     /// row for the usage log to point at.
@@ -255,7 +264,12 @@ mod tests {
         let catalog = catalog(directory.path());
         let repo = only_repo(&catalog);
 
-        let sink = UsageSink::spawn(Arc::clone(&catalog), SINK_INTERVAL, SINK_CAPACITY);
+        let sink = UsageSink::spawn(
+            Arc::clone(&catalog),
+            Arc::new(test_refresher(&catalog)),
+            SINK_INTERVAL,
+            SINK_CAPACITY,
+        );
         sink.record(
             ServedRequest::new("openai/whisper/resolve/main/model.bin", 200)
                 .from_client(Some("10.0.0.7".to_owned()))
@@ -284,7 +298,12 @@ mod tests {
         let catalog = catalog(directory.path());
         let repo = only_repo(&catalog);
 
-        let sink = UsageSink::spawn(Arc::clone(&catalog), SINK_INTERVAL, SINK_CAPACITY);
+        let sink = UsageSink::spawn(
+            Arc::clone(&catalog),
+            Arc::new(test_refresher(&catalog)),
+            SINK_INTERVAL,
+            SINK_CAPACITY,
+        );
         sink.record(
             ServedRequest::new("unknown/repo/resolve/main/model.bin", 200)
                 .from_client(Some("10.0.0.9".to_owned()))

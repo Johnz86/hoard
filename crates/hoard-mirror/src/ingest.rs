@@ -11,6 +11,7 @@ use hoard_index::catalog::{Catalog, ServedFile};
 use hoard_index::hash::git_blob_sha1_bytes;
 use sha2::{Digest, Sha256 as Sha256Hasher};
 
+use crate::batch::SearchRefresher;
 use crate::cache::{BlockCache, CacheEntry};
 use crate::error::{MirrorError, Result};
 use crate::local::index_repo::{LFS_THRESHOLD, on_catalog};
@@ -38,12 +39,14 @@ pub struct IngestOutcome {
 /// Ingests a cache entry once every block of it is on disk.
 ///
 /// Returns `None` while the entry is still incomplete, so a caller can offer every finished
-/// response to it without checking first.
+/// response to it without checking first. The search index is not brought up to date here:
+/// the refresher is poked and applies this change with whatever else has piled up.
 pub async fn ingest_cached_file(
     catalog: &Arc<Catalog>,
     cache: &BlockCache,
     entry: &mut CacheEntry,
     file: CachedFile<'_>,
+    refresh: &SearchRefresher,
 ) -> Result<Option<IngestOutcome>> {
     entry.refresh_present().await?;
     if !entry.is_complete() {
@@ -76,17 +79,18 @@ pub async fn ingest_cached_file(
         git_sha1: hashes.git_sha1,
         cache_root: cache.root().to_path_buf(),
     };
-    on_catalog(catalog, move |catalog| {
+    let outcome = on_catalog(catalog, move |catalog| {
         let record = catalog.ingest_served(&served)?;
-        catalog.refresh_search(|_| {})?;
-        Ok(Some(IngestOutcome {
+        Ok(IngestOutcome {
             sha256: served.sha256,
             size: served.size,
             artifact: record.artifact,
             entry: record.entry,
-        }))
+        })
     })
-    .await
+    .await?;
+    refresh.poke();
+    Ok(Some(outcome))
 }
 
 async fn discard(entry: &mut CacheEntry) {
@@ -139,6 +143,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::batch::test_refresher;
     use crate::config::{Geometry, MirrorConfig};
 
     const SHA: &str = "9f1a2b3c4d5e6f708192a3b4c5d6e7f809a1b2c3";
@@ -240,6 +245,7 @@ mod tests {
                 path: "config.json",
                 expected: None,
             },
+            &test_refresher(&catalog),
         )
         .await
         .expect("ingest runs")
@@ -260,6 +266,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn many_ingests_share_one_refresh() {
+        let root = TempDir::new().expect("temp dir");
+        let catalog = catalog(&root);
+        let cache = cache(&root);
+        let refresh = test_refresher(&catalog);
+        for index in 0..3u8 {
+            let bytes: Vec<u8> = (index..100u8).cycle().take(96).collect();
+            let path = format!("unet/model-{index}.safetensors");
+            let mut entry = cache
+                .file_entry(&repo(), &commit(), &path, 96, Some(b"\"etag\""))
+                .await
+                .expect("entry opens");
+            entry
+                .write_block(0, &bytes[..64])
+                .await
+                .expect("block writes");
+            entry
+                .write_block(1, &bytes[64..])
+                .await
+                .expect("block writes");
+            ingest_cached_file(
+                &catalog,
+                &cache,
+                &mut entry,
+                CachedFile {
+                    repo: &repo(),
+                    commit: commit(),
+                    path: &path,
+                    expected: None,
+                },
+                &refresh,
+            )
+            .await
+            .expect("ingest runs")
+            .expect("entry is complete");
+        }
+
+        assert_eq!(
+            catalog.pending_changes().expect("changes count"),
+            3,
+            "no ingest refreshed the index on its own"
+        );
+        assert!(refresh.poked(), "every ingest asked for a refresh");
+        refresh.flush().await.expect("one refresh applies them all");
+        assert_eq!(
+            catalog.pending_changes().expect("changes count"),
+            0,
+            "one refresh applied every change the three ingests logged"
+        );
+        assert!(!refresh.poked());
+    }
+
+    #[tokio::test]
     async fn a_completed_entry_becomes_a_searchable_artifact() {
         let root = TempDir::new().expect("temp dir");
         let catalog = catalog(&root);
@@ -267,10 +326,16 @@ mod tests {
         let bytes: Vec<u8> = (0..100u8).cycle().take(129).collect();
         let mut entry = entry_of(&cache, &bytes, 3).await;
 
-        let outcome = ingest_cached_file(&catalog, &cache, &mut entry, file(&repo(), None))
-            .await
-            .expect("ingest runs")
-            .expect("entry is complete");
+        let outcome = ingest_cached_file(
+            &catalog,
+            &cache,
+            &mut entry,
+            file(&repo(), None),
+            &test_refresher(&catalog),
+        )
+        .await
+        .expect("ingest runs")
+        .expect("entry is complete");
         assert_eq!(outcome.sha256, sha256_of(&bytes));
         assert_eq!(outcome.size, 129);
 
@@ -306,14 +371,26 @@ mod tests {
         let bytes = vec![9u8; 64];
         let mut entry = entry_of(&cache, &bytes, 1).await;
 
-        let first = ingest_cached_file(&catalog, &cache, &mut entry, file(&repo(), None))
-            .await
-            .expect("ingest runs")
-            .expect("complete");
-        let second = ingest_cached_file(&catalog, &cache, &mut entry, file(&repo(), None))
-            .await
-            .expect("ingest runs")
-            .expect("complete");
+        let first = ingest_cached_file(
+            &catalog,
+            &cache,
+            &mut entry,
+            file(&repo(), None),
+            &test_refresher(&catalog),
+        )
+        .await
+        .expect("ingest runs")
+        .expect("complete");
+        let second = ingest_cached_file(
+            &catalog,
+            &cache,
+            &mut entry,
+            file(&repo(), None),
+            &test_refresher(&catalog),
+        )
+        .await
+        .expect("ingest runs")
+        .expect("complete");
         assert_eq!(first, second);
         assert_eq!(served_entries(&catalog).len(), 1);
     }
@@ -327,9 +404,15 @@ mod tests {
         let mut entry = entry_of(&cache, &bytes, 2).await;
 
         assert_eq!(
-            ingest_cached_file(&catalog, &cache, &mut entry, file(&repo(), None))
-                .await
-                .expect("ingest runs"),
+            ingest_cached_file(
+                &catalog,
+                &cache,
+                &mut entry,
+                file(&repo(), None),
+                &test_refresher(&catalog),
+            )
+            .await
+            .expect("ingest runs"),
             None
         );
         assert!(
@@ -353,6 +436,7 @@ mod tests {
             &cache,
             &mut entry,
             file(&repo(), Some(Sha256::from_bytes([0u8; 32]))),
+            &test_refresher(&catalog),
         )
         .await
         .expect_err("a wrong hash is refused");
@@ -362,9 +446,15 @@ mod tests {
             "the bytes that failed the check are gone rather than left to be served"
         );
         assert_eq!(
-            ingest_cached_file(&catalog, &cache, &mut entry, file(&repo(), None))
-                .await
-                .expect("ingest runs"),
+            ingest_cached_file(
+                &catalog,
+                &cache,
+                &mut entry,
+                file(&repo(), None),
+                &test_refresher(&catalog),
+            )
+            .await
+            .expect("ingest runs"),
             None,
             "and the entry reports itself incomplete until it is fetched again"
         );
@@ -375,6 +465,7 @@ mod tests {
             &cache,
             &mut refetched,
             file(&repo(), Some(sha256_of(&bytes))),
+            &test_refresher(&catalog),
         )
         .await
         .expect("the right hash is accepted")
