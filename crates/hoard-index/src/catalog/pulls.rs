@@ -226,6 +226,7 @@ fn pull_source(transaction: &RwTransaction<'_>, root: &Path) -> Result<()> {
         file_count: 0,
         byte_count: 0,
         last_scan: None,
+        pending_hashes: 0,
     })?;
     Ok(())
 }

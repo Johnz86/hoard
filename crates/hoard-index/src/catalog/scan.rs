@@ -251,30 +251,41 @@ impl Catalog {
         Ok(())
     }
 
-    /// Counts every repository's present entries again from the entries themselves, which
-    /// is what a catalog whose repositories predate those counts needs once on open.
-    pub(super) fn recount_presence(&self) -> Result<()> {
+    /// Counts again, from the entries themselves, everything the records above them carry:
+    /// each repository's present files and bytes and each source's owed hashes. This is
+    /// what a catalog whose records predate one of those counts needs once on open.
+    pub(super) fn recount_derived(&self) -> Result<()> {
         let read = self.database.r_transaction()?;
-        let mut counted: HashMap<i64, (u32, u64)> = HashMap::new();
+        let mut counted: HashMap<i64, (u32, u64, u64)> = HashMap::new();
         for entry in read.scan().primary::<Entry>()?.all()? {
             let entry: Entry = entry?;
             if entry.state == State::Remote {
                 continue;
             }
-            let slot = counted.entry(entry.repo_id).or_insert((0, 0));
+            let slot = counted.entry(entry.repo_id).or_insert((0, 0, 0));
             slot.0 = slot.0.saturating_add(1);
             slot.1 = slot.1.saturating_add(entry.size);
+            if owes_a_hash(&entry) {
+                slot.2 = slot.2.saturating_add(1);
+            }
         }
         let repositories: Vec<Repository> = read
             .scan()
             .primary()?
             .all()?
             .collect::<native_db::db_type::Result<_>>()?;
+        let sources: Vec<Source> = read
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
         drop(read);
+        let mut owed: HashMap<&str, u64> = HashMap::with_capacity(sources.len());
         let transaction = self.database.rw_transaction()?;
-        for repository in repositories {
-            let (present_files, present_bytes) =
-                counted.get(&repository.id).copied().unwrap_or((0, 0));
+        for repository in &repositories {
+            let (present_files, present_bytes, pending) =
+                counted.get(&repository.id).copied().unwrap_or((0, 0, 0));
+            *owed.entry(repository.source.as_str()).or_default() += pending;
             if repository.present_files == present_files
                 && repository.present_bytes == present_bytes
             {
@@ -283,7 +294,17 @@ impl Catalog {
             transaction.upsert(Repository {
                 present_files,
                 present_bytes,
-                ..repository
+                ..repository.clone()
+            })?;
+        }
+        for source in sources {
+            let pending_hashes = owed.get(source.name.as_str()).copied().unwrap_or_default();
+            if source.pending_hashes == pending_hashes {
+                continue;
+            }
+            transaction.upsert(Source {
+                pending_hashes,
+                ..source
             })?;
         }
         transaction.commit()?;
@@ -309,6 +330,7 @@ impl Catalog {
             file_count: 0,
             byte_count: 0,
             last_scan: None,
+            pending_hashes: 0,
         });
         transaction.upsert(Source {
             config: source.clone(),
@@ -763,10 +785,19 @@ pub(super) struct Counters {
     pub(super) presence: PresenceShift,
 }
 
-/// What a pass moved in the present file and byte counts of each repository it wrote to,
-/// so a repository's record is rewritten once per pass rather than once per entry.
+/// What one entry contributes to the counts kept on the records above it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Contribution {
+    files: i64,
+    bytes: i64,
+    owed: i64,
+}
+
+/// What a pass moved in the counts derived from its entries: each repository's present
+/// files and bytes, and each source's owed hashes. Accumulating them means a repository
+/// and a source are rewritten once per pass rather than once per entry.
 #[derive(Debug, Default)]
-pub(super) struct PresenceShift(HashMap<i64, (i64, i64)>);
+pub(super) struct PresenceShift(HashMap<i64, Contribution>);
 
 impl PresenceShift {
     /// Counts an entry the caller is about to write. An entry holding no bytes on any node
@@ -785,28 +816,54 @@ impl PresenceShift {
             return;
         }
         let bytes = i64::try_from(entry.size).unwrap_or(i64::MAX);
-        let slot = self.0.entry(entry.repo_id).or_insert((0, 0));
-        slot.0 = slot.0.saturating_add(sign);
-        slot.1 = slot.1.saturating_add(sign.saturating_mul(bytes));
+        let slot = self.0.entry(entry.repo_id).or_default();
+        slot.files = slot.files.saturating_add(sign);
+        slot.bytes = slot.bytes.saturating_add(sign.saturating_mul(bytes));
+        if owes_a_hash(entry) {
+            slot.owed = slot.owed.saturating_add(sign);
+        }
     }
 
-    /// Writes what has accumulated onto the repositories it names and starts again empty.
+    /// Writes what has accumulated onto the repositories and sources it names, and starts
+    /// again empty.
     pub(super) fn flush(&mut self, transaction: &RwTransaction<'_>) -> Result<()> {
-        for (repo_id, (files, bytes)) in self.0.drain() {
-            if files == 0 && bytes == 0 {
+        let mut owed: HashMap<String, i64> = HashMap::new();
+        for (repo_id, moved) in self.0.drain() {
+            if moved == Contribution::default() {
                 continue;
             }
             let Some(stored) = transaction.get().primary::<Repository>(repo_id)? else {
                 continue;
             };
+            if moved.owed != 0 {
+                *owed.entry(stored.source.clone()).or_default() += moved.owed;
+            }
+            if moved.files == 0 && moved.bytes == 0 {
+                continue;
+            }
             transaction.upsert(Repository {
-                present_files: shifted_u32(stored.present_files, files),
-                present_bytes: shifted_u64(stored.present_bytes, bytes),
+                present_files: shifted_u32(stored.present_files, moved.files),
+                present_bytes: shifted_u64(stored.present_bytes, moved.bytes),
+                ..stored
+            })?;
+        }
+        for (name, moved) in owed {
+            let Some(stored) = transaction.get().primary::<Source>(name)? else {
+                continue;
+            };
+            transaction.upsert(Source {
+                pending_hashes: shifted_u64(stored.pending_hashes, moved),
                 ..stored
             })?;
         }
         Ok(())
     }
+}
+
+/// Whether this row still owes the catalog a sha256: bytes on this disk that nothing has
+/// read yet.
+pub(super) fn owes_a_hash(entry: &Entry) -> bool {
+    entry.sha256.is_none() && entry.state != State::Remote && entry.abs_path.is_some()
 }
 
 fn shifted_u64(current: u64, by: i64) -> u64 {

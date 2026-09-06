@@ -202,6 +202,7 @@ impl Seeding<'_, '_> {
             file_count: 0,
             byte_count: 0,
             last_scan: None,
+            pending_hashes: 0,
         });
         let present = seed
             .revisions

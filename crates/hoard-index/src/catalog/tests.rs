@@ -21,7 +21,7 @@ use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, ArtifactRecordV1, Entry, EntryKey, EntryV1,
     LOCAL_NODE, Manifest, ManifestV1, Node, Override, Ref, Repository, RepositoryKey, RepositoryV1,
     RepositoryV2, RepositoryV3, Revision, RevisionV1, RevisionV2, SearchChange, SearchText, Source,
-    SourceV1, Summary, SummaryV1, SummaryV2,
+    SourceV1, SourceV2, Summary, SummaryV1, SummaryV2,
 };
 use super::search::QueryPath;
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
@@ -2261,6 +2261,7 @@ fn a_version_2_repository_is_migrated_on_open() -> Result<()> {
             file_count: 0,
             byte_count: 0,
             last_scan: None,
+            pending_hashes: 0,
         })?;
         transaction.insert(RepositoryV2 {
             id: 11,
@@ -2399,6 +2400,7 @@ fn a_migrated_repository_recounts_its_presence() -> Result<()> {
             file_count: 0,
             byte_count: 0,
             last_scan: None,
+            pending_hashes: 0,
         })?;
         transaction.insert(RepositoryV3 {
             id: 11,
@@ -2445,6 +2447,43 @@ fn legacy_entry(id: i64, repo_id: i64, size: u64, state: State) -> Entry {
         pass: 0,
         pull_progress: None,
     }
+}
+
+#[test]
+fn pending_hashes_are_counted_without_a_scan() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("models");
+    fs::create_dir_all(&input)?;
+    for index in 0..3 {
+        fs::write(
+            input.join(format!("w{index}.safetensors")),
+            lora_header_named(&format!("t{index}")),
+        )?;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    assert_eq!(catalog.sources()?[0].pending_hashes, 3);
+    assert_eq!(catalog.pending_hashes()?, 3);
+
+    catalog.hash_pending(&config, |_| {})?;
+    assert_eq!(catalog.sources()?[0].pending_hashes, 0);
+    assert_eq!(catalog.pending_hashes()?, 0);
+
+    let touched = input.join("w1.safetensors");
+    fs::write(&touched, lora_header_named("t1-again"))?;
+    catalog.rescan(&config, HashPolicy::Never, |_, _| {})?;
+    assert_eq!(catalog.sources()?[0].pending_hashes, 1);
+    assert_eq!(catalog.pending_hashes()?, 1);
+    Ok(())
 }
 
 fn only_repository(catalog: &Catalog) -> Result<RepositoryDetail> {
@@ -2715,6 +2754,21 @@ fn frozen_artifact() -> Artifact {
 #[test]
 fn source_encoding_is_frozen() -> Result<()> {
     let value = Source {
+        name: "frozen".to_owned(),
+        config: frozen_source_config(),
+        resolved_kind: SourceKind::Git,
+        file_count: 12,
+        byte_count: 4096,
+        last_scan: Some("2026-09-04T09:10:00Z".to_owned()),
+        pending_hashes: 5,
+    };
+    insta::assert_snapshot!(frozen_encoding(&value)?);
+    Ok(())
+}
+
+#[test]
+fn source_v2_encoding_is_frozen() -> Result<()> {
+    let value = SourceV2 {
         name: "frozen".to_owned(),
         config: frozen_source_config(),
         resolved_kind: SourceKind::Git,

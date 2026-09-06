@@ -125,7 +125,7 @@ pub struct SourceRecord {
 }
 
 impl SourceRecord {
-    fn of(stored: Source, pending_hashes: u64) -> Result<Self> {
+    fn of(stored: Source) -> Result<Self> {
         Ok(Self {
             name: stored.name,
             path: stored.config.path,
@@ -133,7 +133,7 @@ impl SourceRecord {
             file_count: stored.file_count,
             byte_count: stored.byte_count,
             last_scan: parse_opt_timestamp(stored.last_scan)?,
-            pending_hashes,
+            pending_hashes: stored.pending_hashes,
         })
     }
 }
@@ -153,7 +153,6 @@ impl Catalog {
     /// Every nominated root this catalog holds, ordered by name, with the files each still
     /// owes a content hash. A peer's namespace is not a root on this node, so it is left out.
     pub fn sources(&self) -> Result<Vec<SourceRecord>> {
-        let pending = self.pending_by_source()?;
         let read = self.database.r_transaction()?;
         let rows: Vec<Source> = read
             .scan()
@@ -162,10 +161,7 @@ impl Catalog {
             .collect::<native_db::db_type::Result<_>>()?;
         rows.into_iter()
             .filter(|row| !row.name.starts_with(PEER_SOURCE))
-            .map(|row| {
-                let owed = pending.get(&row.name).copied().unwrap_or_default();
-                SourceRecord::of(row, owed)
-            })
+            .map(SourceRecord::of)
             .collect()
     }
 

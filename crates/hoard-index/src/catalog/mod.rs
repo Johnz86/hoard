@@ -31,7 +31,8 @@ use crate::error::{IndexError, Result};
 use crate::row::DiskPressure;
 
 use self::models::{
-    ArtifactRecord, Entry, Manifest, Repository, RepositoryV3, Source, Summary, define_models,
+    ArtifactRecord, Entry, Manifest, Repository, RepositoryV3, Source, SourceV2, Summary,
+    define_models,
 };
 
 pub use self::digest::{DigestApplied, DigestEntry, DigestPage, RemoteEntry};
@@ -124,7 +125,8 @@ impl Catalog {
     pub fn open(directory: &Path) -> Result<Self> {
         let database = builder().open(models()?, directory.join("catalog.redb"))?;
         let transaction = database.rw_transaction()?;
-        let repositories_lack_counts = transaction.len().primary::<RepositoryV3>()? > 0;
+        let counts_are_stale = transaction.len().primary::<RepositoryV3>()? > 0
+            || transaction.len().primary::<SourceV2>()? > 0;
         transaction.migrate::<Manifest>()?;
         transaction.migrate::<Summary>()?;
         transaction.migrate::<Repository>()?;
@@ -137,8 +139,8 @@ impl Catalog {
             directory: directory.to_path_buf(),
             search_cache: RwLock::new(None),
         };
-        if repositories_lack_counts {
-            catalog.recount_presence()?;
+        if counts_are_stale {
+            catalog.recount_derived()?;
         }
         let manifest = catalog.manifest()?;
         if manifest.format_version != 5 {

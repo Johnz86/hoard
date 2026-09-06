@@ -1,7 +1,6 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 
-use native_db::transaction::{RTransaction, RwTransaction};
+use native_db::transaction::RwTransaction;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use serde::Serialize;
 
@@ -12,11 +11,11 @@ use crate::error::Result;
 
 use super::Catalog;
 use super::models::{
-    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Override, Repository,
-    SearchText,
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Override, SearchText,
+    Source,
 };
 use super::naming::content_hashes;
-use super::scan::{Counters, log_changes};
+use super::scan::{Counters, log_changes, owes_a_hash};
 use super::verdict::apply_override;
 
 /// How many files one hashing pass reads and records at a time.
@@ -35,12 +34,6 @@ pub struct HashReport {
 /// Two copies of one file share a record because they hash to this same key.
 pub fn content_key(sha: &Sha256) -> u128 {
     xxhash_rust::xxh3::xxh3_128(format!("sha256:{sha}").as_bytes())
-}
-
-/// Whether this row still owes the catalog a sha256: bytes on this disk that nothing has
-/// read yet.
-fn is_pending(entry: &Entry) -> bool {
-    entry.sha256.is_none() && entry.state != State::Remote && entry.abs_path.is_some()
 }
 
 impl Catalog {
@@ -72,26 +65,16 @@ impl Catalog {
         Ok(report)
     }
 
-    /// How many present files are still waiting for a content hash.
+    /// How many present files are still waiting for a content hash, as the writers that
+    /// stored them left each source's count.
     pub fn pending_hashes(&self) -> Result<u64> {
-        Ok(self.pending_by_source()?.values().sum())
-    }
-
-    /// How many present files each nominated root still owes a content hash, by source name.
-    pub(super) fn pending_by_source(&self) -> Result<HashMap<String, u64>> {
         let read = self.database.r_transaction()?;
-        let sources = sources_by_repo(&read)?;
-        let mut pending: HashMap<String, u64> = HashMap::with_capacity(sources.len());
-        for entry in read.scan().primary::<Entry>()?.all()? {
-            let entry = entry?;
-            if !is_pending(&entry) {
-                continue;
-            }
-            if let Some(source) = sources.get(&entry.repo_id) {
-                *pending.entry((*source).to_owned()).or_default() += 1;
-            }
+        let mut owed = 0_u64;
+        for source in read.scan().primary::<Source>()?.all()? {
+            let source: Source = source?;
+            owed = owed.saturating_add(source.pending_hashes);
         }
-        Ok(pending)
+        Ok(owed)
     }
 
     /// The present entry holding each named content hash, one per hash, preferring the
@@ -133,7 +116,7 @@ impl Catalog {
         let mut batch = Vec::with_capacity(HASH_BATCH);
         for entry in read.scan().primary::<Entry>()?.range((after + 1)..)? {
             let entry = entry?;
-            let Some(path) = entry.abs_path.clone().filter(|_| is_pending(&entry)) else {
+            let Some(path) = entry.abs_path.clone().filter(|_| owes_a_hash(&entry)) else {
                 continue;
             };
             batch.push((entry, PathBuf::from(path)));
@@ -161,15 +144,19 @@ impl Catalog {
                 }
                 None => None,
             };
-            transaction.upsert(Entry {
+            counters.presence.removed(&entry);
+            let hashed = Entry {
                 artifact_id,
                 sha256: Some(digest.sha256),
                 content: Some(content_key(&digest.sha256)),
                 git_sha1: entry.git_sha1.or(digest.git_sha1),
                 ..entry
-            })?;
+            };
+            counters.presence.added(&hashed);
+            transaction.upsert(hashed)?;
         }
         log_changes(&transaction, counters)?;
+        counters.presence.flush(&transaction)?;
         transaction.commit()?;
         Ok(merged)
     }
@@ -308,18 +295,4 @@ fn absorb(
     }
     transaction.upsert(survivor)?;
     Ok(())
-}
-
-/// The source each repository sits under, so a per-entry count reaches a source name
-/// without reading its repository again.
-fn sources_by_repo(read: &RTransaction<'_>) -> Result<HashMap<i64, String>> {
-    let repositories: Vec<Repository> = read
-        .scan()
-        .primary()?
-        .all()?
-        .collect::<native_db::db_type::Result<_>>()?;
-    Ok(repositories
-        .into_iter()
-        .map(|repository| (repository.id, repository.source))
-        .collect())
 }

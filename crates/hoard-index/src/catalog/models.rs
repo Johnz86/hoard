@@ -22,12 +22,10 @@ pub(super) struct SourceV1 {
     pub(super) resolved_kind: SourceKind,
 }
 
-/// A nominated root, with what the last walk of it counted. A source no scan has reached
-/// yet reports no last scan and zeroes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 1, version = 2, from = SourceV1)]
 #[native_db]
-pub(super) struct Source {
+pub(super) struct SourceV2 {
     #[primary_key]
     pub(super) name: String,
     pub(super) config: SourceConfig,
@@ -37,7 +35,26 @@ pub(super) struct Source {
     pub(super) last_scan: Option<String>,
 }
 
-impl From<SourceV1> for Source {
+/// A nominated root, with what the last walk of it counted. A source no scan has reached
+/// yet reports no last scan and zeroes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 1, version = 3, from = SourceV2)]
+#[native_db]
+pub(super) struct Source {
+    #[primary_key]
+    pub(super) name: String,
+    pub(super) config: SourceConfig,
+    pub(super) resolved_kind: SourceKind,
+    pub(super) file_count: u64,
+    pub(super) byte_count: u64,
+    pub(super) last_scan: Option<String>,
+    /// The present files under this root that carry no sha256 yet. Moved by the same
+    /// writers that move a repository's present counts, through
+    /// [`super::scan::PresenceShift`]; a writer added later must do the same.
+    pub(super) pending_hashes: u64,
+}
+
+impl From<SourceV1> for SourceV2 {
     fn from(source: SourceV1) -> Self {
         Self {
             name: source.name,
@@ -50,12 +67,39 @@ impl From<SourceV1> for Source {
     }
 }
 
-impl From<Source> for SourceV1 {
+impl From<SourceV2> for SourceV1 {
+    fn from(source: SourceV2) -> Self {
+        Self {
+            name: source.name,
+            config: source.config,
+            resolved_kind: source.resolved_kind,
+        }
+    }
+}
+
+impl From<SourceV2> for Source {
+    fn from(source: SourceV2) -> Self {
+        Self {
+            name: source.name,
+            config: source.config,
+            resolved_kind: source.resolved_kind,
+            file_count: source.file_count,
+            byte_count: source.byte_count,
+            last_scan: source.last_scan,
+            pending_hashes: 0,
+        }
+    }
+}
+
+impl From<Source> for SourceV2 {
     fn from(source: Source) -> Self {
         Self {
             name: source.name,
             config: source.config,
             resolved_kind: source.resolved_kind,
+            file_count: source.file_count,
+            byte_count: source.byte_count,
+            last_scan: source.last_scan,
         }
     }
 }
@@ -859,6 +903,7 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<SummaryV2>()?;
     models.define::<Summary>()?;
     models.define::<SourceV1>()?;
+    models.define::<SourceV2>()?;
     models.define::<Source>()?;
     models.define::<EntryV1>()?;
     models.define::<Entry>()?;
