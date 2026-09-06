@@ -314,6 +314,39 @@ The server holds the catalog and the Tantivy reader open, so a route pays only f
 query, which is why each of these is one to two orders of magnitude under the same query
 run as a fresh `hoard ls` process. `/api/v1/repos` is the slowest of the six.
 
+### Workstation, single-format catalog
+
+Commit `1ba8475`, release build, the same three sources, scanned into an empty
+`./data/native` after every record was reduced to one shape and every migration path was
+deleted. `hoard.toml` no longer nominates the `clones` source whose root was gone.
+
+```sh
+cargo build --release
+time ./target/release/hoard --config hoard.toml scan
+time ./target/release/hoard --config hoard.toml scan
+./target/release/hoard --config hoard.toml doctor
+du -sh data/native
+./target/release/hoard --config hoard.toml ls 'role:lora'
+```
+
+- First scan: 5 m 35.686 s wall, reporting `unchanged=728 changed=0 added=0 absent=0
+  hashed=445 merged=2`. That is the merged run's 5 m 42.385 s within its own spread: the
+  wall time is the 445 files read end to end for a content hash, which no change to the
+  record shapes touches.
+- Second scan immediately after: 0.182 s, reporting `unchanged=728 changed=0 added=0
+  absent=0 hashed=0 merged=0`, against 0.229 s merged.
+- `doctor`: every check passes. git, the data directory, the node record `workstation`,
+  zero peers, the summary at 228 artifacts, 228 present and 103 repositories, the three
+  sources at 477 files and 414.4 GB (`hf-cache`), 223 files and 819.7 GB (`comfy`) and 28
+  files and 405.8 GB (`lmstudio`), the block cache and the upstream. No check fails, and
+  there is no longer a `legacy` check to report a `hoard.db` nothing writes.
+- Catalog on disk: 6.9 MB for `data/native`, of which `catalog.redb` is 6.3 MB (8,957,952
+  bytes apparent) and the published search directory is 572 KB. The apparent size is the
+  merged run's byte for byte; one shape per record costs no more and no less on disk than
+  the ladder of versions did, because only the current shape was ever written.
+- `ls 'role:lora'`: 35 artifacts, the same 35 the merged run listed.
+- `catalog status` reports `format_version: 1` and names every table `<model id>_1_<key>`.
+
 ## Scale
 
 Synthetic loose source of header-only safetensors files, 1,000 per directory, one artifact
