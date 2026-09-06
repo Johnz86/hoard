@@ -2093,6 +2093,7 @@ dependencies = [
  "humansize",
  "jiff",
  "mime_guess",
+ "parking_lot",
  "percent-encoding",
  "rust-embed",
  "secrecy",

@@ -15,7 +15,7 @@ use hoard_index::search::SortSpec;
 
 use crate::api::common::{authorize, blocking};
 use crate::error::{ApiError, ApiResult};
-use crate::state::AppState;
+use crate::state::{AppState, WatchHealth};
 
 const DENSITY_KEY: &str = "density";
 const ROLE_COLOR_KEY: &str = "role_color_mode";
@@ -34,12 +34,13 @@ const DEFAULT_ROLE_COLOR: &str = ROLE_COLORS[0];
 const DEFAULT_THEME: &str = THEMES[0];
 
 /// What `GET /healthz` answers. `upstream` is `offline` when this node is configured never
-/// to leave the LAN.
+/// to leave the LAN, and `watch` is `off` when it is configured not to watch its sources.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HealthView {
     pub status: &'static str,
     pub index: &'static str,
     pub upstream: &'static str,
+    pub watch: &'static str,
     pub peers: u64,
 }
 
@@ -139,7 +140,8 @@ impl SettingsView {
 ///
 /// The peer count is the index probe: an index that cannot answer it is reported as
 /// degraded, because a health route that returns an error tells a watchdog nothing about
-/// which half of the node is down.
+/// which half of the node is down. A source that cannot be watched is degraded for the same
+/// reason: the node still serves and still scans by hand, and nothing else would say so.
 pub async fn healthz(State(state): State<AppState>) -> ApiResult<Json<HealthView>> {
     let catalog = Arc::clone(state.catalog());
     let probe = tokio::task::spawn_blocking(move || {
@@ -151,17 +153,23 @@ pub async fn healthz(State(state): State<AppState>) -> ApiResult<Json<HealthView
     })
     .await
     .unwrap_or_else(|error| Err(IndexError::Catalog(error.to_string())));
-    let (status, index, peers) = match probe {
+    let (indexed, index, peers) = match probe {
         Ok(peers) => ("ok", "ok", peers),
         Err(error) => {
             tracing::error!(%error, "the index did not answer the health probe");
             ("degraded", "error", 0)
         }
     };
+    let watch = state.watch_health();
+    let status = match watch {
+        WatchHealth::Degraded => "degraded",
+        WatchHealth::Off | WatchHealth::Ok => indexed,
+    };
     Ok(Json(HealthView {
         status,
         index,
         upstream: state.upstream_health().as_str(),
+        watch: watch.as_str(),
         peers,
     }))
 }

@@ -2,10 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use parking_lot::Mutex;
 use secrecy::{ExposeSecret, SecretString};
 
 use hoard_index::catalog::Catalog;
 use hoard_index::coordinate::Coordinator;
+use hoard_index::watch::Watcher;
 use hoard_mirror::MirrorError;
 use hoard_mirror::access::AccessPolicy;
 use hoard_mirror::cache::BlockCache;
@@ -58,6 +60,37 @@ impl UpstreamHealth {
     }
 }
 
+/// What this node is doing about watching its sources, which is what `/healthz` reports as
+/// `watch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchHealth {
+    /// This node is configured not to watch, or has no source to watch.
+    Off,
+    /// Every configured source is watched.
+    Ok,
+    /// A configured root the platform refused to watch. Manual scans still index it.
+    Degraded,
+}
+
+impl WatchHealth {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            WatchHealth::Off => "off",
+            WatchHealth::Ok => "ok",
+            WatchHealth::Degraded => "degraded",
+        }
+    }
+}
+
+/// The watcher this node started, held so `/healthz` can report it and shutdown can join it.
+#[derive(Debug, Default)]
+enum Watch {
+    #[default]
+    Off,
+    Unavailable,
+    Running(Watcher),
+}
+
 /// Everything a handler needs, cloned per request. Cheap to clone: everything in it is
 /// behind an `Arc`.
 #[derive(Clone)]
@@ -77,6 +110,7 @@ struct Inner {
     access: Arc<AccessPolicy>,
     mirror: Arc<Mirror>,
     usage: UsageSink,
+    watch: Mutex<Watch>,
     upstream_health: AtomicU8,
     local_node_name: String,
     public_url: String,
@@ -140,6 +174,7 @@ impl AppState {
                 ),
                 catalog,
                 coordinator,
+                watch: Mutex::new(Watch::Off),
                 cache,
                 access,
                 mirror,
@@ -167,6 +202,38 @@ impl AppState {
     /// than spawning, and shutdown drains it.
     pub fn coordinator(&self) -> &Arc<Coordinator> {
         &self.inner.coordinator
+    }
+
+    /// Records the watcher this node started. [`crate::serve`] joins it before draining the
+    /// lane it feeds, and `/healthz` reports what it watches until then.
+    pub fn hold_watcher(&self, watcher: Watcher) {
+        *self.inner.watch.lock() = Watch::Running(watcher);
+    }
+
+    /// Records that this node meant to watch its sources and could not.
+    pub fn watch_unavailable(&self) {
+        *self.inner.watch.lock() = Watch::Unavailable;
+    }
+
+    /// A root that is not a directory is not degraded here: a scan skips it with a warning
+    /// too, so the watcher is no worse off than the command it feeds.
+    pub fn watch_health(&self) -> WatchHealth {
+        match &*self.inner.watch.lock() {
+            Watch::Off => WatchHealth::Off,
+            Watch::Unavailable => WatchHealth::Degraded,
+            Watch::Running(watcher) => match watcher.status().failed.is_empty() {
+                true => WatchHealth::Ok,
+                false => WatchHealth::Degraded,
+            },
+        }
+    }
+
+    /// Hands the watcher over to whoever stops it, leaving this node not watching.
+    pub(crate) fn take_watcher(&self) -> Option<Watcher> {
+        match std::mem::take(&mut *self.inner.watch.lock()) {
+            Watch::Running(watcher) => Some(watcher),
+            Watch::Off | Watch::Unavailable => None,
+        }
     }
 
     pub fn config(&self) -> &HoardConfig {

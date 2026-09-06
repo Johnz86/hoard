@@ -1899,12 +1899,66 @@ async fn nodes_peers_and_the_digest_answer_the_lan() {
 }
 
 #[tokio::test]
+async fn healthz_reports_the_watch_state() {
+    let world = seeded();
+    let health = get(&world.state, "/healthz").await;
+    assert_eq!(
+        health["watch"], "off",
+        "a node that was never asked to watch is not degraded for it"
+    );
+    assert_eq!(health["status"], "ok");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let not_a_directory = dir.path().join("a-file-not-a-directory");
+    std::fs::write(&not_a_directory, b"not a source root").expect("the file is writable");
+    let mut config = HoardConfig::default();
+    config.server.data_dir = dir.path().to_path_buf();
+    config.index.data_dir = dir.path().to_path_buf();
+    config.index.reconcile_interval_secs = 0;
+    config.index.sources = vec![SourceConfig {
+        name: "broken".to_owned(),
+        path: not_a_directory,
+        kind: SourceKind::Loose,
+        include: Vec::new(),
+        exclude: Vec::new(),
+        follow_symlinks: false,
+        repo_per_folder: true,
+    }];
+    let catalog = crate::testing::empty_catalog(dir.path(), "test");
+    let state = AppState::new(config, catalog).expect("state builds");
+    crate::start_watcher(&state);
+
+    let watching = get(&state, "/healthz").await;
+    assert_eq!(
+        watching["watch"], "ok",
+        "a root that is not a directory is skipped by a scan too, so it is not degraded"
+    );
+    assert_eq!(watching["status"], "ok");
+
+    if let Some(watcher) = state.take_watcher() {
+        watcher.shutdown().await;
+    }
+
+    state.watch_unavailable();
+    let degraded = get(&state, "/healthz").await;
+    assert_eq!(
+        degraded["watch"], "degraded",
+        "a watch the platform refused is visible"
+    );
+    assert_eq!(
+        degraded["status"], "degraded",
+        "a refused watch degrades the node as an unreadable index does"
+    );
+    assert_eq!(degraded["index"], "ok", "manual scans still work");
+}
+
+#[tokio::test]
 async fn health_stats_and_settings_answer_the_shell() {
     let world = seeded();
     let health = get(&world.state, "/healthz").await;
     assert_eq!(
         health,
-        json!({ "status": "ok", "index": "ok", "upstream": "ok", "peers": 1 })
+        json!({ "status": "ok", "index": "ok", "upstream": "ok", "watch": "off", "peers": 1 })
     );
 
     let stats = get(&world.state, "/api/v1/stats").await;

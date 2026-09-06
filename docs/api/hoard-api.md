@@ -167,8 +167,13 @@ no `dir` at all and always uses the configured root.
 ## System
 
 - `GET /healthz`: `{ "status": "ok" | "degraded", "index": "ok" | "error",
-  "upstream": "ok" | "offline" | "unreachable", "peers": 3 }`. It answers 200 even when
-  degraded: a health route that fails to respond tells a watchdog nothing.
+  "upstream": "ok" | "offline" | "unreachable", "watch": "off" | "ok" | "degraded",
+  "peers": 3 }`. It answers 200 even when degraded: a health route that fails to respond
+  tells a watchdog nothing. `watch` is `off` when this node is configured not to watch its
+  sources or has none to watch, and `degraded` when the platform refused a watch on a
+  configured root, which degrades `status` with it while manual scans keep working. A
+  configured root that is not a directory is not degraded: a scan skips it with a warning
+  too.
 - `GET /api/v1/stats`: `{ "artifacts", "blobs", "repos", "triage" }` totals, `indexed_bytes`
   (and `indexed_bytes_human`), `roles`/`formats`/`nodes` facet breakdowns, and `cache`
   (`bytes`, `bytes_human`, `limit`, `limit_human`).

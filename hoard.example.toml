@@ -18,6 +18,10 @@ static = []
 hash_policy = "background"
 lfs_threshold = 10485760
 triage_confidence = 0.85
+# Index what changes under a source while `hoard serve` runs, without a manual scan.
+watch = true
+# How often to rescan every source regardless of what the watch reported. 0 turns it off.
+reconcile_interval_secs = 3600
 
 [[index.sources]]
 name = "hf-cache"

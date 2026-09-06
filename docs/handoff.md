@@ -22,10 +22,11 @@ first; this document assumes it.
   `docs/superpowers/research/2026-09-05-native-db-tantivy.md` are the decision and the
   dependency research; they stay. The wave plan files under `docs/superpowers/plans/` are
   deleted - git keeps them, and a stale plan in the tree is a trap for the next agent.
-- Phases 0 to 9 and 11 are done; 10 is partial, waiting on the watcher through `serve` and on
-  a design for TREE and DISK. `docs/feature-plan.md` holds the table.
-- At the head of `master` after the scan-coordination wave all four checks pass:
-  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 803 passed,
+- Phases 0 to 11 are done. `docs/feature-plan.md` holds the table. The TREE and DISK views
+  are not an unfinished phase: they wait on a design decision and are recorded under that
+  document's "Risks and open decisions".
+- At the head of `master` after the live-rescan wave all four checks pass:
+  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 816 passed,
   0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness
   and its supplemental fixture, the mDNS test that needs a multicast route and the sniffer
   test that reads the local model caches. `cargo doc --workspace --no-deps` emits no warning.
@@ -172,12 +173,23 @@ Decisions taken on 2026-09-06, by the project owner:
   source the other holds, the configured hash policy is preserved, an overflowed watch marks
   its source dirty rather than losing the change, Hoard's own writes under the data directory
   are excluded, shutdown joins the watcher, and the rebuild-versus-write boundary is
-  enforced. **The coordination and the boundary are met:** `hoard_index::coordinate::Coordinator`
-  is the one lane every scan under `serve` runs on, `POST /api/v1/scan` submits to it and
-  `serve` drains it, and `Catalog::search_lane` serialises `rebuild_search` against
-  `refresh_search` while a rebuild now prunes only what it indexed. `crates/hoard-index/src/watch.rs`
-  is still started by nothing: the watcher wave makes it a producer of `ScanRequest`s with
-  `Origin::Watched` and adds the dirty-source, hash-policy and shutdown-join behaviour.
+  enforced. Every one of them is met. `hoard_index::coordinate::Coordinator` is the one lane
+  every scan under `serve` runs on, `POST /api/v1/scan` submits to it and `serve` drains it,
+  and `Catalog::search_lane` serialises `rebuild_search` against `refresh_search` while a
+  rebuild prunes only what it indexed. `crates/hoard-index/src/watch.rs` is now a producer
+  for that lane: `hoard_server::start_watcher` starts it from `[index] watch`, each debounced
+  burst is one `ScanRequest` with `Origin::Watched` under the configured hash policy, an
+  overflow, a lost signal or a watch the platform refused reconciles every source with
+  `Origin::Reconcile`, a timer does the same every `reconcile_interval_secs` and once at
+  startup, the data directory, the index directory and the mirror cache root are excluded
+  whole and resolved to absolute paths before the debounce so a root spelled relative to the
+  working directory cannot feed a scan its own writes, `/healthz` carries `watch` and
+  degrades only on a watch the platform refused, and `hoard_server::serve` joins the watcher
+  before draining the lane. A configured root that is not a directory is reported in
+  `WatchStatus.missing` and is not degraded, because a scan skips it with a warning too.
+  `Watcher::start` walks every directory of every source synchronously to register inotify
+  watches, and each directory costs one watch against `fs.inotify.max_user_watches`.
+  **Done in wave 3.**
 - **Managed sources stay visible.** `GET /api/v1/sources` lists every source the catalog
   holds, including a peer's namespace, and each row carries `can_scan`, true exactly when the
   configuration names it, and `managed_by`, one of `"downloads"`, `"pulls"`, `"peer"` or
@@ -189,9 +201,9 @@ Decisions taken on 2026-09-06, by the project owner:
   remote artifact and does not enter this node's queue: local evidence decides local triage.
   **Already the behaviour; recorded, no code.**
 - **Phase 1 stays complete and Phase 11 is done.** Phase 1's SQLite implementation is
-  history, not an unfinished phase. Phase 10 stays partial until the watcher starts,
-  reconciles and shuts down through `serve`, and TREE and DISK need a design decision before
-  either can be implemented. Phase 11's storage replacement is complete; the optimisation
+  history, not an unfinished phase. Phase 10 is done as of wave 3, now that the watcher
+  starts, reconciles and shuts down through `serve`; TREE and DISK need a design decision
+  before either can be implemented and are a risk rather than a phase. Phase 11's storage replacement is complete; the optimisation
   that continues is a list of follow-ups with their own acceptance criteria under `### Phase
   11`. **Done in this wave.**
 - **How should the base facet be counted?** Still open, and still not an implementer's call.

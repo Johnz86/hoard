@@ -35,6 +35,7 @@ humansize.workspace = true
 url.workspace = true
 percent-encoding.workspace = true
 jiff.workspace = true
+parking_lot.workspace = true
 
 [dev-dependencies]
 hoard-index = { workspace = true, features = ["fixtures"] }

@@ -292,6 +292,19 @@ Run `search`, `status`, `rebuild` and `compact` one after another; the lock is e
 scan that fails removes the directory it started, and a source whose root is missing is
 skipped with a warning.
 
+`serve` also writes the catalog without being asked to: it watches every configured source
+unless `[index] watch = false`, and each debounced burst of filesystem events is one scan
+request over the sources it named, under the configured `hash_policy`. A kernel queue
+overflow, a signal the watcher could not queue, and every `reconcile_interval_secs` (3600 by
+default, 0 to turn it off, and once at startup) each ask for a scan of every source instead,
+which is cheap on an unchanged tree because a rescan short-circuits on stamps. Events under
+the server's data directory, the index's data directory or the mirror cache root are dropped
+before the debounce, so the catalog, the block cache and a projection's symlinks never cause
+a rescan of a source they sit under. Every one of those roots and every source root is
+resolved to the absolute path an event carries first, because a root spelled relative to the
+working directory would match nothing. Every one of these is a request on the same lane
+`POST /api/v1/scan` uses, so a watched scan and a manual one never run at once.
+
 `compact` is the only thing that compacts a catalog on demand. A scan compacts at the end of
 building one, because that is bulk construction; a rescan never does, so a shared catalog
 stays readable. `compact` reports the bytes `catalog.redb` was allocated before and after,

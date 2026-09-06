@@ -80,6 +80,52 @@ pub fn start_eviction(state: &AppState) -> Option<hoard_mirror::cache::EvictionH
     ))
 }
 
+/// Starts watching every configured source, so a file added while this node serves is
+/// searchable without a manual scan.
+///
+/// Nothing is started when the configuration turns the watcher off or names no source. The
+/// watcher produces requests for the lane every other scan runs on, so [`serve`] joins it
+/// before draining that lane rather than the caller stopping it.
+///
+/// Every data root is excluded whole rather than by the subdirectories in use, so the
+/// catalog, the block cache and the profile symlinks a projection writes are all Hoard's own
+/// writes and none of them asks for a rescan of a source they happen to sit under.
+pub fn start_watcher(state: &AppState) {
+    let config = state.config();
+    if !config.index.watch || config.index.sources.is_empty() {
+        return;
+    }
+    let options = hoard_index::watch::WatchOptions {
+        debounce: hoard_index::watch::DEFAULT_DEBOUNCE,
+        excluded: vec![
+            config.server.data_dir.clone(),
+            config.index.data_dir.clone(),
+            config.cache_root(),
+        ],
+        reconcile_every: config.index.reconcile_every(),
+    };
+    match hoard_index::watch::Watcher::start(
+        std::sync::Arc::clone(state.coordinator()),
+        &config.index,
+        options,
+    ) {
+        Ok(watcher) => {
+            let status = watcher.status();
+            tracing::info!(
+                watching = status.watching.len(),
+                unwatchable = status.failed.len(),
+                missing = status.missing.len(),
+                "watching the configured sources for changes"
+            );
+            state.hold_watcher(watcher);
+        }
+        Err(error) => {
+            tracing::warn!(%error, "no source can be watched; manual scans still index them");
+            state.watch_unavailable();
+        }
+    }
+}
+
 /// Builds the whole application.
 ///
 /// Route order is load bearing. The hoard API and the Hub API both live under `/api`, and
@@ -179,6 +225,9 @@ where
     )
     .with_graceful_shutdown(shutdown)
     .await;
+    if let Some(watcher) = closing.take_watcher() {
+        watcher.shutdown().await;
+    }
     if let Err(error) = closing.coordinator().shutdown().await {
         tracing::warn!(%error, "the scan lane did not drain before the node stopped");
     }

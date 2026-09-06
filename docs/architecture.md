@@ -168,7 +168,7 @@ hoard/
           facets.rs          per-dimension counts excluding own key, disk pressure
         shard.rs             groups a model split across files into one artifact
         triage.rs            queue, confirm, reject, noise list
-        watch.rs             notify-driven incremental rescans
+        watch.rs             notify-driven rescan requests for the scan lane
       tests/scale.rs         ignored harness: 100k and 1M synthetic entries
     hoard-mirror/            serving faces and upstreams, transport-agnostic
       src/
@@ -238,8 +238,14 @@ precision, trigger, confidence) -> catalog; sha256 in a background job; low conf
 
 Under `serve` every scan goes through `coordinate::Coordinator`: a request answers its job
 id at once and the lane runs the rescan, the hashing and the refresh one request at a time,
-merging a request for a source set that is queued and has not started into it. Shutdown
-drains the lane before the usage sink and the search refresher flush.
+merging a request for a source set that is queued and has not started into it.
+
+`watch::Watcher` is the second producer for that lane. It watches every configured source
+root, drops events under the catalog and cache roots, coalesces the rest over a debounce
+window and submits one request per burst; an overflow, a signal it could not queue, or its
+reconciliation timer submits one over every source instead. Shutdown joins the watcher
+first, then drains the lane, then flushes the usage sink and the search refresher, so
+nothing is still submitting when the lane closes.
 
 Serve, local hit on the Hub face:
 

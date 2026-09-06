@@ -20,7 +20,7 @@ speak. Sources: `docs/use-case.md` (brief), `docs/design/ui-spec.md` and
 | 7 | Upstream proxy and block cache | done | M3 Cross the LAN |
 | 8 | Nodes: discovery, gossip, peer pulls | done | M3 |
 | 9 | Shelves, loadouts, projection, usage | done | M4 Make it usable |
-| 10 | Live index and polish | partial | M4 |
+| 10 | Live index and polish | done | M4 |
 | 11 | Native catalog (native_db + Tantivy) | done | M1 |
 
 Tick a phase only when its acceptance check passes and `/hoard-verify` is clean.
@@ -37,12 +37,13 @@ apply pulled one whose sha256 matched the origin byte for byte before it became 
 searchable. The static `[peers]` path was verified independently, because mDNS is blocked
 on many networks.
 
-Phase 10 is partial: PyTorch zip key extraction, dataset sniffing, the `?` sheet and the
-doctor command are in. The `notify` watcher exists and is tested but nothing starts it, so
-live rescanning does not ship until `serve` starts, reconciles and shuts it down. The TREE
-and DISK views need a design decision before they can be built: `docs/design/ui-spec.md`
-records them as named in the proposal but absent from the prototype, so there is no design to
-build them from.
+Phase 10 is done: PyTorch zip key extraction, dataset sniffing, the `?` sheet, the doctor
+command and live rescanning. `hoard serve` watches every configured source by default,
+submits what changes to the scan lane under the configured hash policy, reconciles every
+source after an overflow and on an interval, never rescans on its own catalog and cache
+writes, reports the watch in `/healthz`, and joins the watcher before the lane drains. The
+TREE and DISK views are not part of the phase: they need a design decision before they can
+be built, and are recorded under "Risks and open decisions".
 
 Phase 11 is done. It replaced the SQLite index with the native catalog: every command, every
 route, both faces and gossip read and write it, and no SQLite code remains, which is what the
@@ -337,17 +338,20 @@ native catalog, and the bullets below describe what the catalog holds.
 
 ### Phase 10: Live index and polish
 
-- Done: PyTorch zip key extraction, ONNX and dataset sniffing, the `?` key sheet, and the
-  doctor command, which diagnoses by default and repairs the derived totals on `--repair`.
+- PyTorch zip key extraction, ONNX and dataset sniffing, the `?` key sheet, and the doctor
+  command, which diagnoses by default and repairs the derived totals on `--repair`.
 - The `notify` watcher through `serve`: started with the server, reconciling what changed
-  while it was down, and joined on shutdown. Accept: a file added under a configured source
-  while `serve` runs is searchable without a manual scan, a manual scan and a watched scan
-  never run over the same source at once, the configured hash policy is preserved, an
-  overflowed watch marks its source dirty rather than losing the change, and shutdown leaves
-  no running watcher.
-- TREE and DISK views: blocked on a design decision, not on implementation. There is no
-  layout for them in `docs/design/handoff/`, so what they show has to be decided before
-  either can be built.
+  while it was down, and joined on shutdown.
+- Accept, and each holds: a file added under a configured source while `serve` runs is
+  searchable without a manual scan; a manual scan and a watched scan never run over the same
+  source at once, because both are requests on `coordinate::Coordinator`; the configured
+  hash policy is preserved rather than forced; an overflowed or lost watch marks the sources
+  dirty and reconciles every one of them instead of losing the change; a timer reconciles on
+  `index.reconcile_interval_secs` regardless, starting with the tick that covers what changed
+  while the node was down; Hoard's own catalog and cache writes never trigger a rescan; a
+  source that cannot be watched is `degraded` in `/healthz` while manual scans keep working;
+  and shutdown joins the watcher before the lane it feeds is drained, so it leaves nothing
+  running.
 
 ### Phase 11: Native catalog
 
@@ -385,3 +389,7 @@ store that already works, not the remainder of the phase.
 - mDNS may be blocked on some networks; the manual `[peers]` list is the fallback.
 - The catalog takes an exclusive lock: one process at a time, which `hoard doctor` reports
   when a second one tries.
+- TREE and DISK views are blocked on a design decision, not on implementation. There is no
+  layout for them in `docs/design/handoff/`: `docs/design/ui-spec.md` records them as named
+  in the proposal but absent from the prototype, so what they show has to be decided before
+  either can be built.

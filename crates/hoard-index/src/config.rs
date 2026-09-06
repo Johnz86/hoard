@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +79,10 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from("./data")
 }
 
+fn default_reconcile_interval() -> u64 {
+    3600
+}
+
 /// The `[index]` section of `hoard.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexConfig {
@@ -92,6 +97,15 @@ pub struct IndexConfig {
     /// Artifacts inferred below this confidence land in the triage queue.
     #[serde(default = "default_triage_confidence")]
     pub triage_confidence: f32,
+    /// Whether `serve` watches the configured sources and indexes what changes without a
+    /// manual scan.
+    #[serde(default = "default_true")]
+    pub watch: bool,
+    /// How often a watching node rescans every source regardless of what it was told, which
+    /// is what covers an overflowed watch and the time the node was not running. Zero turns
+    /// reconciliation off and leaves the watcher driven by events alone.
+    #[serde(default = "default_reconcile_interval")]
+    pub reconcile_interval_secs: u64,
     #[serde(default, rename = "sources")]
     pub sources: Vec<SourceConfig>,
 }
@@ -103,6 +117,8 @@ impl Default for IndexConfig {
             hash_policy: HashPolicy::default(),
             lfs_threshold: default_lfs_threshold(),
             triage_confidence: default_triage_confidence(),
+            watch: true,
+            reconcile_interval_secs: default_reconcile_interval(),
             sources: Vec::new(),
         }
     }
@@ -129,6 +145,14 @@ impl IndexConfig {
             seen.push(source.name.clone());
         }
         Ok(())
+    }
+
+    /// How often a watching node reconciles, or `None` when reconciliation is off.
+    pub fn reconcile_every(&self) -> Option<Duration> {
+        match self.reconcile_interval_secs {
+            0 => None,
+            seconds => Some(Duration::from_secs(seconds)),
+        }
     }
 
     pub fn source(&self, name: &str) -> Option<&SourceConfig> {
@@ -181,6 +205,26 @@ mod tests {
         assert_eq!(config.hash_policy, HashPolicy::Background);
         assert_eq!(config.lfs_threshold, 10_485_760);
         assert_eq!(config.native_path(), PathBuf::from("./data/native"));
+    }
+
+    #[test]
+    fn watch_defaults_on_and_reconciles_hourly() {
+        let config: IndexConfig =
+            toml::from_str("hash_policy = \"never\"\n").expect("an [index] section parses");
+        assert!(
+            config.watch,
+            "a config that predates the watcher still watches"
+        );
+        assert_eq!(config.reconcile_interval_secs, 3600);
+        assert_eq!(config.reconcile_every(), Some(Duration::from_secs(3600)));
+
+        let off: IndexConfig =
+            toml::from_str("reconcile_interval_secs = 0\n").expect("an [index] section parses");
+        assert_eq!(
+            off.reconcile_every(),
+            None,
+            "zero seconds turns reconciliation off rather than spinning"
+        );
     }
 
     #[test]
