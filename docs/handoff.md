@@ -152,6 +152,19 @@ what wave 9 looked at and left.
   that is not. Storing the bytes is the remaining half, and it is a record shape change.
 - **A read-only open** is waiting on redb offering one, so searches could run beside a
   rebuild rather than beside a lock.
+- **A retirement killed before its recount leaves path counts stale with nothing to find
+  them.** `retire_entries` marks entries absent in one transaction and `recount_retired_paths`
+  corrects the affected artifacts' `path_count` from `Counters.touched` afterwards, which is
+  an in-memory set. A kill between the two loses it, and because both the stored summary and
+  a fresh count read whatever `path_count` is stored, the two agree and `hoard doctor` sees
+  nothing. Found during wave 4 of the predictable-memory run and deliberately not fixed
+  there: it is a different pass, and fixing it properly means giving retirement a durable
+  record of what it still owes, which is a design rather than an edit.
+- **Discovery is not bounded, only the walk is.** Wave 4 groups a source's repositories in
+  sixty-fours for the stored-row map and the retraction, but `discover` still returns a
+  source whole with every entry materialised, so a fresh scan's peak is unchanged. Making
+  discovery itself yield groups is possible for an hf-cache and a git source and impossible
+  for a loose one, and means changing what `discover` returns.
 - The narrower items each carry their own paragraph in `docs/native-catalog.md` under
   "Remaining work": the tally's slot per term of a column, the sampled path's fallback
   recollecting, `sweep_artifact` decompressing a cold row to delete it, and
