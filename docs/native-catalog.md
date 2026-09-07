@@ -1109,6 +1109,102 @@ and the after column runs two more queries before it than the before column does
 mark it is measured from is set differently. The absolute peak, the 866 MiB the scan grows
 by, is the same in every run of both columns.
 
+### Three workloads the harness had never run, at 1M
+
+Three phases the scale harness did not have before `2403264`, each behind its own
+environment variable and skipped when it is unset, so a run without them prints exactly what
+the run printed at `0935fde`: a mass deletion, eight concurrent midpoint queries, and a usage
+log of half a million rows. They exist because the run of 2026-09-07 rewrote four subsystems
+for memory without measuring any of them; these are the three workloads the project owner
+named as the gaps. **This wave changed no production code and proposes no fix.**
+
+```sh
+HOARD_SCALE_ENTRIES=1000000 HOARD_SCALE_DIR=<scratch>/scale \
+  HOARD_SCALE_CONCURRENT=1 HOARD_SCALE_USAGE=1 HOARD_SCALE_DELETE=1 \
+  cargo test --release -p hoard-index --test scale -- --nocapture --ignored
+```
+
+Both columns are the harness at `2403264` on this workstation, two runs of one session over
+one tree, nothing else running, no `RUSTFLAGS`. The phases run in the order below, after the
+existing incremental workload and before the tree is put back: the concurrent queries first,
+so they read the same index state the single-threaded midpoint row above them read, and the
+deletion last, because it is the only phase that changes what the catalog holds.
+
+Each phase measures its peak against a mark it sets itself, by writing `5` to
+`/proc/self/clear_refs`, which lowers `VmHWM` to what is resident at that moment. Without it
+every one of these rows would read zero, because the scan's own 830 MiB peak is never
+exceeded again in the process. The resident row beside each peak is `VmRSS` before against
+after, which is what a process doing only that work would still hold.
+
+| measure | first run | second run |
+| --- | --- | --- |
+| eight concurrent midpoint queries, offset | 499,950 | 499,950 |
+| slowest of the eight | 632.547 ms | 681.280 ms |
+| wall from spawn to join | 633.047 ms | 681.684 ms |
+| the same page single-threaded, same run | 72.006 ms | 72.266 ms |
+| peak rss growth over the eight | 19,296,256 (18.40 MiB) | 20,193,280 (19.26 MiB) |
+| resident rss over the eight | 16,252,928 (15.50 MiB) | 16,232,448 (15.48 MiB) |
+| repositories the usage rows name | 1 | 1 |
+| usage rows seeded, in batches of 256 | 500,000 | 500,000 |
+| seed wall | 5.203 s | 5.171 s |
+| peak rss growth while the log was seeded | 0 | 0 |
+| `recent_pulls` at 20 | 163.689 ms | 172.482 ms |
+| peak rss growth over `recent_pulls` | 70,823,936 (67.54 MiB) | 71,512,064 (68.20 MiB) |
+| resident rss over `recent_pulls` | 25,034,752 (23.88 MiB) | 25,034,752 (23.88 MiB) |
+| `usage_report` at 7 days and 20 rows | 146.091 ms | 149.435 ms |
+| peak rss growth over `usage_report` | 45,723,648 (43.61 MiB) | 46,342,144 (44.20 MiB) |
+| `usage_days` at 90 days | 427.532 ms | 442.417 ms |
+| peak rss growth over `usage_days` | 119,779,328 (114.23 MiB) | 118,431,744 (112.95 MiB) |
+| pulls the 90 day chart counted | 500,000 | 500,000 |
+| directories deleted, of 1,000 | 100 | 100 |
+| files deleted | 100,000 | 100,000 |
+| rescan wall with a tenth of the tree gone | 16.573 s | 16.942 s |
+| the same walk with 1,000 changed, same run | 4.783 s | 4.901 s |
+| peak rss growth during the deletion rescan | 399,179,776 (380.69 MiB) | 406,638,592 (387.80 MiB) |
+| resident rss over the deletion rescan | 42,807,296 (40.82 MiB) | 41,693,184 (39.76 MiB) |
+| `absent` the deletion rescan reported | 100,000 | 100,000 |
+| files in the tree after it was restored | 1,000,000 | 1,000,000 |
+| scan wall, same run | 76.085 s | 73.127 s |
+| peak rss growth during the scan, same run | 873,218,048 (832.77 MiB) | 871,112,704 (830.76 MiB) |
+
+**A rescan that finds 100,000 files gone: no problem found.** It reports exactly the 100,000
+it should, retires them without an interrupted walk, and grows the process by 380.7 and
+387.8 MiB against a gate of 2 GB and against the 832.8 MiB the full scan in the same run
+grows by. The wall is 16.6 and 16.9 s, against 4.8 and 4.9 s for the same walk of the same
+tree when 1,000 files changed and none was missing, so retiring 100,000 entries costs about
+12 s, roughly 120 microseconds each. No gate is written for a rescan's wall.
+
+**Eight concurrent midpoint queries: no problem found on memory; the latency is a number to
+read carefully.** All eight together grow the process by 18.40 and 19.26 MiB, against the
+13.62 MiB of resident memory one midpoint page holds on its own in the rows above: aggregate
+memory across concurrent expensive searches is bounded, which is what the workload was built
+to find out. The slowest of the eight took 632.5 and 681.3 ms, against 72.0 and 72.3 ms for
+the same page single-threaded in the same run. Eight times 72 ms is 576 ms, so the eight are
+close to serialized, and the slowest one is over the standing 500 ms query gate while the
+single-request row is 427 ms inside it. That gate is written for a query, and nothing in this
+document says whether it is meant to bind on the slowest of eight at once; this wave measured
+the number and takes no view on the mechanism, which no measurement here establishes.
+
+**A usage log of 500,000 rows: no problem found against the gates.** All three reads the
+USAGE tab makes are under 500 ms, the widest of them, the 90 day chart that is counted from
+the log rather than from the repository's own record, by 57.5 and 72.5 ms. Nothing in the
+phase approaches the memory gate: the largest is 114.23 MiB over that chart.
+
+Three facts about that log which are not verdicts. The gate fixture is one repository, not a
+hundred, because `config` in the harness sets `repo_per_folder: false` and loose discovery
+then groups every file under one repository, so the skew this phase was written for has
+nowhere to spread and the one repository holds all 500,000 rows. `recent_pulls` returns 20
+rows and grows the process by 67.5 and 68.2 MiB doing it. The same three reads over the same
+500,000 row log on a tree of 5,000 files took 145.3, 133.1 and 408.5 ms, so what they cost is
+in the length of the log and not in the size of the catalog; their peak growth over that
+smaller tree read 90.07, 44.10 and 208.79 MiB, which is not comparable to the column above,
+because a process that has just scanned a million files has an allocator that can serve the
+same work without asking the kernel for more.
+
+Seeding grew the process by zero, which is not evidence that seeding allocates nothing: the
+peak mark is set after a scan and a rebuild have already run, and 500,000 rows written in
+1,954 transactions fit inside what those left behind.
+
 ### Thresholds
 
 At 1M entries, absolute: peak RSS growth during the scan under 2 GB, allocated disk under

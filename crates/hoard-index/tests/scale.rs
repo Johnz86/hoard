@@ -1,16 +1,42 @@
 #![allow(clippy::expect_used, clippy::print_stderr)]
 
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use hoard_index::catalog::{Catalog, QueryRequest, RescanScope, StorageReport};
+use hoard_core::RepoRowId;
+use hoard_index::catalog::{
+    Catalog, QueryRequest, RepositoryFilter, RescanScope, StorageReport, UsageEvent,
+};
 use hoard_index::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
 use hoard_index::search::{CompileContext, Facets, SortKey, SortSpec};
 
 const FILES_PER_DIRECTORY: usize = 1000;
 const PAGE: u32 = 100;
 const TOUCHED: usize = 1000;
+/// One in this many of the tree's directories the deletion phase removes before it rescans.
+const DELETED_DIRECTORY_SHARE: usize = 10;
+/// How many midpoint queries the concurrency phase runs at once, which is what a small
+/// office asks of one server between keystrokes.
+const CONCURRENT_QUERIES: usize = 8;
+/// How many usage rows the usage phase seeds, and how many one `log_usage_batch` writes.
+const USAGE_ROWS: usize = 500_000;
+const USAGE_BATCH: usize = 256;
+/// One row in this many is served by the busiest repository, so one log is far longer than
+/// the rest the way one popular model's is.
+const USAGE_SKEW: usize = 2;
+/// How many days the seeded rows are spread back over. Longer than the per-day counts a
+/// repository's record keeps, so a chart wider than that is counted from the log itself.
+const USAGE_SPREAD_DAYS: i64 = 45;
+/// How many distinct clients the seeded rows come from, which is what a LAN holds and is
+/// well under the cap a repository's record keeps.
+const USAGE_CLIENTS: usize = 16;
+const USAGE_PULL_LIMIT: u32 = 20;
+const USAGE_REPORT_DAYS: u32 = 7;
+const USAGE_CHART_DAYS: u32 = 90;
+/// How many repositories of the tree the seeded rows are spread over.
+const USAGE_REPOSITORIES: u32 = 1000;
 /// How often the rebuild samples the output directory while it writes a new index, in
 /// documents. Sparse enough that the walk is not part of what is being measured.
 const REBUILD_SAMPLE: u64 = 51_200;
@@ -60,17 +86,7 @@ fn synthetic_tree(root: &Path, count: usize) -> PathBuf {
         fs::remove_dir_all(&tree).expect("stale tree is removable");
     }
     let started = Instant::now();
-    for index in 0..count {
-        let directory = tree.join(format!("d{}", index / FILES_PER_DIRECTORY));
-        if index % FILES_PER_DIRECTORY == 0 {
-            fs::create_dir_all(&directory).expect("tree directory is creatable");
-        }
-        fs::write(
-            directory.join(format!("w{index}.safetensors")),
-            header(index),
-        )
-        .expect("synthetic header is writable");
-    }
+    rewrite(&tree, 0..count, 0);
     fs::write(&marker, b"ok").expect("marker is writable");
     eprintln!("generated {count} files in {:?}", started.elapsed());
     tree
@@ -158,24 +174,60 @@ fn kb_between(before: u64, after: u64) -> String {
 /// Rewrites the first `count` headers so a rescan has to read them again and log a change
 /// per artifact, without adding or removing a path.
 fn touch(tree: &Path, count: usize) {
-    rewrite(tree, count, 1);
+    rewrite(tree, 0..count, 1);
 }
 
 /// Puts the headers `touch` rewrote back, so the next binary measured against this tree
 /// reads exactly the same input.
 fn restore(tree: &Path, count: usize) {
-    rewrite(tree, count, 0);
+    rewrite(tree, 0..count, 0);
 }
 
-fn rewrite(tree: &Path, count: usize, offset: usize) {
-    for index in 0..count {
+fn rewrite(tree: &Path, indices: Range<usize>, offset: usize) {
+    for index in indices {
         let directory = tree.join(format!("d{}", index / FILES_PER_DIRECTORY));
+        if index.is_multiple_of(FILES_PER_DIRECTORY) {
+            fs::create_dir_all(&directory).expect("tree directory is creatable");
+        }
         fs::write(
             directory.join(format!("w{index}.safetensors")),
             header(index + offset),
         )
         .expect("synthetic header is rewritable");
     }
+}
+
+/// How many directories a tree of `count` files is spread over.
+fn directories_of(count: usize) -> usize {
+    count.div_ceil(FILES_PER_DIRECTORY)
+}
+
+/// Removes the last `removed` directories of the tree and returns the index of the first
+/// file that went with them. The last directories, so the headers `touch` rewrote stay
+/// where they are.
+fn remove_directories(tree: &Path, count: usize, removed: usize) -> usize {
+    let kept = directories_of(count) - removed;
+    for directory in kept..directories_of(count) {
+        fs::remove_dir_all(tree.join(format!("d{directory}")))
+            .expect("tree directory is removable");
+    }
+    kept * FILES_PER_DIRECTORY
+}
+
+/// Whether an optional phase of the gate run was asked for. Each phase is off unless its
+/// own variable is set, so a run without it prints what the run printed before the phase
+/// existed.
+fn phase_enabled(variable: &str) -> bool {
+    std::env::var_os(variable).is_some_and(|value| !value.is_empty())
+}
+
+/// Moves the peak resident mark down to what is resident now and returns the mark to
+/// measure a phase's growth from, so the growth is that phase's own peak rather than a
+/// difference from a mark an earlier phase set. Where the kernel refuses, the mark is the
+/// unchanged high water mark and the growth is what it always was.
+fn reset_peak_rss() -> u64 {
+    let _ = fs::write("/proc/self/clear_refs", b"5");
+    peak_rss_kb()
 }
 
 fn timed<T>(work: impl FnOnce() -> T) -> (T, Duration) {
@@ -247,6 +299,250 @@ fn facet_summary(facets: &Facets) -> String {
         .map(usize::to_string)
         .collect::<Vec<String>>()
         .join(" / ")
+}
+
+/// One piece of work, its wall, and what the process held over it, each against a peak
+/// mark this measurement set itself.
+struct Measured<T> {
+    value: T,
+    wall: Duration,
+    peak: String,
+    resident: String,
+}
+
+fn measure<T>(work: impl FnOnce() -> T) -> Measured<T> {
+    let mark = reset_peak_rss();
+    let resident = current_rss_kb();
+    let (value, wall) = timed(work);
+    Measured {
+        value,
+        wall,
+        peak: kb_between(mark, peak_rss_kb()),
+        resident: kb_between(resident, current_rss_kb()),
+    }
+}
+
+/// One served response, spread back over [`USAGE_SPREAD_DAYS`] days oldest first, with
+/// [`USAGE_SKEW`] of the rows on the first repository the tree holds.
+fn usage_event(repositories: &[RepoRowId], row: usize, now: jiff::Timestamp) -> UsageEvent {
+    let repo = match row.is_multiple_of(USAGE_SKEW) {
+        true => repositories[0],
+        false => repositories[row % repositories.len()],
+    };
+    let age = (USAGE_ROWS - row) as i64 * USAGE_SPREAD_DAYS * 86_400 / USAGE_ROWS as i64;
+    UsageEvent {
+        at: now
+            .checked_sub(jiff::Span::new().seconds(age))
+            .expect("the seeded time is representable"),
+        client: Some(format!("10.0.0.{}", row % USAGE_CLIENTS)),
+        repo: Some(repo),
+        artifact: None,
+        path: format!("d{}/w{row}.safetensors", row / FILES_PER_DIRECTORY),
+        bytes: 1_073_741_824 + row as u64,
+        rate_bps: Some(94_371_840),
+        status: 200,
+    }
+}
+
+/// Seeds [`USAGE_ROWS`] served responses and reports what the three reads the USAGE tab
+/// makes cost against a log that long.
+fn usage_phase(catalog: &Catalog) -> Vec<(&'static str, String)> {
+    if !phase_enabled("HOARD_SCALE_USAGE") {
+        return Vec::new();
+    }
+    let listing = catalog
+        .repositories(&RepositoryFilter::default(), None, USAGE_REPOSITORIES)
+        .expect("the repositories listing answers");
+    let repositories: Vec<RepoRowId> = listing.rows.iter().map(|row| row.id).collect();
+    let busiest = *repositories.first().expect("the tree holds a repository");
+    let now = jiff::Timestamp::now();
+    let seeded = measure(|| {
+        let mut written = 0_u64;
+        let mut batch = Vec::with_capacity(USAGE_BATCH);
+        for row in 0..USAGE_ROWS {
+            batch.push(usage_event(&repositories, row, now));
+            if batch.len() == USAGE_BATCH {
+                written += catalog
+                    .log_usage_batch(&batch)
+                    .expect("a batch of usage rows is written");
+                batch.clear();
+            }
+        }
+        written
+            + catalog
+                .log_usage_batch(&batch)
+                .expect("the last batch of usage rows is written")
+    });
+    let pulls = measure(|| {
+        catalog
+            .recent_pulls(busiest, USAGE_PULL_LIMIT)
+            .expect("the recent pulls answer")
+    });
+    let usage = measure(|| {
+        catalog
+            .usage_report(busiest, USAGE_REPORT_DAYS, USAGE_PULL_LIMIT)
+            .expect("the usage report answers")
+    });
+    let chart = measure(|| {
+        catalog
+            .usage_days(busiest, USAGE_CHART_DAYS)
+            .expect("the usage chart answers")
+    });
+    vec![
+        (
+            "repositories the usage rows name",
+            repositories.len().to_string(),
+        ),
+        ("usage rows seeded", seeded.value.to_string()),
+        ("usage seed wall", format!("{:?}", seeded.wall)),
+        ("peak rss growth while the log was seeded", seeded.peak),
+        ("resident rss over the seeding", seeded.resident),
+        ("recent_pulls at 20, wall", format!("{:?}", pulls.wall)),
+        ("peak rss growth over recent_pulls", pulls.peak),
+        ("resident rss over recent_pulls", pulls.resident),
+        ("rows recent_pulls returned", pulls.value.len().to_string()),
+        (
+            "usage_report at 7 days and 20 rows, wall",
+            format!("{:?}", usage.wall),
+        ),
+        ("peak rss growth over usage_report", usage.peak),
+        ("resident rss over usage_report", usage.resident),
+        ("days usage_report drew", usage.value.days.len().to_string()),
+        (
+            "clients usage_report counted",
+            usage.value.clients.to_string(),
+        ),
+        ("usage_days at 90 days, wall", format!("{:?}", chart.wall)),
+        ("peak rss growth over usage_days", chart.peak),
+        ("resident rss over usage_days", chart.resident),
+        ("days usage_days drew", chart.value.len().to_string()),
+        (
+            "pulls usage_days counted",
+            chart
+                .value
+                .iter()
+                .map(|day| day.pulls)
+                .sum::<u64>()
+                .to_string(),
+        ),
+    ]
+}
+
+/// Runs [`CONCURRENT_QUERIES`] midpoint pages at once against one catalog and reports what
+/// the process holds across all of them, because a per-request figure says nothing about
+/// what a server answering eight of them at once needs.
+fn concurrency_phase(
+    catalog: &Catalog,
+    context: &CompileContext,
+    offset: u32,
+) -> Vec<(&'static str, String)> {
+    if !phase_enabled("HOARD_SCALE_CONCURRENT") {
+        return Vec::new();
+    }
+    let mark = reset_peak_rss();
+    let resident_before = current_rss_kb();
+    let (walls, wall) = timed(|| {
+        std::thread::scope(|scope| {
+            let queries: Vec<_> = (0..CONCURRENT_QUERIES)
+                .map(|_| {
+                    scope.spawn(|| {
+                        timed(|| {
+                            catalog
+                                .query(QueryRequest {
+                                    raw: "",
+                                    sort: SortSpec::new(SortKey::Name, false),
+                                    limit: PAGE,
+                                    offset,
+                                    context,
+                                })
+                                .expect("a concurrent query succeeds")
+                        })
+                        .1
+                    })
+                })
+                .collect();
+            queries
+                .into_iter()
+                .map(|query| query.join().expect("a query thread finishes"))
+                .collect::<Vec<Duration>>()
+        })
+    });
+    let peak = peak_rss_kb();
+    let resident_after = current_rss_kb();
+    vec![
+        (
+            "concurrent midpoint queries",
+            CONCURRENT_QUERIES.to_string(),
+        ),
+        ("concurrent midpoint queries, offset", offset.to_string()),
+        (
+            "peak rss growth over the concurrent queries",
+            kb_between(mark, peak),
+        ),
+        (
+            "resident rss over the concurrent queries",
+            kb_between(resident_before, resident_after),
+        ),
+        (
+            "slowest of the concurrent queries",
+            format!("{:?}", walls.iter().max().copied().unwrap_or_default()),
+        ),
+        ("concurrent queries, wall to join", format!("{wall:?}")),
+    ]
+}
+
+/// Deletes a tenth of the tree, rescans, and reports what the walk that finds a tenth of
+/// its files gone costs. Restores the tree afterwards, because the harness reuses trees.
+fn deletion_phase(
+    catalog: &Catalog,
+    config: &IndexConfig,
+    tree: &Path,
+    count: usize,
+) -> Vec<(&'static str, String)> {
+    if !phase_enabled("HOARD_SCALE_DELETE") {
+        return Vec::new();
+    }
+    let removed = (directories_of(count) / DELETED_DIRECTORY_SHARE).max(1);
+    let first = remove_directories(tree, count, removed);
+    let mark = reset_peak_rss();
+    let resident_before = current_rss_kb();
+    let (rescanned, rescan_time) = timed(|| {
+        catalog
+            .rescan(
+                config,
+                HashPolicy::Never,
+                RescanScope::Configured,
+                |_, _| {},
+            )
+            .expect("the rescan after a mass deletion succeeds")
+    });
+    let peak = peak_rss_kb();
+    let resident_after = current_rss_kb();
+    rewrite(tree, first..count, 0);
+    let whole = directory_size(tree, |_| 1);
+    assert_eq!(
+        whole, count as u64,
+        "the tree holds every file again after the deletion phase"
+    );
+    vec![
+        ("directories removed", removed.to_string()),
+        ("files removed", (count - first).to_string()),
+        ("deletion rescan wall", format!("{rescan_time:?}")),
+        (
+            "peak rss growth during the deletion rescan",
+            kb_between(mark, peak),
+        ),
+        (
+            "resident rss over the deletion rescan",
+            kb_between(resident_before, resident_after),
+        ),
+        ("deletion rescan report", format!("{rescanned:?}")),
+        (
+            "absent after the deletion rescan",
+            rescanned.absent.to_string(),
+        ),
+        ("files in the restored tree", whole.to_string()),
+    ]
 }
 
 fn report(rows: &[(&str, String)]) {
@@ -393,6 +689,9 @@ fn native_catalog_at_scale() {
             .expect("rebuild over a published index succeeds")
     });
     let republished_allocated = directory_size(&output, allocated);
+    let mut phases = concurrency_phase(&catalog, &context, midpoint);
+    phases.extend(usage_phase(&catalog));
+    phases.extend(deletion_phase(&catalog, &config, &tree, count));
     drop(catalog);
     restore(&tree, TOUCHED);
 
@@ -514,6 +813,9 @@ fn native_catalog_at_scale() {
             bytes(republished_allocated),
         ),
     ]);
+    if !phases.is_empty() {
+        report(&phases);
+    }
 }
 
 /// The costs the one-artifact-per-file gate above cannot show, because its fixture has no
