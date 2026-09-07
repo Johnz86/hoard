@@ -55,7 +55,7 @@ pub use self::verdict::OverrideRecord;
 
 /// The one shape this build reads and writes. A catalog whose manifest names another is
 /// rebuilt from disk rather than converted.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// One redb table's share of the catalog file: the rows it holds, the payload bytes those
 /// rows spend, the btree pages holding them, and the space inside those pages that holds

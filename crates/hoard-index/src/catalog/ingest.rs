@@ -392,7 +392,6 @@ impl Ingesting<'_, '_> {
         self.transaction.upsert(SearchText {
             artifact_id: id,
             keys: tensor_keys(None),
-            card: String::new(),
         })?;
         self.transaction.upsert(detail)?;
         self.transaction.upsert(record)?;

@@ -101,7 +101,7 @@ hoard/
     design/ui-spec.md        tokens, layout, columns, keys extracted from the design
     design/handoff/          Claude Design export, verbatim
     superpowers/specs/       decision records
-    superpowers/research/    dependency research notes
+    superpowers/research/    dependency and design research notes
     superpowers/history/     condensed record of finished work
   src/
     main.rs                  clap entry

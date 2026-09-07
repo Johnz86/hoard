@@ -25,8 +25,8 @@ first; this document assumes it.
 - Phases 0 to 11 are done. `docs/feature-plan.md` holds the table. The TREE and DISK views
   are not an unfinished phase: they wait on a design decision and are recorded under that
   document's "Risks and open decisions".
-- At the head of `master` after the rescan-identity wave all four checks pass:
-  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 854 passed,
+- At the head of `master` after the disk wave all four checks pass:
+  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 860 passed,
   0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness
   and its supplemental fixture, the mDNS test that needs a multicast route and the sniffer
   test that reads the local model caches. `cargo doc --workspace --no-deps` emits no warning.
@@ -108,6 +108,24 @@ Performance, with the numbers from `docs/native-catalog.md`:
   `ArtifactDetail` summary itself (497 MiB of pages, 37 per cent of the file), and one card
   per revision instead of one per artifact in `SearchText`. The per-table breakdown in
   `docs/native-catalog.md` is current.
+- **The disk wave took the three record levers and closed the fourth.** A revision's card is
+  one `RevisionText` row keyed by `(repo_id, revision)` rather than a copy in every
+  artifact's `SearchText`; every record but `Manifest` is on the compact codec, `Manifest`
+  alone keeping native_model's default so a format mismatch is found before any compact row
+  is decoded; and `ArtifactDetail` keeps the sixteen tensor samples the triage queue reads a
+  hidden dimension from rather than the sixty-four the sniff draws for inference.
+  `FORMAT_VERSION` is 5, so every existing catalog is rebuilt from disk. Nothing was
+  measured: the four rows for wave 8 to watch are allocated disk at 1M, the rebuild (one card
+  read per revision, not per artifact), the inspector detail row, and the supplemental
+  fixture with cards, which loses most of its `SearchText`.
+- **Page packing is answered and not worth doing.**
+  `docs/superpowers/research/2026-09-page-packing.md` reads redb 2.6.3: the 42 to 55 per cent
+  leaf fill comes from one split rule that always cuts at the byte midpoint and has no append
+  case, so insertion order, a bulk load in key order and a dense rewrite all land at the same
+  fill, `Database::compact` moves whole pages and never rebuilds a leaf, and
+  `Builder::set_page_size` is compiled only under `cfg(any(fuzzing, test))`. The reachable
+  saving is 0 to 5 per cent; the lever that works is payload, at about two bytes of file per
+  byte off a row.
 - **A page anywhere in the order costs a page.** A window of at most 16,384 rows for a text
   key, or 131,072 for a numeric one, keeps the heap it always kept; a deeper one is found by
   rank, in three passes that sample the order, count the documents between consecutive

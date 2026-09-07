@@ -28,9 +28,9 @@ use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::usage::Window;
 use super::{
     Catalog, DigestApplied, EntryDetail, FORMAT_VERSION, JobProgress, JobState, MIRROR_SOURCE,
-    NewProjection, PullMark, PulledFile, QueryPage, QueryRequest, RemoteEntry, RepositoryDetail,
-    RepositoryFilter, RescanReport, RescanScope, ServedFile, Totals, TriageItem, UsageEvent,
-    builder, models, query,
+    NewProjection, PullMark, PullSlot, PulledFile, QueryPage, QueryRequest, RemoteEntry,
+    RepositoryDetail, RepositoryFilter, RescanReport, RescanScope, ServedFile, Totals, TriageItem,
+    UsageEvent, builder, models, query,
 };
 
 fn running_as_root() -> bool {
@@ -1051,6 +1051,221 @@ fn hf_cache_rows_match_the_legacy_shape() -> Result<()> {
     Ok(())
 }
 
+/// The body of a card, with a word nothing else in a fixture uses.
+fn card_body(word: &str) -> Vec<u8> {
+    format!("---\nlicense: mit\n---\nTrained on {word} photographs.\n").into_bytes()
+}
+
+/// The card one revision of the catalog holds, read straight from the record.
+fn stored_card(catalog: &Catalog, repo_id: i64, revision: u32) -> Result<Option<String>> {
+    let read = catalog.database.r_transaction()?;
+    let stored: Option<models::RevisionText> = read
+        .get()
+        .primary(LocationKey::revision(repo_id, revision))?;
+    Ok(stored.map(|stored| stored.card))
+}
+
+/// The repository and revision the fixture's one weight sits at.
+fn only_slot(catalog: &Catalog) -> Result<(i64, u32)> {
+    let read = catalog.database.r_transaction()?;
+    let entry: Entry = read
+        .scan()
+        .primary()?
+        .all()?
+        .next()
+        .transpose()?
+        .ok_or_else(|| IndexError::Catalog("the fixture holds no entry".into()))?;
+    Ok((entry.repo_id, entry.revision))
+}
+
+#[test]
+fn a_revision_card_is_stored_once_and_indexed_for_every_artifact() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("acme");
+    fs::create_dir(&input)?;
+    fs::write(input.join("README.md"), card_body("chinchilla"))?;
+    for index in 0..5 {
+        fs::write(
+            input.join(format!("adapter{index}.safetensors")),
+            lora_header_named(&format!("block{index}")),
+        )?;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "loose")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    catalog.rebuild_search(|_| {})?;
+
+    let read = catalog.database.r_transaction()?;
+    assert_eq!(
+        read.len().primary::<models::RevisionText>()?,
+        1,
+        "five artifacts of one revision share one card"
+    );
+    drop(read);
+    assert_eq!(
+        search(&catalog, "")?.total,
+        5,
+        "every weight is an artifact of its own"
+    );
+    assert_eq!(
+        search(&catalog, "chinchilla")?.total,
+        5,
+        "the card the revision holds is indexed into every one of them"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_changed_card_reindexes_the_revision_and_an_unchanged_one_writes_nothing() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("acme");
+    fs::create_dir(&input)?;
+    fs::write(input.join("README.md"), card_body("chinchilla"))?;
+    fs::write(input.join("adapter.safetensors"), lora_header())?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "loose")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    catalog.rebuild_search(|_| {})?;
+    let (repo_id, revision) = only_slot(&catalog)?;
+    assert_eq!(
+        stored_card(&catalog, repo_id, revision)?.as_deref(),
+        Some("Trained on chinchilla photographs.\n"),
+        "the revision holds the body of its README"
+    );
+    assert_eq!(search(&catalog, "chinchilla")?.total, 1);
+
+    let sentinel = "a card no walk of this tree would produce";
+    let transaction = catalog.database.rw_transaction()?;
+    transaction.upsert(models::RevisionText {
+        key: LocationKey::revision(repo_id, revision),
+        card: sentinel.to_owned(),
+    })?;
+    transaction.commit()?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    assert_eq!(
+        stored_card(&catalog, repo_id, revision)?.as_deref(),
+        Some(sentinel),
+        "a revision no file of which changed does not have its card written again"
+    );
+
+    fs::write(input.join("README.md"), card_body("vicuna"))?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    catalog.refresh_search(|_| {})?;
+    assert_eq!(
+        stored_card(&catalog, repo_id, revision)?.as_deref(),
+        Some("Trained on vicuna photographs.\n"),
+        "a card that changed is written once for the revision"
+    );
+    assert_eq!(
+        search(&catalog, "vicuna")?.total,
+        1,
+        "the artifact the card belongs to is indexed again"
+    );
+    assert_eq!(
+        search(&catalog, "chinchilla")?.total,
+        0,
+        "the card it replaced is gone from the index"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_revision_refiled_onto_a_new_slot_keeps_the_card_the_new_commit_wrote() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("clones");
+    let clone = input.join("org").join("clone");
+    fs::create_dir_all(&clone)?;
+    git(&clone, &["init", "--initial-branch=main", "--quiet"]);
+    fs::write(clone.join("README.md"), card_body("chinchilla"))?;
+    fs::write(clone.join("adapter.safetensors"), lora_header())?;
+    git(&clone, &["add", "."]);
+    git(&clone, &["commit", "-m", "first import", "--quiet"]);
+    let config = IndexConfig {
+        sources: vec![SourceConfig {
+            kind: SourceKind::Git,
+            ..source(&input, "clones")
+        }],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let repo = RepoId::parse_ref(RepoType::Models, "org/clone")?;
+    let held = only_revision(&catalog, &repo)?;
+    assert_eq!(
+        stored_card(&catalog, held.0, held.1)?.as_deref(),
+        Some("Trained on chinchilla photographs.\n")
+    );
+
+    fs::write(clone.join("README.md"), card_body("vicuna"))?;
+    git(&clone, &["add", "."]);
+    git(&clone, &["commit", "-m", "reword the card", "--quiet"]);
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+
+    let advanced = only_revision(&catalog, &repo)?;
+    assert_ne!(
+        advanced.1, held.1,
+        "the branch moved onto a commit the catalog had not seen"
+    );
+    assert_eq!(
+        stored_card(&catalog, advanced.0, advanced.1)?.as_deref(),
+        Some("Trained on vicuna photographs.\n"),
+        "the weights refiled onto the new slot do not carry the old card back with them"
+    );
+    assert_eq!(
+        stored_card(&catalog, held.0, held.1)?,
+        None,
+        "and the slot they left keeps none"
+    );
+    Ok(())
+}
+
+/// The repository row id and the ordinal of the revision `main` names.
+fn only_revision(catalog: &Catalog, repo: &RepoId) -> Result<(i64, u32)> {
+    let detail = catalog
+        .repository(repo)?
+        .ok_or_else(|| IndexError::Catalog("the fixture holds no repository".into()))?;
+    let main = catalog
+        .resolve_revision(&detail, "main")
+        .ok_or_else(|| IndexError::Catalog("the fixture holds no main".into()))?;
+    Ok((detail.id.get(), main.ordinal))
+}
+
 const STYLER: &str = "models--acme--styler";
 
 fn hub_config(hub: &Path) -> IndexConfig {
@@ -1324,10 +1539,12 @@ fn a_source_dropped_from_the_configuration_is_retired_by_the_next_full_rescan() 
     fs::create_dir(&kept)?;
     fs::create_dir(&dropped)?;
     fs::write(kept.join("kept.safetensors"), lora_header_named("kept"))?;
+    fs::write(kept.join("README.md"), card_body("chinchilla"))?;
     fs::write(
         dropped.join("dropped.safetensors"),
         lora_header_named("gone"),
     )?;
+    fs::write(dropped.join("README.md"), card_body("vicuna"))?;
     let both = IndexConfig {
         sources: vec![source(&kept, "kept"), source(&dropped, "dropped")],
         ..IndexConfig::default()
@@ -1366,7 +1583,10 @@ fn a_source_dropped_from_the_configuration_is_retired_by_the_next_full_rescan() 
         RescanScope::Configured,
         |_, _| {},
     )?;
-    assert_eq!(report.absent, 1, "the dropped source's one path is retired");
+    assert_eq!(
+        report.absent, 2,
+        "both paths of the dropped source are retired"
+    );
     let names: Vec<String> = catalog
         .sources()?
         .into_iter()
@@ -1380,18 +1600,36 @@ fn a_source_dropped_from_the_configuration_is_retired_by_the_next_full_rescan() 
         .primary()?
         .all()?
         .collect::<native_db::db_type::Result<_>>()?;
+    let mut paths: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry.rel_path.as_str())
+        .collect();
+    paths.sort_unstable();
     assert_eq!(
-        entries
-            .iter()
-            .map(|entry| entry.rel_path.as_str())
-            .collect::<Vec<_>>(),
-        ["kept.safetensors"],
+        paths,
+        ["README.md", "kept.safetensors"],
         "the retired source's rows go with it"
     );
+    let repositories: Vec<Repository> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(repositories.len(), 1, "a repository outlives no source");
+    let cards: Vec<models::RevisionText> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
     assert_eq!(
-        read.len().primary::<Repository>()?,
+        cards.len(),
         1,
-        "a repository outlives no source"
+        "the retired repository's card is removed with its rows"
+    );
+    assert_eq!(
+        cards[0].key,
+        LocationKey::revision(repositories[0].id, 0),
+        "and the one that is left is the kept repository's"
     );
     assert_eq!(
         read.len().primary::<ArtifactRecord>()?,
@@ -4457,57 +4695,53 @@ fn cold_records_read_back_through_the_inspector() -> Result<()> {
             ("ss_comment".to_owned(), format!("run {index}")),
         ]),
     };
-    let entries: Vec<SeedEntry> = cards
-        .iter()
-        .enumerate()
-        .map(|(index, card)| SeedEntry {
-            node: LOCAL_NODE,
-            rel_path: format!("w{index}.safetensors"),
-            abs_path: Some(format!("/vault/w{index}.safetensors")),
-            size: 1024 + index as u64,
-            state: State::Local,
-            is_symlink: false,
-            sha256: None,
-            git_sha1: None,
-            artifact: Some(SeedArtifact {
-                identity: 900 + index as u128,
-                artifact: Artifact {
-                    id: ArtifactId::new(0),
-                    blob: BlobId::new(0),
-                    sha256: None,
-                    size: 1024 + index as u64,
-                    format: ArtifactFormat::Safetensors,
-                    role: Role::Lora,
-                    sub_role: None,
-                    role_confidence: 0.9,
-                    base: Base::new("sdxl"),
-                    base_label: None,
-                    base_confidence: 0.9,
-                    precision: None,
-                    quant: None,
-                    rank: None,
-                    alpha: None,
-                    params: None,
-                    context: None,
-                    trigger: None,
-                    sniff_version: 1,
-                },
-                name: format!("w{index}.safetensors"),
-                org: None,
-                tensors: Some(tensors(index)),
-                evidence: vec![Evidence {
-                    field: "role".to_owned(),
-                    value: "lora".to_owned(),
-                    source: EvidenceSource::Tensor,
-                    detail: Some(card.clone()),
-                    confidence: 0.9,
-                }],
-                card: Some(card.clone()),
-                group_bytes: None,
-                shard_count: None,
-            }),
-        })
-        .collect();
+    let entry = |index: usize, card: &String| SeedEntry {
+        node: LOCAL_NODE,
+        rel_path: format!("w{index}.safetensors"),
+        abs_path: Some(format!("/vault/w{index}.safetensors")),
+        size: 1024 + index as u64,
+        state: State::Local,
+        is_symlink: false,
+        sha256: None,
+        git_sha1: None,
+        artifact: Some(SeedArtifact {
+            identity: 900 + index as u128,
+            artifact: Artifact {
+                id: ArtifactId::new(0),
+                blob: BlobId::new(0),
+                sha256: None,
+                size: 1024 + index as u64,
+                format: ArtifactFormat::Safetensors,
+                role: Role::Lora,
+                sub_role: None,
+                role_confidence: 0.9,
+                base: Base::new("sdxl"),
+                base_label: None,
+                base_confidence: 0.9,
+                precision: None,
+                quant: None,
+                rank: None,
+                alpha: None,
+                params: None,
+                context: None,
+                trigger: None,
+                sniff_version: 1,
+            },
+            name: format!("w{index}.safetensors"),
+            org: None,
+            tensors: Some(tensors(index)),
+            evidence: vec![Evidence {
+                field: "role".to_owned(),
+                value: "lora".to_owned(),
+                source: EvidenceSource::Tensor,
+                detail: Some(card.clone()),
+                confidence: 0.9,
+            }],
+            card: Some(card.clone()),
+            group_bytes: None,
+            shard_count: None,
+        }),
+    };
     let repo = RepoId::parse_ref(RepoType::Models, "acme/cold")?;
     catalog.seed(&[SeedRepository {
         repo,
@@ -4515,15 +4749,19 @@ fn cold_records_read_back_through_the_inspector() -> Result<()> {
         kind: SourceKind::HfCache,
         root_path: "/vault".into(),
         git_dir: None,
-        revisions: vec![SeedRevision {
-            name: "main".to_owned(),
-            sha: None,
-            refs: vec![("main".to_owned(), RefKind::Branch)],
-            title: None,
-            author: None,
-            committed: None,
-            entries,
-        }],
+        revisions: cards
+            .iter()
+            .enumerate()
+            .map(|(index, card)| SeedRevision {
+                name: format!("r{index}"),
+                sha: None,
+                refs: vec![(format!("r{index}"), RefKind::Branch)],
+                title: None,
+                author: None,
+                committed: None,
+                entries: vec![entry(index, card)],
+            })
+            .collect(),
     }])?;
     catalog.rebuild_search(|_| {})?;
     let ids: Vec<ArtifactId> = search(&catalog, "")?
@@ -4566,6 +4804,298 @@ fn cold_records_read_back_through_the_inspector() -> Result<()> {
         found.total, 1,
         "a compressed card is still what the search index was built from"
     );
+    Ok(())
+}
+
+/// A LoRA header holding more tensors than a stored row keeps its samples of.
+fn many_tensor_header(count: usize) -> Vec<u8> {
+    let mut header = String::from(r#"{"__metadata__":{"ss_network_dim":"16"}"#);
+    for index in 0..count {
+        let start = index * 2048;
+        header.push_str(&format!(
+            ",\"lora_unet_block{index:03}_attn.lora_down.weight\":\
+             {{\"dtype\":\"F16\",\"shape\":[16,64],\"data_offsets\":[{start},{}]}}",
+            start + 2048
+        ));
+    }
+    header.push('}');
+    crate::sniff::tests::safetensors_fixture(&header)
+}
+
+#[test]
+fn a_stored_detail_keeps_the_samples_the_inspector_shows_and_no_more() -> Result<()> {
+    let tensors = 40;
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("acme");
+    fs::create_dir(&input)?;
+    fs::write(input.join("wide.safetensors"), many_tensor_header(tensors))?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "loose")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    catalog.rebuild_search(|_| {})?;
+    let row = search(&catalog, "")?
+        .rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| IndexError::Catalog("the fixture indexed no artifact".into()))?;
+    assert_eq!(row.role, Role::Lora, "inference read the whole header");
+    let header = catalog
+        .artifact_detail(row.artifact_id)?
+        .and_then(|detail| detail.tensors)
+        .ok_or_else(|| IndexError::Catalog("the artifact carries no header".into()))?;
+
+    assert_eq!(
+        header.tensor_count, tensors as u32,
+        "what the header proved is kept whole"
+    );
+    assert_eq!(
+        header.params,
+        tensors as u64 * 16 * 64,
+        "so are the parameters it counted"
+    );
+    assert_eq!(header.dtypes.get("F16").copied(), Some(tensors as u32));
+    assert_eq!(
+        header.metadata.get("ss_network_dim").map(String::as_str),
+        Some("16"),
+        "and the metadata the file carried"
+    );
+    let names: Vec<&str> = header
+        .samples
+        .iter()
+        .map(|sample| sample.name.as_str())
+        .collect();
+    let expected: Vec<String> = (0..tensors)
+        .step_by(tensors.div_ceil(16))
+        .map(|index| format!("lora_unet_block{index:03}_attn.lora_down.weight"))
+        .collect();
+    assert_eq!(
+        names, expected,
+        "the bound thins the draw by a stride, so it spans the file rather than its first \
+         quarter"
+    );
+    assert!(
+        header.samples.len() <= 16,
+        "and never more than sixteen of them, got {}",
+        header.samples.len()
+    );
+    Ok(())
+}
+
+/// Every record the compact codec was turned on for, with the fields most likely to be
+/// spelled differently by a varint encoding: a path, an enum, a float, a nested vector and
+/// integers at the edge of their width.
+#[test]
+fn every_record_round_trips_through_the_compact_codec() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let native = config.native_path();
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+
+    let repo = RepoId::parse_ref(RepoType::Models, "acme/round-trip")?;
+    let source = Source {
+        name: "codec".to_owned(),
+        config: SourceConfig {
+            name: "codec".to_owned(),
+            path: PathBuf::from("/vault/models"),
+            kind: SourceKind::HfCache,
+            include: vec!["*.safetensors".to_owned()],
+            exclude: vec!["*.tmp".to_owned(), "*.part".to_owned()],
+            follow_symlinks: true,
+            repo_per_folder: true,
+        },
+        resolved_kind: SourceKind::Loose,
+        file_count: 1 << 40,
+        byte_count: u64::MAX,
+        last_scan: Some("2026-09-07T08:00:00Z".to_owned()),
+        pending_hashes: 300,
+    };
+    let repository = Repository {
+        id: 4242,
+        key: models::repository_key("codec", &repo),
+        source: "codec".to_owned(),
+        repo: repo.clone(),
+        root_path: "/vault/models/acme".to_owned(),
+        git_dir: Some("/vault/models/acme/.git".to_owned()),
+        default_ref: "main".to_owned(),
+        remote: Some("https://example.invalid/acme/round-trip".to_owned()),
+        revisions: vec![models::Revision {
+            name: "v2".to_owned(),
+            sha: Some(CommitSha::from_bytes([0x5a; 20])),
+            refs: vec![models::Ref {
+                name: "v2".to_owned(),
+                kind: RefKind::Tag,
+            }],
+            title: Some("second".to_owned()),
+            author: Some("someone".to_owned()),
+            committed: Some("2026-09-06T10:00:00Z".to_owned()),
+        }],
+        present_files: u32::MAX,
+        present_bytes: 1 << 50,
+    };
+    let verdict = models::Override {
+        artifact_id: 4243,
+        role: Some(Role::Lora),
+        sub_role: Some(SubRole::Ipa),
+        base: Some(Base::new("sdxl")),
+        decided_at: "2026-09-07T08:01:00Z".to_owned(),
+    };
+    let change = SearchChange {
+        seq: u64::MAX - 3,
+        artifact_id: 4243,
+    };
+    let summary = models::Summary {
+        id: 3,
+        reclaimable_bytes: 1 << 45,
+        duplicate_artifacts: 12,
+        artifacts: 1_000_000,
+        present_artifacts: 999_999,
+        triage_artifacts: 7,
+        indexed_bytes: u64::MAX / 3,
+        repositories: 4096,
+        advertised_artifacts: 128,
+    };
+    let allocator = Allocator {
+        id: 7,
+        repos: 1 << 33,
+        artifacts: 1 << 34,
+        entries: 1 << 35,
+    };
+    let setting = models::Setting {
+        key: "codec.round.trip".to_owned(),
+        value: "dense".to_owned(),
+    };
+    let shelf = Shelf {
+        id: 9001,
+        name: "codec round trip".to_owned(),
+        query: "role:lora sort:size".to_owned(),
+        builtin: false,
+        position: -3,
+    };
+    let noise = models::Noise {
+        id: 9002,
+        path: "/vault/noise".to_owned(),
+        reason: Some("not weights".to_owned()),
+        added_at: "2026-09-07T08:02:00Z".to_owned(),
+    };
+    let projection = models::Projection {
+        id: 9003,
+        link_path: "/tools/comfy/loras/round-trip.safetensors".to_owned(),
+        profile: "comfy".to_owned(),
+        target_path: "/vault/models/acme/round-trip.safetensors".to_owned(),
+        artifact_id: Some(4243),
+        written_at: "2026-09-07T08:03:00Z".to_owned(),
+    };
+    let usage = models::Usage {
+        seq: 9004,
+        repo_id: Some(4242),
+        at: "2026-09-07T08:04:00Z".to_owned(),
+        client: Some("10.0.0.9".to_owned()),
+        artifact_id: Some(4243),
+        path: "round-trip.safetensors".to_owned(),
+        bytes: 1 << 40,
+        rate_bps: Some(125_000_000),
+        status: 206,
+    };
+    let repo_usage = models::RepoUsage {
+        repo_id: 4242,
+        pulls: 4096,
+        clients: vec!["10.0.0.9".to_owned(), "10.0.0.10".to_owned()],
+        last_pull: "2026-09-07T08:04:00Z".to_owned(),
+    };
+    let artifact_use = models::ArtifactUse {
+        artifact_id: 4243,
+        count: 77,
+        last_used: "2026-09-07T08:05:00Z".to_owned(),
+    };
+    let loadout = models::LoadoutDoc {
+        id: 9006,
+        name: "codec".to_owned(),
+        document: "name = \"codec\"\n".to_owned(),
+        created_at: "2026-09-07T08:06:00Z".to_owned(),
+        updated_at: "2026-09-07T08:07:00Z".to_owned(),
+    };
+    let job = models::Job {
+        id: 9007,
+        kind: "scan".to_owned(),
+        state: JobState::Failed,
+        phase: Some("walking".to_owned()),
+        subject: Some("codec".to_owned()),
+        progress: 0.625,
+        bytes: 1 << 41,
+        total: Some(1 << 42),
+        rate_bps: Some(9_000_000),
+        error: Some("a root went away".to_owned()),
+        started: "2026-09-07T08:08:00Z".to_owned(),
+        finished: Some("2026-09-07T08:09:00Z".to_owned()),
+    };
+    let node = Node {
+        id: 9008,
+        node_id: "codec-peer".to_owned(),
+        name: "peer".to_owned(),
+        url: Some("http://10.0.0.10:7777".to_owned()),
+        is_self: false,
+        online: true,
+        indexed_bytes: 1 << 46,
+        last_seen: Some("2026-09-07T08:10:00Z".to_owned()),
+        cursor: Some("2026-09-07T08:09:59Z".to_owned()),
+        synced: Some("2026-09-07T08:10:01Z".to_owned()),
+        pass: 19,
+        filed: 65_536,
+    };
+
+    let transaction = catalog.database.rw_transaction()?;
+    transaction.upsert(source.clone())?;
+    transaction.upsert(repository.clone())?;
+    transaction.upsert(verdict.clone())?;
+    transaction.upsert(change.clone())?;
+    transaction.upsert(summary.clone())?;
+    transaction.upsert(allocator.clone())?;
+    transaction.upsert(setting.clone())?;
+    transaction.upsert(shelf.clone())?;
+    transaction.upsert(noise.clone())?;
+    transaction.upsert(projection.clone())?;
+    transaction.upsert(usage.clone())?;
+    transaction.upsert(repo_usage.clone())?;
+    transaction.upsert(artifact_use.clone())?;
+    transaction.upsert(loadout.clone())?;
+    transaction.upsert(job.clone())?;
+    transaction.upsert(node.clone())?;
+    transaction.commit()?;
+    drop(catalog);
+
+    let reopened = Catalog::open(&native)?;
+    let read = reopened.database.r_transaction()?;
+    assert_eq!(read.get().primary("codec".to_owned())?, Some(source));
+    assert_eq!(read.get().primary(4242_i64)?, Some(repository));
+    assert_eq!(read.get().primary(4243_i64)?, Some(verdict));
+    assert_eq!(read.get().primary(u64::MAX - 3)?, Some(change));
+    assert_eq!(read.get().primary(3_u8)?, Some(summary));
+    assert_eq!(read.get().primary(7_u8)?, Some(allocator));
+    assert_eq!(
+        read.get().primary("codec.round.trip".to_owned())?,
+        Some(setting)
+    );
+    assert_eq!(read.get().primary(9001_i64)?, Some(shelf));
+    assert_eq!(read.get().primary(9002_i64)?, Some(noise));
+    assert_eq!(read.get().primary(9003_i64)?, Some(projection));
+    assert_eq!(read.get().primary(9004_u64)?, Some(usage));
+    assert_eq!(read.get().primary(4242_i64)?, Some(repo_usage));
+    assert_eq!(read.get().primary(4243_i64)?, Some(artifact_use));
+    assert_eq!(read.get().primary(9006_i64)?, Some(loadout));
+    assert_eq!(read.get().primary(9007_i64)?, Some(job));
+    assert_eq!(read.get().primary(9008_i64)?, Some(node));
     Ok(())
 }
 
@@ -5697,6 +6227,118 @@ fn a_pull_is_marked_while_moving_and_filed_when_verified() -> Result<()> {
         catalog.digest(None, 10)?.total,
         1,
         "a pulled artifact is offered onward"
+    );
+    Ok(())
+}
+
+/// Files one pulled file into a slot, sniffed and inferred the way the pull queue does, and
+/// answers the artifact it was filed under.
+fn pull_into(
+    catalog: &Catalog,
+    slot: PullSlot,
+    root: &Path,
+    rel_path: &str,
+    bytes: &[u8],
+    sha: u8,
+) -> Result<ArtifactId> {
+    let destination = root.join(rel_path);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&destination, bytes)?;
+    let sniff = crate::sniff::sniff_path(&destination)?;
+    let name = crate::shard::file_name(rel_path);
+    let mut input = crate::infer::InferInput::new(sniff.format, &destination, name, sniff.size);
+    if let Some(tensors) = &sniff.tensors {
+        input = input.with_tensors(tensors);
+    }
+    let inference = crate::infer::infer(&input);
+    catalog
+        .file_pulled(&PulledFile {
+            slot,
+            rel_path,
+            abs_path: &destination,
+            sha256: Sha256::from_bytes([sha; 32]),
+            git_sha1: None,
+            sniff: &sniff,
+            inference: &inference,
+            served: true,
+            triage: false,
+        })?
+        .artifact
+        .ok_or_else(|| IndexError::Catalog(format!("{rel_path} was filed under no artifact")))
+}
+
+#[test]
+fn a_pulled_readme_becomes_the_revisions_card_and_reindexes_what_it_holds() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = Catalog::open_or_scan(
+        &IndexConfig {
+            data_dir: directory.path().join("native"),
+            ..IndexConfig::default()
+        },
+        "workstation",
+        |_, _| {},
+    )?;
+    let repo = RepoId::parse_ref(RepoType::Models, "kohya/film-grain")?;
+    let root = directory.path().join("pulled");
+    let slot = catalog.pull_slot(&repo, CommitSha::from_bytes([0x22; 20]), &root)?;
+    let weight = pull_into(
+        &catalog,
+        slot,
+        &root,
+        "loras/film-grain.safetensors",
+        &lora_header(),
+        0x42,
+    )?;
+    catalog.rebuild_search(|_| {})?;
+    assert_eq!(
+        stored_card(&catalog, slot.repo.get(), slot.revision)?,
+        None,
+        "a revision holds no card until one is pulled"
+    );
+
+    pull_into(
+        &catalog,
+        slot,
+        &root,
+        "README.md",
+        &card_body("chinchilla"),
+        1,
+    )?;
+    assert_eq!(
+        stored_card(&catalog, slot.repo.get(), slot.revision)?.as_deref(),
+        Some("Trained on chinchilla photographs.\n"),
+        "the pulled README is the revision's card"
+    );
+    catalog.refresh_search(|_| {})?;
+    assert!(
+        search(&catalog, "chinchilla")?
+            .rows
+            .iter()
+            .any(|row| row.artifact_id == weight),
+        "the weight pulled before the card is indexed again with it"
+    );
+
+    pull_into(&catalog, slot, &root, "NOTES.md", &card_body("vicuna"), 2)?;
+    assert_eq!(
+        stored_card(&catalog, slot.repo.get(), slot.revision)?.as_deref(),
+        Some("Trained on chinchilla photographs.\n"),
+        "markdown that is not a README is not a card"
+    );
+
+    pull_into(
+        &catalog,
+        slot,
+        &root,
+        "loras/README.md",
+        &card_body("capybara"),
+        3,
+    )?;
+    assert_eq!(
+        stored_card(&catalog, slot.repo.get(), slot.revision)?.as_deref(),
+        Some("Trained on chinchilla photographs.\n"),
+        "and a README below the shallowest one is not either"
     );
     Ok(())
 }

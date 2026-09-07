@@ -24,7 +24,8 @@ use super::hashing::content_key;
 use super::models::{
     Allocator, ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE,
     LocationKey, Manifest, Node, Override, Placement, Ref, Repository, RepositoryKey, Revision,
-    SearchChange, SearchText, Source, Summary, repository_key,
+    SearchChange, SearchText, Source, Summary, move_revision_card, remove_revision_cards,
+    repository_key, store_revision_card,
 };
 use super::naming::{
     InferenceContext, Naming, artifact_name, content_hashes, disambiguate_labels, index_document,
@@ -216,6 +217,7 @@ impl Catalog {
                     let units = revision_units(&revision.entries, sets);
                     let plan = revision_plan(&context, documents, &units);
                     let labels = set_labels(&plan.naming, &units);
+                    let mut card_written = false;
                     for (unit, label) in units.iter().zip(labels) {
                         let prepare = match decide_unit(walk, found, unit) {
                             UnitDecision::Skip => {
@@ -242,6 +244,16 @@ impl Catalog {
                             continue;
                         }
                         let transaction = self.database.rw_transaction()?;
+                        if !std::mem::replace(&mut card_written, true)
+                            && store_revision_card(
+                                &transaction,
+                                walked.id,
+                                ordinal,
+                                plan.context.card().unwrap_or_default(),
+                            )?
+                        {
+                            log_revision_artifacts(&transaction, walked.id, ordinal, counters)?;
+                        }
                         let taken = replace_known(&transaction, walk, counters, found, &prepare)?;
                         store_unit(&transaction, &context, prepared, counters)?;
                         sweep_taken(&transaction, taken, counters)?;
@@ -273,6 +285,9 @@ impl Catalog {
                 let Some(entry) = transaction.get().primary::<Entry>(*entry_id)? else {
                     continue;
                 };
+                if entry.revision != *ordinal {
+                    move_revision_card(&transaction, entry.repo_id, entry.revision, *ordinal)?;
+                }
                 if let Some(artifact) = entry.artifact_id {
                     counters.pending.push(artifact);
                 }
@@ -494,6 +509,7 @@ impl Catalog {
                 transaction.commit()?;
             }
             let transaction = self.database.rw_transaction()?;
+            remove_revision_cards(&transaction, repo_id)?;
             if let Some(stored) = transaction.get().primary::<Repository>(repo_id)? {
                 transaction.remove(stored)?;
             }
@@ -798,6 +814,27 @@ pub(super) fn sweep_artifact(transaction: &RwTransaction<'_>, id: i64) -> Result
         _ => {}
     }
     Ok(false)
+}
+
+/// Marks every artifact of one revision for indexing, which is what a card the revision
+/// shares changing means: the text belongs to documents that are otherwise untouched.
+pub(super) fn log_revision_artifacts(
+    transaction: &RwTransaction<'_>,
+    repo_id: i64,
+    revision: u32,
+    counters: &mut Counters,
+) -> Result<()> {
+    for entry in transaction
+        .scan()
+        .secondary::<Entry>(EntryKey::location)?
+        .start_with(LocationKey::revision(repo_id, revision))?
+    {
+        let entry: Entry = entry?;
+        if let Some(id) = entry.artifact_id {
+            counters.pending.push(id);
+        }
+    }
+    Ok(())
 }
 
 /// Every path pointing at one artifact, which is the bound on recounting what it holds.
@@ -1727,12 +1764,11 @@ pub(super) fn creates_artifact(
     format.is_artifact() && !presence.pointer_bytes && !matches!(role, EntryRole::Member)
 }
 
-/// What one file that becomes an artifact contributes: only such a file pays for inference,
-/// a copy of the revision's card, and a content identity.
+/// What one file that becomes an artifact contributes: only such a file pays for inference
+/// and a content identity.
 struct ArtifactDraft {
     identity: u128,
     inference: Inference,
-    card: Option<String>,
 }
 
 struct PreparedEntry<'a> {
@@ -2115,7 +2151,6 @@ fn prepare_entry<'a>(
             Ok(ArtifactDraft {
                 identity: identity(entry, &presence)?,
                 inference: infer::infer(&input),
-                card: plan.context.card().map(str::to_owned),
             })
         })
         .transpose()?;
@@ -2342,7 +2377,6 @@ fn store_artifact(
     let text = SearchText {
         artifact_id: id,
         keys: tensor_keys(detail.tensors.as_ref()),
-        card: draft.card.clone().unwrap_or_default(),
     };
     match stored {
         Some(_) => {
@@ -2512,10 +2546,6 @@ pub(super) fn record_of(facts: RecordFacts<'_>) -> (ArtifactRecord, ArtifactDeta
         triage_cleared: false,
         first_seen: first_seen.unwrap_or_else(|| jiff::Timestamp::now().to_string()),
     };
-    let detail = ArtifactDetail {
-        artifact_id: id,
-        tensors,
-        evidence: inference.evidence.clone(),
-    };
+    let detail = ArtifactDetail::new(id, tensors, inference.evidence.clone());
     (record, detail)
 }

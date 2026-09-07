@@ -60,10 +60,11 @@ const LZ4_OVERHEAD: usize = size_of::<u32>();
 /// How the catalog's cold records are written: [`Compact`]'s bytes behind a tag, and an
 /// LZ4 block instead when the whole envelope comes out smaller.
 ///
-/// `ArtifactDetail` and `SearchText` are read one row at a time by the inspector and once
-/// per artifact by a search rebuild, never scanned as a group, and they are the two largest
-/// tables. Each row is compressed on its own, so reading one is still one primary lookup
-/// and one bounded decode; nothing here is a block store or a second join.
+/// It is on `ArtifactDetail`, `SearchText` and `RevisionText`: the first two are read one row
+/// at a time by the inspector and once per artifact by a search rebuild, the third once per
+/// revision, and none of the three is ever scanned as a group. Each row is compressed on its
+/// own, so reading one is still one primary lookup and one bounded decode; nothing here is a
+/// block store or a second join.
 #[derive(Default)]
 pub(super) struct Cold;
 

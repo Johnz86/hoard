@@ -13,11 +13,13 @@ use super::Catalog;
 use super::hashing::content_key;
 use super::ingest::IngestRecord;
 use super::models::{
-    ArtifactRecord, ArtifactRecordKey, Entry, LOCAL_NODE, Placement, Repository, RepositoryKey,
-    Revision, SearchText, Source, Summary, entry_at, placement_in, repository_key,
+    ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, LocationKey, Placement,
+    Repository, RepositoryKey, Revision, SearchText, Source, Summary, entry_at, placement_in,
+    repository_key, store_revision_card,
 };
 use super::scan::{
-    Counters, RecordFacts, log_changes, next_id, preference, record_of, tensor_keys,
+    Counters, RecordFacts, log_changes, log_revision_artifacts, next_id, preference, record_of,
+    tensor_keys,
 };
 
 /// The source every file pulled from a peer is filed under.
@@ -128,6 +130,22 @@ impl Catalog {
         let transaction = self.database.rw_transaction()?;
         let identity = content_key(&file.sha256);
         let (artifact_id, created) = filed_artifact(&transaction, &mut counters, file, identity)?;
+        if let Some(readme) = &file.sniff.readme
+            && is_revision_card(&transaction, file.slot, file.rel_path)?
+            && store_revision_card(
+                &transaction,
+                file.slot.repo.get(),
+                file.slot.revision,
+                &readme.body,
+            )?
+        {
+            log_revision_artifacts(
+                &transaction,
+                file.slot.repo.get(),
+                file.slot.revision,
+                &mut counters,
+            )?;
+        }
         counters.pending.push(artifact_id);
         let previous = entry_of_slot(&transaction, file.slot, file.rel_path)?;
         let id = match &previous {
@@ -178,6 +196,41 @@ impl Catalog {
             artifact: Some(ArtifactId::new(artifact_id)),
         })
     }
+}
+
+/// Whether a pulled file is the card of the revision it lands in.
+///
+/// A sniff parses any markdown as a card, and a scan takes only the shallowest `README.md` of
+/// a revision as one. A pull that took every markdown would let a licence or a changelog land
+/// on top of the card the revision already has, so it answers to the same rule: this name,
+/// and no `README.md` above it in the same slot.
+fn is_revision_card(
+    transaction: &RwTransaction<'_>,
+    slot: PullSlot,
+    rel_path: &str,
+) -> Result<bool> {
+    if !is_card_name(rel_path) {
+        return Ok(false);
+    }
+    let depth = rel_path.matches('/').count();
+    for entry in transaction
+        .scan()
+        .secondary::<Entry>(EntryKey::location)?
+        .start_with(LocationKey::revision(slot.repo.get(), slot.revision))?
+    {
+        let entry: Entry = entry?;
+        if entry.rel_path != rel_path
+            && is_card_name(&entry.rel_path)
+            && entry.rel_path.matches('/').count() < depth
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn is_card_name(rel_path: &str) -> bool {
+    crate::shard::file_name(rel_path).eq_ignore_ascii_case("README.md")
 }
 
 /// A pulled file reads the way a scanned one does, minus the two facts a pull settles on
@@ -348,12 +401,6 @@ fn filed_artifact(
     transaction.upsert(SearchText {
         artifact_id: id,
         keys: tensor_keys(file.sniff.tensors.as_ref()),
-        card: file
-            .sniff
-            .readme
-            .as_ref()
-            .map(|readme| readme.body.clone())
-            .unwrap_or_default(),
     })?;
     transaction.upsert(detail)?;
     transaction.upsert(record)?;

@@ -86,7 +86,10 @@ short. The server logs the window at `debug`; nothing in the response names it.
 ## Triage
 
 - `GET /api/v1/triage`: unclassified artifacts with `guess` (`role`, `base`, `confidence`)
-  and `header` (tensor count, key prefixes, hidden dim, dtype).
+  and `header` (tensor count, key prefixes, hidden dim, dtype). The count, the prefixes and
+  the dtype are what the sniff measured over the whole file; the hidden dimension is read
+  from the at most sixteen tensor samples the stored header keeps, thinned by a stride from
+  the sniff's draw rather than taken off its front, not from every tensor the file holds. Inference itself ran over all of them before the row was written.
 - `POST /api/v1/triage/{id}/confirm { "role", "base", "sub_role" }`: assigns and leaves
   triage; `sub_role` is optional.
 - `POST /api/v1/triage/{id}/reject`: records the path as noise; later scans skip it.

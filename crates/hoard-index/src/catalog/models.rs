@@ -17,7 +17,7 @@ use super::jobs::JobState;
 /// A nominated root, with what the last walk of it counted. A source no scan has reached
 /// yet reports no last scan and zeroes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 1, version = 1)]
+#[native_model(id = 1, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct Source {
     #[primary_key]
@@ -36,7 +36,7 @@ pub(super) struct Source {
 /// A repository as a scan found it, with the clone directory the git face serves from and
 /// what each revision's commit says about itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 2, version = 1)]
+#[native_model(id = 2, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct Repository {
     #[primary_key]
@@ -168,7 +168,7 @@ impl Placement {
 /// exactly one revision. Ids come from the allocator and are positive, which is what makes
 /// the big-endian order the numeric one. The path is not folded or canonicalized: two rows
 /// spelling a path differently are two locations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct LocationKey(Vec<u8>);
 
 /// Everything a location key holds before the relative path.
@@ -290,7 +290,7 @@ pub(super) fn entry_at(
 /// A user's verdict on what an artifact is. It outranks inference: the artifact record
 /// carries what the verdict says, and a rescan re-applies it over freshly inferred facts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 12, version = 1)]
+#[native_model(id = 12, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct Override {
     #[primary_key]
@@ -300,6 +300,18 @@ pub(super) struct Override {
     pub(super) base: Option<Base>,
     pub(super) decided_at: String,
 }
+
+/// The most tensor samples a stored header keeps, out of the `sniff::MAX_SAMPLES` the sniff
+/// draws.
+///
+/// The sniff draws its samples so that inference can read shapes, ranks and keyword keys out
+/// of a file it will not open again. What is read back afterwards is the triage queue's
+/// hidden dimension, the most common trailing dimension among the samples of rank two or
+/// more; nothing prints a sample by name. So the row thins the draw by a stride rather than
+/// keeping its head: a mode is a fact about the spread, and the front of a name-sorted header
+/// is one end of the model. A full draw of 64 keeps every fourth; a header already inside the
+/// bound keeps all of it.
+const DETAIL_SAMPLES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 8, version = 1, with = super::codec::Cold)]
@@ -311,6 +323,31 @@ pub(super) struct ArtifactDetail {
     pub(super) evidence: Vec<Evidence>,
 }
 
+impl ArtifactDetail {
+    /// The row as it is stored: the header the sniff measured with its samples cut to
+    /// [`DETAIL_SAMPLES`], and the evidence behind the verdict whole.
+    pub(super) fn new(
+        artifact_id: i64,
+        tensors: Option<TensorSummary>,
+        evidence: Vec<Evidence>,
+    ) -> Self {
+        Self {
+            artifact_id,
+            tensors: tensors.map(|mut tensors| {
+                let drawn = std::mem::take(&mut tensors.samples);
+                let step = drawn.len().div_ceil(DETAIL_SAMPLES).max(1);
+                tensors.samples = drawn
+                    .into_iter()
+                    .step_by(step)
+                    .take(DETAIL_SAMPLES)
+                    .collect();
+                tensors
+            }),
+            evidence,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 5, version = 1, with = super::codec::Cold)]
 #[native_db]
@@ -318,7 +355,100 @@ pub(super) struct SearchText {
     #[primary_key]
     pub(super) artifact_id: i64,
     pub(super) keys: String,
+}
+
+/// The card of one revision, stored once however many artifacts the revision holds and
+/// indexed into every one of their documents.
+///
+/// The key is [`LocationKey::revision`], the same 12 bytes an entry's location starts with,
+/// so one revision is a point lookup and one repository's cards are an 8 byte prefix scan.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 23, version = 1, with = super::codec::Cold)]
+#[native_db]
+pub(super) struct RevisionText {
+    #[primary_key]
+    pub(super) key: LocationKey,
     pub(super) card: String,
+}
+
+/// Stores the card of one revision, writing only when the text is not the one already
+/// there: a rescan that reaches a revision whose card did not change leaves the row alone,
+/// and a revision that lost its card loses its row. Answers whether the row moved, which is
+/// what tells the caller the revision's artifacts have to be indexed again.
+pub(super) fn store_revision_card(
+    transaction: &native_db::transaction::RwTransaction<'_>,
+    repo_id: i64,
+    revision: u32,
+    card: &str,
+) -> super::Result<bool> {
+    let key = LocationKey::revision(repo_id, revision);
+    let stored: Option<RevisionText> = transaction.get().primary(key.clone())?;
+    match (stored, card.is_empty()) {
+        (Some(stored), true) => {
+            transaction.remove(stored)?;
+            Ok(true)
+        }
+        (Some(stored), false) if stored.card != card => {
+            transaction.upsert(RevisionText {
+                card: card.to_owned(),
+                ..stored
+            })?;
+            Ok(true)
+        }
+        (Some(_), false) | (None, true) => Ok(false),
+        (None, false) => {
+            transaction.insert(RevisionText {
+                key,
+                card: card.to_owned(),
+            })?;
+            Ok(true)
+        }
+    }
+}
+
+/// Refiles a revision's card onto the ordinal its entries have moved to, for a revision the
+/// walk rediscovered at a fresh slot with every file it holds unchanged.
+///
+/// A card already at the new ordinal is the one the walk just wrote from the revision's own
+/// README, and it outranks the one the entries are moving from: the commit the branch
+/// advanced onto is what the card of that slot describes. The old row goes either way.
+pub(super) fn move_revision_card(
+    transaction: &native_db::transaction::RwTransaction<'_>,
+    repo_id: i64,
+    from: u32,
+    to: u32,
+) -> super::Result<()> {
+    let Some(stored) = transaction
+        .get()
+        .primary::<RevisionText>(LocationKey::revision(repo_id, from))?
+    else {
+        return Ok(());
+    };
+    let held: Option<RevisionText> = transaction
+        .get()
+        .primary(LocationKey::revision(repo_id, to))?;
+    let carried = held.is_none().then(|| stored.card.clone());
+    transaction.remove(stored)?;
+    match carried {
+        Some(card) => store_revision_card(transaction, repo_id, to, &card).map(|_| ()),
+        None => Ok(()),
+    }
+}
+
+/// Drops every card of one repository, for a repository whose rows are being forgotten.
+pub(super) fn remove_revision_cards(
+    transaction: &native_db::transaction::RwTransaction<'_>,
+    repo_id: i64,
+) -> super::Result<()> {
+    let cards: Vec<RevisionText> = transaction
+        .scan()
+        .primary()?
+        .start_with(LocationKey::repository(repo_id))?
+        .collect::<native_db::db_type::Result<_>>()?;
+    for card in cards {
+        transaction.remove(card)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -345,7 +475,7 @@ pub(super) struct Manifest {
 /// One artifact whose documents the published search index no longer matches. The sequence
 /// orders the log; a refresh replays every row after the manifest's cursor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 10, version = 1)]
+#[native_model(id = 10, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct SearchChange {
     #[primary_key]
@@ -357,7 +487,7 @@ pub(super) struct SearchChange {
 /// record rather than scanning every artifact. `advertised_artifacts` is what a peer's
 /// digest reports as its total: the hashed records this node holds a path to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 11, version = 1)]
+#[native_model(id = 11, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct Summary {
     #[primary_key]
@@ -374,7 +504,7 @@ pub(super) struct Summary {
 
 /// The high-water marks a later scan continues from, so ids stay stable across runs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 9, version = 1)]
+#[native_model(id = 9, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct Allocator {
     #[primary_key]
@@ -386,7 +516,7 @@ pub(super) struct Allocator {
 
 /// One key of the shell's presentation state, as the settings sheet writes it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 13, version = 1)]
+#[native_model(id = 13, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct Setting {
     #[primary_key]
@@ -397,7 +527,7 @@ pub(super) struct Setting {
 /// A saved query. The six shelves hoard ships with are seeded on every open and keep the
 /// positions the design gives them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 14, version = 1)]
+#[native_model(id = 14, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct Shelf {
     #[primary_key]
@@ -411,7 +541,7 @@ pub(super) struct Shelf {
 
 /// A path a rejection marked as noise, which later scans walk past.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 15, version = 1)]
+#[native_model(id = 15, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct Noise {
     #[primary_key]
@@ -424,7 +554,7 @@ pub(super) struct Noise {
 
 /// One symlink `hoard link` or `hoard apply` wrote into a tool's layout.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 16, version = 1)]
+#[native_model(id = 16, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct Projection {
     #[primary_key]
@@ -482,7 +612,7 @@ impl ToKey for RepoAtKey {
 /// The repository is indexed with the time beside it rather than alone, so a window reads
 /// the rows inside it instead of every row the repository ever served.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 17, version = 1)]
+#[native_model(id = 17, version = 1, with = super::codec::Compact)]
 #[native_db(secondary_key(repo_at -> RepoAtKey, optional))]
 pub(super) struct Usage {
     #[primary_key]
@@ -510,7 +640,7 @@ impl Usage {
 /// counted from the log: how often this node served one repository, which clients pulled
 /// it, and when the last pull was.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 22, version = 1)]
+#[native_model(id = 22, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct RepoUsage {
     #[primary_key]
@@ -526,7 +656,7 @@ pub(super) struct RepoUsage {
 /// How often one artifact has been served and when it last was, which is what `used:` and
 /// the last-used column read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 18, version = 1)]
+#[native_model(id = 18, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct ArtifactUse {
     #[primary_key]
@@ -537,7 +667,7 @@ pub(super) struct ArtifactUse {
 
 /// A saved loadout: the TOML document the drawer edits, keyed by the name inside it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 19, version = 1)]
+#[native_model(id = 19, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct LoadoutDoc {
     #[primary_key]
@@ -551,7 +681,7 @@ pub(super) struct LoadoutDoc {
 
 /// A scan, hash run, pull or apply as the JOBS tab shows it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 20, version = 1)]
+#[native_model(id = 20, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct Job {
     #[primary_key]
@@ -572,7 +702,7 @@ pub(super) struct Job {
 /// A machine this install knows about: this one, which is always [`LOCAL_NODE`], plus every
 /// peer discovered or configured.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[native_model(id = 21, version = 1)]
+#[native_model(id = 21, version = 1, with = super::codec::Compact)]
 #[native_db]
 pub(super) struct Node {
     #[primary_key]
@@ -605,6 +735,7 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<Repository>()?;
     models.define::<ArtifactRecord>()?;
     models.define::<SearchText>()?;
+    models.define::<RevisionText>()?;
     models.define::<Manifest>()?;
     models.define::<Entry>()?;
     models.define::<ArtifactDetail>()?;

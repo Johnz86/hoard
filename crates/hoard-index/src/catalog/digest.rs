@@ -480,13 +480,9 @@ impl Applying<'_, '_> {
         self.transaction.upsert(SearchText {
             artifact_id: id,
             keys: String::new(),
-            card: String::new(),
         })?;
-        self.transaction.upsert(ArtifactDetail {
-            artifact_id: id,
-            tensors: None,
-            evidence: Vec::new(),
-        })?;
+        self.transaction
+            .upsert(ArtifactDetail::new(id, None, Vec::new()))?;
         self.transaction.upsert(ArtifactRecord {
             id,
             identity,

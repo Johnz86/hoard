@@ -44,16 +44,18 @@ records that do not name one keep native_model's own bincode default, which is w
 `Manifest` bootstraps from before any changed record is read.
 
 - `Compact` is bincode 1.3 with variable length integers, little endian, trailing bytes
-  refused. It is on `Entry` and `ArtifactRecord`. native_model's default spends eight bytes
-  on every string and vector length, four on every enum discriminant and eight on every
-  integer whatever it holds; nothing outside this process reads a row, so none of that is
-  paid for.
+  refused. It is on every record but `Manifest` and the three cold ones. native_model's
+  default spends eight bytes on every string and vector length, four on every enum
+  discriminant and eight on every integer whatever it holds; nothing outside this process
+  reads a row, so none of that is paid for.
 - `Cold` wraps `Compact`'s bytes in a one byte tag and, when the whole envelope comes out
-  smaller, an LZ4 block with a checked four byte decoded length. It is on `ArtifactDetail`
-  and `SearchText`, the two largest tables and the two nothing scans: the inspector reads
-  one row and a rebuild reads one per artifact. Each row is compressed on its own, so a read
-  is still one primary lookup and one bounded decode, and a length claiming more than the
-  256 MiB maximum is refused before anything is allocated for it.
+  smaller, an LZ4 block with a checked four byte decoded length. It is on `ArtifactDetail`,
+  `SearchText` and `RevisionText`, the tables nothing scans: the inspector reads one row and
+  a rebuild reads one per artifact and one per revision. Each row is compressed on its own,
+  so a read is still one primary lookup and one bounded decode, and a length claiming more
+  than the 256 MiB maximum is refused before anything is allocated for it.
+- `Manifest` alone keeps native_model's default, because `open_checked` reads it to compare
+  `format_version` before any record in either of the other two codecs is decoded.
 
 Hashes and row ids serialize as bytes and integers to a binary format and as hex and
 prefixed strings to a human-readable one, so the catalog is compact and the JSON the API
@@ -64,6 +66,19 @@ the three fields that say so, as `repo_id` big endian, then `revision` big endia
 relative path's own bytes. The first 8 bytes are exactly one repository and the first 12
 exactly one revision, so a repository listing and a revision listing are both one prefix
 scan of that index and `Entry` needs no repository index of its own.
+
+`RevisionText` holds one revision's card, keyed by the same 12 bytes an entry's location
+starts with, so the card an artifact's documents are indexed from is one point lookup by
+`(repo_id, revision)` and one repository's cards are an 8 byte prefix scan. Every artifact of
+a revision reads that one row rather than carrying a copy; a build reads it once per run of
+entries that share a revision. A card that changes marks every artifact of its revision for
+indexing, because nothing else about those artifacts moved.
+
+`ArtifactDetail` keeps at most sixteen of the up to sixty-four tensor samples the sniff draws
+for inference, thinned by a stride so the triage queue's hidden dimension is read from a
+spread of the file rather than its first quarter; a header already inside the bound keeps all
+of it. Inference runs over the whole header before the row is written; nothing prints a sample
+by name.
 
 `hoard catalog` takes any directory with `--directory`. Every other command opens or creates
 the catalog at `<data_dir>/native`.
@@ -76,8 +91,8 @@ the catalog at `<data_dir>/native`.
   report, compact.
 - `codec.rs` the compact and cold record encodings, named by `#[native_model(with = ...)]`.
 - `models.rs` every `native_model` record: `Source`, `Repository`, `Revision`,
-  `ArtifactRecord`, `ArtifactDetail`, `Entry`, `SearchText`, `SearchChange`, `Manifest`,
-  `Summary`, `Allocator`, `Node`, and the user-data rows.
+  `ArtifactRecord`, `ArtifactDetail`, `Entry`, `SearchText`, `RevisionText`, `SearchChange`,
+  `Manifest`, `Summary`, `Allocator`, `Node`, and the user-data rows.
 - `scan.rs` discovery to sniff to infer to one transaction per unit; `Counters`,
   `DerivedShift`, `log_changes`, the artifact sweep.
 - `naming.rs` the config and card a revision carries, artifact names, per-file hashes.
@@ -522,8 +537,8 @@ du -sh data/native
 - Catalog on disk: 6.9 MB, of which `catalog.redb` is 6.3 MB and the published search
   directory 572 KB.
 - `catalog status` reported `format_version: 1` and named every table `<model id>_1_<key>`.
-  The format version is 2 from `969ebe4`; the native_model version of every record is still
-  1, so the table names are unchanged.
+  The format version is 5 from the disk wave; the native_model version of every record is
+  still 1, so the table names are unchanged.
 - `ls 'role:lora'`: 35 artifacts. Every `hoard ls` query on this catalog is 15 to 17 ms,
   which is process start and opening two files rather than the query; on a running server,
   which holds the catalog and the Tantivy reader open, every route is 0.5 to 2.4 ms.
@@ -1028,7 +1043,8 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
   operation channel is `bounded(PIPELINE_MAX_SIZE_IN_DOCS)`, 10,000 items, and an item was
   one document and is now one artifact's whole set, so the documents in flight ahead of the
   indexing thread scale with entries per artifact times the size of a document, which the
-  revision card dominates. The synthetic tree has few entries per artifact and a small card,
+  revision card dominates: the card is stored once per revision but is still indexed into
+  every document of it. The synthetic tree has few entries per artifact and a small card,
   so the harness cannot show this; read the rebuild RSS row with it in mind.
 - **A collapsed pass reads a chosen row's facet ordinals one document at a time.** The
   primary path reads the five facet columns and the base label per block through
@@ -1050,32 +1066,21 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
   stands: reaching it needs a bucket that dodged every sample slot, which the odd stride
   makes improbable, and the alternative is a second way to assemble a `Summary` for a path
   that should not run.
-- **Shrink `ArtifactDetail` further.** It is 497.00 MiB of 1,421,844,480 bytes at 1M, 35.0
-  per cent of `catalog.redb` and the largest table by a wide margin, of which 217.01 MiB is
-  B-tree fill factor rather than payload. LZ4 takes 75 per cent off a row carrying a real
-  card and real tensor metadata and 7 per cent off this fixture's one-tensor summary, so
-  what is left is the summary itself: samples, key prefixes and verbatim metadata, per
-  artifact rather than per revision.
-- **Share a card between the artifacts of one revision.** `SearchText` holds the revision's
-  README per artifact. On the supplemental fixture that is 104,968,250 payload bytes
-  compressed to 17,335,378; sharing it would remove the copies rather than compress them.
 - **Pack the pages.** Intra-page slack is the largest single term left in `catalog.redb`:
   608,835,673 bytes at 1M, 45.4 per cent of the file, with the four record tables at 42 to
-  55 per cent leaf fill. It is ordinary B-tree occupancy after a pass of inserts in primary
-  key order interleaved across tables, and `Database::compact` does not reclaim it: it
-  rewrites the file without its free pages and leaves the pages holding rows as full as they
-  were. The lever is a bulk load or a dense rewrite that fills leaves before it seals them,
-  not another codec. Another codec would halve the payload and halve the pages with it,
-  leaving the same 45 per cent slack in half the file.
+  55 per cent leaf fill. `docs/superpowers/research/2026-09-page-packing.md` reads redb 2.6.3
+  and answers it: the fill is decided by one split rule that always cuts a leaf at the byte
+  midpoint and has no append case, so insertion order does not touch it, a bulk load in key
+  order buys nothing, `Database::compact` moves whole pages and never rebuilds a leaf, and
+  `Builder::set_page_size` is `cfg(any(fuzzing, test))` and so is not in a release build at
+  all. The recommendation there is to leave it: the
+  reachable saving is 0 to 5 per cent, and the lever that works is payload, at about two
+  bytes of file per byte off a row.
 - **`sweep_artifact` decompresses a cold row to delete it.** native_db 0.8.2 has no
   remove-by-primary-key: `remove` takes the value, so the sweep reads `ArtifactDetail` and
   `SearchText` in full, LZ4 and bincode included, only to hand them straight back. Every
   artifact a pass orphans pays a decode it does not use. A `remove_by_key` upstream, or a
   cheaper path that reads the raw bytes, would take it off the rescan.
-- **Compact the remaining records.** `Compact` and `Cold` are on the four tables that carry
-  the bulk. `Repository`, `Source`, `Node`, `Usage`, `SearchChange` and the user-data rows
-  still take native_model's fixed-width default. None of them is large now that the change
-  log is not written before the first publish.
 - **`native_model::Model::native_model_decode` unwraps** a payload shorter than its eight
   byte header rather than returning an error, so a truncated row panics. `codec.rs` cannot
   see that byte range; it is reached before any codec is called.

@@ -27,7 +27,8 @@ use crate::search::{
 };
 
 use super::models::{
-    ArtifactRecord, Entry, EntryKey, Manifest, Repository, Revision, SearchChange, SearchText,
+    ArtifactRecord, Entry, EntryKey, LocationKey, Manifest, Repository, Revision, RevisionText,
+    SearchChange, SearchText,
 };
 use super::nodes::NodeNames;
 use crate::error::{IndexError, Result};
@@ -170,6 +171,7 @@ impl Catalog {
             fields: &fields,
             names: &names,
             repository: None,
+            card: None,
         };
         let mut indexed = 0_u64;
         let mut reported = 0_u64;
@@ -260,6 +262,7 @@ impl Catalog {
                 fields: &fields,
                 names: &names,
                 repository: None,
+                card: None,
             };
             let mut operations: Vec<UserOperation> = Vec::new();
             for id in ids {
@@ -1712,7 +1715,12 @@ impl Fields {
         self.keywords[index]
     }
 
-    fn document(&self, facts: &EntryFacts<'_>, text: Option<&SearchText>) -> TantivyDocument {
+    fn document(
+        &self,
+        facts: &EntryFacts<'_>,
+        text: Option<&SearchText>,
+        card: &str,
+    ) -> TantivyDocument {
         let EntryFacts {
             entry,
             repository,
@@ -1790,23 +1798,39 @@ impl Fields {
         }
         if let Some(text) = text {
             document.add_text(self.text, &text.keys);
-            document.add_text(self.text, &text.card);
+        }
+        if !card.is_empty() {
+            document.add_text(self.text, card);
         }
         document
     }
 }
 
-/// One pass over the catalog turning artifacts into documents, with the one-element
-/// repository cache that keeps consecutive entries from reading the same repository again.
+/// One pass over the catalog turning artifacts into documents, with the one-element caches
+/// that keep consecutive entries from reading the same repository and the same revision's
+/// card again. A build walks artifacts in id order, which is the order a scan wrote them
+/// in, so one revision's entries are one run and its card is read once.
 struct Indexing<'a, 'db> {
     snapshot: &'a native_db::transaction::RTransaction<'db>,
     fields: &'a Fields,
     names: &'a NodeNames,
     repository: Option<(i64, Repository)>,
+    card: Option<((i64, u32), String)>,
 }
 
 impl Indexing<'_, '_> {
-    fn repository(&mut self, repo_id: i64) -> Result<&Repository> {
+    /// The repository one entry sits in and the card of the revision it sits at.
+    fn resolve(&mut self, entry: &Entry) -> Result<(&Repository, &str)> {
+        self.load_repository(entry.repo_id)?;
+        self.load_card(entry.repo_id, entry.revision)?;
+        let repository = self.repository.as_ref().map(|(_, repository)| repository);
+        let card = self.card.as_ref().map(|(_, card)| card.as_str());
+        repository
+            .zip(card)
+            .ok_or_else(|| IndexError::Catalog("resolution cache went empty".into()))
+    }
+
+    fn load_repository(&mut self, repo_id: i64) -> Result<()> {
         if self
             .repository
             .as_ref()
@@ -1818,10 +1842,19 @@ impl Indexing<'_, '_> {
                 })?;
             self.repository = Some((repo_id, repository));
         }
-        self.repository
-            .as_ref()
-            .map(|(_, repository)| repository)
-            .ok_or_else(|| IndexError::Catalog("resolution cache went empty".into()))
+        Ok(())
+    }
+
+    fn load_card(&mut self, repo_id: i64, revision: u32) -> Result<()> {
+        let slot = (repo_id, revision);
+        if self.card.as_ref().is_none_or(|(held, _)| *held != slot) {
+            let text: Option<RevisionText> = self
+                .snapshot
+                .get()
+                .primary(LocationKey::revision(repo_id, revision))?;
+            self.card = Some((slot, text.map(|text| text.card).unwrap_or_default()));
+        }
+        Ok(())
     }
 }
 
@@ -1888,7 +1921,7 @@ fn documents_from(
         .map(|entry| entry.id);
     let mut documents = Vec::with_capacity(entries.len());
     for entry in &entries {
-        let repository = indexing.repository(entry.repo_id)?;
+        let (repository, card) = indexing.resolve(entry)?;
         let facts = EntryFacts {
             revision: revision_of(repository, entry)?,
             entry,
@@ -1898,7 +1931,7 @@ fn documents_from(
             primary: preferred == Some(entry.id),
             last_used,
         };
-        documents.push(fields.document(&facts, text.as_ref()));
+        documents.push(fields.document(&facts, text.as_ref(), card));
     }
     Ok(documents)
 }
