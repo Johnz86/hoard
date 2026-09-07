@@ -26,9 +26,9 @@ What is left, and is code:
   channel holds 10,000 groups and a group is one artifact's documents, each carrying the
   revision card, so the documents in flight scale with entries per artifact times card size.
 - **The fresh scan's memory scales with the source.** Discovery materialises every entry of
-  a source before the walk starts, and the counters keep one summary snapshot per artifact
-  touched until the pass ends. At 1M that is most of the 860 MiB the scan grows by; the
-  page cache is another 256 MiB.
+  a source before the walk starts, and the counters keep one summary snapshot and one id per
+  artifact touched until the pass ends, which for a fresh scan is every artifact there is.
+  At 1M that is most of the 860 MiB the scan grows by; the page cache is another 256 MiB.
 - **Recent pulls materialise a repository's whole key range.** `newest_usage` reads the
   `repo_at` secondary key, which native_db collects in full before yielding the last page.
 - **Usage updates re-index served artifacts on every refresh.** Each served artifact logs a
@@ -104,14 +104,26 @@ squashed commit on `master`, in this order.
    response is folded into the counts the next write applies (pulls per repository, per
    day and per client, uses per artifact) with no pull row, and one warning per overflow
    episode says how many were folded. `FORMAT_VERSION` bumps.
-4. **scan-scope.** The scan works in groups of repositories: discovery yields a source's
-   repositories in groups, each group is stored, walked and, for a rescan, its absent paths
-   retracted before the next group is discovered, and the known-stamp map is loaded per
-   group; repositories the catalog holds for the source that discovery never yielded are
-   retracted after the last group. The summary delta is folded per transaction rather than
-   kept per touched artifact until the pass ends. `[index] cache_mib` sets the redb page
-   cache, default 256. Every recovery, refile and revision-identity test keeps its
-   assertions. The 1M scan RSS row is what the last wave reads it on.
+4. **scan-scope.** Three changes, in the order they pay. **The summary delta is folded per
+   transaction** rather than kept per touched artifact until the pass ends: `Counters.before`
+   and `Counters.touched` hold one entry per artifact a pass touches, and a fresh scan
+   touches every one, so at a million artifacts they are the largest thing the pass keeps
+   after discovery. Folding the difference into the stored `Summary` in the transaction that
+   earns it, the way `DerivedShift` already folds the repository counts, removes both; the
+   pass mark and `settle_counts` stay, for a killed pass. **Discovery yields groups of
+   repositories** where the layout allows it: an hf-cache and a git source enumerate their
+   repository directories before reading any file, so each group of 64 is stored, walked
+   and, for a rescan, its absent paths retracted before the next is discovered, with the
+   known-stamp map loaded per group. A loose source cannot: `walker::walk` collects the
+   whole source's file list and only then groups it by organisation, so a repository does
+   not exist until every file has been seen. A loose source therefore yields one group of
+   every repository it found and takes the same path with the same code, buying the
+   per-group known map and nothing else; say so in the plan rather than expecting otherwise.
+   Repositories the catalog holds for the source that discovery never yielded are retracted
+   after the last group. **`[index] cache_mib`** sets the redb page cache, default 256.
+   Every recovery, refile and revision-identity test keeps its assertions. The gate tree is
+   a loose source, so the 1M scan RSS row reads the first and third changes and almost
+   nothing of the second.
 5. **budgets-measured.** The harness gains what this run must measure: a deletion phase
    that removes a tenth of the tree and rescans, reporting wall and peak RSS growth; a
    concurrent-search phase that runs eight midpoint queries at once and reports peak RSS
@@ -149,9 +161,12 @@ before its wave opens; after it lands, overturning is a wave of its own.
    the `used:` token read stay exact.
 4. **The index's `last_used` grain** is one minute. The catalog keeps the exact time; only
    the change log and the indexed value are floored.
-5. **The scan's unit of memory** is a group of 64 repositories, and a single repository of
-   any size stays one unit: a loose repository of a million files is discovered whole, as
-   today, and the run records that rather than splitting a repository.
+5. **The scan's unit of memory** is a group of 64 repositories where the layout yields
+   repositories before files, and one group of everything where it does not. A single
+   repository of any size stays one unit: a loose repository of a million files is
+   discovered whole, as today, and the run records that rather than splitting a repository.
+   Rewriting how a loose source decides its organisations, so that it too could yield
+   repositories before reading every file, is not in this run.
 6. **The page cache** is `[index] cache_mib`, default 256, the value the catalog has used
    since the native catalog landed.
 7. **Retention** is not taken in this run. Tombstoned revisions, removed paths marked
