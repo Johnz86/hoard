@@ -12,6 +12,9 @@ first; this document assumes it.
 - `docs/superpowers/specs/2026-09-06-remaining-work-goal.md` is the brief every wave now
   follows: what "remaining work" means, the finish condition that ends the run, and the rule
   that performance is measured once, in the last wave, rather than in each one.
+  The run is finished: `docs/superpowers/history/2026-09-remaining-work-review.md` is the
+  review of what each wave changed, the final numbers, what the closing reviews found and
+  the recommendations for what comes next.
 - The native_db (redb) plus Tantivy catalog replaced the SQLite index and is merged. Every
   command, every route, both faces and gossip read and write it, and no SQLite code remains.
   `docs/native-catalog.md` is the current-state document;

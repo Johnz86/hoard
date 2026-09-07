@@ -149,6 +149,9 @@ The run is finished when every line holds:
 
 ## Review and recommendations
 
+Written: `docs/superpowers/history/2026-09-remaining-work-review.md`, at `ae0265e`. The
+finish condition holds; the review says how each line holds and what comes next.
+
 Written by the dispatcher after wave 8 and the two reviews, to
 `docs/superpowers/history/2026-09-remaining-work-review.md`: what each wave changed, the
 final table against the `3a9fa1f` column and the `95cd3ad` column before the disk wave, the
