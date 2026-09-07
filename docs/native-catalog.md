@@ -106,7 +106,8 @@ the catalog at `<data_dir>/native`.
 - `usage.rs` the served-response log and per-artifact use counts.
 - `loadouts.rs` loadout documents and pin resolution.
 - `jobs.rs` scan, apply and pull job rows.
-- `hashing.rs` sha256 and git blob sha1 per file, content identities, merges.
+- `hashing.rs` sha256 and git blob sha1 per file, content identities, merges, and the
+  bounded worker dispatch a hashing pass reads through.
 - `ingest.rs` a file the mirror fetched, filed as a served entry.
 - `nodes.rs` this machine and every peer it knows.
 - `digest.rs` the rows this node offers and the rows a peer advertises.
@@ -221,17 +222,21 @@ itself is unavoidable and is 48 bytes a row.
 
 A pass that commits many times can also be asked to stop. `Catalog::rescan_until` checks a
 `Stop` before each source it discovers and between the units of the one it is inside, and
-`Catalog::hash_pending_until` checks it before the pass opens, before each batch and once per
-megabyte of every file it reads, so a shutdown costs a megabyte rather than an 80 GB
-checkpoint. What it cannot cut short is the discovery walk of the source it is already
-inside, so an exit costs a batch, a unit or one source's discovery, never a whole pass. Both
-passes leave the pass mark set and retire nothing: an interrupted walk never looked for the
-paths it did not reach, so it must not retract them, and the next pass settles the counts and
-finishes the hashing. A hashing pass is not started behind an interrupted walk at all, since
-opening a pass whose mark is held counts every artifact record before its first batch would
-break on the same stop. The scan lane raises that stop when it closes, finishes the job that
-was running with its phase set to `interrupted by shutdown; resumes on the next scan`, and
-cancels the requests that had not started.
+`Catalog::hash_pending_until` checks it before the pass opens, before each file is handed to a
+worker and once per megabyte of every file being read, so a shutdown costs a megabyte rather
+than an 80 GB checkpoint. A hashing pass hands files to `[index] hash_threads` workers (the
+rayon pool's size by default) through a bounded queue rather than in batches of 64; the writer
+still commits every 64 digests it receives, however many workers are reading at once. What
+discovery cannot cut short is the walk of the source it is already inside, so a rescan's exit
+costs a unit or one source's discovery; a hashing pass's exit costs at most one file per
+worker still reading when the stop was raised, never a whole pass. Both passes leave the pass
+mark set and retire nothing: an interrupted walk never looked for the paths it did not reach,
+so it must not retract them, and the next pass settles the counts and finishes the hashing. A
+hashing pass is not started behind an interrupted walk at all, since opening a pass whose mark
+is held counts every artifact record before its first file would break on the same stop. The
+scan lane raises that stop when it closes, finishes the job that was running with its phase
+set to `interrupted by shutdown; resumes on the next scan`, and cancels the requests that had
+not started.
 
 `Known`, the row that map holds, is 48 bytes: an entry id, an artifact id, a stamp, an
 ordinal and a shard count, with the two absent cases spelled as zero rather than as an
@@ -313,7 +318,10 @@ completes. What each stage leaves:
   repeats it and finds nothing, and a kill in between leaves nothing to find: the next walk
   skips the rows the killed pass wrote, so it would never look at that artifact again.
 - **The hash pass** commits every 64 digests with the derived counts in the same transaction,
-  so the next pass reads the files still owing a hash and no others.
+  so the next pass reads the files still owing a hash and no others. A kill mid-pass leaves
+  whatever the workers had already finished: the writer drains behind them and commits it, so
+  a file a worker was still reading when the kill landed is the only kind of file left owing
+  that a clean pass would not also have read.
 - **The refresh** commits Tantivy, advances the cursor and then prunes what it applied. A
   kill before the cursor replays the batch, and a replay deletes an artifact's documents by
   term and adds them again, so it changes nothing. A kill between the cursor and the prune
@@ -499,6 +507,11 @@ a rescan of a source they sit under. Every one of those roots and every source r
 resolved to the absolute path an event carries first, because a root spelled relative to the
 working directory would match nothing. Every one of these is a request on the same lane
 `POST /api/v1/scan` uses, so a watched scan and a manual one never run at once.
+
+`[index] hash_threads` is an integer, 0 by default, meaning the rayon pool's size; any other
+value pins a hashing pass to that many workers instead. It is the setting an HDD or NAS owner
+turns down, because a hashing pass otherwise reads as many files at once as the pool has
+threads for, and a spinning disk answers concurrent reads worse than one at a time.
 
 `compact` is the only thing that compacts a catalog on demand. A scan compacts at the end of
 building one, because that is bulk construction; a rescan never does, so a shared catalog

@@ -106,6 +106,9 @@ pub struct IndexConfig {
     /// reconciliation off and leaves the watcher driven by events alone.
     #[serde(default = "default_reconcile_interval")]
     pub reconcile_interval_secs: u64,
+    /// How many files a hashing pass reads at once. Zero means the rayon pool's size.
+    #[serde(default)]
+    pub hash_threads: usize,
     #[serde(default, rename = "sources")]
     pub sources: Vec<SourceConfig>,
 }
@@ -119,6 +122,7 @@ impl Default for IndexConfig {
             triage_confidence: default_triage_confidence(),
             watch: true,
             reconcile_interval_secs: default_reconcile_interval(),
+            hash_threads: 0,
             sources: Vec::new(),
         }
     }
@@ -167,6 +171,16 @@ impl IndexConfig {
             ..self.clone()
         }
     }
+
+    /// The worker count a hashing pass runs with: `hash_threads`, or the rayon pool's size
+    /// when it is zero, clamped to between 1 and 256 either way.
+    pub fn hash_workers(&self) -> usize {
+        match self.hash_threads {
+            0 => rayon::current_num_threads(),
+            threads => threads,
+        }
+        .clamp(1, 256)
+    }
 }
 
 /// The source a path belongs to, longest root first so nested roots resolve to the inner
@@ -205,6 +219,42 @@ mod tests {
         assert_eq!(config.hash_policy, HashPolicy::Background);
         assert_eq!(config.lfs_threshold, 10_485_760);
         assert_eq!(config.native_path(), PathBuf::from("./data/native"));
+    }
+
+    #[test]
+    fn hash_threads_of_zero_is_the_rayon_pools_size_and_any_other_value_is_itself() {
+        assert_eq!(
+            IndexConfig::default().hash_workers(),
+            rayon::current_num_threads().clamp(1, 256)
+        );
+        let pinned = IndexConfig {
+            hash_threads: 3,
+            ..IndexConfig::default()
+        };
+        assert_eq!(pinned.hash_workers(), 3);
+
+        let solo = IndexConfig {
+            hash_threads: 1,
+            ..IndexConfig::default()
+        };
+        assert_eq!(solo.hash_workers(), 1, "one thread stays one worker");
+
+        let huge = IndexConfig {
+            hash_threads: 10_000,
+            ..IndexConfig::default()
+        };
+        assert_eq!(
+            huge.hash_workers(),
+            256,
+            "the worker count is capped at 256"
+        );
+
+        let parsed: IndexConfig =
+            toml::from_str("hash_policy = \"never\"\n").expect("an [index] section parses");
+        assert_eq!(
+            parsed.hash_threads, 0,
+            "a config that names no hash_threads gets the serde default"
+        );
     }
 
     #[test]

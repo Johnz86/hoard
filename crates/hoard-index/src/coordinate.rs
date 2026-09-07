@@ -123,10 +123,10 @@ impl Coordinator {
 
     /// Stops the lane within a batch of work rather than within a whole pass.
     ///
-    /// The running scan is asked to stop between units and between hashing batches and
-    /// keeps what it committed; what is still waiting is dropped with its job row
-    /// cancelled. A request after this is refused at once rather than waiting for the stop,
-    /// and the next start rescans what neither finished.
+    /// The running scan is asked to stop between units and before each file a hashing pass
+    /// hands out, and keeps what it committed; what is still waiting is dropped with its
+    /// job row cancelled. A request after this is refused at once rather than waiting for
+    /// the stop, and the next start rescans what neither finished.
     pub async fn shutdown(&self) -> Result<()> {
         let dropped = {
             let _admission = self.lane.admission.lock().await;
@@ -318,9 +318,9 @@ fn settle(
 /// The rescan, the hashing and the search refresh of one request, in that order.
 ///
 /// A walk the stop ended is not followed by a hashing pass: the pass would open on a mark
-/// the walk left held, which counts every artifact record before its first batch breaks on
-/// the same stop. The refresh still runs, so what the walk committed is published, and the
-/// job carries the interruption as its last phase.
+/// the walk left held, which counts every artifact record before its first file would break
+/// on the same stop. The refresh still runs, so what the walk committed is published, and
+/// the job carries the interruption as its last phase.
 fn run_scan(
     catalog: &Catalog,
     config: &IndexConfig,
@@ -800,7 +800,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_shutdown_stops_the_hashing_pass_at_a_batch_boundary_and_the_next_scan_finishes_it()
+    async fn a_shutdown_stops_the_hashing_pass_within_a_queue_of_files_and_the_next_scan_finishes_it()
     -> Result<()> {
         let directory = tempfile::tempdir()?;
         let root = wide(directory.path(), 1500)?;

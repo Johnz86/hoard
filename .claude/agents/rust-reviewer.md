@@ -17,6 +17,10 @@ empty. The change set is a commit range in that worktree: `git diff master..HEAD
 list, ask; do not review the whole repository, and do not report an empty diff as nothing to
 review.
 
+The dispatcher's brief names the earlier waves this change set builds on. Check the change
+set against those waves' tests and invariants, not only against `master`: two of the previous
+run's regressions were against an earlier wave rather than against `master`.
+
 You are read-only. Report only findings that a maintainer would act on, most severe first:
 
 1. Correctness against `docs/api/hub-compat.md` (status codes, header names, ETag quoting,

@@ -27,7 +27,7 @@ use super::search::{Cost, Paging, QueryPath};
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::usage::{HISTORY_DAYS, Window};
 use super::{
-    Catalog, Dedupe, DigestApplied, EntryDetail, FORMAT_VERSION, JobProgress, JobState,
+    Catalog, Dedupe, DigestApplied, EntryDetail, FORMAT_VERSION, HashReport, JobProgress, JobState,
     MIRROR_SOURCE, NewProjection, PullMark, PullSlot, PulledFile, QueryPage, QueryRequest,
     RemoteEntry, RepositoryDetail, RepositoryFilter, RescanReport, RescanScope, ServedFile, Stop,
     Totals, TriageItem, UsageEvent, builder, models, query,
@@ -9254,6 +9254,173 @@ fn hashing_now_gives_content_identities_from_the_first_scan() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_file_that_blocks_holds_no_other_file_back() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let empty = directory.path().join("empty");
+    fs::create_dir_all(&empty)?;
+    let config = IndexConfig {
+        sources: vec![source(&empty, "files")],
+        hash_threads: 2,
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+
+    let storage = directory.path().join("files");
+    fs::create_dir_all(&storage)?;
+    let fifo = storage.join("blocked.bin");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .map_err(|error| IndexError::Catalog(format!("mkfifo is unavailable: {error}")))?;
+    assert!(status.success(), "mkfifo did not create the fifo");
+
+    let mut entries = vec![SeedEntry {
+        node: LOCAL_NODE,
+        abs_path: Some(fifo.to_string_lossy().into_owned()),
+        rel_path: "blocked.bin".to_owned(),
+        size: 20 * 1024 * 1024,
+        state: State::Local,
+        is_symlink: false,
+        sha256: None,
+        git_sha1: None,
+        artifact: None,
+    }];
+    for index in 0..300_u32 {
+        let name = format!("f{index:03}.bin");
+        let path = storage.join(&name);
+        fs::write(&path, format!("payload-{index}\n"))?;
+        entries.push(SeedEntry {
+            node: LOCAL_NODE,
+            abs_path: Some(path.to_string_lossy().into_owned()),
+            rel_path: name,
+            size: fs::metadata(&path)?.len(),
+            state: State::Local,
+            is_symlink: false,
+            sha256: None,
+            git_sha1: None,
+            artifact: None,
+        });
+    }
+    catalog.seed(&[SeedRepository {
+        repo: RepoId::parse_ref(RepoType::Models, "acme/blocked").expect("a valid reference"),
+        source: "files".to_owned(),
+        kind: SourceKind::Loose,
+        root_path: storage.clone(),
+        git_dir: None,
+        revisions: vec![SeedRevision {
+            name: "main".to_owned(),
+            sha: None,
+            refs: Vec::new(),
+            title: None,
+            author: None,
+            committed: None,
+            entries,
+        }],
+    }])?;
+    assert_eq!(catalog.pending_hashes()?, 301);
+
+    let mut fifo_writer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)?;
+
+    let report = std::thread::scope(|scope| -> Result<HashReport> {
+        let handle = scope.spawn(|| catalog.hash_pending(&config, |_| {}));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if catalog.pending_hashes()? == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the blocked file held the rest back"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::io::Write::write_all(&mut fifo_writer, b"abc")?;
+        drop(fifo_writer);
+        handle
+            .join()
+            .map_err(|_| IndexError::Catalog("the hashing pass panicked".into()))?
+    })?;
+
+    assert_eq!(report.hashed, 301);
+    assert_eq!(report.unreadable, 0);
+    assert!(!report.interrupted);
+    assert_eq!(catalog.pending_hashes()?, 0);
+    let read = catalog.database.r_transaction()?;
+    let entries: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    drop(read);
+    let fifo_entry = entries
+        .iter()
+        .find(|entry| entry.rel_path == "blocked.bin")
+        .ok_or_else(|| IndexError::Catalog("the fifo entry vanished".into()))?;
+    assert_eq!(
+        fifo_entry.sha256,
+        Some(crate::hash::sha256_bytes(b"abc")),
+        "the fifo's entry carries the hash of what was written to it"
+    );
+    Ok(())
+}
+
+#[test]
+fn hash_threads_of_one_hashes_in_primary_key_order() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(&input)?;
+    for index in 0..130_u32 {
+        fs::write(
+            input.join(format!("f{index:03}.bin")),
+            format!("payload-{index}\n"),
+        )?;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        hash_threads: 1,
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    assert_eq!(catalog.pending_hashes()?, 130);
+
+    let mut counts = Vec::new();
+    let report = catalog.hash_pending(&config, |hashed| counts.push(hashed))?;
+
+    assert_eq!(report.hashed, 130);
+    assert!(
+        counts.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the progress counts never go backwards: {counts:?}"
+    );
+    assert_eq!(counts.last().copied(), Some(130));
+    let read = catalog.database.r_transaction()?;
+    let entries: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert!(
+        entries.iter().all(|entry| entry.sha256.is_some()),
+        "every entry has a sha256 after the pass"
+    );
+    Ok(())
+}
+
 /// Interrupting a stage at a chosen commit and comparing what the next run completes to
 /// against a run nothing interrupted.
 mod recovery {
@@ -10106,7 +10273,7 @@ fn pass_is_open(catalog: &Catalog) -> Result<bool> {
 }
 
 #[test]
-fn a_raised_stop_ends_a_hashing_pass_at_a_batch_boundary_and_the_next_pass_finishes_it()
+fn a_raised_stop_ends_a_hashing_pass_within_a_queue_of_files_and_the_next_pass_finishes_it()
 -> Result<()> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("files");
@@ -10121,6 +10288,7 @@ fn a_raised_stop_ends_a_hashing_pass_at_a_batch_boundary_and_the_next_pass_finis
     }
     let config = IndexConfig {
         sources: vec![source(&input, "files")],
+        hash_threads: 2,
         ..IndexConfig::default()
     };
     let catalog = Catalog::scan_sources(
@@ -10140,11 +10308,20 @@ fn a_raised_stop_ends_a_hashing_pass_at_a_batch_boundary_and_the_next_pass_finis
     })?;
 
     assert!(report.interrupted, "the raised stop ended the pass early");
-    assert_eq!(report.hashed, batch, "the pass stopped at a batch boundary");
+    assert!(
+        report.hashed >= batch,
+        "the pass ran at least until the stop was observed, got {}",
+        report.hashed
+    );
+    assert!(
+        report.hashed < total,
+        "the pass did not reach every file, got {}",
+        report.hashed
+    );
     let left = catalog.pending_hashes()?;
     assert_eq!(
         left,
-        total - batch,
+        total - report.hashed,
         "what it did not reach still owes a hash"
     );
     assert!(
@@ -10159,6 +10336,114 @@ fn a_raised_stop_ends_a_hashing_pass_at_a_batch_boundary_and_the_next_pass_finis
     assert!(
         !pass_is_open(&catalog)?,
         "a pass that ran to its end clears the mark"
+    );
+    Ok(())
+}
+
+/// Seeded, not scanned, so the large file gets the lowest id and is the first the producer
+/// pages, regardless of what order a walker would have found these paths in.
+#[test]
+fn a_stop_raised_while_a_file_is_being_read_leaves_that_file_owing() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let empty = directory.path().join("empty");
+    fs::create_dir_all(&empty)?;
+    let config = IndexConfig {
+        sources: vec![source(&empty, "files")],
+        hash_threads: 1,
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+
+    let storage = directory.path().join("files");
+    fs::create_dir_all(&storage)?;
+    let large_path = storage.join("large.bin");
+    let large_file = fs::File::create(&large_path)?;
+    large_file.set_len(64 * 1024 * 1024)?;
+    drop(large_file);
+
+    let mut entries = vec![SeedEntry {
+        node: LOCAL_NODE,
+        abs_path: Some(large_path.to_string_lossy().into_owned()),
+        rel_path: "large.bin".to_owned(),
+        size: 64 * 1024 * 1024,
+        state: State::Local,
+        is_symlink: false,
+        sha256: None,
+        git_sha1: None,
+        artifact: None,
+    }];
+    for index in 0..8_u32 {
+        let name = format!("f{index}.bin");
+        let path = storage.join(&name);
+        fs::write(&path, format!("payload-{index}\n"))?;
+        entries.push(SeedEntry {
+            node: LOCAL_NODE,
+            abs_path: Some(path.to_string_lossy().into_owned()),
+            rel_path: name,
+            size: fs::metadata(&path)?.len(),
+            state: State::Local,
+            is_symlink: false,
+            sha256: None,
+            git_sha1: None,
+            artifact: None,
+        });
+    }
+    catalog.seed(&[SeedRepository {
+        repo: RepoId::parse_ref(RepoType::Models, "acme/large").expect("a valid reference"),
+        source: "files".to_owned(),
+        kind: SourceKind::Loose,
+        root_path: storage.clone(),
+        git_dir: None,
+        revisions: vec![SeedRevision {
+            name: "main".to_owned(),
+            sha: None,
+            refs: Vec::new(),
+            title: None,
+            author: None,
+            committed: None,
+            entries,
+        }],
+    }])?;
+    assert_eq!(catalog.pending_hashes()?, 9);
+
+    let stop = Stop::default();
+    let report = catalog.hash_pending_until(&config, &stop, |_| {
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    })?;
+    assert!(report.interrupted, "the raised stop ended the pass early");
+
+    let read = catalog.database.r_transaction()?;
+    let seeded: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    drop(read);
+    let large_entry = seeded
+        .iter()
+        .find(|entry| entry.rel_path == "large.bin")
+        .ok_or_else(|| IndexError::Catalog("the large file's entry vanished".into()))?;
+    assert!(
+        large_entry.sha256.is_none(),
+        "the stop was raised while the large file was still being read"
+    );
+    assert!(
+        catalog.pending_hashes()? >= 1,
+        "the file the stop caught mid-read still owes a hash"
+    );
+
+    let finished = catalog.hash_pending(&config, |_| {})?;
+    assert!(!finished.interrupted);
+    assert_eq!(
+        catalog.pending_hashes()?,
+        0,
+        "a fresh pass finishes what is left"
     );
     Ok(())
 }

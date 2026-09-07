@@ -19,7 +19,8 @@ first; this document assumes it.
   that follows it: predictable memory under unusual workloads, background work that yields
   and writes that are not repeated. It names its waves, the decisions the dispatcher took so
   no wave waits on one, the rule that every wave's implementer is a Sonnet
-  `wave-implementer`, and its finish condition.
+  `wave-implementer`, and its finish condition. Wave 1, hash-dispatch, has landed; wave 2 is
+  index-bytes.
 - The native_db (redb) plus Tantivy catalog replaced the SQLite index and is merged. Every
   command, every route, both faces and gossip read and write it, and no SQLite code remains.
   `docs/native-catalog.md` is the current-state document;
@@ -33,9 +34,9 @@ first; this document assumes it.
 - Phases 0 to 11 are done. `docs/feature-plan.md` holds the table. The TREE and DISK views
   are not an unfinished phase: they wait on a design decision and are recorded under that
   document's "Risks and open decisions".
-- At the head of `master` after the fix wave all four checks pass: `cargo fmt --check`,
-  clippy with `-D warnings`, `cargo test --workspace` at 878 passed, 0 failed, 4 ignored, and
-  `cargo build --workspace`. The four ignored are the scale harness and its supplemental
+- At the head of `master` after the hash-dispatch wave all four checks pass:
+  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 882 passed,
+  0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness and its supplemental
   fixture, the mDNS test that needs a multicast route and the sniffer test that reads the
   local model caches. `cargo doc --workspace --no-deps` emits no warning, and
   `cargo test --release -p hoard-server --lib assets::` passes 5.
@@ -61,12 +62,17 @@ them.
    `.claude/skills/hoard-write-plan/SKILL.md` to
    `../hoard-<name>/docs/superpowers/plans/<name>.md`, untracked. Anchor its Verified facts to
    the commit the branch starts from and grep every symbol it mentions before you hand it
-   over. The plan carries the subject and body of the wave commit `master` will receive.
+   over. The plan carries the subject and body of the wave commit `master` will receive. Run
+   every gate grep the plan names and quote the count each one found; for every invariant a
+   task relies on, name the file and function that enforces it. Name the pinned tests: the
+   tests of the waves this one builds on that must keep their assertions.
 2. **Dispatch the implementer.** The `wave-implementer` agent, given the worktree path and
-   the plan path, and nothing else. It follows
-   `.claude/skills/hoard-implement-plan/SKILL.md`: preflight in the worktree, the AGENTS.md
-   rules, the checks, foreground-only process hygiene, a record of every deviation from the
-   plan, one checkpoint commit per task, and a report.
+   the plan path, and nothing else, with the model override the goal names (`sonnet` for the
+   predictable-memory goal). It follows `.claude/skills/hoard-implement-plan/SKILL.md`:
+   preflight in the worktree, the AGENTS.md rules, the checks, foreground-only process
+   hygiene, a record of every deviation from the plan, one checkpoint commit per task, and a
+   report. A fix a review asks for is a task appended to the same wave for the same
+   implementer, not a new wave.
 
    The report is written so you can verify without reading the transcript, and section 7 of
    that skill fixes what it contains: the commit hashes and subjects in order, every
@@ -90,8 +96,9 @@ them.
    `crates/hoard-server/` or `web/`, and `cargo doc --workspace --no-deps` once. Then
    `perf-reviewer` for a performance wave, following
    `.claude/skills/hoard-perf-review/SKILL.md`; `rust-reviewer` otherwise. Both are
-   read-only and review `master..HEAD` in the worktree. Do not run a build while a reviewer
-   is measuring, or dispatch a measuring reviewer beside anything else that uses the disk.
+   read-only and review `master..HEAD` in the worktree. The reviewer's brief names the waves
+   this change set builds on, not only `master`. Do not run a build while a reviewer is
+   measuring, or dispatch a measuring reviewer beside anything else that uses the disk.
    Fixes from the review go on the same branch, as more checkpoints, before landing.
 4. **Land the wave.** From the main checkout on `master`:
    `git merge --squash wave/<name>`, then one commit whose subject and body are the plan's

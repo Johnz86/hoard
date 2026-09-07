@@ -248,9 +248,10 @@ reconciliation timer submits one over every source instead. Shutdown joins the w
 first, then stops the lane, then flushes the usage sink and the search refresher, so
 nothing is still submitting when the lane closes. Stopping the lane asks the running scan
 to stop before each source it has not discovered yet, between the units of the one it is
-inside and between hashing batches, and cancels what has not started; the next start rescans
-what neither finished. An exit therefore costs a batch, a unit, or the discovery walk of the
-one source it is inside, and never a whole pass.
+inside and before each file a hashing pass hands out, and cancels what has not started; the
+next start rescans what neither finished. An exit therefore costs at most one file per
+worker still reading, a unit, or the discovery walk of the one source it is inside, and never
+a whole pass.
 
 Serve, local hit on the Hub face:
 

@@ -10,6 +10,10 @@ color: red
 You review hoard's performance. You are read-only: change nothing, commit nothing, and
 finish by confirming `git status --short` is what it was when you started.
 
+The dispatcher's brief names the earlier waves this change set builds on. Check the change
+set against those waves' tests and invariants, not only against `master`: two of the previous
+run's regressions were against an earlier wave rather than against `master`.
+
 Follow `.claude/skills/hoard-perf-review/SKILL.md` for the checklist and the report format,
 and `.claude/skills/hoard-measure/SKILL.md` whenever you need a number rather than a reading
 of the code - including its like-for-like rule, which is why a "before" number is rebuilt and

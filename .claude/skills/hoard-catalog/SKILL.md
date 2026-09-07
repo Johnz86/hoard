@@ -39,7 +39,8 @@ One line per file in `crates/hoard-index/src/catalog/`:
 - `usage.rs` the served-response log and per-artifact use counts.
 - `loadouts.rs` loadout documents and pin resolution.
 - `jobs.rs` scan, apply and pull job rows.
-- `hashing.rs` sha256 and git blob sha1 per file, content identities, merges.
+- `hashing.rs` sha256 and git blob sha1 per file, content identities, merges, and the
+  bounded worker dispatch a hashing pass reads through.
 - `ingest.rs` a file the mirror fetched, filed as a served entry.
 - `nodes.rs` this machine and every peer it knows.
 - `digest.rs` the rows this node offers and the rows a peer advertises.

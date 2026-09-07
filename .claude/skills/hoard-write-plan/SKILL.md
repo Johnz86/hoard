@@ -67,7 +67,7 @@ usual size. `---` separates the constraints from the first task and every task f
 
 ## Global Constraints
 
-Six bullets, in this order. The implementer skill
+Seven bullets, in this order. The implementer skill
 (`.claude/skills/hoard-implement-plan/SKILL.md`) carries the standing contract, so these
 bullets carry only what changes per wave.
 
@@ -102,10 +102,12 @@ bullets carry only what changes per wave.
 
 6. **Verified facts.** See below.
 
+7. **Pinned tests.** The pinned tests are the tests of the waves this one builds on that
+   must keep their assertions, with the wave named.
+
 Add, when the wave calls for it: a scope fence naming exactly what stays behind and what may
 not be called; numeric thresholds to beat, quoted with their previous numbers; a scratchpad
-placement rule for synthetic trees; a pinned expectation list of existing test functions that
-must keep their assertions.
+placement rule for synthetic trees.
 
 ## Verified facts
 
@@ -123,6 +125,13 @@ occurrence counts, and for every ambiguous pair an inline verdict.
 - A second bullet for **library facts** - invariants of a dependency that shape the design
   rather than repo state. For the catalog, do not restate them: point at
   `.claude/skills/hoard-catalog/SKILL.md` and name only the ones this wave turns on.
+- Before handing the plan over, run every gate grep the plan names and quote the count each
+  one found; a grep that returns nothing when the plan expected a match is a fact that went
+  stale, not a fact to write down anyway.
+- For every invariant a task relies on, name the code that enforces it: file and function.
+  About once a wave, a previous run's plan stated an invariant that did not hold; naming the
+  enforcing code is what lets the implementer check it rather than take the sentence on
+  faith.
 
 Facts go stale. The implementer skill requires the implementer to grep every symbol the plan
 names before each task and to record every deviation; write the facts so that check is cheap.
@@ -195,3 +204,5 @@ must hold when the plan is done, written so a reviewer can falsify them.** Two s
 - Nothing in the plan restates the implementer contract, the check list, the catalog facts or
   the measurement protocol; each of those is a pointer to its skill.
 - The file is ASCII: `grep -nP '[^\x00-\x7F]' <the plan>` returns nothing.
+- Any draft that must survive a session lives in the worktree beside the plan, never in the
+  session scratchpad.
