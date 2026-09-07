@@ -15,6 +15,11 @@ first; this document assumes it.
   The run is finished: `docs/superpowers/history/2026-09-remaining-work-review.md` is the
   review of what each wave changed, the final numbers, what the closing reviews found and
   the recommendations for what comes next.
+- **`docs/finish-the-memory-work.md` is the plan for finishing it, and it is short.** The
+  reverted waves are recoverable at the tag in their post-review state, so finishing means
+  restoring, measuring against the harness `master` now has, keeping only what the numbers
+  earn, and paying the code-quality debt on what survives. Do not write another goal document
+  and do not rebuild those waves from scratch.
 - **The predictable-memory run of 2026-09-07 is reverted.** It set five waves and landed
   four, measured nothing, and was halted by the owner. Its code is gone from `master`; the
   commits stay reachable at the tag `reverted/2026-09-07-predictable-memory`.
