@@ -25,11 +25,19 @@ first; this document assumes it.
 - Phases 0 to 11 are done. `docs/feature-plan.md` holds the table. The TREE and DISK views
   are not an unfinished phase: they wait on a design decision and are recorded under that
   document's "Risks and open decisions".
-- At the head of `master` after the disk wave all four checks pass:
+- At the head of `master` after the measurement wave all four checks pass:
   `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 862 passed,
   0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness
   and its supplemental fixture, the mDNS test that needs a multicast route and the sniffer
-  test that reads the local model caches. `cargo doc --workspace --no-deps` emits no warning.
+  test that reads the local model caches. `cargo doc --workspace --no-deps` emits no warning,
+  and `cargo test --release -p hoard-server --lib assets::` passes 5.
+- Waves 1 to 8 of the goal are on `master` and the run is measured. The measurement is in
+  `docs/native-catalog.md` under "Measured": the whole scale harness at 100k and 1M against
+  a `3a9fa1f` column rebuilt and run in the same session over the same tree, the eleven
+  routes at 100k in both columns, the supplemental fixture in both, and a fresh scan of this
+  workstation's three sources with `doctor` and `doctor --repair` after it. Every standing
+  gate at 1M is met; the one miss is on three of the eleven routes and is recorded there and
+  under "Follow-ups".
 
 ## Running the loop
 
@@ -97,27 +105,31 @@ plan and hands it to the same loop.
 
 Performance, with the numbers from `docs/native-catalog.md`:
 
-- **The 1M disk gate is met by 100.4 MB.** Allocated disk after the rebuild is
-  1,399,648,256 bytes against 1,500,000,000, a 41 per cent reduction from the computed
-  location key, the compact and LZ4 record codecs, the trimmed search columns and no longer
-  writing a change log before the first index is published. A rebuild that replaces a
-  published index holds two search directories while it runs and peaks at 1,463,869,440
-  bytes, inside the gate by 36.1 MB; that transient is the number to watch. The next levers,
-  in order of measured size, are intra-page slack (608,835,673 bytes, 45 per cent of the redb
-  file, which `compact` does not reclaim and only a dense rewrite would), the
-  `ArtifactDetail` summary itself (497 MiB of pages, 37 per cent of the file), and one card
-  per revision instead of one per artifact in `SearchText`. The per-table breakdown in
-  `docs/native-catalog.md` is current.
+- **The 1M disk gate is met by 102.8 MB, measured at the head.** Allocated disk after the
+  rebuild is 1,397,235,712 bytes against 1,500,000,000; after the incremental workload
+  1,400,991,744; and at the peak of a rebuild that replaces a published index, which holds
+  two search directories while it runs, 1,461,485,568, inside the gate by 38.5 MB. That
+  transient is still the number to watch. The next levers, in order of measured size, are
+  intra-page slack (608,456,492 bytes, 45.4 per cent of the redb file, which `compact` does
+  not reclaim and only a dense rewrite would, and which the page-packing research says is
+  not worth doing) and the `ArtifactDetail` summary itself (497.00 MiB of pages, 38.9 per
+  cent of the file). The per-table breakdown in `docs/native-catalog.md` is current.
 - **The disk wave took the three record levers and closed the fourth.** A revision's card is
   one `RevisionText` row keyed by `(repo_id, revision)` rather than a copy in every
   artifact's `SearchText`; every record but `Manifest` is on the compact codec, `Manifest`
   alone keeping native_model's default so a format mismatch is found before any compact row
   is decoded; and `ArtifactDetail` keeps the sixteen tensor samples the triage queue reads a
   hidden dimension from rather than the sixty-four the sniff draws for inference.
-  That wave bumped `FORMAT_VERSION`, so every existing catalog is rebuilt from disk. Nothing
-  was measured: the four rows for wave 8 to watch are allocated disk at 1M, the rebuild (one
-  card read per revision, not per artifact), the inspector detail row, and the supplemental
-  fixture with cards, which loses most of its `SearchText`.
+  That wave bumped `FORMAT_VERSION`, so every existing catalog is rebuilt from disk. It is
+  measured now, and the four rows it was to be read on split cleanly. On the gate fixture,
+  which has no card, one revision per repository and one tensor per file, it is worth one
+  byte a row: allocated disk at 1M fell 1,925,120 bytes and the rebuild did not move. On the
+  supplemental fixture, which has all three, `SearchText` fell to 32.1 per cent of what it
+  stored, 600 `RevisionText` rows replaced 27,300 copies of a card, and the whole directory
+  fell 12.3 per cent. The inspector detail row's spread is wider than any difference between
+  the columns. On this workstation's own disks `catalog.redb` fell from 6.3 to 4.2 MB while
+  the search directory grew from 572 KB to 1.3 MB, because every cached revision now has a
+  card to index.
 - **Page packing is answered and not worth doing.**
   `docs/superpowers/research/2026-09-page-packing.md` reads redb 2.6.3: the 42 to 55 per cent
   leaf fill comes from one split rule that always cuts at the byte midpoint and has no append
@@ -125,7 +137,8 @@ Performance, with the numbers from `docs/native-catalog.md`:
   fill, `Database::compact` moves whole pages and never rebuilds a leaf, and
   `Builder::set_page_size` is compiled only under `cfg(any(fuzzing, test))`. The reachable
   saving is 0 to 5 per cent; the lever that works is payload, at about two bytes of file per
-  byte off a row.
+  byte off a row. The measurement bears it out: slack at 1M is 608,456,492 bytes at the head
+  against 608,374,746 at `3a9fa1f`, the same 45.4 per cent of the file after seven waves.
 - **A page anywhere in the order costs a page.** A window of at most 16,384 rows for a text
   key, or 131,072 for a numeric one, keeps the heap it always kept; a deeper one is found by
   rank, in three passes that sample the order, count the documents between consecutive
@@ -152,33 +165,55 @@ Performance, with the numbers from `docs/native-catalog.md`:
   bitset themselves. Before that override the midpoint after a refresh sat 24.2 ms above the
   plain midpoint at 1M against 4.6 ms before the wave; with it, 4.7 ms. A new collector in
   this file must override `collect_segment` the same way or it silently falls back.
-- **Every query path is bounded by the page and the sample as of wave 4, and the numbers are
-  not in yet.** The collapse path folds each artifact's run of entry documents inside the
-  segment collectors instead of retaining a row per matching artifact, a primary query no
-  longer counts its match in a pass of its own, and the base rail is capped. The final
-  measurement of the run is what says what that bought. The harness carries the rows for it:
-  `query node:self midpoint offset`, `query node:self deep offset` and `resident rss over the
-  collapse queries` were added in wave 4 and have never been run, so wave 8 reports them
-  against nothing. The first, last and middle primary pages are the rows that should move for
-  the pass count.
+- **The collapse path is what wave 4 bought, and the number is in.** `node:self` at 1M is
+  50.887 ms against 198.184 ms at `3a9fa1f`, 74.3 per cent, against a spread of 1.9 ms in the
+  before column and 0.2 ms in the after one; on the route list the same query is 11.70 ms
+  against 22.20 ms. Its two pages that no column before this one could report cost 107.071 ms
+  in the middle of the order and 74.765 ms at the far end, and the resident memory over the
+  two of them is zero, so the whole collapse path is now bounded and 4.7 times inside the
+  gate at its worst. The primary pages did not move for the pass count: the first page, the
+  midpoints, `role:lora` and the filtered query are 0.6 to 1.4 ms slower at 1M, 1.5 to 3.6
+  per cent, consistent across both runs of both columns and unexplained, and within 0.15 ms
+  at 100k.
 - **Two things wave 4 traded, both recorded in `docs/native-catalog.md` under "Remaining
   work".** A shallow window is no longer cut from the far end, because the pass that counts
   it is the pass that keeps it, so a page just inside the shallow bound and past the middle
   of a small result holds `offset + limit` rows rather than `total - offset`; it is bounded
-  by the shallow constant and the fix is named there. And the index writer now sends one
+  by the shallow constant and the fix is named there; measured, the last page of a million
+  costs 38.807 ms against 21.337 ms and the last page of 100,000 costs 4.684 against
+  2.958 ms, because the total is now learned from a sampling pass that reads the sort column
+  where a `Count` that read no column learned it before. And the index writer now sends one
   operation group per artifact rather than per document, which is what makes an artifact's
   documents one run in one segment, so tantivy's 10,000-item pipeline now buffers 10,000
   artifacts' documents rather than 10,000 documents; the synthetic tree cannot show it, and
-  wave 8 should read the rebuild RSS row knowing it.
+  the rebuild RSS row it did produce, 329 MiB either side, is that tree's and not a
+  catalog's with cards.
 - **A revision the walk no longer finds keeps its slot forever.** An entry names its
   revision by ordinal, so the slot is an identity and cannot be reclaimed while any entry
   names it. A repository whose branch moves on every scan grows one stored revision per old
   head, each carrying its title, author and commit but no refs. Reclaiming a slot needs the
   entries of a retired revision removed rather than marked absent, which is the same decision
   as pruning a deleted path's row; neither is taken.
-- **The usage views are O(rows of the repository).** The client count the USAGE tab shows is
-  a claim about every pull the repository ever served, so bounding the chart alone would not
-  bound the route: 20,000 rows cost 9.1 ms. It needs a maintained count, not a bound.
+- **The usage route is bounded now and costs more on a small log.** Wave 5b replaced one
+  read of the repository's whole log with a scan of the seven-day window by the `repo_at`
+  key, a second scan for the newest pulls and a point read of the repository's own
+  `RepoUsage` row for the client count. On a 2,000-pull log where every pull is inside the
+  window that is 2.32 ms against 1.50 ms, because the new path reads what the old one read
+  and pays for two scans and a lookup instead of one. What it buys is the asymptote the old
+  route did not have.
+- **Three of the eleven routes are slower than the column measured beside them, and two have
+  no established mechanism.** `GET /api/models/org0/repo000` is 4.55 ms against 2.79 and
+  `GET /api/v1/search?q=` is 5.58 against 3.71, both outside the spread of their own six
+  runs, with byte-identical responses, an unchanged handler and, for the search route, an
+  unchanged catalog query time at 100k. The third is the usage route above, which is
+  explained. This is the one miss of the finish condition's line 5 and it is a fix wave's to
+  find, at 1.8 and 1.9 ms on routes that answer in single-digit milliseconds.
+- **An orderly shutdown joins the reconcile scan the watcher starts.** On this workstation,
+  serving a catalog scanned with `--hash never` under `hash_policy = "background"`, SIGTERM
+  was answered in about 4.5 minutes: the watcher reconciles once at startup, that scan ran
+  the hashing pass the scan had skipped, and shutdown waits for the lane. The next run, with
+  the hashes stored, exits in 15 ms. Nothing is lost either way, but a shutdown that waits on
+  a hash pass of 445 files gives the caller no sign of how long it will be.
 
 Decisions taken on 2026-09-06, by the project owner:
 

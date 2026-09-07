@@ -520,68 +520,107 @@ this workstation drift by more than most effects being measured, so a "before" n
 from this document is not a comparison: rebuild the previous commit and measure both in one
 session.
 
-### This workstation's disks, commit `1ba8475`
+### This workstation's disks, commit `7bb681f`
 
-Release build, three sources from `./hoard.toml`: the HuggingFace cache, the ComfyUI tree and
-the LM Studio tree. `hash_policy = "background"`.
+Release build, the three sources of `hoard.toml` copied into a scratch data directory under
+the session scratchpad: the HuggingFace cache, the ComfyUI tree and the LM Studio tree.
 
 ```sh
-cargo build --release
-time ./target/release/hoard --config hoard.toml scan
-time ./target/release/hoard --config hoard.toml scan
-./target/release/hoard --config hoard.toml doctor
-du -sh data/native
-./target/release/hoard --config hoard.toml ls 'role:lora'
+hoard --config <scratch>/workstation.toml catalog scan \
+  --directory <scratch>/workstation/native --hash never
+hoard --config <scratch>/workstation.toml doctor
+hoard --config <scratch>/workstation.toml doctor --repair
+hoard --config <scratch>/workstation.toml serve
+hoard --config <scratch>/workstation.toml ls 'role:lora'
 ```
 
-- First scan: 5 m 35.686 s wall, `unchanged=728 changed=0 added=0 absent=0 hashed=445
-  merged=2`. The walk and the header sniffing are a fraction of that; the wall time is the
-  445 files read end to end for a content hash, which on this disk are the ComfyUI and LM
-  Studio weights. A cache blob already names its hash, so the 477 `hf-cache` entries are not
-  among them.
-- Second scan immediately after: 0.182 s, hashing nothing and re-opening nothing.
-- `doctor`: every check passes. The node record `workstation`, zero peers, the summary at 228
-  artifacts, 228 present and 103 repositories, the three sources at 477 files and 414.4 GB
-  (`hf-cache`), 223 files and 819.7 GB (`comfy`) and 28 files and 405.8 GB (`lmstudio`), the
-  block cache and the upstream.
-- Catalog on disk: 6.9 MB, of which `catalog.redb` is 6.3 MB and the published search
-  directory 572 KB.
-- `catalog status` reported `format_version: 1` and named every table `<model id>_1_<key>`.
-  The format version is 5 from the disk wave; the native_model version of every record is
-  still 1, so the table names are unchanged.
-- `ls 'role:lora'`: 35 artifacts. Every `hoard ls` query on this catalog is 15 to 17 ms,
-  which is process start and opening two files rather than the query; on a running server,
-  which holds the catalog and the Tantivy reader open, every route is 0.5 to 2.4 ms.
+- Scan: 3.465 s wall, `unchanged=728 changed=0 added=0 absent=0`, 3 sources, 103
+  repositories, 230 artifacts, 728 entries, `format_version: 6`. The reading at `1ba8475`
+  was 5 m 35.686 s under `hash_policy = "background"`, nearly all of it the 445 files read
+  end to end for a content hash; with `--hash never` no file is read past its header, so the
+  two numbers measure different work and are not comparable.
+- `doctor`: every check passes. git 2.43.0, the data directory, the catalog at format 6
+  generation 1, the node `workstation`, zero peers, the summary at 230 artifacts, 230
+  present and 103 repositories, the search built with 0 pending changes, the three sources
+  at 477 files and 414.4 GB (`hf-cache`), 223 files and 819.7 GB (`comfy`) and 28 files and
+  405.8 GB (`lmstudio`), the block cache not created yet and the upstream. Exit status 0.
+- `doctor --repair`: `no drift; the stored totals were already exact: Totals { artifacts:
+  230, present_artifacts: 230, triage_artifacts: 24, indexed_bytes: 1559570182409,
+  repositories: 103, advertised_artifacts: 27 }`. Every other check passes as above.
+- `serve` for one minute with the watcher on: 31 ms from exec to the first answered
+  `/healthz`, `watching=3 unwatchable=0 missing=0`, 439 inotify watch descriptors held by
+  the process, `{"status":"ok","index":"ok","upstream":"ok","watch":"ok","peers":0}` at
+  startup and at 60 s, and 15 ms from SIGTERM to exit.
+- The first `serve` after a scan that skipped hashing is not that. The watcher reconciles
+  once at startup, that scan runs the hashing pass the scan was told to skip, and an orderly
+  shutdown joins the lane, so SIGTERM was answered in about 4.5 minutes rather than 15 ms.
+  Nothing is lost and the second run costs 15 ms because the hashes are stored, but a
+  shutdown waiting on a hash pass of 445 files is a wait a caller cannot see the end of.
+- After that hashing pass the summary is 228 artifacts, not 230: content hashes merged two
+  artifacts the header sniff had filed apart, which is the `merged=2` the `1ba8475` reading
+  also saw.
+- Catalog on disk: 5,496,832 bytes allocated over the directory, of which `catalog.redb` is
+  4,198,400 and the published search directory 1,298,432. At `1ba8475` the same three
+  sources came to 6.9 MB with a 6.3 MB `catalog.redb` and a 572 KB search directory: the
+  record file is 2.1 MB smaller and the search directory 726 KB larger, because every
+  cached revision now has a card. The `RevisionText` table holds 16 rows and 127,658 stored
+  bytes, which is those READMEs and configs; before `7bb681f` no hf-cache revision had a
+  card at all.
+- `ls 'role:lora'`: 35 artifacts in 17 ms, which is process start and opening two files
+  rather than the query.
 
-The catalog groups every shard set the same way whichever run produces it, including the two
-overlapping sets in `nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4` that both label `model/model`
-and both mark triage: a `*.index.json` claims two of the ten declared files and the naming
-convention takes the remaining eight.
+### Routes at 100k entries, commits `3a9fa1f` and `7bb681f`
 
-### Routes at 100k entries, commit `64e11af`
+A synthetic tree of 100 loose repositories of 1,000 valid safetensors headers each, plus a
+git clone of 1,000 more committed on `main` as `org0/repo000`, so `resolve` names a
+repository a commit names and the model route lists a repository of the same size as the
+loose ones: 101 repositories and 101,000 entries. `hash_policy = "never"`, `offline = true`,
+the watcher off, and 2,000 usage events seeded on `org0/repo000` before the first timed
+request. Both columns were scanned, served and timed in one session over the same tree, one
+server at a time under `timeout`. Six runs per route across two server starts, median, whole
+request including the response body.
 
-A synthetic tree of 100 loose repositories of 1,000 valid safetensors headers each,
-`hash_policy = "never"`, `offline = true`, with one git clone source beside it so `resolve`
-has a repository a commit names, and 2,000 usage events seeded on one repository. Three runs
-per route, median, whole request including the response body.
+| route | `3a9fa1f` | `7bb681f` | before min-max | after min-max |
+| --- | --- | --- | --- | --- |
+| `GET /api/v1/repos?limit=1` | 0.46 ms | 0.76 ms | 0.40-0.70 | 0.53-0.81 |
+| `GET /api/v1/repos?limit=100` | 0.63 ms | 0.78 ms | 0.54-0.84 | 0.66-0.94 |
+| `GET /api/models?limit=1` | 0.54 ms | 0.54 ms | 0.38-0.60 | 0.44-0.82 |
+| `GET /api/models/org0/repo000` | 2.79 ms | 4.55 ms | 2.73-3.42 | 4.23-5.38 |
+| `HEAD /org0/repo000/resolve/main/w0.safetensors` | 0.65 ms | 0.72 ms | 0.39-0.77 | 0.60-1.14 |
+| `GET /api/v1/sources` | 0.37 ms | 0.45 ms | 0.28-0.70 | 0.23-0.65 |
+| `GET /api/v1/search?q=` | 3.71 ms | 5.58 ms | 3.47-4.85 | 5.41-8.05 |
+| `GET /api/v1/search?q=node:self` | 22.20 ms | 11.70 ms | 18.70-24.63 | 11.41-11.82 |
+| `GET /api/v1/search?q=role:lora` | 3.99 ms | 5.14 ms | 3.94-4.24 | 3.87-6.47 |
+| `GET /api/v1/triage?limit=20` | 4.64 ms | 3.45 ms | 3.49-6.11 | 3.43-3.60 |
+| `GET /api/v1/repos/models/org0/repo000/usage` | 1.50 ms | 2.32 ms | 1.38-1.55 | 2.23-2.86 |
 
-| route | median |
-| --- | --- |
-| `GET /api/v1/repos?limit=1` | 0.90 ms |
-| `GET /api/v1/repos?limit=100` | 0.67 ms |
-| `GET /api/models?limit=1` | 0.54 ms |
-| `GET /api/models/org0/repo000` | 3.38 ms |
-| `HEAD /org0/repo000/resolve/main/w0.safetensors` | 0.78 ms |
-| `GET /api/v1/sources` | 0.64 ms |
-| `GET /api/v1/search?q=` | 13.7 ms |
-| `GET /api/v1/search?q=node:self` | 41.6 ms |
-| `GET /api/v1/search?q=role:lora` | 16.1 ms |
-| `GET /api/v1/triage?limit=20` | 9.35 ms |
-| `GET /api/v1/repos/models/org0/repo000/usage` | 1.39 ms |
+Two routes are the work of these waves. `node:self` is the collapse path bounded in wave 4:
+22.20 ms to 11.70 ms, and its spread does not reach the difference. `triage` is the
+`triage_queue` index of wave 5b: 4.64 ms to 3.45 ms, and it is the only route whose spread
+narrowed to nothing.
 
-A streamed response costs about 40 ms in HTTP framing whatever the catalog does, so the
-resolve loop measures the framing: 200 sequential requests take 0.99 s and 400 with 20 in
-flight take 0.81 s.
+Three routes are slower by more than the spread of their own runs.
+
+- `GET /api/v1/repos/models/org0/repo000/usage`, 1.50 to 2.32 ms, is the USAGE tab read of
+  wave 5b and the reason is in the code: one read of the repository's whole log became a
+  scan of the seven-day window by the `repo_at` key, a second scan for the newest pulls, and
+  a point read of the repository's own `RepoUsage` row for the client count. On this fixture
+  every one of the 2,000 pulls is inside the window, so the new path reads what the old one
+  read and pays for two scans and a lookup instead of one scan. What it buys is the
+  asymptote: the old route was O(rows of the repository) for a count it can now read.
+- `GET /api/models/org0/repo000`, 2.79 to 4.55 ms, lists 1,000 siblings. The handler is
+  byte-identical between the columns, the response body is byte-identical at 33,288 bytes,
+  and the added 1.76 ms is therefore below it, in what the catalog answers a repository and
+  its entries with. Which of waves 5a, 5b and 7 spent it is not established here.
+- `GET /api/v1/search?q=`, 3.71 to 5.58 ms, is the default page of 100 rows. The response is
+  byte-identical at 72,082 bytes and the same query through the harness at 100k costs the
+  same in both columns (2.72 against 2.65 ms), so the difference is in what the route does
+  around the query, not in the selection. It is not established either.
+
+The reading at `64e11af` is history from a tree built the same way but before the tally
+wave, and its query rows were 13.7, 41.6, 16.1 and 9.35 ms where this tree reads 3.7, 11.7,
+5.1 and 3.4; only the two slower rows above are within reach of it, at +1.17 ms for the
+model route and +0.93 ms for the usage route.
 
 ### The scale harness
 
@@ -852,47 +891,138 @@ difference measured after the queries, so a run that faulted less of the index i
 queries leaves the refresh more room to raise the mark. The absolute peak, the 864 MiB the
 scan grows by, is the same in every run.
 
+### The remaining work measured once, at `7bb681f`
+
+Waves 1 to 7 of `docs/superpowers/specs/2026-09-06-remaining-work-goal.md` changed the query
+paths, the scan, the readers and the record shapes, and none of them measured. This is the
+one measurement of all of it: `3a9fa1f`, the commit the goal was set at, against `7bb681f`,
+the head after wave 7, both built release in one session on this workstation, both run over
+one tree that was generated once and its headers restored between runs, one process at a
+time with nothing else on the disk. Two runs per column at 1M; the column is the first run
+and the second is beside it.
+
+| measure, 1M | `3a9fa1f` | run 2 | `7bb681f` | run 2 |
+| --- | --- | --- | --- | --- |
+| scan wall | 74.838 s | 76.788 s | 76.954 s | 76.003 s |
+| peak rss growth during scan | 910,503,936 (868.32 MiB) | 911,605,760 | 901,083,136 (859.34 MiB) | 908,177,408 |
+| rebuild wall | 7.459 s | 7.488 s | 7.995 s | 8.840 s |
+| peak rss growth during rebuild | 344,657,920 (328.69 MiB) | 345,051,136 | 345,157,632 (329.17 MiB) | 344,354,816 |
+| on disk after scan, allocated | 1,340,702,720 | 1,340,780,544 | 1,338,777,600 | 1,338,748,928 |
+| record payload after scan | 563,970,209 (537.84 MiB) | 563,970,982 | 561,970,119 (535.94 MiB) | 561,970,286 |
+| on disk after rebuild, allocated | 1,399,160,832 (1334.34 MiB) | 1,399,238,656 | 1,397,235,712 (1332.51 MiB) | 1,397,207,040 |
+| of which the search directory | 58,458,112 | 58,458,112 | 58,458,112 | 58,458,112 |
+| segments after rebuild | 3 | 3 | 3 | 3 |
+| query empty by name | 20.941 ms | 20.791 ms | 21.524 ms | 21.633 ms |
+| query deep offset | 21.337 ms | 21.230 ms | 38.807 ms | 38.860 ms |
+| query midpoint offset | 71.924 ms | 71.925 ms | 72.995 ms | 72.991 ms |
+| query midpoint offset by size | 58.185 ms | 58.197 ms | 59.376 ms | 59.514 ms |
+| query role:lora with facets | 24.028 ms | 23.881 ms | 24.759 ms | 24.819 ms |
+| query filtered | 38.206 ms | 37.908 ms | 39.585 ms | 39.572 ms |
+| query node:self with facets | 198.184 ms | 200.063 ms | 50.887 ms | 50.713 ms |
+| query node:self midpoint offset | not in the harness | | 107.071 ms | 107.019 ms |
+| query node:self deep offset | not in the harness | | 74.765 ms | 74.775 ms |
+| query midpoint offset after refresh | 76.582 ms | 76.323 ms | 76.386 ms | 76.693 ms |
+| segments after refresh | 4 | 4 | 4 | 4 |
+| inspector artifact_detail | 26.704 us | 26.929 us | 26.688 us | 26.559 us |
+| inspector entries_of | 27.744 us | 28.880 us | 29.776 us | 30.688 us |
+| inspector artifact_row | 8.496 us | 8.832 us | 8.816 us | 8.608 us |
+| resident rss over the queries | 13,770,752 (13.13 MiB) | 16,314,368 | 16,322,560 (15.57 MiB) | 16,388,096 |
+| resident rss over the midpoint queries | 14,315,520 (13.65 MiB) | 14,278,656 | 14,278,656 (13.62 MiB) | 14,278,656 |
+| resident rss over the collapse queries | not in the harness | | 0 | 0 |
+| rescan wall (1,000 changed) | 5.237 s | 5.238 s | 5.068 s | 5.063 s |
+| refresh wall | 29.302 ms | 29.046 ms | 27.598 ms | 22.318 ms |
+| on disk after churn, allocated | 1,403,031,552 | 1,403,002,880 | 1,400,991,744 | 1,401,040,896 |
+| rebuild wall over a published index | 8.256 s | 7.681 s | 7.490 s | 7.360 s |
+| peak allocated while an index was replaced | 1,465,954,304 | 1,464,471,552 | 1,461,444,608 | 1,461,485,568 |
+
+| measure, 100k | `3a9fa1f` | `7bb681f` | `7bb681f` again |
+| --- | --- | --- | --- |
+| scan wall | 5.185 s | 5.215 s | 5.176 s |
+| rebuild wall | 861.5 ms | 838.9 ms | 709.8 ms |
+| on disk after rebuild, allocated | 143,687,680 | 142,630,912 | 142,639,104 |
+| record payload after rebuild | 55,512,643 | 55,312,343 | 55,312,202 |
+| query empty by name | 2.720 ms | 2.647 ms | 2.618 ms |
+| query deep offset | 2.958 ms | 4.684 ms | 4.658 ms |
+| query midpoint offset | 7.987 ms | 8.073 ms | 8.051 ms |
+| query midpoint offset by size | 4.695 ms | 4.791 ms | 4.694 ms |
+| query role:lora with facets | 2.875 ms | 2.936 ms | 2.908 ms |
+| query filtered | 4.182 ms | 4.324 ms | 4.345 ms |
+| query node:self with facets | 6.900 ms | 5.398 ms | 5.379 ms |
+| query node:self midpoint offset | not in the harness | 11.446 ms | 11.302 ms |
+| query node:self deep offset | not in the harness | 8.236 ms | 8.157 ms |
+| query midpoint offset after refresh | 9.328 ms | 9.298 ms | 9.353 ms |
+
+**The collapse path is the result.** `node:self` at 1M fell from 198.184 to 50.887 ms, 74.3
+per cent, against a spread of 1.9 ms in the before column and 0.2 ms in the after one, which
+is wave 4 folding an artifact's run of entry documents inside the segment collectors instead
+of retaining a row per matching artifact. Its two new pages, which no column before this one
+could report, cost 107.071 ms in the middle of the order and 74.765 ms at the far end, and
+the resident memory over the two of them is zero. At 100k the same row is 6.900 to 5.398 ms.
+
+**A deep page pays a sampling pass it did not pay before.** `query deep offset` at 1M went
+from 21.337 to 38.807 ms and at 100k from 2.958 to 4.684 ms, in both runs of both columns.
+Wave 4 removed the `Count` pass a primary query ran before anything else, so the total is
+now learned from the sampling pass, and only then does `Window::of` discover that the page
+is nearer the far end and a reversed heap of 100 rows will answer it. Before, a `Count` that
+read no column bought that knowledge; now a sampling pass that reads the sort column does.
+This is exactly the trade named under "Remaining work" as the price of dropping the `Count`,
+now with its number: 17.5 ms at 1M on the last page of a million, which is 12.9 times inside
+the 500 ms gate.
+
+**Everything else is inside its own spread or nearly so.** The scan, both rebuilds, the
+rescan, the refresh, the three inspector rows and the disk rows moved by less than the
+difference between the two runs of a single column. `query empty by name`, `query midpoint
+offset`, `query midpoint offset by size`, `role:lora` and the filtered query are 0.6 to
+1.4 ms slower at 1M, 1.5 to 3.6 per cent, consistently across both runs of both columns and
+therefore just outside a spread of 0.2 ms; nothing in these waves put those rows on a new
+path and no mechanism is established for them. At 100k the same five rows are within 0.15 ms
+either way, so whatever it is does not scale with the entry count. This is the same shape of
+residual the paging wave recorded and left, and it is recorded and left again.
+
+**The disk rows barely moved and were not expected to.** The disk wave's three levers - one
+card per revision, the remaining records on the compact codec, a smaller `ArtifactDetail`
+summary - need cards, many revisions and many tensor samples to show anything, and the gate
+fixture has one tensor per file, one revision per repository and no card at all. `SearchText`
+lost 1,000,000 bytes of payload and `ArtifactRecord` 1,000,306; `ArtifactDetail` is identical
+to the byte. What the wave was worth is in the supplemental fixture below, where the whole
+directory fell 12.3 per cent.
+
+**One row moved for a reason none of these waves can reach.** Peak RSS growth during the
+rescan and refresh reads 57,901,056 and 57,593,856 bytes before and 140,234,752 and
+123,826,176 after. It is a high-water-mark difference attributed to a phase by subtraction,
+and the after column runs two more queries before it than the before column does, so the
+mark it is measured from is set differently. The absolute peak, the 866 MiB the scan grows
+by, is the same in every run of both columns.
+
 ### Thresholds
 
 At 1M entries, absolute: peak RSS growth during the scan under 2 GB, allocated disk under
-1,500,000,000 bytes, every query under 500 ms, rebuild no slower than the scan. Measured at
-`1783f2b`; the disk rows are the same to within 37 KB across three runs, the rest is one run
-on an otherwise idle machine.
+1,500,000,000 bytes at rest and at the peak of a rebuild that replaces a published index,
+every query under 500 ms including the collapse path and a page anywhere in the order, and a
+rebuild no slower than the scan. Measured at `7bb681f` over the tree of the section above,
+first run of two, with the second beside it where the two differ.
 
-| gate | measured | verdict |
+| gate | measured at `7bb681f` | verdict |
 | --- | --- | --- |
-| allocated disk after the rebuild | 1,399,648,256 bytes | met, by 100.4 MB |
-| allocated disk after the incremental workload | 1,403,404,288 bytes | met, by 96.6 MB |
-| allocated disk at the peak of a rebuild that replaces a published index | 1,463,869,440 bytes | met, by 36.1 MB |
-| peak RSS growth during the scan | 880,521,216 bytes | met |
-| rebuild no slower than the scan | 7.51 s against 76.39 s | met |
-| every query on the original list under 500 ms | slowest is `node:self` at 474.98 ms before, 408.32 ms after | met |
+| allocated disk after the rebuild | 1,397,235,712 bytes (1332.51 MiB) | met, by 102.8 MB |
+| allocated disk after the incremental workload | 1,400,991,744 bytes | met, by 99.0 MB |
+| allocated disk at the peak of a rebuild that replaces a published index | 1,461,485,568 bytes | met, by 38.5 MB |
+| peak RSS growth during the scan | 908,177,408 bytes (866.11 MiB) | met, by 1.1 GB |
+| rebuild no slower than the scan | 7.995 s against 76.954 s | met |
+| every primary query under 500 ms | slowest is `query midpoint offset` at 72.995 ms | met, by 427.0 ms |
+| the collapse queries under 500 ms | 50.887, 107.071 and 74.765 ms | met, by 392.9 ms |
+| every page of the default order under 500 ms | 21.524 first, 72.995 middle, 38.807 last, 76.693 after a refresh | met, by 423.3 ms |
+| no route of the eleven slower than the column beside it | the model route +1.76 ms, the default search page +1.87 ms, the usage route +0.82 ms | **missed** on three, two of them unexplained |
 
-Three rows the original list did not carry, measured at `2552309` against `55330c2` on the
-same tree in one session:
+The disk gate's margin is the number to watch and it has not moved: the resting figure is
+102.8 MB inside it, and a rebuild that replaces a published index holds two search
+directories for as long as it runs and comes to 38.5 MB inside it. That transient is one
+search directory, 58,458,112 bytes, above the resting figure.
 
-| gate | measured | verdict |
-| --- | --- | --- |
-| a page in the middle of the default order under 500 ms | 184.532 ms, from 1.508 s | met, by 315.5 ms |
-| the same page after a refresh, over four segments | 189.565 ms, from 1.544 s | met, by 310.4 ms |
-| a page in the middle by size under 500 ms | 170.737 ms, from 225.749 ms | met, by 329.3 ms |
-| the first page and the last page unmoved | +1.7 ms and +1.3 ms | met, inside their own spread |
-| `role:lora` and the filtered query unmoved | +4.7 ms and +7.4 ms, 3.2 per cent | **missed**, outside their spread |
-| `node:self` unmoved | 411.8, 381.4 and 322.4 ms across three commits | met, the spread exceeds the difference |
-| resident memory over the queries no higher than before | 15.56 MiB against 16.32 MiB | met |
-
-This wave's rows, measured at `e2e1809` against `95d6fe0` on the same tree in one session:
-
-| gate | measured | verdict |
-| --- | --- | --- |
-| `query empty by name` at least 40 per cent faster | 21.143 ms from 120.306 ms, 82.4 per cent | met |
-| `query deep offset` at least 40 per cent faster | 21.448 ms from 120.761 ms, 82.2 per cent | met |
-| `query role:lora with facets` at least 40 per cent faster | 24.182 ms from 146.224 ms, 83.5 per cent | met |
-| `query filtered` at least 40 per cent faster | 38.341 ms from 234.624 ms, 83.7 per cent | met |
-| the three midpoint rows no slower than their spread | 71.963, 58.298 and 76.649 ms from 184.543, 170.409 and 189.095 ms | met, 61, 66 and 59 per cent faster |
-| `node:self` no slower than its spread | 120.578 ms from 338.563 ms | met, 64 per cent faster |
-| resident memory over the queries no higher | 15.56 MiB against a before column of 53.63 and 15.56 MiB | met |
-| every query on the original list under 500 ms | slowest is `node:self` at 120.578 ms | met, by 379.4 ms |
+This table replaces the per-wave gate tables the disk, paging and tally waves each wrote
+here against the commit their own wave started from. Their measurements are unchanged and
+stay in "The scale harness", "A page anywhere in the order, at 1M" and "Tallying by ordinal
+and reading by block" above; the gates themselves are answered once, here, at the head.
 
 **Where the heap stops paying.** `Paging::DEFAULT.shallow` is the window above which a rank
 selection replaces the heap, and it is 16,384 rows for a text key and eight times that for a
@@ -959,48 +1089,47 @@ Three numbers per table, and they mean different things:
   that ratio did not move: halving a payload halves the pages, it does not pack them
   tighter.
 
-At 1M entries, after the rebuild. `95cd3ad` is the base this wave started from, measured with
-the same harness; `1783f2b` is the wave. Both columns were taken in one session on this
-workstation.
+At 1M entries, after the rebuild, at `3a9fa1f` and `7bb681f`, both taken in one session on
+this workstation with the same harness over the same tree.
 
-| table | rows | pages at `95cd3ad` | pages at `1783f2b` | stored at `1783f2b` | leaf fill |
+| table | rows | pages at `3a9fa1f` | pages at `7bb681f` | stored at `7bb681f` | leaf fill |
 | --- | --- | --- | --- | --- | --- |
-| `8_1_artifact_id`, `ArtifactDetail` | 1,000,000 | 869.82 MiB | 497.00 MiB | 267.52 MiB | 54.8% |
-| `3_1_id`, `ArtifactRecord` | 1,000,000 | 424.43 MiB | 278.74 MiB | 136.11 MiB | 49.7% |
-| `7_1_id`, `Entry` | 1,000,000 | 397.49 MiB | 164.78 MiB | 75.00 MiB | 46.3% |
-| `7_1_location`, the unique location index | 1,000,000 | 156.39 MiB | 118.08 MiB | 7.63 MiB | 6.7% |
-| `5_1_artifact_id`, `SearchText` | 1,000,000 | 119.28 MiB | 88.23 MiB | 36.33 MiB | 41.9% |
-| `7_1_artifact_id`, the artifact index | 1,000,000 | 63.11 MiB | 63.11 MiB | 7.63 MiB | 12.3% |
-| `3_1_identity`, the identity index | 1,000,000 | 58.13 MiB | 57.89 MiB | 7.63 MiB | 13.4% |
-| `10_1_seq`, the change log, after the scan | 1,000,000 then 0 | 80,171,008 bytes | never written | | |
-| `7_1_repo_id`, the repository index | 1,000,000 | 23.25 MiB | gone | | |
+| `8_1_artifact_id`, `ArtifactDetail` | 1,000,000 | 497.00 MiB | 497.00 MiB | 267.52 MiB | 53.8% |
+| `3_1_id`, `ArtifactRecord` | 1,000,000 | 278.11 MiB | 278.18 MiB | 135.15 MiB | 48.6% |
+| `7_1_id`, `Entry` | 1,000,000 | 164.78 MiB | 164.78 MiB | 75.00 MiB | 45.5% |
+| `7_1_location`, the unique location index | 1,000,000 | 118.08 MiB | 118.08 MiB | 7.63 MiB | 6.5% |
+| `5_1_artifact_id`, `SearchText` | 1,000,000 | 88.23 MiB | 86.31 MiB | 35.37 MiB | 41.0% |
+| `7_1_artifact_id`, the artifact index | 1,000,000 | 63.11 MiB | 63.11 MiB | 7.63 MiB | 12.1% |
+| `3_1_identity`, the identity index | 1,000,000 | 58.11 MiB | 58.11 MiB | 7.63 MiB | 13.1% |
 
-The seven surviving tables came to 2,214,522,880 bytes of pages and now come to
-1,329,451,008, against 1,341,190,144 bytes allocated for `catalog.redb`: the 11.19 MiB
-residual is redb's own allocator state, its freed-page tables and the region headers. That
-residual was 87.68 MiB while the change log was written and freed, because redb does not
-give a freed page back to the operating system. The published Tantivy directory is
-58,458,112 bytes, 55.75 MiB, down from 83,243,008.
+The seven tables came to 1,328,984,064 bytes of pages and now come to 1,327,046,656, against
+1,338,748,928 bytes allocated for `catalog.redb`: the 11.16 MiB residual is redb's own
+allocator state, its freed-page tables and the region headers. The published Tantivy
+directory is 58,458,112 bytes in both columns.
 
-Per row, in payload bytes: `ArtifactDetail` 516 to 272, `ArtifactRecord` 218 to 135, `Entry`
-197 to 71, `SearchText` 46 to 30. The location index key averaged 76 bytes and now averages
-55: it lost 40 bytes of zero-padded decimal and gained the relative path unchanged.
+Nothing here is the disk wave's doing, because this fixture cannot show it: one tensor per
+file leaves `ArtifactDetail` nothing to thin, one revision per repository and no card leave
+`SearchText` nothing to move out. `SearchText` lost exactly 1,000,000 stored bytes and
+`ArtifactRecord` 1,000,306: one byte a row off each, which is the size of `sniff_version`
+gone from every artifact record and of the card field gone from every search text once the
+card became a row of its own. `ArtifactDetail` is identical to the byte. What the wave was
+worth is in the supplemental fixture below.
 
-The largest remaining cost is `ArtifactDetail` at 497.00 MiB of pages, 37.1 per cent of
-`catalog.redb`, of which 267.52 MiB is payload and 217.01 MiB is fill factor. On this fixture
-each row is one tensor summary of a single tensor plus its evidence, and LZ4 takes 7 per cent
-off it; on a fixture with real cards and real tensor metadata it takes 75 per cent off. The
-second largest is `ArtifactRecord` at 278.74 MiB.
+The largest remaining cost is `ArtifactDetail` at 497.00 MiB of pages, 38.9 per cent of
+`catalog.redb`, of which 267.52 MiB is payload and 217.01 MiB is fill factor. The second is
+`ArtifactRecord` at 278.18 MiB, 21.8 per cent.
 
-**Intra-page slack is now the largest single term.** Across every table it is 608,835,673
-bytes, 45.4 per cent of `catalog.redb`, and the four record tables sit at 42 to 55 per cent
-leaf fill. That is ordinary B-tree occupancy after a pass of random-order inserts, and
-`Database::compact` does not reclaim it: compaction rewrites the file without its free pages
-and leaves the pages that hold rows exactly as full as they were. Halving a payload again
-would halve the pages again, but the fill factor would not move. See "Remaining work".
+**Intra-page slack is still the largest single term.** Across every table it is 608,456,492
+bytes, 45.4 per cent of `catalog.redb`, exactly where it was at `3a9fa1f` at 608,374,746 and
+45.4 per cent. `docs/superpowers/research/2026-09-page-packing.md` reads redb 2.6.3 and
+answers why: one split rule that always cuts at the byte midpoint with no append case, so
+insertion order, a bulk load in key order and a dense rewrite all land at the same fill,
+`Database::compact` moves whole pages and never rebuilds a leaf, and `set_page_size` is
+compiled only under `cfg(any(fuzzing, test))`. The reachable saving is 0 to 5 per cent. The
+lever that works is payload, at about two bytes of file per byte off a row.
 
-At 100k the same order and ratios hold: the whole directory is 143,675,392 bytes,
-137.02 MiB, against 243,363,840 at `95cd3ad`.
+At 100k the same order and ratios hold: the whole directory is 142,630,912 bytes against
+143,687,680 at `3a9fa1f`.
 
 ### What the one-artifact-per-file fixture cannot show
 
@@ -1010,22 +1139,31 @@ blob shas, a full model card and tensor summary per artifact, and one artifact i
 by more than one path. 30,000 entries, 27,300 artifacts. It needs `--features fixtures`;
 `-p hoard-index` alone leaves the module out and the command reports success over zero tests.
 
-| measure | records compact, search untrimmed | `1783f2b` |
+| measure | `3a9fa1f` | `7bb681f` |
 | --- | --- | --- |
-| whole directory, allocated | 311,848,960 bytes | 134,791,168 bytes |
-| `catalog.redb`, allocated | 281,985,024 bytes | 109,887,488 bytes |
-| `SearchText` pages | 113.82 MiB | 28.50 MiB |
-| `ArtifactDetail` pages | 113.82 MiB | 28.50 MiB |
-| record payload | 193,738,011 bytes | 53,353,221 bytes |
-| inspector `artifact_detail` | 81.4 us | 45.1 us |
-| seed wall | 2.225 s | 1.606 s |
+| whole directory, allocated | 134,848,512 bytes | 118,280,192 bytes |
+| `catalog.redb`, allocated | 109,944,832 bytes | 93,298,688 bytes |
+| `SearchText` stored | 17,335,378 bytes | 5,568,950 bytes |
+| `RevisionText` stored | no such table | 287,597 bytes over 600 rows |
+| `ArtifactDetail` stored | 17,971,722 bytes | 17,971,722 bytes |
+| record payload | 53,444,433 bytes (50.97 MiB) | 41,896,878 bytes (39.96 MiB) |
+| payload per entry | 1,781 bytes | 1,396 bytes |
+| seed wall | 1.611 s | 1.795 s |
+| rebuild wall | 1.266 s | 1.289 s |
+| inspector `artifact_detail` | 24.5 and 49.2 us | 54.8 and 38.2 us |
 
-Compressing the two cold tables is what does that: on a catalog whose artifacts carry cards
-and tensor metadata it takes 56 per cent off the whole directory and makes the inspector
-faster, because there is less to read. On the no-card gate fixture above it takes 7 per cent
-off `ArtifactDetail`'s payload, which is not enough to change its page count, and costs one
-tag byte per `SearchText` row. Both numbers are real; the second is what the gate measures
-and the first is what a catalog of real files would.
+One card per revision is what the disk wave bought and this is where it shows: 200
+repositories of 3 revisions carry 600 cards rather than 27,300 copies of one, `SearchText`
+falls to 32.1 per cent of what it stored, and the whole directory falls 16,568,320 bytes,
+12.3 per cent. `ArtifactDetail` does not move, because this fixture's tensor summary is
+already inside the sixteen samples the wave capped it at; the cap shows on a real header
+with sixty-four. The inspector row was run twice per column and read 24.5 and 49.2 us
+before against 54.8 and 38.2 us after: a spread wider than any difference between the
+columns, so it says nothing either way.
+
+The earlier reading of this fixture, at the commit before records were compact and the
+search columns trimmed, is history: 311,848,960 bytes for the whole directory against
+134,791,168 at `1783f2b`.
 
 ### Units
 
@@ -1046,7 +1184,11 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
   offset means paging there or forging a cursor. Accepted as the price of dropping the
   `Count` pass, which every query paid. The fix, if a measurement ever asks for it, is to run
   the `Count` only when the offset is above some fraction of the shallow bound, so the
-  common page keeps its one pass and the deep one buys its reversal.
+  common page keeps its one pass and the deep one buys its reversal. A measurement now asks:
+  at `7bb681f` the last page of a million costs 38.807 ms against 21.337 ms at `3a9fa1f`, and
+  at 100k 4.684 against 2.958 ms. The reversal still happens; what a deep page pays for now
+  is the sampling pass that learns the total, where a `Count` reading no column learned it
+  before.
 - **The index writer's pipeline is bounded in artifacts, not documents.** `build_index` and
   `refresh_search` send one `IndexWriter::run` group per artifact, which is what puts an
   artifact's documents in one segment and lets the query path fold them as a run. tantivy's
@@ -1077,15 +1219,16 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
   makes improbable, and the alternative is a second way to assemble a `Summary` for a path
   that should not run.
 - **Pack the pages.** Intra-page slack is the largest single term left in `catalog.redb`:
-  608,835,673 bytes at 1M, 45.4 per cent of the file, with the four record tables at 42 to
-  55 per cent leaf fill. `docs/superpowers/research/2026-09-page-packing.md` reads redb 2.6.3
-  and answers it: the fill is decided by one split rule that always cuts a leaf at the byte
-  midpoint and has no append case, so insertion order does not touch it, a bulk load in key
-  order buys nothing, `Database::compact` moves whole pages and never rebuilds a leaf, and
+  608,456,492 bytes at 1M at `7bb681f`, 45.4 per cent of the file, with the four record
+  tables at 41 to 54 per cent leaf fill; it was 608,374,746 bytes and the same 45.4 per cent
+  at `3a9fa1f`, so seven waves of work moved it by 0.01 per cent.
+  `docs/superpowers/research/2026-09-page-packing.md` reads redb 2.6.3 and answers it: the
+  fill is decided by one split rule that always cuts a leaf at the byte midpoint and has no
+  append case, so insertion order does not touch it, a bulk load in key order buys nothing,
+  `Database::compact` moves whole pages and never rebuilds a leaf, and
   `Builder::set_page_size` is `cfg(any(fuzzing, test))` and so is not in a release build at
-  all. The recommendation there is to leave it: the
-  reachable saving is 0 to 5 per cent, and the lever that works is payload, at about two
-  bytes of file per byte off a row.
+  all. The recommendation there is to leave it: the reachable saving is 0 to 5 per cent, and
+  the lever that works is payload, at about two bytes of file per byte off a row.
 - **`sweep_artifact` decompresses a cold row to delete it.** native_db 0.8.2 has no
   remove-by-primary-key: `remove` takes the value, so the sweep reads `ArtifactDetail` and
   `SearchText` in full, LZ4 and bincode included, only to hand them straight back. Every

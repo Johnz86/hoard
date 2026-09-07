@@ -101,12 +101,21 @@ The run is finished when every line holds:
    in this run, and "Decisions" holds none that is open, other than those the owner defers
    explicitly.
 4. `hoard doctor` passes every check on this workstation's catalog after the fresh scan of
-   wave 8, and `hoard doctor --repair` reports no drift.
+   wave 8, and `hoard doctor --repair` reports no drift. **Held.** At `7bb681f`, over a
+   catalog scanned fresh from the three configured sources into the session scratchpad, every
+   check reads `ok` and `--repair` reports `no drift; the stored totals were already exact`.
 5. Wave 8's tables show every standing gate met at 1M: allocated disk under 1,500,000,000
    bytes at rest and at the rebuild peak; every query on the list, the collapse queries and
    the midpoint pages included, under 500 ms; peak scan RSS growth under 2 GB; rebuild no
    slower than the scan; and no route of the eleven slower than the last recorded column by
-   more than its own spread without a stated reason.
+   more than its own spread without a stated reason. **Held except the last clause.** At
+   `7bb681f`: allocated disk 1,397,235,712 at rest and 1,461,485,568 at the rebuild peak;
+   the slowest query of any kind 107.071 ms, which is `node:self` in the middle of the order;
+   peak scan RSS growth 908,177,408 bytes; rebuild 7.995 s against a scan of 76.954 s. Three
+   routes of the eleven are slower than the `3a9fa1f` column measured beside them by more
+   than their own spread: the usage route by 0.82 ms with the mechanism established in the
+   code, and the model route by 1.76 ms and the default search page by 1.87 ms with no
+   mechanism established. Those two are the fix wave this line asks for.
 6. The two reviewers report no finding ranked above minor that is not fixed or recorded
    with a reason.
 7. The review and recommendations are written and the handoff points at them.
