@@ -107,12 +107,21 @@ pub async fn search(
     Ok(Json(SearchResponse {
         facets: facets(&page.facets, &page.query),
         rows: page.rows.iter().map(RowView::from).collect(),
-        next_cursor: next_cursor(offset, limit, page.rows.len(), page.total, &key),
+        next_cursor: next_cursor(offset, limit, walked(&page), page.total, &key),
         total: page.total,
         nodes: page.nodes,
         summary: summary(page.total, page.nodes),
         query: page.query,
     }))
+}
+
+/// How far into the result this page reached: the rows it assembled plus the candidates it
+/// walked past because a rescan had replaced them. A skipped candidate still occupies its
+/// position in the order, so a page holding one is a full page and the cursor advances.
+fn walked(page: &QueryPage) -> usize {
+    page.rows
+        .len()
+        .saturating_add(usize::try_from(page.skipped).unwrap_or(usize::MAX))
 }
 
 /// One page of the catalog, compiled against the shelves it holds and read on a blocking

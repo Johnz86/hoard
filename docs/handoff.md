@@ -25,8 +25,8 @@ first; this document assumes it.
 - Phases 0 to 11 are done. `docs/feature-plan.md` holds the table. The TREE and DISK views
   are not an unfinished phase: they wait on a design decision and are recorded under that
   document's "Risks and open decisions".
-- At the head of `master` after the recovery wave all four checks pass:
-  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 848 passed,
+- At the head of `master` after the rescan-identity wave all four checks pass:
+  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 854 passed,
   0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness
   and its supplemental fixture, the mDNS test that needs a multicast route and the sniffer
   test that reads the local model caches. `cargo doc --workspace --no-deps` emits no warning.
@@ -253,6 +253,17 @@ Smaller things, each verified:
 - An entry re-served between the sweep's walk and its retire is retired anyway, and the next
   serve of it files it again. Pre-existing: the walk and the retire were two catalog calls
   before this wave and still are, and chunking the walk did not widen the gap.
+- A rescan recognises a stored row by where it is filed - repository, revision ordinal,
+  relative path - rather than by the absolute path its bytes were last found at, so an
+  hf-cache file whose content changes in place is replaced instead of colliding on the unique
+  location key. A revision found at a fresh ordinal still refiles its unchanged rows onto it,
+  from a second index by repository and path that leaves out a path more than one stored
+  revision holds. `docs/native-catalog.md` under "The write path" says so.
+- A query that lands between a rescan and the refresh that follows it answers with `stale`
+  set, skipping the rows that rescan replaced, instead of failing on an entry the published
+  index still names. A skipped row counts as a position walked, so `next_cursor` is offered
+  as it would have been and paging does not stop short. `docs/api/hoard-api.md` under
+  "Search" says what a caller sees.
 
 `docs/native-catalog.md` under "Remaining work" holds the rest: a truncated record panicking
 inside `native_model` before any hoard codec runs, `sweep_artifact` decompressing a cold row

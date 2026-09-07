@@ -119,7 +119,10 @@ pub struct QueryRequest<'a> {
 /// A page of artifacts with the counts the index screen prints beside it. Entry selection
 /// happens after filtering, choosing the highest availability preference and then the
 /// lowest entry id; `nodes` counts the nodes those preferred entries sit on. `stale` says
-/// the answer predates changes a rescan has already logged.
+/// the answer predates changes a rescan has already logged, either because the log holds
+/// them or because a row this page named was one of them and was skipped. `skipped` counts
+/// those rows: the page walked past them, so a caller paging through the result has to
+/// count them as taken even though no row stands for them.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct QueryPage {
     pub query: ParsedQuery,
@@ -128,6 +131,7 @@ pub struct QueryPage {
     pub nodes: u64,
     pub facets: Facets,
     pub stale: bool,
+    pub skipped: u64,
 }
 
 impl Catalog {
@@ -587,7 +591,7 @@ impl Catalog {
             path,
         })?;
         let page = page_of(candidates, &summary.segments, request.sort, window)?;
-        let rows = self.rows(page)?;
+        let (rows, skipped) = self.rows(page, stale)?;
         Ok((
             QueryPage {
                 query: parsed,
@@ -595,7 +599,8 @@ impl Catalog {
                 total,
                 nodes,
                 facets,
-                stale,
+                stale: stale || skipped > 0,
+                skipped,
             },
             Cost { kept, passes },
         ))
@@ -644,26 +649,29 @@ impl Catalog {
         Ok(facets)
     }
 
-    /// The rows one page of collapsed hits stands for. Nothing but this page is read back.
-    fn rows(&self, page: Vec<Retained>) -> Result<Vec<SearchRow>> {
+    /// The rows one page of collapsed hits stands for, and how many of its candidates had
+    /// no row left to assemble. Nothing but this page is read back.
+    ///
+    /// A candidate whose entry, or the artifact that entry named, a rescan has replaced
+    /// since the published index was written is skipped and counted rather than refused:
+    /// the answer predates the change, which is what `stale` says, and the refresh that
+    /// follows the rescan removes the documents. A repository an entry still names but
+    /// which is gone is corruption rather than staleness and stays an error.
+    ///
+    /// `logged_changes` is whether the change log holds anything the published index has
+    /// not applied, which is what tells a skip a refresh will settle from one it will not.
+    fn rows(&self, page: Vec<Retained>, logged_changes: bool) -> Result<(Vec<SearchRow>, u64)> {
         let snapshot = self.database.r_transaction()?;
         let names = self.node_names(&snapshot)?;
         let mut repositories: HashMap<i64, Repository> = HashMap::new();
         let mut rows = Vec::with_capacity(page.len());
+        let mut skipped = 0_u64;
         for candidate in page {
-            let entry: Entry = snapshot.get().primary(candidate.entry_id)?.ok_or_else(|| {
-                IndexError::Catalog(format!(
-                    "search references missing entry {}",
-                    candidate.entry_id
-                ))
-            })?;
-            let artifact_id = entry.artifact_id.ok_or_else(|| {
-                IndexError::Catalog(format!("entry {} lost its artifact", entry.id))
-            })?;
-            let artifact: ArtifactRecord =
-                snapshot.get().primary(artifact_id)?.ok_or_else(|| {
-                    IndexError::Catalog(format!("search references missing artifact {artifact_id}"))
-                })?;
+            let Some((entry, artifact)) = backing_row(&snapshot, candidate.entry_id)? else {
+                report_skipped(candidate.entry_id, logged_changes);
+                skipped += 1;
+                continue;
+            };
             let repository = match repositories.entry(entry.repo_id) {
                 std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
                 std::collections::hash_map::Entry::Vacant(slot) => {
@@ -687,7 +695,7 @@ impl Catalog {
                 last_used: last_used_in(&snapshot, artifact.id)?,
             }));
         }
-        Ok(rows)
+        Ok((rows, skipped))
     }
 
     /// How many segments the published index answers from. A term ordinal is comparable
@@ -1905,6 +1913,42 @@ pub(super) struct EntryFacts<'a> {
     pub(super) node: &'a str,
     pub(super) primary: bool,
     pub(super) last_used: Option<jiff::Timestamp>,
+}
+
+/// A candidate the page had to walk past, at the level its cause deserves. A rescan whose
+/// changes no refresh has applied yet explains a skip and the refresh that follows settles
+/// it; a skip with nothing in the change log behind it is a disagreement between the index
+/// and the catalog that no refresh will settle, and is worth saying so.
+fn report_skipped(entry_id: i64, logged_changes: bool) {
+    match logged_changes {
+        true => tracing::debug!(
+            entry = entry_id,
+            "a rescan replaced a row the search index still names; skipping it"
+        ),
+        false => tracing::warn!(
+            entry = entry_id,
+            "the search index names a row the catalog does not hold and no logged change \
+             accounts for it; skipping it"
+        ),
+    }
+}
+
+/// The entry a search candidate names and the artifact that entry names, or nothing when a
+/// rescan has taken either out from under the published index.
+fn backing_row(
+    snapshot: &native_db::transaction::RTransaction<'_>,
+    entry_id: i64,
+) -> Result<Option<(Entry, ArtifactRecord)>> {
+    let Some(entry) = snapshot.get().primary::<Entry>(entry_id)? else {
+        return Ok(None);
+    };
+    let Some(artifact_id) = entry.artifact_id else {
+        return Ok(None);
+    };
+    Ok(snapshot
+        .get()
+        .primary::<ArtifactRecord>(artifact_id)?
+        .map(|artifact| (entry, artifact)))
 }
 
 pub(super) fn revision_of<'a>(repository: &'a Repository, entry: &Entry) -> Result<&'a Revision> {

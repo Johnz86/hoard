@@ -80,10 +80,15 @@ impl Catalog {
         let sources = available_sources(config)?;
         self.open_pass()?;
         let mut counters = Counters::load(&self.database, config.triage_confidence)?;
-        let (known, sizes) = self.known_stamps(&sources)?;
+        let KnownRows {
+            known,
+            paths,
+            sizes,
+        } = self.known_stamps(&sources)?;
         let mut walk = Walk {
             settings: ScanSettings::new(config, policy),
             known,
+            paths,
             sizes,
             seen: HashSet::new(),
             moved: Vec::new(),
@@ -145,6 +150,7 @@ impl Catalog {
         let mut walk = Walk {
             settings,
             known: HashMap::new(),
+            paths: HashMap::new(),
             sizes: HashMap::new(),
             seen: HashSet::new(),
             moved: Vec::new(),
@@ -188,8 +194,13 @@ impl Catalog {
             let walked = self.store_source(source, kind, discovered.repos(), counters)?;
             for (repo, walked) in discovered.repos().iter().zip(walked) {
                 for (revision, ordinal) in repo.revisions.iter().zip(walked.ordinals) {
-                    if unchanged_revision(walk, walked.id, ordinal, &revision.entries) {
-                        mark_unchanged(walk, &revision.entries, ordinal, 0..revision.entries.len());
+                    let found = RevisionEntries {
+                        repo_id: walked.id,
+                        ordinal,
+                        entries: &revision.entries,
+                    };
+                    if unchanged_revision(walk, found) {
+                        mark_unchanged(walk, found, 0..revision.entries.len());
                         continue;
                     }
                     let context = EntryContext {
@@ -206,18 +217,13 @@ impl Catalog {
                     let plan = revision_plan(&context, documents, &units);
                     let labels = set_labels(&plan.naming, &units);
                     for (unit, label) in units.iter().zip(labels) {
-                        let prepare = match decide_unit(walk, &revision.entries, unit) {
+                        let prepare = match decide_unit(walk, found, unit) {
                             UnitDecision::Skip => {
-                                mark_unchanged(
-                                    walk,
-                                    &revision.entries,
-                                    ordinal,
-                                    unit.positions().iter().copied(),
-                                );
+                                mark_unchanged(walk, found, unit.positions().iter().copied());
                                 continue;
                             }
                             UnitDecision::Prepare { prepare, unchanged } => {
-                                mark_unchanged(walk, &revision.entries, ordinal, unchanged);
+                                mark_unchanged(walk, found, unchanged);
                                 prepare
                             }
                         };
@@ -232,22 +238,11 @@ impl Catalog {
                             label.as_deref(),
                         )?;
                         if changed_while_prepared(&prepared) {
-                            mark_unchanged(
-                                walk,
-                                &revision.entries,
-                                ordinal,
-                                prepare.iter().copied(),
-                            );
+                            mark_unchanged(walk, found, prepare.iter().copied());
                             continue;
                         }
                         let transaction = self.database.rw_transaction()?;
-                        let taken = replace_known(
-                            &transaction,
-                            walk,
-                            counters,
-                            &revision.entries,
-                            &prepare,
-                        )?;
+                        let taken = replace_known(&transaction, walk, counters, found, &prepare)?;
                         store_unit(&transaction, &context, prepared, counters)?;
                         sweep_taken(&transaction, taken, counters)?;
                         log_changes(&transaction, counters)?;
@@ -516,9 +511,10 @@ impl Catalog {
     /// proves it unchanged and the facts a decision needs before any file is opened, and how
     /// many of them each stored revision holds.
     ///
-    /// Keyed by [`path_hash`] rather than by the path: a million paths held as text is the
-    /// largest thing a rescan keeps in memory, and nothing here reads the path back.
-    fn known_stamps(&self, sources: &[&SourceConfig]) -> Result<(KnownPaths, RevisionSizes)> {
+    /// Keyed by [`location_hash`] rather than by the location itself: a million relative
+    /// paths held as text is the largest thing a rescan keeps in memory, and nothing here
+    /// reads a location back.
+    fn known_stamps(&self, sources: &[&SourceConfig]) -> Result<KnownRows> {
         let names: HashSet<&str> = sources.iter().map(|source| source.name.as_str()).collect();
         let read = self.database.r_transaction()?;
         let repositories: Vec<Repository> = read
@@ -527,7 +523,8 @@ impl Catalog {
             .all()?
             .collect::<native_db::db_type::Result<_>>()?;
         let mut shards: HashMap<i64, Option<u32>> = HashMap::new();
-        let mut known = HashMap::new();
+        let mut known: KnownPaths = HashMap::new();
+        let mut paths: PathIndex = HashMap::new();
         let mut sizes: RevisionSizes = HashMap::new();
         for repository in repositories
             .iter()
@@ -539,19 +536,19 @@ impl Catalog {
                 .start_with(LocationKey::repository(repository.id))?
             {
                 let entry: Entry = entry?;
-                let (Some(abs_path), Some(mtime), Some(inode)) = (
-                    entry.placed.resolve(&repository.root_path, &entry.rel_path),
-                    entry.mtime,
-                    entry.inode,
-                ) else {
+                if entry.placed.is_absent() {
+                    continue;
+                }
+                let (Some(mtime), Some(inode)) = (entry.mtime, entry.inode) else {
                     continue;
                 };
                 let shard_count = match entry.artifact_id {
                     Some(id) => shard_count_of(&read, &mut shards, id)?,
                     None => None,
                 };
+                let location = location_hash(repository.id, entry.revision, &entry.rel_path);
                 known.insert(
-                    path_hash(Path::new(&abs_path)),
+                    location,
                     Known {
                         entry_id: entry.id,
                         revision: entry.revision,
@@ -564,10 +561,18 @@ impl Catalog {
                         shard_count,
                     },
                 );
+                paths
+                    .entry(path_hash(repository.id, &entry.rel_path))
+                    .and_modify(|held| *held = None)
+                    .or_insert(Some(location));
                 *sizes.entry((repository.id, entry.revision)).or_default() += 1;
             }
         }
-        Ok((known, sizes))
+        Ok(KnownRows {
+            known,
+            paths,
+            sizes,
+        })
     }
 
     /// A path the walk never reached is still a row: it keeps the path it had and records
@@ -923,6 +928,7 @@ fn available_sources(config: &IndexConfig) -> Result<Vec<&SourceConfig>> {
 struct Walk {
     settings: ScanSettings,
     known: KnownPaths,
+    paths: PathIndex,
     sizes: RevisionSizes,
     seen: HashSet<i64>,
     /// Entries whose revision moved to another ordinal under them, with the ordinal it
@@ -938,6 +944,22 @@ struct WalkedRepo {
     ordinals: Vec<u32>,
 }
 
+/// The discovered entries of one revision of one repository, with the identity the catalog
+/// files them under. A stored row is recognised by where it sits, not by the absolute path
+/// its bytes were last found at, which for an hf-cache entry is a blob a rewrite replaces.
+#[derive(Clone, Copy)]
+struct RevisionEntries<'a> {
+    repo_id: i64,
+    ordinal: u32,
+    entries: &'a [DiscoveredEntry],
+}
+
+impl RevisionEntries<'_> {
+    fn location(&self, position: usize) -> u128 {
+        location_hash(self.repo_id, self.ordinal, &self.entries[position].rel_path)
+    }
+}
+
 /// What the catalog already holds for one path, so a walk can decide without opening it.
 #[derive(Clone, Copy)]
 struct Known {
@@ -948,11 +970,24 @@ struct Known {
     shard_count: Option<u32>,
 }
 
-/// Every path of the selected sources the catalog holds bytes for, by [`path_hash`].
+/// Every path of the selected sources the catalog holds bytes for, by [`location_hash`].
 type KnownPaths = HashMap<u128, Known>;
+
+/// Where a repository holds one relative path, by [`path_hash`]: the location of the one
+/// row that holds it, or nothing when more than one revision of the repository does. It is
+/// what a revision rediscovered at a fresh ordinal is refiled from, and it holds a key
+/// rather than a [`Known`] so the rows themselves are kept once.
+type PathIndex = HashMap<u128, Option<u128>>;
 
 /// How many of those paths each stored revision holds, by repository and ordinal.
 type RevisionSizes = HashMap<(i64, u32), usize>;
+
+/// What the catalog already holds for the sources a rescan is about to walk.
+struct KnownRows {
+    known: KnownPaths,
+    paths: PathIndex,
+    sizes: RevisionSizes,
+}
 
 /// Whether the configuration a rescan was handed is the whole of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -987,36 +1022,69 @@ enum UnitDecision {
     },
 }
 
-fn known_of(walk: &Walk, entry: &DiscoveredEntry) -> Option<Known> {
-    entry
-        .abs_path
-        .as_ref()
-        .and_then(|path| walk.known.get(&path_hash(path)))
-        .copied()
+fn known_of(walk: &Walk, found: RevisionEntries<'_>, position: usize) -> Option<Known> {
+    match walk.known.get(&found.location(position)) {
+        Some(known) => Some(*known),
+        None => refiled_of(walk, found, position),
+    }
 }
 
-/// A path as the key a rescan looks it up by. Two distinct paths colliding on 128 bits is
-/// not a case this workspace budgets for.
-fn path_hash(path: &Path) -> u128 {
-    xxhash_rust::xxh3::xxh3_128(path.as_os_str().as_encoded_bytes())
+/// The row another revision of the same repository holds this path at, when the catalog
+/// holds no row at all for the revision the walk is in.
+///
+/// An entry names its revision by ordinal, so a revision the catalog had not seen - a clone
+/// whose branch advanced onto a fresh commit - takes a fresh slot while every file it holds
+/// is the file the catalog already read. Recognising those rows is what refiles them onto
+/// the new ordinal rather than reading them again and retracting the ones they replace.
+///
+/// The stamp has to match, so only a file that did not change is refiled, and a path more
+/// than one stored revision holds is never refiled: which of them moved is not knowable
+/// from the path, and taking the wrong one would empty the revision it is filed under. A
+/// row another revision of this walk has already accounted for is left to it.
+fn refiled_of(walk: &Walk, found: RevisionEntries<'_>, position: usize) -> Option<Known> {
+    if walk.sizes.contains_key(&(found.repo_id, found.ordinal)) {
+        return None;
+    }
+    let entry = &found.entries[position];
+    let stamp = entry.stamp?;
+    let held = (*walk.paths.get(&path_hash(found.repo_id, &entry.rel_path))?)?;
+    let known = walk.known.get(&held)?;
+    (known.stamp == stamp && !walk.seen.contains(&known.entry_id)).then_some(*known)
+}
+
+/// Where a row sits, as the key a rescan looks it up by: the repository, the revision
+/// ordinal and the relative path, which is the identity the catalog files an entry under
+/// and the one a file rewritten in place keeps. Two distinct locations colliding on 128
+/// bits is not a case this workspace budgets for.
+pub(super) fn location_hash(repo_id: i64, ordinal: u32, rel_path: &str) -> u128 {
+    let seed = repo_id.cast_unsigned().rotate_left(32) ^ u64::from(ordinal);
+    xxhash_rust::xxh3::xxh3_128_with_seed(rel_path.as_bytes(), seed)
+}
+
+/// One relative path of one repository, whichever of its revisions holds it, as the key the
+/// refile lookup uses.
+fn path_hash(repo_id: i64, rel_path: &str) -> u128 {
+    xxhash_rust::xxh3::xxh3_128_with_seed(rel_path.as_bytes(), repo_id.cast_unsigned())
 }
 
 /// Whether nothing in a revision needs opening: it holds every path the catalog holds bytes
 /// for and no others, each at the same size, inode and mtime. The count is as much of the
 /// condition as the stamps are, because a revision that lost a file holds only unchanged
 /// paths too.
-fn unchanged_revision(
-    walk: &Walk,
-    repo_id: i64,
-    ordinal: u32,
-    entries: &[DiscoveredEntry],
-) -> bool {
-    walk.sizes.get(&(repo_id, ordinal)).copied().unwrap_or(0) == entries.len()
-        && entries.iter().all(|entry| unchanged_entry(walk, entry))
+fn unchanged_revision(walk: &Walk, found: RevisionEntries<'_>) -> bool {
+    walk.sizes
+        .get(&(found.repo_id, found.ordinal))
+        .copied()
+        .unwrap_or(0)
+        == found.entries.len()
+        && (0..found.entries.len()).all(|position| unchanged_entry(walk, found, position))
 }
 
-fn unchanged_entry(walk: &Walk, entry: &DiscoveredEntry) -> bool {
-    match (known_of(walk, entry), entry.stamp) {
+fn unchanged_entry(walk: &Walk, found: RevisionEntries<'_>, position: usize) -> bool {
+    match (
+        known_of(walk, found, position),
+        found.entries[position].stamp,
+    ) {
         (Some(known), Some(stamp)) => known.stamp == stamp,
         (Some(_), None) | (None, _) => false,
     }
@@ -1025,20 +1093,20 @@ fn unchanged_entry(walk: &Walk, entry: &DiscoveredEntry) -> bool {
 /// What a unit costs this walk: nothing when every file it holds is the file the catalog
 /// already read, otherwise the positions to prepare again. A set is prepared whole, because
 /// its artifact is the union of its shards.
-fn decide_unit(walk: &Walk, entries: &[DiscoveredEntry], unit: &Unit) -> UnitDecision {
+fn decide_unit(walk: &Walk, found: RevisionEntries<'_>, unit: &Unit) -> UnitDecision {
     match unit {
         Unit::Set(set) => {
             let members = u32::try_from(set.members.len()).unwrap_or(u32::MAX);
             let grouped = set
                 .members
                 .first()
-                .and_then(|position| known_of(walk, &entries[*position]))
+                .and_then(|position| known_of(walk, found, *position))
                 .is_some_and(|known| known.shard_count == Some(members));
             let intact = grouped
                 && set
                     .members
                     .iter()
-                    .all(|position| unchanged_entry(walk, &entries[*position]));
+                    .all(|position| unchanged_entry(walk, found, *position));
             match intact {
                 true => UnitDecision::Skip,
                 false => UnitDecision::Prepare {
@@ -1051,7 +1119,7 @@ fn decide_unit(walk: &Walk, entries: &[DiscoveredEntry], unit: &Unit) -> UnitDec
             let (unchanged, prepare): (Vec<usize>, Vec<usize>) = positions
                 .iter()
                 .copied()
-                .partition(|position| unchanged_entry(walk, &entries[*position]));
+                .partition(|position| unchanged_entry(walk, found, *position));
             match prepare.is_empty() {
                 true => UnitDecision::Skip,
                 false => UnitDecision::Prepare { prepare, unchanged },
@@ -1092,16 +1160,15 @@ pub(super) fn stamp_moved(path: Option<&Path>, stamp: Option<FileStamp>) -> bool
 /// moved to another ordinal since the row was written.
 fn mark_unchanged(
     walk: &mut Walk,
-    entries: &[DiscoveredEntry],
-    ordinal: u32,
+    found: RevisionEntries<'_>,
     positions: impl IntoIterator<Item = usize>,
 ) {
     for position in positions {
-        if let Some(known) = known_of(walk, &entries[position]) {
+        if let Some(known) = known_of(walk, found, position) {
             walk.seen.insert(known.entry_id);
             walk.report.unchanged += 1;
-            if known.revision != ordinal {
-                walk.moved.push((known.entry_id, ordinal));
+            if known.revision != found.ordinal {
+                walk.moved.push((known.entry_id, found.ordinal));
             }
         }
     }
@@ -1115,12 +1182,12 @@ fn replace_known(
     transaction: &RwTransaction<'_>,
     walk: &mut Walk,
     counters: &mut Counters,
-    entries: &[DiscoveredEntry],
+    found: RevisionEntries<'_>,
     positions: &[usize],
 ) -> Result<Vec<i64>> {
     let mut taken = Vec::new();
     for position in positions {
-        let Some(known) = known_of(walk, &entries[*position]) else {
+        let Some(known) = known_of(walk, found, *position) else {
             walk.report.added += 1;
             continue;
         };

@@ -67,6 +67,12 @@ expects to move and why; the last wave measures them all.
    directory: a scan, a hash pass, a refresh and a publish each killed at a chosen point
    reopen to a consistent catalog and complete on the next run to the same counts as an
    uninterrupted run. Fixes for what the tests find land in the same wave.
+6b. **rescan-identity.** The two defects wave 6's hf-cache fixture found at its gate and
+   left, which were not a kill's doing: a rescan keyed its map of stored rows by the
+   absolute path their bytes were last found at rather than by the location they are filed
+   at, so an hf-cache file rewritten in place collided on the unique location key; and a
+   query landing between a rescan and its refresh failed on an entry the published index
+   still named rather than answering with `stale` set.
 7. **disk.** One `SearchText` card per revision referenced by its artifacts, the remaining
    records (`SearchChange`, `Repository`, `Source`, `Node`, `Usage`, user data) on the
    compact codec, and the `ArtifactDetail` summary reduced to what the inspector shows.
@@ -86,8 +92,9 @@ review and the recommendations (below).
 
 The run is finished when every line holds:
 
-1. Waves 1 to 8 are on `master`, one commit each except wave 5, which is two, 5a and 5b;
-   each verified by `.claude/skills/hoard-verify/SKILL.md` and reviewed before landing.
+1. Waves 1 to 8 are on `master`, one commit each except wave 5, which is two, 5a and 5b,
+   and wave 6, which is two, 6 and 6b; each verified by
+   `.claude/skills/hoard-verify/SKILL.md` and reviewed before landing.
 2. `docs/feature-plan.md` marks Phase 10 and Phase 11 done, with the acceptance checks of
    each stated and passing.
 3. `docs/handoff.md` "Follow-ups" holds only the items named above as deliberately not code

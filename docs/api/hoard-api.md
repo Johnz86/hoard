@@ -53,6 +53,14 @@ model, not forty unclassifiable rows. `path_count` stays per file, because dedup
 and serving are per file. In a facet bucket, `token` is what a click toggles in the query
 and `query` is the whole query that selects exactly that bucket.
 
+A page can hold fewer rows than `limit`, and the rows of every page together fewer than
+`total`. The index is answered from even while a rescan has logged changes no refresh has
+applied, so a row whose entry that rescan replaced is skipped rather than the whole request
+being refused; `total` stays what the index counted, and the refresh that follows the rescan
+brings the row back. A skipped row still counts as a position walked, so `next_cursor` is
+offered exactly as it would have been had the row been assembled and paging never stops
+short. The server logs the window at `debug`; nothing in the response names it.
+
 `GET /api/v1/search/parse?q=` returns only `query`, for the token strip while typing.
 
 ## Artifacts and blobs

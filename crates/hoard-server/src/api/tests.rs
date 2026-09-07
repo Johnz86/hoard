@@ -15,10 +15,10 @@ use hoard_core::{
     TensorSummary,
 };
 use hoard_index::catalog::{
-    Catalog, LOCAL_NODE, MIRROR_SOURCE, RemoteEntry, SeedArtifact, SeedEntry, SeedRepository,
-    SeedRevision, ServedFile, UsageEvent, content_key,
+    Catalog, LOCAL_NODE, MIRROR_SOURCE, RemoteEntry, RescanScope, SeedArtifact, SeedEntry,
+    SeedRepository, SeedRevision, ServedFile, UsageEvent, content_key,
 };
-use hoard_index::config::{SourceConfig, SourceKind};
+use hoard_index::config::{HashPolicy, SourceConfig, SourceKind};
 use hoard_index::discover::RefKind;
 
 use crate::api;
@@ -578,6 +578,100 @@ async fn search_answers_the_documented_shape() {
             "{dimension} is a list"
         );
     }
+}
+
+/// A safetensors header with one tensor, which is enough for a scan to make an artifact of
+/// the file without any real weights on disk.
+fn weights(tensor: &str) -> Vec<u8> {
+    let header = format!(
+        "{{\"lora_unet_{tensor}.lora_down.weight\":\
+         {{\"dtype\":\"F16\",\"shape\":[16,768],\"data_offsets\":[0,24576]}}}}"
+    );
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(header.as_bytes());
+    bytes
+}
+
+/// A server whose published index still names a row the catalog has replaced: two weight
+/// files scanned and indexed, then one of them rewritten and rescanned with no refresh
+/// after it, which is the window a query can land in.
+fn a_rescan_ahead_of_the_index() -> (AppState, TempDir) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let input = dir.path().join("models");
+    std::fs::create_dir_all(&input).expect("source dir");
+    std::fs::write(input.join("alpha.safetensors"), weights("alpha")).expect("alpha writes");
+    std::fs::write(input.join("beta.safetensors"), weights("beta")).expect("beta writes");
+    let mut config = HoardConfig::default();
+    config.server.data_dir = dir.path().to_path_buf();
+    config.index.data_dir = dir.path().to_path_buf();
+    config.index.sources = vec![SourceConfig {
+        name: "models".to_owned(),
+        path: input.clone(),
+        kind: SourceKind::Loose,
+        include: Vec::new(),
+        exclude: Vec::new(),
+        follow_symlinks: false,
+        repo_per_folder: false,
+    }];
+    config.node.name = "workstation".to_owned();
+    let catalog = Catalog::open_or_scan(&config.index, &config.node.name, |_, _| {})
+        .expect("the source scans and indexes");
+    let rewritten = input.join("alpha.safetensors");
+    std::fs::write(&rewritten, weights("alpha_again")).expect("alpha is rewritten");
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    std::fs::File::options()
+        .write(true)
+        .open(&rewritten)
+        .expect("alpha opens")
+        .set_modified(later)
+        .expect("its mtime moves");
+    catalog
+        .rescan(
+            &config.index,
+            HashPolicy::Never,
+            RescanScope::Configured,
+            |_, _| {},
+        )
+        .expect("the rescan replaces the row");
+    let state = AppState::new(config, std::sync::Arc::new(catalog)).expect("state builds");
+    (state, dir)
+}
+
+#[tokio::test]
+async fn a_page_whose_row_a_rescan_replaced_still_offers_the_next_one() {
+    let (state, _dir) = a_rescan_ahead_of_the_index();
+
+    let first = get(&state, "/api/v1/search?limit=1").await;
+    assert_eq!(first["total"], 2, "the index counts what it holds");
+    assert!(
+        first["rows"]
+            .as_array()
+            .expect("rows are an array")
+            .is_empty(),
+        "the row the rescan replaced is skipped: {first}"
+    );
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("a page that skipped a row still walks on");
+
+    let second = get(
+        &state,
+        &format!("/api/v1/search?limit=1&cursor={}", encoded(cursor)),
+    )
+    .await;
+    let rows = second["rows"].as_array().expect("rows are an array");
+    assert_eq!(
+        rows.len(),
+        1,
+        "the page after it holds the row that is there"
+    );
+    assert!(
+        rows[0]["path"]
+            .as_str()
+            .expect("a path")
+            .ends_with("beta.safetensors"),
+        "{second}"
+    );
 }
 
 #[tokio::test]

@@ -168,6 +168,26 @@ Every writer of an entry commits through `scan::Counters`:
   `Manifest.search_seq`.
 - `Counters::save(transaction)` flushes whatever shift is left and writes the allocator back.
 
+A rescan recognises a stored row by where it is filed. `known_stamps` keys the map it hands
+the walk by a hash of the location - the repository id, the revision ordinal and the relative
+path - and not by the absolute path the row's bytes were last found at. The two are not the
+same identity: an hf-cache entry sits at a blob under `blobs/`, so a file rewritten in place
+is discovered at a new absolute path, its stored row would never be recognised, and the row
+written for it would collide on the unique `location` key. The location is what the catalog
+itself files an entry under, so the walk and the index agree on what one row is, and it costs
+one hash of a relative path where the absolute path cost one of a longer string.
+
+A location is an ordinal, so a revision the walk finds at a fresh slot matches nothing under
+that key though every file it holds is a file the catalog already read. `known_stamps`
+therefore builds a second index, from the repository and the relative path to the one
+location that holds it, and `refiled_of` consults it only for a revision the catalog holds no
+rows for at all: a stamp-equal hit is refiled onto the new ordinal through `Walk::moved`
+rather than read again. A path more than one stored revision holds is left out of that index,
+because which of them moved is not knowable from the path and taking the wrong one would
+empty the revision it is filed under; such a path is prepared and stored as a row of its own.
+The index holds a key rather than a row, so it costs 32 bytes a row against the 64 the rows
+themselves take.
+
 **Every writer of an entry moves the derived counts.** A writer that skips `DerivedShift`
 leaves `Repository::present_files`, `Repository::present_bytes`, `Source::pending_hashes` and
 `Node::filed` behind; `hoard doctor`'s summary check is what catches it. A writer that skips
@@ -192,7 +212,11 @@ writer of a usage row that skips the record leaves the client count behind.
 deleting an artifact's documents by term and re-adding its entries, then prunes what it
 applied. A rescan followed by a refresh updates search without a rebuild. A query answers
 from the published index even when a rescan has logged changes no refresh has applied, and
-says so with `stale`; only a catalog with no index at all is refused.
+says so with `stale`; only a catalog with no index at all is refused. A candidate on the page
+whose entry, or the artifact that entry named, the rescan replaced is skipped and counted,
+and that count sets `stale` as well, so a query landing in the window between a rescan and
+its refresh answers with the rows that are still there. A repository an entry still names but
+which is gone stays an error: that is corruption, not staleness.
 
 `rebuild_search` and `refresh_search` are the two writers of the search directory and of the
 manifest's search fields, and they hold `Catalog::search_lane` for their whole run so they
