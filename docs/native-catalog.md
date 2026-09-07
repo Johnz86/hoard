@@ -122,6 +122,16 @@ the catalog at `<data_dir>/native`.
   with a unit rather than with a source. A rescan settles a revision whose every path carries
   the stamp the catalog stored before it opens any of them, so an unchanged revision costs
   its documents nothing.
+- A file is classified by the name its revision gives it, never by the name of the file the
+  bytes sit in. An hf-cache snapshot links `README.md` at a blob named by its own hash with
+  no extension, so `sniff::sniff_named` reads the header from the blob and takes the format
+  from the entry's relative path; a cached revision carries a card and a config the way a
+  loose or git one does. A magic number still beats the name, and a loose or git file is
+  unaffected because the two names are the same. A rescan cannot find this on its own: an
+  hf-cache blob's inode, mtime and size do not change when the rule that reads it does, so
+  every stored revision would settle on its stamps. Changing a sniffing or inference rule is
+  therefore a `FORMAT_VERSION` bump and nothing else; the bump deletes the catalog and scans
+  the disk again, which is the only thing that puts a new rule into an index that exists.
 - Only weight and dataset formats become artifacts; every file is still an entry record.
 - Shard sets, whether named `model-<n>-of-<m>` or listed by a `*.index.json` weight map,
   become one artifact anchored on the lowest shard. Members are entries pointing at that

@@ -1852,7 +1852,7 @@ fn is_document(entry: &DiscoveredEntry) -> bool {
     let name = file_name(&entry.rel_path);
     shard::is_index_document(name)
         || matches!(
-            sniff::name_format(Path::new(name)),
+            sniff::name_format(name),
             Some(
                 ArtifactFormat::Readme
                     | ArtifactFormat::Config
@@ -1863,8 +1863,7 @@ fn is_document(entry: &DiscoveredEntry) -> bool {
 }
 
 fn names_an_artifact(entry: &DiscoveredEntry) -> bool {
-    sniff::name_format(Path::new(file_name(&entry.rel_path)))
-        .is_some_and(ArtifactFormat::is_artifact)
+    sniff::name_format(file_name(&entry.rel_path)).is_some_and(ArtifactFormat::is_artifact)
 }
 
 /// Shard sets from names and index documents alone. Whether a set's anchor really holds
@@ -2099,7 +2098,7 @@ fn hash_presences(presences: &mut [Presence], threshold: u64) {
 
 fn sniff_entry(entry: &DiscoveredEntry) -> Option<SniffResult> {
     let path = entry.abs_path.as_deref()?;
-    match sniff::sniff_path(path) {
+    match sniff::sniff_named(path, file_name(&entry.rel_path)) {
         Ok(result) => Some(result),
         Err(error) => {
             tracing::debug!(path = %path.display(), %error, "candidate is unreadable");
@@ -2539,7 +2538,6 @@ pub(super) fn record_of(facts: RecordFacts<'_>) -> (ArtifactRecord, ArtifactDeta
             params: inference.params,
             context: inference.context,
             trigger: inference.trigger.clone(),
-            sniff_version: crate::sniff::SNIFF_VERSION,
         },
         group_bytes,
         shard_count,

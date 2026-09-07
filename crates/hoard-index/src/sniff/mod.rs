@@ -21,13 +21,6 @@ use crate::error::{IndexError, Result};
 
 pub use readme::{ReadmeDoc, parse_readme};
 
-/// The version of the sniffing and inference rules an artifact was produced by.
-///
-/// Bump this whenever those rules change. A scan whose recorded version differs ignores the
-/// stamp cache and reads every header again, because the incremental short-circuit is what
-/// otherwise keeps an improved rule from ever reaching an index that already exists.
-pub const SNIFF_VERSION: u32 = 3;
-
 const PROBE_BYTES: u64 = 4096;
 /// Ceiling for the whole-document reads (README, config JSON).
 const DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
@@ -130,15 +123,22 @@ impl Probe {
 /// silent. Unrecognized files are [`ArtifactFormat::Unknown`], never an error.
 pub fn detect_format(path: &Path) -> Result<ArtifactFormat> {
     let probe = Probe::read(path)?;
-    classify(path, &probe)
+    classify(path, own_name(path), &probe)
 }
 
 /// Reads the header of one file and returns everything it proves: the format, a tensor
 /// summary for weight files, a parsed README or config document, or the LFS pointer that
 /// stands in for absent bytes.
 pub fn sniff_path(path: &Path) -> Result<SniffResult> {
+    sniff_named(path, own_name(path))
+}
+
+/// Reads the header at `path` but classifies by `name` wherever the bytes do not say: an
+/// hf-cache snapshot names a file by its link while the bytes live in a blob named by their
+/// hash, so the blob's own name proves nothing.
+pub fn sniff_named(path: &Path, name: &str) -> Result<SniffResult> {
     let probe = Probe::read(path)?;
-    let format = classify(path, &probe)?;
+    let format = classify(path, name, &probe)?;
     let mut result = SniffResult::empty(format, probe.size);
 
     if probe.size <= MAX_LFS_POINTER_BYTES
@@ -188,20 +188,20 @@ fn recover<T>(path: &Path, outcome: Result<T>) -> Option<T> {
     }
 }
 
-fn classify(path: &Path, probe: &Probe) -> Result<ArtifactFormat> {
-    if let Some(format) = magic_format(path, probe)? {
+fn classify(path: &Path, name: &str, probe: &Probe) -> Result<ArtifactFormat> {
+    if let Some(format) = magic_format(path, name, probe)? {
         return Ok(format);
     }
-    Ok(name_format(path).unwrap_or(ArtifactFormat::Unknown))
+    Ok(name_format(name).unwrap_or(ArtifactFormat::Unknown))
 }
 
-fn magic_format(path: &Path, probe: &Probe) -> Result<Option<ArtifactFormat>> {
+fn magic_format(path: &Path, name: &str, probe: &Probe) -> Result<Option<ArtifactFormat>> {
     let head = probe.head.as_slice();
     if head.starts_with(GGUF_MAGIC) {
         return Ok(Some(ArtifactFormat::Gguf));
     }
     if head.starts_with(ZIP_MAGIC) {
-        return Ok(Some(pickle::zip_format(path)));
+        return Ok(Some(pickle::zip_format(name)));
     }
     if safetensors::looks_like(head, probe.size) {
         return Ok(Some(ArtifactFormat::Safetensors));
@@ -212,7 +212,7 @@ fn magic_format(path: &Path, probe: &Probe) -> Result<Option<ArtifactFormat>> {
     if head.starts_with(PARQUET_MAGIC) && read_tail(path, probe.size, 4)? == PARQUET_MAGIC {
         return Ok(Some(ArtifactFormat::Parquet));
     }
-    if looks_like_onnx(path, head) {
+    if looks_like_onnx(name, head) {
         return Ok(Some(ArtifactFormat::Onnx));
     }
     Ok(None)
@@ -220,21 +220,21 @@ fn magic_format(path: &Path, probe: &Probe) -> Result<Option<ArtifactFormat>> {
 
 /// ONNX is a bare protobuf with no magic, so the name has to agree with a plausible
 /// `ir_version` varint or the producer string before the file counts as one.
-fn looks_like_onnx(path: &Path, head: &[u8]) -> bool {
-    if !matches!(extension(path).as_deref(), Some("onnx")) {
+fn looks_like_onnx(name: &str, head: &[u8]) -> bool {
+    if !matches!(extension(name).as_deref(), Some("onnx")) {
         return false;
     }
     head.first() == Some(&0x08) || head.windows(4).any(|window| window == b"onnx")
 }
 
-pub(crate) fn name_format(path: &Path) -> Option<ArtifactFormat> {
-    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
-    match name.as_str() {
-        "model_index.json" => return Some(ArtifactFormat::Diffusers),
-        "config.json" => return Some(ArtifactFormat::Transformers),
-        _ => {}
+pub(crate) fn name_format(name: &str) -> Option<ArtifactFormat> {
+    if name.eq_ignore_ascii_case("model_index.json") {
+        return Some(ArtifactFormat::Diffusers);
     }
-    match extension(path)?.as_str() {
+    if name.eq_ignore_ascii_case("config.json") {
+        return Some(ArtifactFormat::Transformers);
+    }
+    match extension(name)?.as_str() {
         "safetensors" | "sft" => Some(ArtifactFormat::Safetensors),
         "gguf" => Some(ArtifactFormat::Gguf),
         "ckpt" | "pth" => Some(ArtifactFormat::Pth),
@@ -251,8 +251,14 @@ pub(crate) fn name_format(path: &Path) -> Option<ArtifactFormat> {
     }
 }
 
-fn extension(path: &Path) -> Option<String> {
-    Some(path.extension()?.to_str()?.to_ascii_lowercase())
+pub(crate) fn extension(name: &str) -> Option<String> {
+    Some(Path::new(name).extension()?.to_str()?.to_ascii_lowercase())
+}
+
+fn own_name(path: &Path) -> &str {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
 }
 
 /// The only text file hoard treats as a stand-in for a blob that is not on this disk.
@@ -601,6 +607,39 @@ pub(crate) mod tests {
         let dir = TempDir::new().expect("temp dir");
         let path = write(&dir, "config.json", br#"{"model_type":"clip"}"#);
         let sniffed = sniff_path(&path).expect("sniffs");
+        assert_eq!(sniffed.format, ArtifactFormat::Transformers);
+        let config = sniffed.config.expect("config parses");
+        assert_eq!(config["model_type"], serde_json::json!("clip"));
+    }
+
+    #[test]
+    fn a_blob_is_classified_by_the_name_it_was_given() {
+        let dir = TempDir::new().expect("temp dir");
+        let card = write(
+            &dir,
+            &"a".repeat(64),
+            b"---\nlicense: mit\n---\n\n# Title\n",
+        );
+        assert_eq!(
+            sniff_path(&card).expect("sniffs").format,
+            ArtifactFormat::Unknown,
+            "a blob named by its hash says nothing on its own"
+        );
+        let sniffed = sniff_named(&card, "README.md").expect("sniffs");
+        assert_eq!(sniffed.format, ArtifactFormat::Readme);
+        let readme = sniffed.readme.expect("readme parses");
+        assert_eq!(
+            readme.frontmatter,
+            vec![("license".to_owned(), "mit".to_owned())]
+        );
+        assert!(readme.html.contains("<h1>Title</h1>"));
+
+        let json = write(&dir, &"b".repeat(64), br#"{"model_type":"clip"}"#);
+        assert_eq!(
+            sniff_path(&json).expect("sniffs").format,
+            ArtifactFormat::Unknown
+        );
+        let sniffed = sniff_named(&json, "config.json").expect("sniffs");
         assert_eq!(sniffed.format, ArtifactFormat::Transformers);
         let config = sniffed.config.expect("config parses");
         assert_eq!(config["model_type"], serde_json::json!("clip"));

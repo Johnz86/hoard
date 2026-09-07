@@ -197,7 +197,6 @@ fn lora_artifact() -> SeedArtifact {
             params: None,
             context: None,
             trigger: None,
-            sniff_version: 1,
         },
         name: "film-grain-35mm".to_owned(),
         org: Some("kohya".to_owned()),

@@ -672,7 +672,6 @@ mod supplemental {
             params: Some(12_345_678),
             context: None,
             trigger: Some("ohwx style, cinematic lighting".to_owned()),
-            sniff_version: 1,
         }
     }
 

@@ -26,7 +26,7 @@ first; this document assumes it.
   are not an unfinished phase: they wait on a design decision and are recorded under that
   document's "Risks and open decisions".
 - At the head of `master` after the disk wave all four checks pass:
-  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 860 passed,
+  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 862 passed,
   0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness
   and its supplemental fixture, the mDNS test that needs a multicast route and the sniffer
   test that reads the local model caches. `cargo doc --workspace --no-deps` emits no warning.
@@ -114,9 +114,9 @@ Performance, with the numbers from `docs/native-catalog.md`:
   alone keeping native_model's default so a format mismatch is found before any compact row
   is decoded; and `ArtifactDetail` keeps the sixteen tensor samples the triage queue reads a
   hidden dimension from rather than the sixty-four the sniff draws for inference.
-  `FORMAT_VERSION` is 5, so every existing catalog is rebuilt from disk. Nothing was
-  measured: the four rows for wave 8 to watch are allocated disk at 1M, the rebuild (one card
-  read per revision, not per artifact), the inspector detail row, and the supplemental
+  That wave bumped `FORMAT_VERSION`, so every existing catalog is rebuilt from disk. Nothing
+  was measured: the four rows for wave 8 to watch are allocated disk at 1M, the rebuild (one
+  card read per revision, not per artifact), the inspector detail row, and the supplemental
   fixture with cards, which loses most of its `SearchText`.
 - **Page packing is answered and not worth doing.**
   `docs/superpowers/research/2026-09-page-packing.md` reads redb 2.6.3: the 42 to 55 per cent
@@ -277,6 +277,23 @@ Smaller things, each verified:
   location key. A revision found at a fresh ordinal still refiles its unchanged rows onto it,
   from a second index by repository and path that leaves out a path more than one stored
   revision holds. `docs/native-catalog.md` under "The write path" says so.
+- An hf-cache revision carries a card and a config. A snapshot links `README.md` and
+  `config.json` at blobs named by their hashes, and the sniffer classified the blob's name,
+  so every document of a cached revision was `Unknown` and its inference context was empty;
+  no hf-cache revision had ever had a card. `sniff::sniff_named(path, name)` reads the header
+  from the blob and classifies by the entry's own relative path, and `sniff_path` is that
+  function with the path's own name. `FORMAT_VERSION` is 6, because a blob's inode, mtime and
+  size do not change when the rule that reads it does and a rescan would settle every stored
+  revision on its stamps; the bump rebuilds every existing catalog from disk, which is what
+  puts the cards into one. Wave 8's workstation scan therefore reads and indexes the READMEs
+  and configs of every cached revision: its scan time, its card count and its search answers
+  all move, and nothing in the synthetic tree does, because the tree has no hf-cache source.
+- `sniff::SNIFF_VERSION` and `Artifact::sniff_version` are gone. The constant was written
+  into every artifact record by two sites and read by nothing, and its doc comment promised a
+  re-read of every header that no code performed. A per-artifact stamp could not have
+  delivered it either: the documents whose classification changed are entry records with no
+  artifact of their own. A sniffing or inference rule that changes is a `FORMAT_VERSION` bump
+  and nothing else, which `docs/native-catalog.md` now says under "What the scan produces".
 - A query that lands between a rescan and the refresh that follows it answers with `stale`
   set, skipping the rows that rescan replaced, instead of failing on an entry the published
   index still names. A skipped row counts as a position walked, so `next_cursor` is offered

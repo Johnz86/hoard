@@ -6,7 +6,6 @@ use hoard_core::{
 
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
 use crate::error::{IndexError, Result};
-use crate::sniff::SNIFF_VERSION;
 
 use super::Catalog;
 use super::hashing::content_key;
@@ -505,7 +504,6 @@ impl Applying<'_, '_> {
                 params: None,
                 context: None,
                 trigger: None,
-                sniff_version: SNIFF_VERSION,
             },
             name: row.name.clone(),
             org: row.repo.org().map(str::to_owned),

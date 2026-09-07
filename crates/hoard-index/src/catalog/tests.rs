@@ -1051,6 +1051,80 @@ fn hf_cache_rows_match_the_legacy_shape() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn an_hf_cache_revision_gets_its_card_and_its_config() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    hf_cache_repo(
+        &hub,
+        "acme",
+        "styler",
+        &[
+            (
+                "README.md",
+                b"---\ninstance_prompt: acme style\n---\nTrained on chinchilla photographs.\n"
+                    .to_vec(),
+            ),
+            (
+                "config.json",
+                b"{\"architectures\":[\"LlamaForCausalLM\"]}".to_vec(),
+            ),
+            ("unet/adapter.safetensors", plain_header()),
+        ],
+    )?;
+    let config = IndexConfig {
+        sources: vec![SourceConfig {
+            kind: SourceKind::HfCache,
+            ..source(&hub, "hub")
+        }],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    catalog.rebuild_search(|_| {})?;
+
+    let (repo_id, revision) = only_slot(&catalog)?;
+    assert_eq!(
+        stored_card(&catalog, repo_id, revision)?.as_deref(),
+        Some("Trained on chinchilla photographs.\n"),
+        "the snapshot link names a README the blob it points at does not"
+    );
+    let rows = search(&catalog, "chinchilla")?;
+    assert_eq!(rows.total, 1, "the card of a cached revision is searchable");
+    assert_eq!(rows.rows[0].path, "unet/adapter.safetensors");
+    assert_eq!(
+        rows.rows[0].trigger.as_deref(),
+        Some("acme style"),
+        "the README frontmatter reached inference"
+    );
+
+    let read = catalog.database.r_transaction()?;
+    let records: Vec<ArtifactRecord> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(records.len(), 1, "only the weights become an artifact");
+    let detail: ArtifactDetail = read
+        .get()
+        .primary(records[0].id)?
+        .ok_or_else(|| IndexError::Catalog("detail missing".into()))?;
+    assert!(
+        detail.evidence.iter().any(|evidence| {
+            evidence.field == "role" && evidence.source == hoard_core::EvidenceSource::Config
+        }),
+        "the cached config.json was consulted: {:?}",
+        detail.evidence
+    );
+    Ok(())
+}
+
 /// The body of a card, with a word nothing else in a fixture uses.
 fn card_body(word: &str) -> Vec<u8> {
     format!("---\nlicense: mit\n---\nTrained on {word} photographs.\n").into_bytes()
@@ -2274,7 +2348,6 @@ fn a_seeded_catalog_answers_like_a_scanned_one() -> Result<()> {
             params: None,
             context: None,
             trigger: Some("film grain, 35mm, halation".into()),
-            sniff_version: 1,
         },
         name: "film-grain-35mm".into(),
         org: Some("kohya".into()),
@@ -3144,7 +3217,6 @@ fn seeded_facts() -> Artifact {
         params: None,
         context: None,
         trigger: None,
-        sniff_version: 1,
     }
 }
 
@@ -4474,7 +4546,6 @@ fn compact_records_round_trip_without_changing_public_views() -> Result<()> {
                     params: Some(u64::MAX),
                     context: Some(u32::MAX),
                     trigger: Some("ohwx style".to_owned()),
-                    sniff_version: 3,
                 },
                 name: format!("w{index:04}.safetensors"),
                 org: Some("acme".to_owned()),
@@ -4725,7 +4796,6 @@ fn cold_records_read_back_through_the_inspector() -> Result<()> {
                 params: None,
                 context: None,
                 trigger: None,
-                sniff_version: 1,
             },
             name: format!("w{index}.safetensors"),
             org: None,
@@ -5184,7 +5254,6 @@ fn lean_search_fields_preserve_filters_facets_and_sorting() -> Result<()> {
                     params: None,
                     context: None,
                     trigger: Some(format!("{} style, cinematic", shape.name)),
-                    sniff_version: 1,
                 },
                 name: format!("{}.safetensors", shape.name),
                 org: Some(format!("org-{}", shape.name)),

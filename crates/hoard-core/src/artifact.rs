@@ -296,8 +296,7 @@ fn is_index_dtype(dtype: &str) -> bool {
     precision.as_str().starts_with("int") || precision.as_str() == "bool"
 }
 
-/// A blob interpreted. One blob yields one artifact per sniff version; the same bytes on
-/// twenty paths remain one artifact.
+/// A blob interpreted. The same bytes on twenty paths remain one artifact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Artifact {
     pub id: ArtifactId,
@@ -319,7 +318,6 @@ pub struct Artifact {
     pub params: Option<u64>,
     pub context: Option<u32>,
     pub trigger: Option<String>,
-    pub sniff_version: u32,
 }
 
 impl Artifact {

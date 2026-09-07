@@ -84,7 +84,7 @@ phase, and the follow-ups under `### Phase 11` carry their own acceptance criter
 | Node | A machine running hoard; the local node plus discovered peers | `NodeId` (stable uuid), name |
 | Source | A nominated root on a node: HF cache, git clones, loose folder | path |
 | Blob | Unique bytes | sha256 (LFS parity), git blob sha1 for small files, xxh3 fingerprint for candidates |
-| Artifact | A blob interpreted: format, tensor summary, role, base, rank, precision, confidence | blob + sniff version |
+| Artifact | A blob interpreted: format, tensor summary, role, base, rank, precision, confidence | blob |
 | Repo | `type/org/name`: a git clone, a Hub cache repo, or a bare directory adopted as one | `RepoId` |
 | Revision | A commit, branch or tag; loose repos get one synthetic sha from their content | `CommitSha` |
 | Entry | A path inside a revision pointing at a blob, on a node | (revision, path, node) |

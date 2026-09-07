@@ -687,7 +687,6 @@ mod tests {
                 params: None,
                 context: None,
                 trigger: None,
-                sniff_version: 1,
             },
             name: "model.safetensors".to_owned(),
             org: Some("openai".to_owned()),

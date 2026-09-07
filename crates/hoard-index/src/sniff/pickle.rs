@@ -39,13 +39,8 @@ const GLOBAL: u8 = b'c';
 
 /// Which of the pickle formats an archive is, decided by the name once the magic has said
 /// only that the file is a zip.
-pub fn zip_format(path: &Path) -> ArtifactFormat {
-    match path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
+pub fn zip_format(name: &str) -> ArtifactFormat {
+    match super::extension(name).as_deref() {
         Some("pt") => ArtifactFormat::Pt,
         Some("bin") => ArtifactFormat::Bin,
         _ => ArtifactFormat::Pth,
@@ -637,14 +632,11 @@ mod tests {
 
     #[test]
     fn a_torch_archive_is_named_from_its_extension() {
-        assert_eq!(zip_format(Path::new("a.ckpt")), ArtifactFormat::Pth);
-        assert_eq!(zip_format(Path::new("a.pth")), ArtifactFormat::Pth);
-        assert_eq!(zip_format(Path::new("a.pt")), ArtifactFormat::Pt);
-        assert_eq!(
-            zip_format(Path::new("pytorch_model.bin")),
-            ArtifactFormat::Bin
-        );
-        assert_eq!(zip_format(Path::new("archive")), ArtifactFormat::Pth);
+        assert_eq!(zip_format("a.ckpt"), ArtifactFormat::Pth);
+        assert_eq!(zip_format("a.pth"), ArtifactFormat::Pth);
+        assert_eq!(zip_format("a.pt"), ArtifactFormat::Pt);
+        assert_eq!(zip_format("pytorch_model.bin"), ArtifactFormat::Bin);
+        assert_eq!(zip_format("archive"), ArtifactFormat::Pth);
     }
 
     #[test]

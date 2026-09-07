@@ -356,7 +356,6 @@ fn facts(size: u64, format: ArtifactFormat, role: Role, role_confidence: f32) ->
         params: None,
         context: None,
         trigger: None,
-        sniff_version: 1,
     }
 }
 
