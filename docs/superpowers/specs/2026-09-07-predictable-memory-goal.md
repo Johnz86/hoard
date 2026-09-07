@@ -110,20 +110,31 @@ squashed commit on `master`, in this order.
    touches every one, so at a million artifacts they are the largest thing the pass keeps
    after discovery. Folding the difference into the stored `Summary` in the transaction that
    earns it, the way `DerivedShift` already folds the repository counts, removes both; the
-   pass mark and `settle_counts` stay, for a killed pass. **Discovery yields groups of
-   repositories** where the layout allows it: an hf-cache and a git source enumerate their
-   repository directories before reading any file, so each group of 64 is stored, walked
-   and, for a rescan, its absent paths retracted before the next is discovered, with the
-   known-stamp map loaded per group. A loose source cannot: `walker::walk` collects the
-   whole source's file list and only then groups it by organisation, so a repository does
-   not exist until every file has been seen. A loose source therefore yields one group of
-   every repository it found and takes the same path with the same code, buying the
-   per-group known map and nothing else; say so in the plan rather than expecting otherwise.
-   Repositories the catalog holds for the source that discovery never yielded are retracted
-   after the last group. **`[index] cache_mib`** sets the redb page cache, default 256.
-   Every recovery, refile and revision-identity test keeps its assertions. The gate tree is
-   a loose source, so the 1M scan RSS row reads the first and third changes and almost
-   nothing of the second.
+   pass mark and `settle_counts` stay, for a killed pass. **The walk takes a source's
+   repositories in groups of 64**, storing, walking and, for a rescan, retracting each group
+   before the next, with the known-stamp map loaded per group and repositories no group
+   named retracted after the last one. **What that does and does not bound, corrected after
+   the wave landed:** it bounds the stored-row map and the retraction, and it removed a
+   whole-table scan of every repository in the catalog that the per-source lookup used to
+   do. It does **not** bound discovery. `discover` returns a source whole, with every entry
+   of every repository materialised, and the walk chunks that already-built list, so the
+   peak a fresh scan reaches is unchanged for every layout. Making discovery itself yield
+   groups is possible for an hf-cache and a git source, which enumerate their repository
+   directories before reading any file, and impossible for a loose source, whose walk
+   collects every file and only then groups by organisation. It means changing what
+   `discover` returns, so it is a wave of its own and this run does not do it. Do not let
+   any document say otherwise. **`[index] cache_mib`** sets the redb page cache, default 256,
+   and must reach an opened catalog and not only a created one.
+   Every recovery, refile and revision-identity test keeps its assertions. **What the gate
+   tree can show, settled by the wave's review so wave 5 does not have to guess:** the fold
+   only, on the 1M peak scan RSS row, where the map it removes is about 136 MB resident and
+   up to about 200 MB at its final rehash, against a base near 860 MiB. The grouping it
+   cannot show at all, because the tree is a loose source of a hundred repositories and so
+   takes the single-group path; showing that needs an hf-cache tree of more than sixty-four
+   repositories, which the harness does not build, and wave 5 should say so in prose rather
+   than let a rescan row be read as the grouping. The cache setting it cannot show either,
+   because the default is the value the constant already had, so a row needs the setting
+   turned down deliberately.
 5. **budgets-measured.** The harness gains what this run must measure. From the goal as it
    was set: a deletion phase that removes a tenth of the tree and rescans, reporting wall and
    peak RSS growth; a concurrent-search phase that runs eight midpoint queries at once and
