@@ -15,6 +15,11 @@ first; this document assumes it.
   The run is finished: `docs/superpowers/history/2026-09-remaining-work-review.md` is the
   review of what each wave changed, the final numbers, what the closing reviews found and
   the recommendations for what comes next.
+- `docs/superpowers/specs/2026-09-07-predictable-memory-goal.md` is the brief for the run
+  that follows it: predictable memory under unusual workloads, background work that yields
+  and writes that are not repeated. It names its waves, the decisions the dispatcher took so
+  no wave waits on one, the rule that every wave's implementer is a Sonnet
+  `wave-implementer`, and its finish condition.
 - The native_db (redb) plus Tantivy catalog replaced the SQLite index and is merged. Every
   command, every route, both faces and gossip read and write it, and no SQLite code remains.
   `docs/native-catalog.md` is the current-state document;
