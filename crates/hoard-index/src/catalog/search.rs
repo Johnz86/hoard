@@ -319,6 +319,9 @@ impl Catalog {
             .is_some())
     }
 
+    /// The next batch of the log after `cursor`, up to and including `bound`. The range is
+    /// spelled with an exclusive end, because an inclusive end on a primary key is not one
+    /// native_db answers reliably.
     fn changes_up_to(&self, cursor: u64, bound: u64) -> Result<Vec<SearchChange>> {
         if cursor >= bound {
             return Ok(Vec::new());
@@ -327,10 +330,20 @@ impl Catalog {
         let batch = read
             .scan()
             .primary::<SearchChange>()?
-            .range(cursor.saturating_add(1)..=bound)?
+            .range(cursor.saturating_add(1)..bound.saturating_add(1))?
             .take(REFRESH_BATCH)
             .collect::<native_db::db_type::Result<Vec<_>>>()?;
         Ok(batch)
+    }
+
+    /// The sequences one refresh batch replays, for a test that pins the bound.
+    #[cfg(test)]
+    pub(super) fn change_seqs_up_to(&self, cursor: u64, bound: u64) -> Result<Vec<u64>> {
+        Ok(self
+            .changes_up_to(cursor, bound)?
+            .into_iter()
+            .map(|change| change.seq)
+            .collect())
     }
 
     fn highest_change_seq(&self) -> Result<u64> {
@@ -1241,11 +1254,11 @@ impl<'a> Selecting<'a> {
     ///
     /// A window inside the sort's shallow bound is one heap pass over the front of the
     /// order, and the total its summary carries is what the window is then cut by. A deeper
-    /// one runs the sampling pass first, which counts the match as well, and the total then
-    /// decides between a heap of the rows nearer the far end and the bucket and window
-    /// passes that find the middle by rank. An offset at or past the total leaves no window
-    /// to find, so that pass is the only one: the page is empty and the total is already
-    /// known.
+    /// one counts the match first, because which end the window is cut from is what decides
+    /// how it is found: a window the count puts near the far end is a heap of that end and
+    /// costs two passes, and only a window in the middle pays for the sampling, bucket and
+    /// window passes that find it by rank. An offset at or past the total keeps nothing, and
+    /// still tallies the facets the page is rendered beside.
     fn rows(self) -> Result<Selected> {
         let column = SortColumn::of(self.request.sort.key);
         let wanted = self.wanted();
@@ -1262,31 +1275,38 @@ impl<'a> Selecting<'a> {
                 passes: 1,
             });
         }
-        let (summary, sample) = self.sampled()?;
-        let counted = counted_in(&summary);
+        let counted = self.counted()?;
         let window = Window::of(self.request, counted);
-        if window.keep == 0 {
-            return Ok(Selected {
-                summary,
-                window,
-                passes: 1,
-            });
-        }
         match self.paging.selection(column, window, counted) {
             Selection::Heap => Ok(Selected {
                 summary: self.heaped(window)?,
                 window,
                 passes: 2,
             }),
-            Selection::Sampled => match self.ranked(summary, sample, window)? {
-                Some(selected) => Ok(selected),
-                None => Ok(Selected {
-                    summary: self.heaped(window)?,
-                    window,
-                    passes: 3,
-                }),
-            },
+            Selection::Sampled => {
+                let (summary, sample) = self.sampled()?;
+                match self.ranked(summary, sample, window)? {
+                    Some(selected) => Ok(selected),
+                    None => Ok(Selected {
+                        summary: self.heaped(window)?,
+                        window,
+                        passes: 4,
+                    }),
+                }
+            }
         }
+    }
+
+    /// How many rows the match holds, counted the way the path the query took counts them:
+    /// a primary document stands for its artifact, and a collapsed match counts the runs of
+    /// one artifact rather than the entries in them. It reads nothing else, so it costs a
+    /// fraction of the pass that would have counted it on the way past.
+    fn counted(&self) -> Result<usize> {
+        let counted = match self.path {
+            QueryPath::Primary => self.searcher.search(self.restricted, &Count)? as u64,
+            QueryPath::Collapse => self.searcher.search(self.restricted, &CollapsedCount)?,
+        };
+        Ok(usize::try_from(counted).unwrap_or(usize::MAX))
     }
 
     /// One pass, keeping a heap of everything that can reach the window.
@@ -1321,10 +1341,10 @@ impl<'a> Selecting<'a> {
         Ok((summary, sample))
     }
 
-    /// The two passes that follow the sample: one counts the rows between consecutive
-    /// boundaries, and one keeps the bucket the requested rank falls in plus a page beyond
-    /// it. A bucket over the cap costs more to hold than the heap does, so the heap answers
-    /// instead and nothing about the answer depends on the sample.
+    /// The two passes that follow the count and the sample: one counts the rows between
+    /// consecutive boundaries, and one keeps the bucket the requested rank falls in plus a
+    /// page beyond it. A bucket over the cap costs more to hold than the heap does, so the
+    /// heap answers instead and nothing about the answer depends on the sample.
     fn ranked(
         &self,
         mut summary: Summary,
@@ -1377,7 +1397,7 @@ impl<'a> Selecting<'a> {
                 keep: window.keep - before,
                 reversed: window.reversed,
             },
-            passes: 3,
+            passes: 4,
         }))
     }
 }

@@ -7,8 +7,8 @@ use tempfile::TempDir;
 
 use hoard_core::{
     Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, EntryId, Evidence,
-    EvidenceSource, JobId, Loadout, LoadoutPin, NodeId, Precision, RepoId, RepoType, Role, Sha256,
-    State, SubRole, TensorSample, TensorSummary,
+    EvidenceSource, JobId, Loadout, LoadoutPin, NodeId, Precision, RepoId, RepoRowId, RepoType,
+    Role, Sha256, State, SubRole, TensorSample, TensorSummary,
 };
 
 use crate::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
@@ -25,12 +25,12 @@ use super::models::{
 use super::scan::{Presence, identity, location_hash, preference};
 use super::search::{Cost, Paging, QueryPath};
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
-use super::usage::Window;
+use super::usage::{HISTORY_DAYS, Window};
 use super::{
-    Catalog, DigestApplied, EntryDetail, FORMAT_VERSION, JobProgress, JobState, MIRROR_SOURCE,
-    NewProjection, PullMark, PullSlot, PulledFile, QueryPage, QueryRequest, RemoteEntry,
-    RepositoryDetail, RepositoryFilter, RescanReport, RescanScope, ServedFile, Totals, TriageItem,
-    UsageEvent, builder, models, query,
+    Catalog, Dedupe, DigestApplied, EntryDetail, FORMAT_VERSION, JobProgress, JobState,
+    MIRROR_SOURCE, NewProjection, PullMark, PullSlot, PulledFile, QueryPage, QueryRequest,
+    RemoteEntry, RepositoryDetail, RepositoryFilter, RescanReport, RescanScope, ServedFile, Stop,
+    Totals, TriageItem, UsageEvent, builder, models, query,
 };
 
 fn running_as_root() -> bool {
@@ -1367,7 +1367,7 @@ fn paths_of_revision(
     ordinal: u32,
 ) -> Result<Vec<String>> {
     Ok(catalog
-        .revision_entries(repo.id, ordinal)?
+        .revision_entries(repo.id, ordinal, Dedupe::Ignore)?
         .into_iter()
         .map(|entry| entry.rel_path)
         .collect())
@@ -1488,7 +1488,7 @@ fn a_new_revision_is_appended_and_a_vanished_one_keeps_its_slot() -> Result<()> 
         paths_of_revision(&catalog, &after, 2)?,
         ["fresh.safetensors"]
     );
-    let vanished = catalog.revision_entries(after.id, 1)?;
+    let vanished = catalog.revision_entries(after.id, 1, Dedupe::Ignore)?;
     assert_eq!(
         vanished.len(),
         1,
@@ -1560,6 +1560,7 @@ fn an_unchanged_revision_is_rescanned_without_opening_its_documents() -> Result<
             changed: 0,
             added: 0,
             absent: 0,
+            interrupted: false,
         },
         "a revision no file changed in is settled before anything in it is opened"
     );
@@ -1634,6 +1635,26 @@ fn a_source_dropped_from_the_configuration_is_retired_by_the_next_full_rescan() 
     let before = catalog.totals()?;
     assert_eq!(catalog.sources()?.len(), 2);
     assert_eq!(before.present_artifacts, 2);
+
+    let now = jiff::Timestamp::now();
+    let served = |path: &str| -> Result<RepoRowId> {
+        let row = search(&catalog, path)?
+            .rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| IndexError::Catalog(format!("no row for {path}")))?;
+        catalog.log_usage(&UsageEvent {
+            client: Some("10.0.0.2".to_owned()),
+            repo: Some(row.repo_id),
+            artifact: Some(row.artifact_id),
+            bytes: 10,
+            ..UsageEvent::new(row.path.clone(), now)
+        })?;
+        Ok(row.repo_id)
+    };
+    let kept_repo = served("kept")?;
+    let dropped_repo = served("gone")?;
+    assert_eq!(catalog.recent_pulls(dropped_repo, 10)?.len(), 1);
 
     let only_kept = IndexConfig {
         sources: vec![source(&kept, "kept")],
@@ -1718,6 +1739,17 @@ fn a_source_dropped_from_the_configuration_is_retired_by_the_next_full_rescan() 
         "the totals follow the paths that are still present"
     );
     assert_eq!(after.artifacts, 1);
+    assert!(
+        catalog.recent_pulls(dropped_repo, 10)?.is_empty(),
+        "the retired repository's served history goes with it"
+    );
+    assert_eq!(catalog.distinct_clients(dropped_repo)?, 0);
+    assert_eq!(
+        catalog.recent_pulls(kept_repo, 10)?.len(),
+        1,
+        "the kept repository keeps its own"
+    );
+    assert_eq!(catalog.distinct_clients(kept_repo)?, 1);
 
     catalog.refresh_search(|_| {})?;
     let rows = search(&catalog, "state:local")?;
@@ -2713,7 +2745,7 @@ fn the_read_api_answers_the_inspector_the_repo_screens_and_the_queue() -> Result
         .resolve_revision(&repo, "main")
         .ok_or_else(|| IndexError::Catalog("main".into()))?;
     assert!(catalog.resolve_revision(&repo, "nope").is_none());
-    let files = catalog.revision_entries(repo.id, main.ordinal)?;
+    let files = catalog.revision_entries(repo.id, main.ordinal, Dedupe::Ignore)?;
     assert_eq!(files.len(), 3);
     assert_eq!(catalog.repository_rows(repo.id, 10)?.len(), 1);
     assert_eq!(
@@ -3252,7 +3284,7 @@ fn a_served_file_is_filed_under_the_mirror_source_and_found_by_hash() -> Result<
         .ok_or_else(|| IndexError::Catalog("repo".into()))?;
     assert_eq!(detail.source, MIRROR_SOURCE);
     assert_eq!(detail.revisions.len(), 1);
-    let entries = catalog.revision_entries(detail.id, 0)?;
+    let entries = catalog.revision_entries(detail.id, 0, Dedupe::Resolve)?;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].state, State::Served);
     assert_eq!(entries[0].sha256, Some(sha));
@@ -3282,7 +3314,12 @@ fn a_served_file_is_filed_under_the_mirror_source_and_found_by_hash() -> Result<
         "a config is not an artifact"
     );
     assert_eq!(catalog.totals()?.artifacts, 1);
-    assert_eq!(catalog.revision_entries(detail.id, 0)?.len(), 2);
+    assert_eq!(
+        catalog
+            .revision_entries(detail.id, 0, Dedupe::Ignore)?
+            .len(),
+        2
+    );
     Ok(())
 }
 
@@ -3317,7 +3354,7 @@ fn a_rescan_leaves_the_mirror_source_alone() -> Result<()> {
         .repository(&repo)?
         .ok_or_else(|| IndexError::Catalog("repo".into()))?;
     assert_eq!(
-        catalog.revision_entries(detail.id, 0)?[0].state,
+        catalog.revision_entries(detail.id, 0, Dedupe::Ignore)?[0].state,
         State::Served
     );
     Ok(())
@@ -3459,7 +3496,8 @@ fn a_clone_whose_branch_advanced_keeps_its_unchanged_files_on_the_branch() -> Re
             unchanged: 1,
             changed: 0,
             added: 1,
-            absent: 0
+            absent: 0,
+            interrupted: false,
         },
         "the file the commit did not touch is refiled onto the new ordinal, not read again"
     );
@@ -3467,8 +3505,12 @@ fn a_clone_whose_branch_advanced_keeps_its_unchanged_files_on_the_branch() -> Re
     let detail = repository_of(&catalog, &repo)?;
     assert_eq!(
         detail.revisions.len(),
-        2,
-        "the branch's old head keeps its slot"
+        1,
+        "the branch's old head, which no ref reaches and no entry names, is retired"
+    );
+    assert_eq!(
+        detail.revisions[0].ordinal, 1,
+        "the retired head keeps its ordinal, so the new head takes the next one"
     );
     let mut listed = paths_of_ref(&catalog, &repo, "main")?;
     listed.sort();
@@ -3543,7 +3585,8 @@ fn a_path_two_revisions_share_is_left_alone_when_a_third_revision_appears() -> R
             unchanged: 2,
             changed: 0,
             added: 1,
-            absent: 0
+            absent: 0,
+            interrupted: false,
         },
         "the fresh revision stores its own row; neither stored row is refiled onto it"
     );
@@ -3565,7 +3608,7 @@ fn paths_of_ref(catalog: &Catalog, repo: &RepoId, wanted: &str) -> Result<Vec<St
         .resolve_revision(&detail, wanted)
         .ok_or_else(|| IndexError::Catalog(format!("no revision {wanted}")))?;
     Ok(catalog
-        .revision_entries(detail.id, revision.ordinal)?
+        .revision_entries(detail.id, revision.ordinal, Dedupe::Ignore)?
         .into_iter()
         .map(|entry| entry.rel_path)
         .collect())
@@ -4026,12 +4069,17 @@ fn an_entry_is_found_by_its_location_alone() -> Result<()> {
     );
 
     let paths: Vec<String> = catalog
-        .revision_entries(record.id, 0)?
+        .revision_entries(record.id, 0, Dedupe::Ignore)?
         .into_iter()
         .map(|entry| entry.rel_path)
         .collect();
     assert_eq!(paths, vec!["a".to_owned(), "a/b".to_owned()]);
-    assert_eq!(catalog.revision_entries(record.id, 1)?.len(), 1);
+    assert_eq!(
+        catalog
+            .revision_entries(record.id, 1, Dedupe::Ignore)?
+            .len(),
+        1
+    );
     Ok(())
 }
 
@@ -4160,12 +4208,12 @@ fn location_keys_separate_repositories_revisions_and_paths() -> Result<()> {
         }
     }
     assert_eq!(
-        catalog.revision_entries(left, 0)?.len(),
+        catalog.revision_entries(left, 0, Dedupe::Ignore)?.len(),
         paths.len(),
         "one revision holds exactly its own paths"
     );
     let listed: Vec<String> = catalog
-        .revision_entries(left, 0)?
+        .revision_entries(left, 0, Dedupe::Ignore)?
         .into_iter()
         .map(|entry| entry.rel_path)
         .collect();
@@ -4350,7 +4398,7 @@ fn repository_and_revision_listings_keep_their_order() -> Result<()> {
     );
     for ordinal in 0..2 {
         let listed: Vec<String> = catalog
-            .revision_entries(record.id, ordinal)?
+            .revision_entries(record.id, ordinal, Dedupe::Ignore)?
             .into_iter()
             .map(|entry| entry.rel_path)
             .collect();
@@ -5010,6 +5058,7 @@ fn every_record_round_trips_through_the_compact_codec() -> Result<()> {
             title: Some("second".to_owned()),
             author: Some("someone".to_owned()),
             committed: Some("2026-09-06T10:00:00Z".to_owned()),
+            retired: false,
         }],
         present_files: u32::MAX,
         present_bytes: 1 << 50,
@@ -5081,6 +5130,7 @@ fn every_record_round_trips_through_the_compact_codec() -> Result<()> {
     let repo_usage = models::RepoUsage {
         repo_id: 4242,
         pulls: 4096,
+        days: vec![("2026-09-07".to_owned(), 12), ("2026-09-06".to_owned(), 30)],
         clients: vec!["10.0.0.9".to_owned(), "10.0.0.10".to_owned()],
         last_pull: "2026-09-07T08:04:00Z".to_owned(),
     };
@@ -5923,7 +5973,8 @@ fn an_unchanged_rescan_reads_no_headers_and_a_deleted_file_is_marked_absent() ->
             unchanged: 2,
             changed: 0,
             added: 0,
-            absent: 0
+            absent: 0,
+            interrupted: false,
         }
     );
     assert_eq!(catalog.status()?.generation, 2);
@@ -5942,7 +5993,8 @@ fn an_unchanged_rescan_reads_no_headers_and_a_deleted_file_is_marked_absent() ->
             unchanged: 1,
             changed: 0,
             added: 0,
-            absent: 1
+            absent: 1,
+            interrupted: false,
         }
     );
     let read = catalog.database.r_transaction()?;
@@ -6006,7 +6058,8 @@ fn a_changed_file_is_reread_and_a_new_file_continues_the_ids() -> Result<()> {
             unchanged: 1,
             changed: 1,
             added: 1,
-            absent: 0
+            absent: 0,
+            interrupted: false,
         }
     );
     let read = catalog.database.r_transaction()?;
@@ -6128,13 +6181,14 @@ fn an_hf_cache_file_rewritten_in_place_is_replaced_on_the_next_rescan() -> Resul
             unchanged: 1,
             changed: 1,
             added: 0,
-            absent: 0
+            absent: 0,
+            interrupted: false,
         },
         "the rewritten file is recognised where it is filed, not at the blob it moved to"
     );
 
     let after = only_repository(&catalog)?;
-    let entries = catalog.revision_entries(after.id, 0)?;
+    let entries = catalog.revision_entries(after.id, 0, Dedupe::Ignore)?;
     assert_eq!(entries.len(), 2, "the location holds one row, not two");
     let adapter = entries
         .iter()
@@ -6197,12 +6251,13 @@ fn a_moved_file_under_a_loose_root_is_replaced_not_duplicated() -> Result<()> {
             unchanged: 1,
             changed: 0,
             added: 1,
-            absent: 1
+            absent: 1,
+            interrupted: false,
         },
         "the location it left is retracted and the one it took is a new row"
     );
     let repository = only_repository(&catalog)?;
-    let entries = catalog.revision_entries(repository.id, 0)?;
+    let entries = catalog.revision_entries(repository.id, 0, Dedupe::Ignore)?;
     assert_eq!(entries.len(), 3, "the path it left keeps its row");
     let moved = entries
         .iter()
@@ -6244,13 +6299,13 @@ fn a_pull_is_marked_while_moving_and_filed_when_verified() -> Result<()> {
         state: State::Pulling,
         progress: Some(0.5),
     })?;
-    let entries = catalog.revision_entries(slot.repo, slot.revision)?;
+    let entries = catalog.revision_entries(slot.repo, slot.revision, Dedupe::Ignore)?;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].state, State::Pulling);
     assert_eq!(entries[0].pull_progress, Some(0.5));
     assert_eq!(catalog.reset_stale_pulls()?, 1);
     assert_eq!(
-        catalog.revision_entries(slot.repo, slot.revision)?[0].state,
+        catalog.revision_entries(slot.repo, slot.revision, Dedupe::Ignore)?[0].state,
         State::Remote
     );
     fs::create_dir_all(
@@ -6282,7 +6337,7 @@ fn a_pull_is_marked_while_moving_and_filed_when_verified() -> Result<()> {
         triage: false,
     })?;
     assert_eq!(filed.entry, marked, "the marked row is the filed row");
-    let entries = catalog.revision_entries(slot.repo, slot.revision)?;
+    let entries = catalog.revision_entries(slot.repo, slot.revision, Dedupe::Ignore)?;
     assert_eq!(entries[0].state, State::Served);
     assert_eq!(entries[0].sha256, Some(Sha256::from_bytes([0x42; 32])));
     assert_eq!(entries[0].pull_progress, None);
@@ -7357,8 +7412,8 @@ fn a_sampled_page_reads_no_more_than_the_bucket_and_a_page() -> Result<()> {
         "the pass that counts is the pass that keeps, so the heap holds the whole front"
     );
     assert_eq!(
-        cut.passes, 3,
-        "the deep window is sampled, bucketed and cut"
+        cut.passes, 4,
+        "the deep window is counted, sampled, bucketed and cut"
     );
     assert!(
         cut.kept <= 12,
@@ -7369,7 +7424,7 @@ fn a_sampled_page_reads_no_more_than_the_bucket_and_a_page() -> Result<()> {
 }
 
 #[test]
-fn a_shallow_window_is_answered_in_one_pass_and_a_deep_one_in_three() -> Result<()> {
+fn a_shallow_window_is_answered_in_one_pass_and_a_deep_one_in_four() -> Result<()> {
     let (_directory, catalog) = paging_fixture(60)?;
     let context = catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?;
     let paging = Paging::new(4, 8, 1000);
@@ -7394,22 +7449,22 @@ fn a_shallow_window_is_answered_in_one_pass_and_a_deep_one_in_three() -> Result<
     assert_eq!(
         passes(56)?,
         2,
-        "the last page is the sampling pass and a heap of the far end"
+        "the last page is the count and a heap of the far end"
     );
     assert_eq!(
         passes(28)?,
-        3,
-        "the middle is the sampling pass, the buckets and the window"
+        4,
+        "the middle is the count, the sampling pass, the buckets and the window"
     );
     for offset in [60, 200] {
         let (page, cost) = answered(offset)?;
         assert_eq!(
-            cost.passes, 1,
-            "an offset past the total leaves nothing for a second pass to keep"
+            cost.passes, 2,
+            "an offset past the total is the count and the pass that tallies the facets"
         );
         assert_eq!(cost.kept, 0, "and nothing is kept");
         assert!(page.rows.is_empty(), "offset {offset} is past the total");
-        assert_eq!(page.total, 60, "the sampling pass still counted the match");
+        assert_eq!(page.total, 60, "the count still counted the match");
     }
     Ok(())
 }
@@ -10040,4 +10095,682 @@ mod recovery {
         );
         Ok(())
     }
+}
+
+fn pass_is_open(catalog: &Catalog) -> Result<bool> {
+    let read = catalog.database.r_transaction()?;
+    let manifest: Option<Manifest> = read.get().primary(0_u8)?;
+    manifest
+        .map(|manifest| manifest.pass_open)
+        .ok_or_else(|| IndexError::Catalog("manifest missing".into()))
+}
+
+#[test]
+fn a_raised_stop_ends_a_hashing_pass_at_a_batch_boundary_and_the_next_pass_finishes_it()
+-> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir(&input)?;
+    let batch = super::hashing::HASH_BATCH as u64;
+    let total = 3 * batch;
+    for index in 0..total {
+        fs::write(
+            input.join(format!("shard{index:04}.csv")),
+            format!("prompt,response\nhello,{index}\n"),
+        )?;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    assert_eq!(catalog.pending_hashes()?, total);
+
+    let stop = Stop::default();
+    let report = catalog.hash_pending_until(&config, &stop, |hashed| {
+        if hashed >= batch {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    })?;
+
+    assert!(report.interrupted, "the raised stop ended the pass early");
+    assert_eq!(report.hashed, batch, "the pass stopped at a batch boundary");
+    let left = catalog.pending_hashes()?;
+    assert_eq!(
+        left,
+        total - batch,
+        "what it did not reach still owes a hash"
+    );
+    assert!(
+        pass_is_open(&catalog)?,
+        "an interrupted pass leaves its mark set for the next one"
+    );
+
+    let finished = catalog.hash_pending(&config, |_| {})?;
+    assert!(!finished.interrupted);
+    assert_eq!(finished.hashed, left, "the next pass hashed the rest");
+    assert_eq!(catalog.pending_hashes()?, 0);
+    assert!(
+        !pass_is_open(&catalog)?,
+        "a pass that ran to its end clears the mark"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_raised_stop_ends_a_rescan_between_units_and_retires_nothing() -> Result<()> {
+    let (directory, catalog) = fixture()?;
+    let input = directory.path().join("files");
+    let config = IndexConfig {
+        sources: vec![source(&input, "datasets")],
+        ..IndexConfig::default()
+    };
+    fs::remove_file(input.join("tiny.jsonl"))?;
+
+    let stop = Stop::default();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let report = catalog.rescan_until(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        &stop,
+        |_, _| {},
+    )?;
+
+    assert!(report.interrupted, "the raised stop ended the walk");
+    assert_eq!(report.absent, 0, "an interrupted walk retracts nothing");
+    assert_eq!(
+        catalog.totals()?.present_artifacts,
+        2,
+        "a path the walk never reached is not a path this node stopped holding"
+    );
+    assert!(
+        pass_is_open(&catalog)?,
+        "the mark is left for the next walk"
+    );
+
+    let finished = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    assert!(!finished.interrupted);
+    assert_eq!(finished.absent, 1, "the next walk retracts the gone file");
+    assert_eq!(catalog.totals()?.present_artifacts, 1);
+    assert!(!pass_is_open(&catalog)?);
+    Ok(())
+}
+
+/// Scans one hf-cache repository holding `held` as a snapshot of one blob, then links
+/// `added` to the same blob under the same path and rescans, answering what each revision
+/// holds afterwards.
+fn snapshots_sharing_a_blob(held: &str, added: &str) -> Result<Vec<Vec<String>>> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let repo = hub.join(STYLER);
+    fs::create_dir_all(repo.join("blobs"))?;
+    fs::create_dir_all(repo.join("refs"))?;
+    let blob = repo.join("blobs").join("a".repeat(64));
+    fs::write(&blob, lora_header())?;
+    let link = |commit: &str| -> Result<()> {
+        let snapshot = repo.join("snapshots").join(commit);
+        fs::create_dir_all(&snapshot)?;
+        std::os::unix::fs::symlink(&blob, snapshot.join("adapter.safetensors"))?;
+        Ok(())
+    };
+    link(held)?;
+    fs::write(repo.join("refs/main"), held)?;
+    let config = hub_config(&hub);
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    link(added)?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    let after = only_repository(&catalog)?;
+    (0..u32::try_from(after.revisions.len()).unwrap_or_default())
+        .map(|ordinal| paths_of_revision(&catalog, &after, ordinal))
+        .collect()
+}
+
+#[test]
+fn a_snapshot_that_appears_beside_one_sharing_its_blob_takes_no_row_from_it() -> Result<()> {
+    for (held, added) in [
+        ("b".repeat(40), "a".repeat(40)),
+        ("b".repeat(40), "c".repeat(40)),
+    ] {
+        let revisions = snapshots_sharing_a_blob(&held, &added)?;
+        assert_eq!(
+            revisions.len(),
+            2,
+            "the snapshot added beside {held} is a revision of its own"
+        );
+        for (ordinal, paths) in revisions.iter().enumerate() {
+            assert_eq!(
+                paths,
+                &["adapter.safetensors"],
+                "revision {ordinal} keeps its row when {added} was added beside {held}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_catalog_counts_triage_against_the_threshold_it_was_scanned_with() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("loras"))?;
+    fs::write(input.join("loras/style.safetensors"), lora_header())?;
+    fs::write(input.join("data.csv"), "x,y\n1,2\n")?;
+    fs::write(input.join("tiny.jsonl"), "{\"text\":\"hello\"}\n")?;
+    let lenient = IndexConfig {
+        sources: vec![source(&input, "files")],
+        triage_confidence: 0.5,
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &lenient,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    assert_eq!(
+        catalog.count_summary()?,
+        catalog.totals()?,
+        "a fresh scan at 0.5 counts what a recount of it counts"
+    );
+    let lenient_triage = catalog.totals()?.triage_artifacts;
+
+    catalog.rescan(
+        &lenient,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    assert_eq!(
+        catalog.count_summary()?,
+        catalog.totals()?,
+        "a rescan at the stored threshold leaves the count where it was"
+    );
+
+    let strict = IndexConfig {
+        triage_confidence: 0.99,
+        ..lenient.clone()
+    };
+    catalog.rescan(
+        &strict,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    assert_eq!(
+        catalog.count_summary()?,
+        catalog.totals()?,
+        "a rescan that moves the threshold counts the summary again"
+    );
+    assert!(
+        catalog.totals()?.triage_artifacts > lenient_triage,
+        "a threshold of 0.99 puts more artifacts in triage than 0.5 did"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_rescan_retracts_more_paths_than_one_transaction_holds() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir(&input)?;
+    let total = super::scan::CHUNK + 7;
+    for index in 0..total {
+        fs::write(
+            input.join(format!("row{index:05}.csv")),
+            format!("prompt,response\nhello,{index}\n"),
+        )?;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    assert_eq!(catalog.totals()?.present_artifacts, total as u64);
+
+    for index in 0..total {
+        fs::remove_file(input.join(format!("row{index:05}.csv")))?;
+    }
+    let report = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+
+    assert_eq!(
+        report.absent, total as u64,
+        "every path the walk did not reach is retracted, across the chunk boundary"
+    );
+    assert_eq!(catalog.totals()?.present_artifacts, 0);
+    assert_eq!(
+        catalog.count_summary()?,
+        catalog.totals()?,
+        "the derived counts of every chunk reached the summary"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_usage_chart_is_read_off_the_repository_record_and_not_the_log() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    let row = catalog
+        .artifact_row(ids.lora)?
+        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
+    let now = jiff::Timestamp::now();
+    for index in 0..3_u32 {
+        catalog.log_usage(&UsageEvent {
+            client: Some(format!("10.0.0.{index}")),
+            repo: Some(row.repo_id),
+            artifact: Some(row.artifact_id),
+            ..UsageEvent::new("keep.safetensors", now)
+        })?;
+    }
+    let charted = catalog.usage_days(row.repo_id, 7)?;
+    assert_eq!(charted.len(), 7);
+    assert_eq!(
+        charted[6].pulls, 3,
+        "today holds the three pulls: {charted:?}"
+    );
+
+    let transaction = catalog.database.rw_transaction()?;
+    let logged: Vec<super::models::Usage> = transaction
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(logged.len(), 3);
+    for entry in logged {
+        transaction.remove(entry)?;
+    }
+    transaction.commit()?;
+
+    assert_eq!(
+        catalog.usage_days(row.repo_id, 7)?,
+        charted,
+        "the chart is the record's, not a pass over the log"
+    );
+    assert_eq!(
+        catalog.usage_report(row.repo_id, 7, 20)?.days,
+        charted,
+        "and the report draws the same chart"
+    );
+    assert!(
+        catalog.recent_pulls(row.repo_id, 20)?.is_empty(),
+        "the pulls list is still the log's"
+    );
+    let longer = catalog.usage_days(row.repo_id, HISTORY_DAYS as u32 + 9)?;
+    assert_eq!(
+        longer.iter().map(|day| day.pulls).sum::<u64>(),
+        0,
+        "a window longer than the record keeps is counted from the log"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_branch_that_advances_twice_leaves_one_card_and_slots_that_answer_to_nothing() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = git_fixture(directory.path(), None)?;
+    let clone = input.join("org").join("clone");
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let repo = RepoId::parse_ref(RepoType::Models, "org/clone")?;
+    let first = repository_of(&catalog, &repo)?;
+    let abandoned: Vec<String> = first
+        .revisions
+        .iter()
+        .filter_map(|revision| revision.sha.map(|sha| sha.to_string()))
+        .collect();
+    assert_eq!(abandoned.len(), 1);
+
+    for step in 0..2 {
+        fs::write(clone.join(format!("note{step}.md")), "# notes\n")?;
+        git(&clone, &["add", "."]);
+        git(&clone, &["commit", "-m", "another import", "--quiet"]);
+        catalog.rescan(
+            &config,
+            HashPolicy::Never,
+            RescanScope::Configured,
+            |_, _| {},
+        )?;
+    }
+
+    let detail = repository_of(&catalog, &repo)?;
+    assert_eq!(
+        detail.revisions.len(),
+        1,
+        "only the head a ref reaches is a revision: {:?}",
+        detail.revisions
+    );
+    assert_eq!(
+        detail.revisions[0].ordinal, 2,
+        "the two heads it left keep their ordinals"
+    );
+    for sha in &abandoned {
+        assert!(
+            catalog.resolve_revision(&detail, sha).is_none(),
+            "a retired revision answers to no name of its own"
+        );
+    }
+    assert!(
+        catalog
+            .revision_entries(detail.id, 0, Dedupe::Ignore)?
+            .is_empty(),
+        "and no entry is filed under it"
+    );
+
+    let read = catalog.database.r_transaction()?;
+    let cards: Vec<models::RevisionText> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(
+        cards.len(),
+        1,
+        "one card, on the head that holds it, rather than one per abandoned slot"
+    );
+    assert_eq!(cards[0].key, LocationKey::revision(detail.id.get(), 2));
+    Ok(())
+}
+
+#[test]
+fn a_refresh_batch_holds_the_change_at_its_bound() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    let now = jiff::Timestamp::now();
+    catalog.bump_artifact_use(ids.lora, now)?;
+    catalog.bump_artifact_use(ids.ckpt, now)?;
+
+    let read = catalog.database.r_transaction()?;
+    let logged: Vec<SearchChange> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    drop(read);
+    let seqs: Vec<u64> = logged.iter().map(|change| change.seq).collect();
+    let bound = seqs
+        .last()
+        .copied()
+        .ok_or_else(|| IndexError::Catalog("a bump logs a change".into()))?;
+    assert!(seqs.len() >= 2, "each bump logged its artifact: {seqs:?}");
+
+    assert_eq!(
+        catalog.change_seqs_up_to(0, bound)?,
+        seqs,
+        "a batch bounded by the highest sequence replays it"
+    );
+    assert_eq!(
+        catalog.change_seqs_up_to(bound - 1, bound)?,
+        vec![bound],
+        "and a batch of one is that one"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_revision_listing_resolves_the_dedupe_mark_only_when_it_is_asked_to() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("a"))?;
+    fs::create_dir_all(input.join("b"))?;
+    fs::write(input.join("a/style.safetensors"), lora_header())?;
+    fs::write(input.join("b/style-copy.safetensors"), lora_header())?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    catalog.hash_pending(&config, |_| {})?;
+    let repository = only_repository(&catalog)?;
+
+    let resolved = catalog.revision_entries(repository.id, 0, Dedupe::Resolve)?;
+    assert_eq!(resolved.len(), 2);
+    assert!(
+        resolved.iter().all(|entry| entry.deduped),
+        "two paths hold the one artifact"
+    );
+
+    let ignored = catalog.revision_entries(repository.id, 0, Dedupe::Ignore)?;
+    assert_eq!(
+        ignored
+            .iter()
+            .map(|entry| entry.rel_path.clone())
+            .collect::<Vec<_>>(),
+        resolved
+            .iter()
+            .map(|entry| entry.rel_path.clone())
+            .collect::<Vec<_>>(),
+        "the same files, in the same order"
+    );
+    assert!(
+        ignored.iter().all(|entry| !entry.deduped),
+        "a listing that was not asked for the mark does not read the records behind it"
+    );
+    Ok(())
+}
+
+/// Writes a total the catalog cannot have, so a pass that settles the counts is visible in
+/// what `totals()` reads and a pass that does not is visible too.
+fn miscount_the_summary(catalog: &Catalog) -> Result<u64> {
+    let transaction = catalog.database.rw_transaction()?;
+    let stored: models::Summary = transaction
+        .get()
+        .primary(0_u8)?
+        .ok_or_else(|| IndexError::Catalog("summary missing".into()))?;
+    let wrong = stored.artifacts + 1_000;
+    transaction.upsert(models::Summary {
+        artifacts: wrong,
+        ..stored
+    })?;
+    transaction.commit()?;
+    Ok(wrong)
+}
+
+#[test]
+fn a_hashing_pass_asked_to_stop_before_it_starts_opens_nothing() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir(&input)?;
+    for index in 0..4 {
+        fs::write(
+            input.join(format!("row{index}.csv")),
+            format!("prompt,response\nhello,{index}\n"),
+        )?;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+
+    let stop = Stop::default();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let interrupted = catalog.rescan_until(
+        &config,
+        HashPolicy::Background,
+        RescanScope::Configured,
+        &stop,
+        |_, _| {},
+    )?;
+    assert!(interrupted.interrupted);
+    assert!(pass_is_open(&catalog)?, "the walk left its mark held");
+    let wrong = miscount_the_summary(&catalog)?;
+
+    let report = catalog.hash_pending_until(&config, &stop, |_| {})?;
+
+    assert!(report.interrupted, "a raised stop ends the pass at once");
+    assert_eq!(report.hashed, 0);
+    assert_eq!(
+        catalog.totals()?.artifacts,
+        wrong,
+        "the pass opened nothing, so it counted nothing"
+    );
+    assert!(
+        pass_is_open(&catalog)?,
+        "and left the mark for the next one"
+    );
+    assert_eq!(catalog.pending_hashes()?, 4);
+
+    let finished = catalog.hash_pending(&config, |_| {})?;
+
+    assert!(!finished.interrupted);
+    assert_eq!(finished.hashed, 4);
+    assert_eq!(
+        catalog.totals()?.artifacts,
+        wrong - 1_000,
+        "the pass that did open settled the counts the interrupted one left"
+    );
+    assert!(!pass_is_open(&catalog)?);
+    Ok(())
+}
+
+#[test]
+fn a_hashing_pass_counts_triage_against_the_threshold_the_catalog_stored() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("loras"))?;
+    fs::write(input.join("loras/style.safetensors"), lora_header())?;
+    fs::write(input.join("data.csv"), "x,y\n1,2\n")?;
+    let scanned = IndexConfig {
+        sources: vec![source(&input, "files")],
+        triage_confidence: 0.5,
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &scanned,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+
+    let hashing = IndexConfig {
+        triage_confidence: 0.99,
+        ..scanned.clone()
+    };
+    let report = catalog.hash_pending(&hashing, |_| {})?;
+
+    assert_eq!(report.hashed, 2);
+    assert_eq!(
+        catalog.count_summary()?,
+        catalog.totals()?,
+        "the pass counted against the threshold the scan stored, not the one it was handed"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_retired_repository_forgets_more_pulls_than_one_transaction_holds() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("loras"))?;
+    fs::write(input.join("loras/style.safetensors"), lora_header())?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    catalog.rebuild_search(|_| {})?;
+    let row = search(&catalog, "role:lora")?
+        .rows
+        .into_iter()
+        .next()
+        .ok_or_else(|| IndexError::Catalog("the lora is indexed".into()))?;
+    let now = jiff::Timestamp::now();
+    let served: Vec<UsageEvent> = (0..super::scan::CHUNK + 7)
+        .map(|index| UsageEvent {
+            client: Some(format!("10.0.0.{}", index % 8)),
+            repo: Some(row.repo_id),
+            artifact: Some(row.artifact_id),
+            ..UsageEvent::new("style.safetensors", now)
+        })
+        .collect();
+    catalog.log_usage_batch(&served)?;
+    assert_eq!(
+        catalog.usage_days(row.repo_id, 7)?[6].pulls,
+        served.len() as u64
+    );
+
+    let dropped = IndexConfig {
+        sources: Vec::new(),
+        ..config
+    };
+    catalog.rescan(
+        &dropped,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+
+    assert!(catalog.sources()?.is_empty(), "the source is retired");
+    let read = catalog.database.r_transaction()?;
+    let left: Vec<super::models::Usage> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert!(
+        left.is_empty(),
+        "every row of the retired repository's log went with it, {} left",
+        left.len()
+    );
+    drop(read);
+    assert_eq!(catalog.distinct_clients(row.repo_id)?, 0);
+    assert!(catalog.recent_pulls(row.repo_id, 20)?.is_empty());
+    Ok(())
 }

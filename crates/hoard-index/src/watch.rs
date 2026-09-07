@@ -203,8 +203,8 @@ impl Watcher {
         }
     }
 
-    /// Stops watching and waits for the pump to exit; requests already submitted finish on
-    /// the lane, which the caller drains.
+    /// Stops watching and waits for the pump to exit; a request already submitted is left
+    /// to the lane, which the caller stops.
     pub async fn shutdown(self) {
         let Self {
             mut watcher,
@@ -601,7 +601,13 @@ mod tests {
         wait_for_submissions(&watcher, 1).await;
 
         watcher.shutdown().await;
-        coordinator.shutdown().await.expect("the lane drains");
+        for _ in 0..600 {
+            if !coordinator.busy() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        coordinator.shutdown().await.expect("the lane stops");
     }
 
     #[test]
@@ -893,7 +899,13 @@ mod tests {
         fs::write(root.join("loras/new.safetensors"), safetensors()).expect("fixture is writable");
         wait_for_submissions(&watcher, 1).await;
         watcher.shutdown().await;
-        coordinator.shutdown().await.expect("the lane drains");
+        for _ in 0..600 {
+            if !coordinator.busy() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        coordinator.shutdown().await.expect("the lane stops");
     }
 
     #[tokio::test]
@@ -921,7 +933,13 @@ mod tests {
         );
 
         watcher.shutdown().await;
-        coordinator.shutdown().await.expect("the lane drains");
+        for _ in 0..600 {
+            if !coordinator.busy() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        coordinator.shutdown().await.expect("the lane stops");
     }
 
     #[tokio::test]
@@ -963,7 +981,13 @@ mod tests {
         .expect("fixture is writable");
         wait_for_submissions(&watcher, 1).await;
         watcher.shutdown().await;
-        coordinator.shutdown().await.expect("the lane drains");
+        for _ in 0..600 {
+            if !coordinator.busy() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        coordinator.shutdown().await.expect("the lane stops");
     }
 
     #[test]
@@ -1018,7 +1042,13 @@ mod tests {
         fs::write(root.join("loras/new.safetensors"), safetensors()).expect("fixture is writable");
         wait_for_submissions(&watcher, 1).await;
         watcher.shutdown().await;
-        coordinator.shutdown().await.expect("the lane drains");
+        for _ in 0..600 {
+            if !coordinator.busy() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        coordinator.shutdown().await.expect("the lane stops");
     }
 
     #[tokio::test]

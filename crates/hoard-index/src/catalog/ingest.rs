@@ -4,7 +4,7 @@ use native_db::transaction::RwTransaction;
 
 use hoard_core::{ArtifactFormat, ArtifactId, CommitSha, EntryId, RepoId, Sha256, State};
 
-use crate::config::{IndexConfig, SourceConfig, SourceKind};
+use crate::config::{SourceConfig, SourceKind};
 use crate::error::{IndexError, Result};
 use crate::infer::{InferInput, infer};
 
@@ -50,9 +50,8 @@ impl Catalog {
     /// record classified from its name, size and hash, sharing the record of any copy the
     /// catalog already holds by content. The search index is refreshed by the caller.
     pub fn ingest_served(&self, file: &ServedFile) -> Result<IngestRecord> {
-        let triage = IndexConfig::default().triage_confidence;
-        let mut counters =
-            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
+        let triage = self.stored_triage()?;
+        let mut counters = Counters::load(&self.database, triage)?;
         let transaction = self.database.rw_transaction()?;
         let record = {
             let mut ingesting = Ingesting {
@@ -70,12 +69,14 @@ impl Catalog {
 
     /// Visits every path this node serves whose bytes live only in the block cache - a
     /// SERVED entry of the local node with no file of its own on disk - in chunks of at
-    /// most `chunk`, one repository at a time.
+    /// most `chunk`, one repository at a time. The sweep reads the paths and not the
+    /// artifacts behind them, so [`EntryDetail::deduped`] is not resolved.
     ///
-    /// Each repository is read in its own snapshot, so a sweep of the mirror holds one
-    /// repository's rows and one chunk of details rather than every served path the
-    /// catalog knows. The chunks of one repository arrive in entry id order, and the
-    /// repositories in repository id order.
+    /// Each repository is read in its own snapshot, and each chunk is taken from the scan
+    /// rather than from a list of the repository's rows, so a sweep of the mirror holds one
+    /// chunk of details rather than every served path the catalog knows. The chunks of one
+    /// repository arrive in the order the location key files them, and the repositories in
+    /// repository id order.
     pub fn served_cache_entries_in(
         &self,
         chunk: usize,
@@ -86,28 +87,27 @@ impl Catalog {
             let snapshot = self.database.r_transaction()?;
             let names = self.node_names(&snapshot)?;
             let mut reader = Reader::new(&snapshot, &names);
-            let mut rows: Vec<Entry> = snapshot
-                .scan()
-                .secondary::<Entry>(EntryKey::location)?
-                .start_with(LocationKey::repository(repo_id))?
-                .collect::<native_db::db_type::Result<_>>()?;
-            rows.retain(|entry| {
-                entry.repo_id == repo_id
-                    && entry.node == LOCAL_NODE
-                    && entry.state == State::Served
-                    && entry.placed.is_absent()
-            });
-            rows.sort_unstable_by_key(|entry| entry.id);
-            for batch in rows.chunks(chunk) {
-                let mut details = Vec::with_capacity(batch.len());
-                for entry in batch {
-                    let deduped = match entry.artifact_id {
-                        Some(id) => reader
-                            .record(id)?
-                            .is_some_and(|record| record.path_count > 1),
-                        None => false,
-                    };
-                    details.push(reader.detail(entry, deduped)?);
+            let scan = snapshot.scan();
+            let secondary = scan.secondary::<Entry>(EntryKey::location)?;
+            let mut rows = secondary.start_with(LocationKey::repository(repo_id))?;
+            loop {
+                let mut details = Vec::with_capacity(chunk);
+                for entry in rows.by_ref() {
+                    let entry: Entry = entry?;
+                    if entry.repo_id != repo_id
+                        || entry.node != LOCAL_NODE
+                        || entry.state != State::Served
+                        || !entry.placed.is_absent()
+                    {
+                        continue;
+                    }
+                    details.push(reader.detail(&entry, false)?);
+                    if details.len() == chunk {
+                        break;
+                    }
+                }
+                if details.is_empty() {
+                    break;
                 }
                 visit(details)?;
             }
@@ -125,8 +125,7 @@ impl Catalog {
         if ids.is_empty() {
             return Ok(0);
         }
-        let mut counters =
-            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
+        let mut counters = Counters::load(&self.database, self.stored_triage()?)?;
         let transaction = self.database.rw_transaction()?;
         let mut retired = 0;
         for id in ids {
@@ -335,6 +334,7 @@ impl Ingesting<'_, '_> {
             title: None,
             author: None,
             committed: None,
+            retired: false,
         });
         self.transaction.upsert(Repository {
             revisions,

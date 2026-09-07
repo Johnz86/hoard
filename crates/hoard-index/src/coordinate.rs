@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -14,12 +15,18 @@ use tokio::task::JoinHandle;
 
 use hoard_core::JobId;
 
-use crate::catalog::{Catalog, JobProgress, RescanReport, RescanScope};
+use crate::catalog::{Catalog, JobProgress, RescanReport, RescanScope, Stop};
 use crate::config::{HashPolicy, IndexConfig};
 use crate::error::{IndexError, Result};
 
 /// The `job.kind` every scan the lane runs records.
 pub const SCAN_KIND: &str = "scan";
+
+/// What a job whose pass the closing lane stopped carries in place of its last phase.
+const INTERRUPTED: &str = "interrupted by shutdown; resumes on the next scan";
+
+/// What a job that never started carries when the closing lane drops it.
+const DROPPED: &str = "dropped when the lane closed; resumes on the next scan";
 
 /// Who asked for a scan, which decides how it is reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +74,7 @@ impl Coordinator {
                 queue: Mutex::new(Queue::default()),
                 wake: Notify::new(),
                 admission: tokio::sync::Mutex::new(()),
+                stop: Stop::default(),
             }),
             worker: Mutex::new(None),
         }
@@ -113,14 +121,24 @@ impl Coordinator {
         queue.running || !queue.waiting.is_empty()
     }
 
-    /// Runs what is queued to completion, then stops the lane. A request after this is
-    /// refused as soon as the lane is marked closed, rather than waiting for the drain.
+    /// Stops the lane within a batch of work rather than within a whole pass.
+    ///
+    /// The running scan is asked to stop between units and between hashing batches and
+    /// keeps what it committed; what is still waiting is dropped with its job row
+    /// cancelled. A request after this is refused at once rather than waiting for the stop,
+    /// and the next start rescans what neither finished.
     pub async fn shutdown(&self) -> Result<()> {
-        {
+        let dropped = {
             let _admission = self.lane.admission.lock().await;
-            self.lane.queue.lock().closed = true;
+            self.lane.stop.store(true, Ordering::Relaxed);
+            let mut queue = self.lane.queue.lock();
+            queue.closed = true;
+            let dropped: Vec<JobId> = queue.waiting.drain(..).map(|item| item.job).collect();
+            drop(queue);
             self.lane.wake.notify_one();
-        }
+            dropped
+        };
+        self.lane.drop_jobs(dropped).await;
         let worker = self.worker.lock().take();
         match worker {
             Some(worker) => worker.await.map_err(lane_stopped),
@@ -136,6 +154,7 @@ struct Lane {
     queue: Mutex<Queue>,
     wake: Notify,
     admission: tokio::sync::Mutex<()>,
+    stop: Stop,
 }
 
 #[derive(Debug, Default)]
@@ -197,8 +216,9 @@ impl Lane {
         let origin = item.origin.as_str();
         let catalog = Arc::clone(&self.catalog);
         let config = narrowed(&self.config, item.sources.as_ref());
+        let stop = Stop::clone(&self.stop);
         tracing::info!(%job, origin, "scan started");
-        match tokio::task::spawn_blocking(move || settle(&catalog, &config, &item)).await {
+        match tokio::task::spawn_blocking(move || settle(&catalog, &config, &item, &stop)).await {
             Ok(Ok(report)) => tracing::info!(
                 %job,
                 origin,
@@ -210,6 +230,33 @@ impl Lane {
             ),
             Ok(Err(error)) => tracing::error!(%job, origin, %error, "the scan failed"),
             Err(error) => self.abandon(job, &error.to_string()).await,
+        }
+    }
+
+    /// Settles the job rows of the requests the closing lane will never run.
+    async fn drop_jobs(&self, jobs: Vec<JobId>) {
+        for job in jobs {
+            let catalog = Arc::clone(&self.catalog);
+            let settled = tokio::task::spawn_blocking(move || {
+                catalog.update_job(
+                    job,
+                    &JobProgress {
+                        phase: Some(DROPPED.to_owned()),
+                        ..JobProgress::default()
+                    },
+                )?;
+                catalog.cancel_job(job)
+            })
+            .await;
+            match settled {
+                Ok(Ok(())) => tracing::info!(%job, "the queued scan was dropped by the shutdown"),
+                Ok(Err(error)) => {
+                    tracing::error!(%job, %error, "the dropped job could not be settled")
+                }
+                Err(error) => {
+                    tracing::error!(%job, %error, "the dropped job lost its worker thread")
+                }
+            }
         }
     }
 
@@ -251,8 +298,13 @@ async fn run_lane(lane: Arc<Lane>) {
     }
 }
 
-fn settle(catalog: &Catalog, config: &IndexConfig, item: &Queued) -> Result<RescanReport> {
-    let outcome = run_scan(catalog, config, item);
+fn settle(
+    catalog: &Catalog,
+    config: &IndexConfig,
+    item: &Queued,
+    stop: &Stop,
+) -> Result<RescanReport> {
+    let outcome = run_scan(catalog, config, item, stop);
     let settled = match &outcome {
         Ok(_) => catalog.finish_job(item.job),
         Err(error) => catalog.fail_job(item.job, &error.to_string()),
@@ -263,22 +315,38 @@ fn settle(catalog: &Catalog, config: &IndexConfig, item: &Queued) -> Result<Resc
     outcome
 }
 
-fn run_scan(catalog: &Catalog, config: &IndexConfig, item: &Queued) -> Result<RescanReport> {
+/// The rescan, the hashing and the search refresh of one request, in that order.
+///
+/// A walk the stop ended is not followed by a hashing pass: the pass would open on a mark
+/// the walk left held, which counts every artifact record before its first batch breaks on
+/// the same stop. The refresh still runs, so what the walk committed is published, and the
+/// job carries the interruption as its last phase.
+fn run_scan(
+    catalog: &Catalog,
+    config: &IndexConfig,
+    item: &Queued,
+    stop: &Stop,
+) -> Result<RescanReport> {
     phase(catalog, item.job, "rescanning the sources")?;
     let scope = match item.sources {
         Some(_) => RescanScope::Narrowed,
         None => RescanScope::Configured,
     };
-    let report = catalog.rescan(config, item.hash, scope, |_, _| {})?;
-    match item.hash {
-        HashPolicy::Now | HashPolicy::Background => {
+    let report = catalog.rescan_until(config, item.hash, scope, stop, |_, _| {})?;
+    let hashing = match (item.hash, report.interrupted) {
+        (HashPolicy::Now | HashPolicy::Background, false) => {
             phase(catalog, item.job, "hashing")?;
-            catalog.hash_pending(config, |_| {})?;
+            catalog
+                .hash_pending_until(config, stop, |_| {})?
+                .interrupted
         }
-        HashPolicy::Never => {}
-    }
+        (HashPolicy::Now | HashPolicy::Background, true) | (HashPolicy::Never, _) => false,
+    };
     phase(catalog, item.job, "refreshing search")?;
     catalog.refresh_search(|_| {})?;
+    if report.interrupted || hashing {
+        phase(catalog, item.job, INTERRUPTED)?;
+    }
     Ok(report)
 }
 
@@ -338,7 +406,7 @@ fn lane_stopped(error: tokio::task::JoinError) -> IndexError {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use tempfile::TempDir;
@@ -427,6 +495,40 @@ mod tests {
             .ok_or_else(|| IndexError::Catalog(format!("no source record for {name}")))
     }
 
+    /// Waits for the lane to have taken a job, which the first phase it records proves, so
+    /// a shutdown after this stops a scan that is running rather than one still waiting.
+    async fn started(catalog: &Catalog, job: JobId) -> Result<()> {
+        for _ in 0..600 {
+            if settled(catalog, job)?.phase.is_some() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Err(IndexError::Catalog(format!("job {job} never started")))
+    }
+
+    /// Waits for the lane to run what it has, so a shutdown after this stops nothing.
+    async fn drained(coordinator: &Coordinator) {
+        for _ in 0..600 {
+            if !coordinator.busy() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn wide(directory: &Path, files: usize) -> Result<PathBuf> {
+        let root = directory.join("wide");
+        fs::create_dir(&root)?;
+        for index in 0..files {
+            fs::write(
+                root.join(format!("shard{index:05}.csv")),
+                format!("prompt,response\nhello,{index}\n"),
+            )?;
+        }
+        Ok(root)
+    }
+
     fn settled(catalog: &Catalog, job: JobId) -> Result<crate::catalog::JobRecord> {
         catalog
             .job(job)?
@@ -487,6 +589,7 @@ mod tests {
         );
         assert_ne!(running, queued, "a different source set queues its own job");
 
+        drained(&coordinator).await;
         coordinator.shutdown().await?;
         released(holder).await?;
 
@@ -520,6 +623,7 @@ mod tests {
                 origin: Origin::Reconcile,
             })
             .await?;
+        drained(&coordinator).await;
         coordinator.shutdown().await?;
 
         assert!(!coordinator.busy(), "a drained lane is idle");
@@ -554,6 +658,7 @@ mod tests {
         let following = coordinator
             .request(over("alpha", HashPolicy::Never))
             .await?;
+        drained(&coordinator).await;
         coordinator.shutdown().await?;
 
         let failed = settled(&catalog, failing)?;
@@ -593,7 +698,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn a_request_during_a_drain_is_refused_without_waiting_for_the_drain() -> Result<()> {
+    async fn a_request_during_a_shutdown_is_refused_without_waiting_for_it() -> Result<()> {
         let (_directory, catalog, config) = world()?;
         let coordinator = Arc::new(Coordinator::new(Arc::clone(&catalog), config));
         let (holder, held) = hold_the_search_lane(Arc::clone(&catalog), Duration::from_millis(400));
@@ -604,6 +709,7 @@ mod tests {
             .request(over("alpha", HashPolicy::Never))
             .await?;
         let queued = coordinator.request(over("beta", HashPolicy::Never)).await?;
+        started(&catalog, running).await?;
 
         let asking = tokio::spawn({
             let coordinator = Arc::clone(&coordinator);
@@ -617,27 +723,27 @@ mod tests {
 
         let started = std::time::Instant::now();
         coordinator.shutdown().await?;
-        let drain = started.elapsed();
+        let stopping = started.elapsed();
         released(holder).await?;
         let (refused, waited) = asking.await.map_err(lane_stopped)?;
 
         assert!(
             matches!(refused, Err(IndexError::Catalog(ref text)) if text == "the scan lane is closed"),
-            "a request during a drain is refused, got {refused:?}"
+            "a request during a shutdown is refused, got {refused:?}"
         );
         assert!(
             waited < Duration::from_millis(100),
-            "the refusal answered in {waited:?} rather than parking on the drain"
+            "the refusal answered in {waited:?} rather than parking on the shutdown"
         );
         assert!(
-            drain > Duration::from_millis(300),
-            "the drain this refusal did not wait for took {drain:?}"
+            stopping > Duration::from_millis(300),
+            "the shutdown this refusal did not wait for took {stopping:?}"
         );
         assert_eq!(settled(&catalog, running)?.state, JobState::Done);
         assert_eq!(
             settled(&catalog, queued)?.state,
-            JobState::Done,
-            "the drain still ran what was queued"
+            JobState::Cancelled,
+            "what had not started was dropped"
         );
         assert_eq!(
             catalog.list_jobs(None)?.len(),
@@ -648,7 +754,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn shutdown_drains_what_is_queued_and_refuses_what_comes_after() -> Result<()> {
+    async fn shutdown_finishes_the_running_scan_drops_what_waits_and_refuses_what_comes_after()
+    -> Result<()> {
         let (_directory, catalog, config) = world()?;
         let coordinator = Coordinator::new(Arc::clone(&catalog), config);
         let (holder, held) = hold_the_search_lane(Arc::clone(&catalog), Duration::from_millis(200));
@@ -660,17 +767,24 @@ mod tests {
             .await?;
         let queued = coordinator.request(over("beta", HashPolicy::Never)).await?;
         assert!(coordinator.busy(), "both requests are still in flight");
+        started(&catalog, running).await?;
 
         coordinator.shutdown().await?;
         released(holder).await?;
 
-        assert!(!coordinator.busy(), "shutdown drained the queue");
-        assert_eq!(settled(&catalog, running)?.state, JobState::Done);
+        assert!(!coordinator.busy(), "shutdown emptied the queue");
         assert_eq!(
-            settled(&catalog, queued)?.state,
+            settled(&catalog, running)?.state,
             JobState::Done,
-            "shutdown ran what was still waiting"
+            "the scan already running was finished"
         );
+        let dropped = settled(&catalog, queued)?;
+        assert_eq!(
+            dropped.state,
+            JobState::Cancelled,
+            "shutdown dropped what was still waiting"
+        );
+        assert_eq!(dropped.phase.as_deref(), Some(DROPPED));
 
         let refused = coordinator.request(over("alpha", HashPolicy::Never)).await;
         assert!(
@@ -681,6 +795,59 @@ mod tests {
             catalog.list_jobs(None)?.len(),
             2,
             "the refused request wrote no job row"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_stops_the_hashing_pass_at_a_batch_boundary_and_the_next_scan_finishes_it()
+    -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = wide(directory.path(), 1500)?;
+        let config = IndexConfig {
+            sources: vec![source(&root, "wide")],
+            ..IndexConfig::default()
+        };
+        let catalog = Arc::new(Catalog::scan_sources(
+            &directory.path().join("native"),
+            "test-node",
+            &config,
+            HashPolicy::Never,
+            |_, _| {},
+        )?);
+        catalog.rebuild_search(|_| {})?;
+        let owed = catalog.pending_hashes()?;
+        assert_eq!(owed, 1500, "the scan hashed nothing");
+
+        let coordinator = Coordinator::new(Arc::clone(&catalog), config.clone());
+        let reconcile = ScanRequest {
+            sources: None,
+            hash: HashPolicy::Background,
+            origin: Origin::Reconcile,
+        };
+        let job = coordinator.request(reconcile.clone()).await?;
+        let asked = std::time::Instant::now();
+        coordinator.shutdown().await?;
+        let stopping = asked.elapsed();
+
+        assert!(
+            stopping < Duration::from_secs(5),
+            "the shutdown waited {stopping:?} for the hashing pass"
+        );
+        assert!(
+            settled(&catalog, job)?.state.is_final(),
+            "the interrupted job settled rather than staying in flight"
+        );
+
+        let resumed = Coordinator::new(Arc::clone(&catalog), config);
+        let next = resumed.request(reconcile).await?;
+        drained(&resumed).await;
+        resumed.shutdown().await?;
+        assert_eq!(settled(&catalog, next)?.state, JobState::Done);
+        assert_eq!(
+            catalog.pending_hashes()?,
+            0,
+            "the next scan hashed whatever the shutdown left"
         );
         Ok(())
     }

@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hoard_core::{CommitSha, Sha256};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
@@ -78,13 +79,21 @@ pub fn sha256_bytes(bytes: &[u8]) -> Sha256 {
     Sha256::from_bytes(finish::<32>(hasher.finalize().as_slice()))
 }
 
-/// The content hashes one file owes, read in a single pass.
+/// The content hashes one file owes, read in a single pass, or nothing when `stop` was
+/// raised before the file was read to its end.
 ///
 /// A file under the LFS threshold owes both a sha256 and a git blob sha1, and reading it
 /// once for each doubles the bytes the hashing pass moves. Both hashers are fed from the
 /// same 1 MiB buffer instead. The read is an ordinary buffered read: no page cache hint is
 /// given, because no safe wrapper for one is in this workspace's dependency graph.
-pub fn content_digests(path: &Path, want_git_sha1: bool) -> Result<(Sha256, Option<CommitSha>)> {
+///
+/// `stop` is read once per buffer, so a shutdown that arrives while an 80 GB checkpoint is
+/// being read waits for a megabyte rather than for the file.
+pub fn content_digests(
+    path: &Path,
+    want_git_sha1: bool,
+    stop: &AtomicBool,
+) -> Result<Option<(Sha256, Option<CommitSha>)>> {
     let mut file = File::open(path).map_err(|error| IndexError::io(path, error))?;
     let size = file
         .metadata()
@@ -98,6 +107,9 @@ pub fn content_digests(path: &Path, want_git_sha1: bool) -> Result<(Sha256, Opti
     });
     let mut buffer = vec![0u8; STREAM_BUFFER];
     loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         let read = file
             .read(&mut buffer)
             .map_err(|error| IndexError::io(path, error))?;
@@ -109,10 +121,10 @@ pub fn content_digests(path: &Path, want_git_sha1: bool) -> Result<(Sha256, Opti
             blob.update(&buffer[..read]);
         }
     }
-    Ok((
+    Ok(Some((
         Sha256::from_bytes(finish::<32>(sha256.finalize().as_slice())),
         blob.map(|blob| CommitSha::from_bytes(finish::<20>(blob.finalize().as_slice()))),
-    ))
+    )))
 }
 
 /// The git object name of the file, `sha1("blob {len}\0" + bytes)`. This is the `oid` the
@@ -256,17 +268,39 @@ mod tests {
             ),
         ] {
             let path = write(&dir, name, &payload);
-            let (sha256, git_sha1) = content_digests(&path, true).expect("both digests");
+            let (sha256, git_sha1) = content_digests(&path, true, &AtomicBool::new(false))
+                .expect("both digests")
+                .expect("an unstopped read finishes");
             assert_eq!(sha256, sha256_file(&path).expect("sha256"), "{name}");
             assert_eq!(
                 git_sha1,
                 Some(git_blob_sha1(&path).expect("git blob sha1")),
                 "{name}"
             );
-            let (only_sha256, none) = content_digests(&path, false).expect("one digest");
+            let (only_sha256, none) = content_digests(&path, false, &AtomicBool::new(false))
+                .expect("one digest")
+                .expect("an unstopped read finishes");
             assert_eq!(only_sha256, sha256, "{name}");
             assert_eq!(none, None, "{name}");
         }
+    }
+
+    #[test]
+    fn a_raised_stop_ends_a_read_before_the_file_does() {
+        let dir = TempDir::new().expect("temp dir");
+        let payload = vec![3u8; STREAM_BUFFER * 3 + 17];
+        let path = write(&dir, "checkpoint.bin", &payload);
+        assert_eq!(
+            content_digests(&path, true, &AtomicBool::new(true)).expect("the read answers"),
+            None,
+            "a stop already raised reads no megabyte of the file"
+        );
+        assert!(
+            content_digests(&path, true, &AtomicBool::new(false))
+                .expect("the read answers")
+                .is_some(),
+            "and a pass nobody stopped reads it to the end"
+        );
     }
 
     #[test]

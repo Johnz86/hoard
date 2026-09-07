@@ -7,7 +7,7 @@ use hoard_core::{
     Artifact, ArtifactId, BlobId, CommitSha, Evidence, RepoId, Sha256, State, TensorSummary,
 };
 
-use crate::config::{IndexConfig, SourceConfig, SourceKind};
+use crate::config::{SourceConfig, SourceKind};
 use crate::discover::RefKind;
 use crate::error::{IndexError, Result};
 
@@ -100,7 +100,7 @@ impl Catalog {
     /// Call `rebuild_search` afterwards. Returns the identity of each artifact written and
     /// the id it was given, in the order the seed first named them.
     pub fn seed(&self, repositories: &[SeedRepository]) -> Result<Vec<(u128, ArtifactId)>> {
-        let triage = IndexConfig::default().triage_confidence;
+        let triage = self.stored_triage()?;
         let mut counters = Counters::load(&self.database, triage)?;
         let transaction = self.database.rw_transaction()?;
         let written = {
@@ -189,6 +189,7 @@ impl Seeding<'_, '_> {
                             kind: *kind,
                         })
                         .collect(),
+                    retired: false,
                 })
                 .collect(),
             present_files: present.0,

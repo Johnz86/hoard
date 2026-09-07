@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 
 use native_db::transaction::RwTransaction;
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
@@ -22,7 +22,11 @@ use super::scan::{Counters, log_changes, owes_a_hash, preferred_entry};
 use super::verdict::apply_override;
 
 /// How many files one hashing pass reads and records at a time.
-const HASH_BATCH: usize = 64;
+pub(super) const HASH_BATCH: usize = 64;
+
+/// Raised by whoever wants a running pass to stop early: a hashing pass stops between
+/// batches and a walk between units, keeping everything they had already committed.
+pub type Stop = Arc<AtomicBool>;
 
 /// How many digests may wait to be written before a reader has to wait for the writer.
 const DIGEST_QUEUE: usize = 256;
@@ -34,6 +38,8 @@ pub struct HashReport {
     pub hashed: u64,
     pub merged: u64,
     pub unreadable: u64,
+    /// The pass stopped at a batch boundary with files still owing a hash.
+    pub interrupted: bool,
 }
 
 /// The content identity a sha256 makes, the same text an artifact identity is hashed from.
@@ -53,16 +59,39 @@ impl Catalog {
     pub fn hash_pending(
         &self,
         config: &IndexConfig,
+        progress: impl FnMut(u64),
+    ) -> Result<HashReport> {
+        self.hash_pending_until(config, &Stop::default(), progress)
+    }
+
+    /// Hashes every present entry owing a sha256, stopping once `stop` is raised.
+    ///
+    /// The stop is read before the pass opens, before each batch and once per megabyte of
+    /// every file being read, so a pass over hundreds of gigabytes ends within a megabyte of
+    /// being asked to and a pass asked to stop before it starts opens nothing: opening a
+    /// pass whose mark is held counts every artifact record, which is not work to do on the
+    /// way out. An interrupted pass keeps what it committed and leaves the pass mark set, so
+    /// the next pass settles the counts and hashes what is left.
+    pub fn hash_pending_until(
+        &self,
+        config: &IndexConfig,
+        stop: &Stop,
         mut progress: impl FnMut(u64),
     ) -> Result<HashReport> {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(HashReport {
+                interrupted: true,
+                ..HashReport::default()
+            });
+        }
         self.open_pass()?;
-        let mut counters = Counters::load(&self.database, config.triage_confidence)?;
+        let mut counters = Counters::load(&self.database, self.stored_triage()?)?;
         let mut report = HashReport::default();
         let (sender, receiver) = mpsc::sync_channel::<Digest>(DIGEST_QUEUE);
         let recording = &mut counters;
         let merged = std::thread::scope(|scope| -> Result<u64> {
             let writing = scope.spawn(move || self.record_digests(receiver, recording));
-            let read = self.read_digests(config, &sender, &mut progress);
+            let read = self.read_digests(config, stop, &sender, &mut progress);
             drop(sender);
             let merged = writing
                 .join()
@@ -72,7 +101,9 @@ impl Catalog {
         })?;
         report.merged = merged;
         self.sweep_artifacts(&mut counters)?;
-        self.close_pass()?;
+        if !report.interrupted {
+            self.close_pass()?;
+        }
         Ok(report)
     }
 
@@ -81,6 +112,7 @@ impl Catalog {
     fn read_digests(
         &self,
         config: &IndexConfig,
+        stop: &Stop,
         sender: &mpsc::SyncSender<Digest>,
         progress: &mut impl FnMut(u64),
     ) -> Result<HashReport> {
@@ -91,11 +123,16 @@ impl Catalog {
             let Some((last, _)) = batch.last() else {
                 break;
             };
+            if stop.load(Ordering::Relaxed) {
+                report.interrupted = true;
+                break;
+            }
             after = last.id;
             let sent = AtomicU64::new(0);
+            let unreadable = AtomicU64::new(0);
             batch.par_iter().for_each(|(entry, path)| {
-                match content_hashes(path, entry.size, config.lfs_threshold) {
-                    Ok((sha256, git_sha1)) => {
+                match content_hashes(path, entry.size, config.lfs_threshold, stop) {
+                    Ok(Some((sha256, git_sha1))) => {
                         let digest = Digest {
                             entry_id: entry.id,
                             sha256,
@@ -105,15 +142,20 @@ impl Catalog {
                             sent.fetch_add(1, Ordering::Relaxed);
                         }
                     }
+                    Ok(None) => {}
                     Err(error) => {
+                        unreadable.fetch_add(1, Ordering::Relaxed);
                         tracing::debug!(path = %path.display(), %error, "file is unhashable");
                     }
                 }
             });
-            let read = sent.load(Ordering::Relaxed);
-            report.hashed += read;
-            report.unreadable += batch.len() as u64 - read;
+            report.hashed += sent.load(Ordering::Relaxed);
+            report.unreadable += unreadable.load(Ordering::Relaxed);
             progress(report.hashed);
+            if stop.load(Ordering::Relaxed) {
+                report.interrupted = true;
+                break;
+            }
         }
         Ok(report)
     }

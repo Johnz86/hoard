@@ -76,6 +76,25 @@ pub(super) struct Revision {
     pub(super) author: Option<String>,
     /// RFC 3339, the way every other catalog timestamp is stored.
     pub(super) committed: Option<String>,
+    /// A slot no ref reaches and no entry names any more. An entry names its revision by
+    /// ordinal, so the slot cannot be reclaimed; everything in it is given up instead, and
+    /// nothing resolves to it.
+    pub(super) retired: bool,
+}
+
+impl Revision {
+    /// The slot a revision leaves behind: its ordinal, and nothing else.
+    pub(super) fn tombstone() -> Self {
+        Self {
+            name: String::new(),
+            sha: None,
+            refs: Vec::new(),
+            title: None,
+            author: None,
+            committed: None,
+            retired: true,
+        }
+    }
 }
 
 /// The identity a repository keeps across scans: its source and its qualified name.
@@ -465,6 +484,10 @@ pub(super) struct Manifest {
     pub(super) search_directory: Option<String>,
     pub(super) search_generation: u64,
     pub(super) search_seq: u64,
+    /// The triage threshold the last scan ran with, which every writer that counts an
+    /// artifact into the summary counts against, so a reader's own configuration cannot
+    /// restate what a scan settled.
+    pub(super) triage_confidence: f32,
     /// Whether a pass that commits many times is running. The derived counts move in the
     /// transaction that moves the entries behind them, but the totals are a running sum a
     /// pass settles once at the end, so a pass that finds this set is resuming after one
@@ -646,6 +669,10 @@ pub(super) struct RepoUsage {
     #[primary_key]
     pub(super) repo_id: i64,
     pub(super) pulls: u64,
+    /// How many pulls each of the most recent `usage::HISTORY_DAYS` UTC days holds, newest
+    /// first, as the chart draws them. Moved by the write that moves `pulls`, so the chart
+    /// is a point read rather than a pass over the window.
+    pub(super) days: Vec<(String, u64)>,
     /// Sorted, so a client already counted is a binary search rather than a scan. The LAN's
     /// clients bound it, not the log's rows, and `usage::CLIENT_CAP` bounds it absolutely at
     /// 4,096 addresses, past which the count is that cap rather than the true one.

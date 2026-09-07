@@ -90,26 +90,24 @@ pub fn start_eviction(state: &AppState) -> Option<hoard_mirror::cache::EvictionH
 /// Every data root is excluded whole rather than by the subdirectories in use, so the
 /// catalog, the block cache and the profile symlinks a projection writes are all Hoard's own
 /// writes and none of them asks for a rescan of a source they happen to sit under.
-pub fn start_watcher(state: &AppState) {
+///
+/// Registering the watches walks every directory of every source, which on a disk of a
+/// million files is a filesystem pass, so it runs on a blocking thread rather than holding
+/// the reactor before the listener is served.
+pub async fn start_watcher(state: &AppState) {
     let config = state.config();
     if !config.index.watch || config.index.sources.is_empty() {
         return;
     }
-    let options = hoard_index::watch::WatchOptions {
-        debounce: hoard_index::watch::DEFAULT_DEBOUNCE,
-        excluded: vec![
-            config.server.data_dir.clone(),
-            config.index.data_dir.clone(),
-            config.cache_root(),
-        ],
-        reconcile_every: config.index.reconcile_every(),
-    };
-    match hoard_index::watch::Watcher::start(
-        std::sync::Arc::clone(state.coordinator()),
-        &config.index,
-        options,
-    ) {
-        Ok(watcher) => {
+    let options = watch_options(config);
+    let index = config.index.clone();
+    let coordinator = std::sync::Arc::clone(state.coordinator());
+    let started = tokio::task::spawn_blocking(move || {
+        hoard_index::watch::Watcher::start(coordinator, &index, options)
+    })
+    .await;
+    match started {
+        Ok(Ok(watcher)) => {
             let status = watcher.status();
             tracing::info!(
                 watching = status.watching.len(),
@@ -119,10 +117,34 @@ pub fn start_watcher(state: &AppState) {
             );
             state.hold_watcher(watcher);
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             tracing::warn!(%error, "no source can be watched; manual scans still index them");
             state.watch_unavailable();
         }
+        Err(error) => {
+            tracing::warn!(%error, "the watcher could not be started; manual scans still index them");
+            state.watch_unavailable();
+        }
+    }
+}
+
+/// What the watcher watches with: every root Hoard writes to itself, excluded whole.
+///
+/// A projection root is one of them. `hoard link` writes the profile's symlinks there, and a
+/// projection under a watched source would otherwise submit a scan of that source on every
+/// link.
+fn watch_options(config: &HoardConfig) -> hoard_index::watch::WatchOptions {
+    hoard_index::watch::WatchOptions {
+        debounce: hoard_index::watch::DEFAULT_DEBOUNCE,
+        excluded: [
+            config.server.data_dir.clone(),
+            config.index.data_dir.clone(),
+            config.cache_root(),
+        ]
+        .into_iter()
+        .chain(config.server.projection_roots.iter().cloned())
+        .collect(),
+        reconcile_every: config.index.reconcile_every(),
     }
 }
 
@@ -245,7 +267,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{HeaderValue, Method, Request, StatusCode, header};
     use hoard_core::{CommitSha, RepoId, RepoType, State};
-    use hoard_index::catalog::{JobState, PullMark};
+    use hoard_index::catalog::{Dedupe, JobState, PullMark};
     use tower::ServiceExt;
 
     use super::*;
@@ -263,6 +285,31 @@ mod tests {
             .oneshot(request)
             .await
             .expect("the assembled application answers")
+    }
+
+    #[test]
+    fn every_root_hoard_writes_to_itself_is_excluded_from_the_watch() {
+        let mut config = HoardConfig::default();
+        config.server.data_dir = std::path::PathBuf::from("/srv/hoard");
+        config.index.data_dir = std::path::PathBuf::from("/srv/hoard/index");
+        config.server.projection_roots = vec![
+            std::path::PathBuf::from("/models/comfy"),
+            std::path::PathBuf::from("/models/webui"),
+        ];
+        let excluded = watch_options(&config).excluded;
+        for root in [
+            config.server.data_dir.clone(),
+            config.index.data_dir.clone(),
+            config.cache_root(),
+            std::path::PathBuf::from("/models/comfy"),
+            std::path::PathBuf::from("/models/webui"),
+        ] {
+            assert!(
+                excluded.contains(&root),
+                "{} is written by this node and must not feed the watch: {excluded:?}",
+                root.display()
+            );
+        }
     }
 
     #[tokio::test]
@@ -374,7 +421,7 @@ mod tests {
 
         assert_eq!(sweep_stale_pulls(&state).await, 1);
         let settled = catalog
-            .revision_entries(slot.repo, slot.revision)
+            .revision_entries(slot.repo, slot.revision, Dedupe::Ignore)
             .expect("the entry reads back")
             .into_iter()
             .next()

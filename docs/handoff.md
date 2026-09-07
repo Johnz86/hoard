@@ -25,19 +25,20 @@ first; this document assumes it.
 - Phases 0 to 11 are done. `docs/feature-plan.md` holds the table. The TREE and DISK views
   are not an unfinished phase: they wait on a design decision and are recorded under that
   document's "Risks and open decisions".
-- At the head of `master` after the measurement wave all four checks pass:
-  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 862 passed,
-  0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness
-  and its supplemental fixture, the mDNS test that needs a multicast route and the sniffer
-  test that reads the local model caches. `cargo doc --workspace --no-deps` emits no warning,
-  and `cargo test --release -p hoard-server --lib assets::` passes 5.
-- Waves 1 to 8 of the goal are on `master` and the run is measured. The measurement is in
+- At the head of `master` after the fix wave all four checks pass: `cargo fmt --check`,
+  clippy with `-D warnings`, `cargo test --workspace` at 878 passed, 0 failed, 4 ignored, and
+  `cargo build --workspace`. The four ignored are the scale harness and its supplemental
+  fixture, the mDNS test that needs a multicast route and the sniffer test that reads the
+  local model caches. `cargo doc --workspace --no-deps` emits no warning, and
+  `cargo test --release -p hoard-server --lib assets::` passes 5.
+- Waves 1 to 9 of the goal are on `master` and the run is measured. The measurement is in
   `docs/native-catalog.md` under "Measured": the whole scale harness at 100k and 1M against
   a `3a9fa1f` column rebuilt and run in the same session over the same tree, the eleven
   routes at 100k in both columns, the supplemental fixture in both, and a fresh scan of this
   workstation's three sources with `doctor` and `doctor --repair` after it. Every standing
-  gate at 1M is met; the one miss is on three of the eleven routes and is recorded there and
-  under "Follow-ups".
+  gate at 1M is met. Wave 8's three route misses are settled under "The fix wave's rows":
+  two of them were the timing protocol rather than the code, and all three read faster at the
+  head than at the `3a9fa1f` column beside them.
 
 ## Running the loop
 
@@ -103,33 +104,12 @@ plan and hands it to the same loop.
 
 ## Follow-ups
 
-Performance, with the numbers from `docs/native-catalog.md`:
+Every measured number and the narrative that explains it lives in `docs/native-catalog.md`
+under "Measured": the disk gate and where the bytes are, a page anywhere in the order, the
+tallying pass, the collapse path, the routes at 100k, the fix wave's rows and the thresholds
+table that answers each gate once. What is left here is what is deliberately not code, and
+what wave 9 looked at and left.
 
-- **The 1M disk gate is met by 102.8 MB, measured at the head.** Allocated disk after the
-  rebuild is 1,397,235,712 bytes against 1,500,000,000; after the incremental workload
-  1,400,991,744; and at the peak of a rebuild that replaces a published index, which holds
-  two search directories while it runs, 1,461,485,568, inside the gate by 38.5 MB. That
-  transient is still the number to watch. The next levers, in order of measured size, are
-  intra-page slack (608,456,492 bytes, 45.4 per cent of the redb file, which `compact` does
-  not reclaim and only a dense rewrite would, and which the page-packing research says is
-  not worth doing) and the `ArtifactDetail` summary itself (497.00 MiB of pages, 38.9 per
-  cent of the file). The per-table breakdown in `docs/native-catalog.md` is current.
-- **The disk wave took the three record levers and closed the fourth.** A revision's card is
-  one `RevisionText` row keyed by `(repo_id, revision)` rather than a copy in every
-  artifact's `SearchText`; every record but `Manifest` is on the compact codec, `Manifest`
-  alone keeping native_model's default so a format mismatch is found before any compact row
-  is decoded; and `ArtifactDetail` keeps the sixteen tensor samples the triage queue reads a
-  hidden dimension from rather than the sixty-four the sniff draws for inference.
-  That wave bumped `FORMAT_VERSION`, so every existing catalog is rebuilt from disk. It is
-  measured now, and the four rows it was to be read on split cleanly. On the gate fixture,
-  which has no card, one revision per repository and one tensor per file, it is worth one
-  byte a row: allocated disk at 1M fell 1,925,120 bytes and the rebuild did not move. On the
-  supplemental fixture, which has all three, `SearchText` fell to 32.1 per cent of what it
-  stored, 600 `RevisionText` rows replaced 27,300 copies of a card, and the whole directory
-  fell 12.3 per cent. The inspector detail row's spread is wider than any difference between
-  the columns. On this workstation's own disks `catalog.redb` fell from 6.3 to 4.2 MB while
-  the search directory grew from 572 KB to 1.3 MB, because every cached revision now has a
-  card to index.
 - **Page packing is answered and not worth doing.**
   `docs/superpowers/research/2026-09-page-packing.md` reads redb 2.6.3: the 42 to 55 per cent
   leaf fill comes from one split rule that always cuts at the byte midpoint and has no append
@@ -137,83 +117,30 @@ Performance, with the numbers from `docs/native-catalog.md`:
   fill, `Database::compact` moves whole pages and never rebuilds a leaf, and
   `Builder::set_page_size` is compiled only under `cfg(any(fuzzing, test))`. The reachable
   saving is 0 to 5 per cent; the lever that works is payload, at about two bytes of file per
-  byte off a row. The measurement bears it out: slack at 1M is 608,456,492 bytes at the head
-  against 608,374,746 at `3a9fa1f`, the same 45.4 per cent of the file after seven waves.
-- **A page anywhere in the order costs a page.** A window of at most 16,384 rows for a text
-  key, or 131,072 for a numeric one, keeps the heap it always kept; a deeper one is found by
-  rank, in three passes that sample the order, count the documents between consecutive
-  samples and read only the bucket the rank falls in plus a page beyond it. Both constants
-  are measured, in the crossover table under "Thresholds" in `docs/native-catalog.md`. At 1M
-  the middle page of the default order is 184.5 ms against 1.508 s and holds 13.62 MiB above
-  its own page against 58.56 MiB; the same page after a refresh, over four segments, is
-  189.6 ms against 1.544 s. Two rows this wave did not put on a new path, `role:lora` and the
-  filtered query, are 4.7 and 7.4 ms slower at 1M and outside their own spread; they are back
-  on their before numbers at 100k, so it does not scale. Codegen around the collector's inner
-  loop is the hypothesis for what is left, and profiling has not established it.
-- **A tallying pass now costs about what a counting pass costs.** Each facet dimension is a
-  vector indexed by term ordinal per segment rather than a `HashMap` keyed by
-  `(segment, dimension, ordinal)` per document, and every collector reads its columns once
-  per block of up to 64 documents through `first_vals` rather than once per document. At 1M
-  the first page of the default order is 21.1 ms against 120.3 ms, the deep page 21.4 against
-  120.8, `role:lora` with its rail 24.2 against 146.2, the filtered query 38.3 against 234.6,
-  the middle page 72.0 against 184.5 and `node:self` 120.6 against 338.6. Of the 9.8 ms the
-  first page lost at 100k, the vectors took 8.6 ms and the block reads 1.2.
-- **A block read has to survive deletes to be worth anything.** tantivy's
-  `default_collect_segment_impl` drops to one `collect` per document as soon as a segment
-  carries a delete file, which every segment a refresh has touched does, so hoard's
-  collectors override `Collector::collect_segment` and filter each block through the alive
-  bitset themselves. Before that override the midpoint after a refresh sat 24.2 ms above the
-  plain midpoint at 1M against 4.6 ms before the wave; with it, 4.7 ms. A new collector in
-  this file must override `collect_segment` the same way or it silently falls back.
-- **The collapse path is what wave 4 bought, and the number is in.** `node:self` at 1M is
-  50.887 ms against 198.184 ms at `3a9fa1f`, 74.3 per cent, against a spread of 1.9 ms in the
-  before column and 0.2 ms in the after one; on the route list the same query is 11.70 ms
-  against 22.20 ms. Its two pages that no column before this one could report cost 107.071 ms
-  in the middle of the order and 74.765 ms at the far end, and the resident memory over the
-  two of them is zero, so the whole collapse path is now bounded and 4.7 times inside the
-  gate at its worst. The primary pages did not move for the pass count: the first page, the
-  midpoints, `role:lora` and the filtered query are 0.6 to 1.4 ms slower at 1M, 1.5 to 3.6
-  per cent, consistent across both runs of both columns and unexplained, and within 0.15 ms
-  at 100k.
-- **Two things wave 4 traded, both recorded in `docs/native-catalog.md` under "Remaining
-  work".** A shallow window is no longer cut from the far end, because the pass that counts
-  it is the pass that keeps it, so a page just inside the shallow bound and past the middle
-  of a small result holds `offset + limit` rows rather than `total - offset`; it is bounded
-  by the shallow constant and the fix is named there; measured, the last page of a million
-  costs 38.807 ms against 21.337 ms and the last page of 100,000 costs 4.684 against
-  2.958 ms, because the total is now learned from a sampling pass that reads the sort column
-  where a `Count` that read no column learned it before. And the index writer now sends one
-  operation group per artifact rather than per document, which is what makes an artifact's
-  documents one run in one segment, so tantivy's 10,000-item pipeline now buffers 10,000
-  artifacts' documents rather than 10,000 documents; the synthetic tree cannot show it, and
-  the rebuild RSS row it did produce, 329 MiB either side, is that tree's and not a
-  catalog's with cards.
-- **A revision the walk no longer finds keeps its slot forever.** An entry names its
-  revision by ordinal, so the slot is an identity and cannot be reclaimed while any entry
-  names it. A repository whose branch moves on every scan grows one stored revision per old
-  head, each carrying its title, author and commit but no refs. Reclaiming a slot needs the
-  entries of a retired revision removed rather than marked absent, which is the same decision
-  as pruning a deleted path's row; neither is taken.
-- **The usage route is bounded now and costs more on a small log.** Wave 5b replaced one
-  read of the repository's whole log with a scan of the seven-day window by the `repo_at`
-  key, a second scan for the newest pulls and a point read of the repository's own
-  `RepoUsage` row for the client count. On a 2,000-pull log where every pull is inside the
-  window that is 2.32 ms against 1.50 ms, because the new path reads what the old one read
-  and pays for two scans and a lookup instead of one. What it buys is the asymptote the old
-  route did not have.
-- **Three of the eleven routes are slower than the column measured beside them, and two have
-  no established mechanism.** `GET /api/models/org0/repo000` is 4.55 ms against 2.79 and
-  `GET /api/v1/search?q=` is 5.58 against 3.71, both outside the spread of their own six
-  runs, with byte-identical responses, an unchanged handler and, for the search route, an
-  unchanged catalog query time at 100k. The third is the usage route above, which is
-  explained. This is the one miss of the finish condition's line 5 and it is a fix wave's to
-  find, at 1.8 and 1.9 ms on routes that answer in single-digit milliseconds.
-- **An orderly shutdown joins the reconcile scan the watcher starts.** On this workstation,
-  serving a catalog scanned with `--hash never` under `hash_policy = "background"`, SIGTERM
-  was answered in about 4.5 minutes: the watcher reconciles once at startup, that scan ran
-  the hashing pass the scan had skipped, and shutdown waits for the lane. The next run, with
-  the hashes stored, exits in 15 ms. Nothing is lost either way, but a shutdown that waits on
-  a hash pass of 445 files gives the caller no sign of how long it will be.
+  byte off a row. Whether to act on it is the owner's call, and the recommendation is not to.
+- **The five 1M query rows that were 1.5 to 3.6 per cent slower are back, unexplained.** The
+  first page, the two midpoints, `role:lora` and the filtered query read within 1 per cent of
+  the `3a9fa1f` column at the head, inside the spread of two runs of the same binary. The
+  hypothesis for the gap was codegen around the collectors' inner loop - wave 4 gave every
+  primary collector a per-document `Collapsing::offer` that did not exist before - and it was
+  never tested: monomorphising the four collectors over a `const COLLAPSING: bool` would
+  duplicate every call site and the rows no longer ask for it. If they slow again, that is
+  the first thing to try.
+- **A revision slot is emptied but never reclaimed.** A revision no ref reaches and no entry
+  names is written back as a tombstone and its card is dropped, so an advancing branch costs
+  one empty slot per old head rather than a card and a commit per head. Reclaiming the slot
+  itself needs the entries of a retired revision removed rather than marked absent, which is
+  the same decision as pruning a deleted path's row; neither is taken.
+- **A path outside UTF-8 is identified but not stored.** The identity a scan computes is
+  byte-exact, but `Repository.root_path` and `Entry.placed` hold `to_string_lossy` text, the
+  walker drops a relative path that is not UTF-8, and `SourceConfig` cannot serialise a root
+  that is not. Storing the bytes is the remaining half, and it is a record shape change.
+- **A read-only open** is waiting on redb offering one, so searches could run beside a
+  rebuild rather than beside a lock.
+- The narrower items each carry their own paragraph in `docs/native-catalog.md` under
+  "Remaining work": the tally's slot per term of a column, the sampled path's fallback
+  recollecting, `sweep_artifact` decompressing a cold row to delete it, and
+  `native_model::Model::native_model_decode` unwrapping a payload shorter than its header.
 
 Decisions taken on 2026-09-06, by the project owner:
 
@@ -282,9 +209,9 @@ Decisions taken on 2026-09-06, by the project owner:
 - **Phase 1 stays complete and Phase 11 is done.** Phase 1's SQLite implementation is
   history, not an unfinished phase. Phase 10 is done as of wave 3, now that the watcher
   starts, reconciles and shuts down through `serve`; TREE and DISK need a design decision
-  before either can be implemented and are a risk rather than a phase. Phase 11's storage replacement is complete; the optimisation
-  that continues is a list of follow-ups with their own acceptance criteria under `### Phase
-  11`. **Done in this wave.**
+  before either can be implemented and are a risk rather than a phase. Phase 11's storage
+  replacement is complete; the optimisation that continues is a list of follow-ups with
+  their own acceptance criteria under `### Phase 11`. **Done in this wave.**
 - **How should the base facet be counted?** Taken by default in wave 4: the rail is
   truncated to the 32 most populous bases by tally before the per-bucket count runs, so the
   searches a query pays for the rail are bounded by a constant rather than by how many bases
@@ -295,6 +222,19 @@ Decisions taken on 2026-09-06, by the project owner:
   still not an implementer's call. **Taken in wave 4.**
 
 Smaller things, each verified:
+
+- A shutdown costs a megabyte, not a pass. The scan lane raises one stop when it closes: a
+  walk checks it between units, a hashing pass before each batch and once per megabyte of
+  every file it reads, and requests that had not started are cancelled. Both passes leave the
+  pass mark set and retire nothing, so the next start settles the counts and finishes the
+  hashing. On this workstation, SIGTERM during the startup reconciliation's hashing is
+  answered in 0.040 s where it took about 4.5 minutes.
+- A file listing reads the artifact behind each file only for the screen that renders the
+  `deduped` mark. The Hub metadata routes, the projection, the peer digest and the cache
+  sweep asked for a mark they threw away, at one random point read per file.
+- The triage threshold a catalog was scanned with is stored in its manifest and every later
+  writer counts against it, so `hoard doctor` no longer fails a healthy catalog scanned with
+  a non-default threshold.
 
 - The hourly cache eviction sweep walks the mirror in chunks. `hoard-mirror`'s
   `cache/reconcile.rs` calls `Catalog::served_cache_entries_in`, which reads the mirror's
@@ -317,12 +257,13 @@ Smaller things, each verified:
   so every document of a cached revision was `Unknown` and its inference context was empty;
   no hf-cache revision had ever had a card. `sniff::sniff_named(path, name)` reads the header
   from the blob and classifies by the entry's own relative path, and `sniff_path` is that
-  function with the path's own name. `FORMAT_VERSION` is 6, because a blob's inode, mtime and
-  size do not change when the rule that reads it does and a rescan would settle every stored
-  revision on its stamps; the bump rebuilds every existing catalog from disk, which is what
-  puts the cards into one. Wave 8's workstation scan therefore reads and indexes the READMEs
-  and configs of every cached revision: its scan time, its card count and its search answers
-  all move, and nothing in the synthetic tree does, because the tree has no hf-cache source.
+  function with the path's own name. That wave bumped `FORMAT_VERSION`, because a blob's
+  inode, mtime and size do not change when the rule that reads it does and a rescan would
+  settle every stored revision on its stamps; the bump rebuilds every existing catalog from
+  disk, which is what puts the cards into one. It is 7 now, moved once more by wave 9. Wave
+  8's workstation scan therefore reads and indexes the READMEs and configs of every cached
+  revision: its scan time, its card count and its search answers all move, and nothing in the
+  synthetic tree does, because the tree has no hf-cache source.
 - `sniff::SNIFF_VERSION` and `Artifact::sniff_version` are gone. The constant was written
   into every artifact record by two sites and read by nothing, and its doc comment promised a
   re-read of every header that no code performed. A per-artifact stamp could not have

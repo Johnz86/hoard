@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use futures::TryStreamExt;
 
 use hoard_core::{ArtifactId, CommitSha, RepoId, RepoRowId, Sha256};
-use hoard_index::catalog::Catalog;
+use hoard_index::catalog::{Catalog, Dedupe};
 use hoard_mirror::MirrorError;
 use hoard_mirror::git::LfsLocation;
 use hoard_mirror::resolve::{FileAnswer, FileRequest, IngestTrigger, read_range, served_response};
@@ -354,7 +354,7 @@ async fn attribute(
         };
         let artifact = match catalog.resolve_revision(&record, &commit) {
             Some(revision) => catalog
-                .revision_entries(record.id, revision.ordinal)?
+                .revision_entries(record.id, revision.ordinal, Dedupe::Ignore)?
                 .into_iter()
                 .find(|entry| entry.rel_path == path)
                 .and_then(|entry| entry.artifact_id),

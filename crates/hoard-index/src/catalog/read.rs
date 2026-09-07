@@ -10,7 +10,7 @@ use hoard_core::{
     TensorSummary,
 };
 
-use crate::config::{IndexConfig, SourceKind};
+use crate::config::SourceKind;
 use crate::discover::RefKind;
 use crate::error::{IndexError, Result};
 use crate::row::SearchRow;
@@ -45,10 +45,21 @@ pub struct EntryDetail {
     pub is_symlink: bool,
     pub lfs_pointer: bool,
     pub artifact_id: Option<ArtifactId>,
+    /// Whether another path holds the same bytes. Resolving it reads the artifact record
+    /// behind the file, so a listing that was not asked for it reads `false`.
     pub deduped: bool,
     pub sha256: Option<Sha256>,
     pub git_sha1: Option<CommitSha>,
     pub pull_progress: Option<f32>,
+}
+
+/// Whether a listing of files resolves each one's [`EntryDetail::deduped`] mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dedupe {
+    /// Read the artifact record behind each file, for a screen that renders the mark.
+    Resolve,
+    /// Leave the mark unset, for a caller that reads the paths and throws the mark away.
+    Ignore,
 }
 
 /// What only the inspector reads: the header the sniffer measured, the evidence behind the
@@ -433,18 +444,28 @@ impl Catalog {
     }
 
     /// Every file one revision of a repository holds.
-    pub fn revision_entries(&self, repo: RepoRowId, revision: u32) -> Result<Vec<EntryDetail>> {
+    ///
+    /// `dedupe` says whether each file's [`EntryDetail::deduped`] mark is resolved, which
+    /// costs the artifact record behind every file. Only the screen that renders the mark
+    /// asks for it; a listing of a thousand-file revision that does not is a thousand
+    /// random reads cheaper.
+    pub fn revision_entries(
+        &self,
+        repo: RepoRowId,
+        revision: u32,
+        dedupe: Dedupe,
+    ) -> Result<Vec<EntryDetail>> {
         let snapshot = self.database.r_transaction()?;
         let names = self.node_names(&snapshot)?;
         let mut reader = Reader::new(&snapshot, &names);
         let entries = reader.entries_of_revision(repo.get(), revision)?;
         let mut details = Vec::with_capacity(entries.len());
         for entry in &entries {
-            let deduped = match entry.artifact_id {
-                Some(id) => reader
+            let deduped = match (dedupe, entry.artifact_id) {
+                (Dedupe::Resolve, Some(id)) => reader
                     .record(id)?
                     .is_some_and(|record| record.path_count > 1),
-                None => false,
+                (Dedupe::Resolve, None) | (Dedupe::Ignore, _) => false,
             };
             details.push(reader.detail(entry, deduped)?);
         }
@@ -500,8 +521,8 @@ impl Catalog {
 
     /// Every artifact still waiting for a verdict, most recently numbered last.
     ///
-    /// The confidence a queued artifact is measured against is [`IndexConfig::default`]'s;
-    /// the manifest does not yet carry the threshold the scan actually ran with.
+    /// A queued artifact is measured against the triage threshold the manifest carries,
+    /// which is the one the scan that filed it ran with.
     ///
     /// The queue is a `state:triage` page of the search index in artifact id order, so a
     /// catalog holding a million settled artifacts pays for the page rather than for every
@@ -509,7 +530,7 @@ impl Catalog {
     /// still measured against its record before it is kept. A catalog with no search
     /// directory answers the same rows from the records themselves rather than erroring.
     pub fn triage_queue(&self, limit: u32) -> Result<Vec<TriageItem>> {
-        let threshold = IndexConfig::default().triage_confidence;
+        let threshold = self.stored_triage()?;
         if !self.status()?.search_built {
             return self.triage_queue_by_record(limit, threshold);
         }
@@ -652,6 +673,7 @@ fn repository_detail(
         .revisions
         .iter()
         .enumerate()
+        .filter(|(_, revision)| !revision.retired)
         .map(|(ordinal, revision)| RevisionDetail {
             ordinal: ordinal as u32,
             name: revision.name.clone(),

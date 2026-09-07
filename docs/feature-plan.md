@@ -367,8 +367,8 @@ store that already works, not the remainder of the phase.
 
 - Bounded collapse. Accept: every query that takes the collapse path answers under 500 ms at
   1M with memory bounded by the page and the sample, as the primary path already is.
-  Implemented in wave 4, which folds each artifact's run of entry documents inside the
-  segment collectors; the acceptance is the final measurement's job in wave 8.
+  **Done:** wave 4 folds each artifact's run of entry documents inside the segment
+  collectors, and wave 8 measured the worst collapse query at 107 ms at 1M.
 - Power-loss and process-kill recovery tests. Accept: a catalog killed mid-scan reopens and
   rescans to the same counts a clean run gives. **Done:** wave 6 interrupts the scan, the
   hash pass, the refresh and the rebuild from the progress callback each already takes, and
@@ -377,8 +377,11 @@ store that already works, not the remainder of the phase.
   handed out twice after a kill, derived counts left behind by one, a log row the cursor had
   passed that no refresh dropped, and the directory a killed rebuild left.
 - Byte-exact path identities, so an identity is the path's bytes rather than its lossy string.
-- Revision ordinals stored rather than recomputed on every rescan.
+  **Half done:** wave 5a hashes the path's bytes for the identity a walk recognises a row by;
+  the row still stores the lossy string, so a path that is not UTF-8 is stored as it renders.
+- Revision ordinals stored rather than recomputed on every rescan. **Done in wave 5a.**
 - Counting a revision's artifact units without counting content another revision claimed.
+  **Done in wave 5a.**
 - Complete repository git metadata with identities that are stable across scans. **Done:**
   wave 5a keeps revision ordinals, unit names and path identities stable across rescans, and
   wave 5b records the remote URL a clone came from, which was the one fact discovery read

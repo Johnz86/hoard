@@ -2073,7 +2073,7 @@ async fn healthz_reports_the_watch_state() {
     }];
     let catalog = crate::testing::empty_catalog(dir.path(), "test");
     let state = AppState::new(config, catalog).expect("state builds");
-    crate::start_watcher(&state);
+    crate::start_watcher(&state).await;
 
     let watching = get(&state, "/healthz").await;
     assert_eq!(

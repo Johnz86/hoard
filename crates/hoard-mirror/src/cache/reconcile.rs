@@ -75,6 +75,7 @@ fn scope_layouts(layout: &CacheLayout) -> Vec<CacheLayout> {
 
 #[cfg(test)]
 mod tests {
+    use hoard_index::catalog::Dedupe;
     use std::path::Path;
     use std::time::Duration;
 
@@ -157,7 +158,7 @@ mod tests {
             .expect("the seed filed a repository");
         let revision = record.revisions.first().expect("the seed filed a revision");
         catalog
-            .revision_entries(record.id, revision.ordinal)
+            .revision_entries(record.id, revision.ordinal, Dedupe::Ignore)
             .expect("entries read")
     }
 
@@ -221,9 +222,11 @@ mod tests {
         }
 
         let mut visits: Vec<usize> = Vec::new();
+        let mut visited: Vec<String> = Vec::new();
         catalog
             .served_cache_entries_in(100, |rows| {
                 visits.push(rows.len());
+                visited.extend(rows.into_iter().map(|row| row.rel_path));
                 Ok(())
             })
             .expect("the mirror walks");
@@ -231,6 +234,13 @@ mod tests {
             visits,
             vec![100, 100, 50],
             "250 served rows arrive in chunks of at most 100"
+        );
+        visited.sort_unstable();
+        visited.dedup();
+        assert_eq!(
+            visited.len(),
+            250,
+            "every served path is visited exactly once across the chunks"
         );
 
         let retired = reconcile_index(&catalog, &layout, &test_refresher(&catalog))

@@ -115,8 +115,8 @@ short. The server logs the window at `debug`; nothing in the response names it.
 - `GET /api/v1/repos/{type}/{org}/{name}/usage`: `{ "days": [ { "date", "pulls" } ],
   "pulls": [ { "when", "at", "who", "what", "bytes", "rate_bps" } ], "clients": 3,
   "total": 41 }`. `when` is the relative spelling the design prints, `at` the instant
-  behind it. `days` is the seven day window, read as one range of the repository's log
-  rather than a pass over it; `clients` is the distinct clients over the whole history, as
+  behind it. `days` is the seven day window, read off the repository's own record,
+  which every usage write moves, rather than from its log; `clients` is the distinct clients over the whole history, as
   the repository's own record has counted them, exact up to a cap of 4,096 addresses and
   reported as that cap beyond it; `pulls` is the newest twenty rows, newest first. A client
   is the first `x-forwarded-for` or `x-real-ip` value that parses as an IP address,
@@ -161,7 +161,9 @@ no `dir` at all and always uses the configured root.
   configuration names it; `managed_by` says who writes it instead, one of `"downloads"`,
   `"pulls"`, `"peer"` or `"nobody"`, and is absent when `can_scan` is true. `"nobody"` is a
   source the catalog still holds that the configuration no longer names, which is what a
-  dropped or renamed `[[index.sources]]` leaves behind: nothing removes a `Source` row. A
+  dropped or renamed `[[index.sources]]` leaves behind. It lasts until the next
+  whole-configuration rescan, which deletes the source, its repositories, its entries and
+  the history it served. A
   client offers the scan action on `can_scan` alone and never on a name it recognises.
 - `POST /api/v1/scan { "source" | null, "hash": "now" | "later" | "never" }` returns
   `{ "job_id" }`. `"background"` is accepted as an alias for `"later"`; omitting `hash`

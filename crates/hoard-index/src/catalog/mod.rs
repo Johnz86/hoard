@@ -34,7 +34,7 @@ use crate::row::DiskPressure;
 use self::models::{Manifest, Summary, define_models};
 
 pub use self::digest::{DigestApplied, DigestEntry, DigestPage, RemoteEntry};
-pub use self::hashing::{HashReport, content_key};
+pub use self::hashing::{HashReport, Stop, content_key};
 pub use self::ingest::{IngestRecord, MIRROR_SOURCE, ServedFile};
 pub use self::jobs::{JobProgress, JobRecord, JobState};
 pub use self::loadouts::LoadoutRecord;
@@ -42,8 +42,8 @@ pub use self::models::LOCAL_NODE;
 pub use self::nodes::{NodeRecord, PEER_SOURCE};
 pub use self::pulls::{PULL_SOURCE, PullMark, PullSlot, PulledFile};
 pub use self::read::{
-    ArtifactDetailView, EntryDetail, RefDetail, RepositoryDetail, RepositoryFilter, RepositoryPage,
-    RevisionDetail, SourceRecord, TriageItem,
+    ArtifactDetailView, Dedupe, EntryDetail, RefDetail, RepositoryDetail, RepositoryFilter,
+    RepositoryPage, RevisionDetail, SourceRecord, TriageItem,
 };
 pub use self::scan::{RescanReport, RescanScope};
 pub use self::search::{QueryPage, QueryRequest};
@@ -55,7 +55,7 @@ pub use self::verdict::OverrideRecord;
 
 /// The one shape this build reads and writes. A catalog whose manifest names another is
 /// rebuilt from disk rather than converted.
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
 /// One redb table's share of the catalog file: the rows it holds, the payload bytes those
 /// rows spend, the btree pages holding them, and the space inside those pages that holds
@@ -320,6 +320,11 @@ impl Catalog {
     pub fn totals(&self) -> Result<Totals> {
         let summary: Option<Summary> = self.database.r_transaction()?.get().primary(0_u8)?;
         Ok(summary.map_or_else(Totals::default, |summary| totals_of(&summary)))
+    }
+
+    /// The triage threshold this catalog was scanned with.
+    pub(super) fn stored_triage(&self) -> Result<f32> {
+        Ok(self.manifest()?.triage_confidence)
     }
 
     fn manifest(&self) -> Result<Manifest> {

@@ -4,7 +4,7 @@ use hoard_core::{
     Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, RepoId, Role, Sha256, State,
 };
 
-use crate::config::{IndexConfig, SourceConfig, SourceKind};
+use crate::config::{SourceConfig, SourceKind};
 use crate::error::{IndexError, Result};
 
 use super::Catalog;
@@ -119,8 +119,7 @@ impl Catalog {
         rows: &[RemoteEntry],
         pass: u64,
     ) -> Result<DigestApplied> {
-        let mut counters =
-            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
+        let mut counters = Counters::load(&self.database, self.stored_triage()?)?;
         let transaction = self.database.rw_transaction()?;
         let node: Node = transaction
             .get()
@@ -173,8 +172,7 @@ impl Catalog {
         let node = stored
             .ok_or_else(|| IndexError::Catalog(format!("node {peer} is not a known peer")))?;
         let source = format!("{PEER_SOURCE}{}", node.node_id);
-        let mut counters =
-            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
+        let mut counters = Counters::load(&self.database, self.stored_triage()?)?;
         let mut artifacts = Vec::new();
         let mut removed = 0;
         for repo_id in self.repositories_of_source(&source)? {
@@ -276,8 +274,7 @@ impl Catalog {
     /// Only a pull writes PULLING, so only the repositories filed under the pull source are
     /// read, in chunks of `CHUNK` rows per transaction.
     pub fn reset_stale_pulls(&self) -> Result<u64> {
-        let mut counters =
-            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
+        let mut counters = Counters::load(&self.database, self.stored_triage()?)?;
         let mut reset = 0;
         for repo_id in self.repositories_of_source(PULL_SOURCE)? {
             let pulling = self.entries_in_state(repo_id, State::Pulling)?;
@@ -455,6 +452,7 @@ impl Applying<'_, '_> {
             title: None,
             author: None,
             committed: None,
+            retired: false,
         });
         self.transaction.upsert(Repository {
             revisions,

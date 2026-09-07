@@ -1242,6 +1242,7 @@ async fn rewind(
 #[cfg(test)]
 mod tests {
     use hoard_core::{NodeId, RepoType};
+    use hoard_index::catalog::Dedupe;
     use hoard_index::catalog::EntryDetail;
     use hoard_index::search::{SortKey, SortSpec};
     use hoard_mirror::access::{AccessPolicy, AccessRule};
@@ -1346,7 +1347,7 @@ mod tests {
                 return Ok(None);
             };
             Ok(catalog
-                .revision_entries(repository.id, revision.ordinal)?
+                .revision_entries(repository.id, revision.ordinal, Dedupe::Ignore)?
                 .into_iter()
                 .find(|entry| entry.rel_path == wanted))
         })

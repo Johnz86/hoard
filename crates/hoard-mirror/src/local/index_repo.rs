@@ -11,7 +11,7 @@ use std::sync::Arc;
 use hoard_core::{ArtifactId, CommitSha, RepoId, RepoRowId, RepoType, Sha256, clean_repo_path};
 use hoard_index::IndexError;
 use hoard_index::catalog::{
-    Catalog, EntryDetail, RepositoryDetail, RepositoryFilter, RevisionDetail,
+    Catalog, Dedupe, EntryDetail, RepositoryDetail, RepositoryFilter, RevisionDetail,
 };
 use hoard_index::hash::git_blob_sha1_bytes;
 use hoard_index::sniff::parse_readme;
@@ -196,7 +196,7 @@ pub(crate) fn revision_files(
     revision: &RevisionDetail,
 ) -> Result<Vec<RevisionFile>> {
     let mut files: Vec<RevisionFile> = catalog
-        .revision_entries(repository.id, revision.ordinal)?
+        .revision_entries(repository.id, revision.ordinal, Dedupe::Ignore)?
         .into_iter()
         .filter(|entry| entry.present)
         .map(RevisionFile::of)

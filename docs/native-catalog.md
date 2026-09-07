@@ -92,7 +92,7 @@ the catalog at `<data_dir>/native`.
 - `codec.rs` the compact and cold record encodings, named by `#[native_model(with = ...)]`.
 - `models.rs` every `native_model` record: `Source`, `Repository`, `Revision`,
   `ArtifactRecord`, `ArtifactDetail`, `Entry`, `SearchText`, `RevisionText`, `SearchChange`,
-  `Manifest`, `Summary`, `Allocator`, `Node`, and the user-data rows.
+  `Manifest`, `Summary`, `Allocator`, `Node`, `Usage`, `RepoUsage`, and the user-data rows.
 - `scan.rs` discovery to sniff to infer to one transaction per unit; `Counters`,
   `DerivedShift`, `log_changes`, the artifact sweep.
 - `naming.rs` the config and card a revision carries, artifact names, per-file hashes.
@@ -169,7 +169,8 @@ the catalog at `<data_dir>/native`.
   unusable rather than exposing a partial catalog.
 - A rescan does not compact, so a catalog shared by the server can be walked again without
   an exclusive borrow. Only a fresh scan compacts, and `hoard catalog scan` compacts again
-  after it finishes; there is no compact subcommand.
+  after it finishes; `hoard catalog compact` is the on-demand path, and it needs the
+  exclusive borrow a running server holds.
 
 ## The write path
 
@@ -203,15 +204,39 @@ itself files an entry under, so the walk and the index agree on what one row is,
 one hash of a relative path where the absolute path cost one of a longer string.
 
 A location is an ordinal, so a revision the walk finds at a fresh slot matches nothing under
-that key though every file it holds is a file the catalog already read. `known_stamps`
-therefore builds a second index, from the repository and the relative path to the one
-location that holds it, and `refiled_of` consults it only for a revision the catalog holds no
-rows for at all: a stamp-equal hit is refiled onto the new ordinal through `Walk::moved`
-rather than read again. A path more than one stored revision holds is left out of that index,
-because which of them moved is not knowable from the path and taking the wrong one would
-empty the revision it is filed under; such a path is prepared and stored as a row of its own.
-The index holds a key rather than a row, so it costs 32 bytes a row against the 64 the rows
-themselves take.
+that key though every file it holds is a file the catalog already read. The walk therefore
+builds a second index, from the repository and the relative path to the one location that
+holds it, and `refiled_of` consults it only for a revision the catalog holds no rows for at
+all: a stamp-equal hit is refiled onto the new ordinal through `Walk::moved` rather than read
+again. A path more than one stored revision holds is left out of that index, because which of
+them moved is not knowable from the path and taking the wrong one would empty the revision it
+is filed under; such a path is prepared and stored as a row of its own. So is a path whose
+row sits on a revision this walk discovered: that revision is still on this disk, so nothing
+moved, which is what two hf-cache snapshots linking one blob look like.
+
+That index is built one repository at a time, as the walk reaches a revision the catalog
+holds no rows for, and not for every source before the walk starts: only a repository with a
+fresh slot pays for it and only one repository's worth is held. The map of stored rows
+itself is unavoidable and is 48 bytes a row.
+
+A pass that commits many times can also be asked to stop. `Catalog::rescan_until` checks a
+`Stop` before each source it discovers and between the units of the one it is inside, and
+`Catalog::hash_pending_until` checks it before the pass opens, before each batch and once per
+megabyte of every file it reads, so a shutdown costs a megabyte rather than an 80 GB
+checkpoint. What it cannot cut short is the discovery walk of the source it is already
+inside, so an exit costs a batch, a unit or one source's discovery, never a whole pass. Both
+passes leave the pass mark set and retire nothing: an interrupted walk never looked for the
+paths it did not reach, so it must not retract them, and the next pass settles the counts and
+finishes the hashing. A hashing pass is not started behind an interrupted walk at all, since
+opening a pass whose mark is held counts every artifact record before its first batch would
+break on the same stop. The scan lane raises that stop when it closes, finishes the job that
+was running with its phase set to `interrupted by shutdown; resumes on the next scan`, and
+cancels the requests that had not started.
+
+`Known`, the row that map holds, is 48 bytes: an entry id, an artifact id, a stamp, an
+ordinal and a shard count, with the two absent cases spelled as zero rather than as an
+`Option` discriminant, because ids come from the allocator and are positive and a set of no
+shards is not a set.
 
 **Every writer of an entry moves the derived counts.** A writer that skips `DerivedShift`
 leaves `Repository::present_files`, `Repository::present_bytes`, `Source::pending_hashes` and
@@ -227,11 +252,19 @@ fresh scan of a million artifacts no longer writes and then deletes a million ro
 The usage log carries a second discipline of the same shape. `log_usage` and
 `log_usage_batch` write each served response and, in the transaction that wrote it, move the
 `RepoUsage` record of every repository the write served: its pull count, its sorted client
-list and its last pull. The USAGE tab's client count is read from that record rather than
-counted from the log, and a `Usage` row carries a `repo_at` secondary key - the repository id
-in big-endian bytes followed by the row's RFC 3339 time - so the chart's window is one range
-scan of the days it draws and the recent pulls are the tail of that range read backwards. A
-writer of a usage row that skips the record leaves the client count behind.
+list, its last pull and how many pulls each of the last 31 UTC days holds. The USAGE tab's
+client count and its chart are both read from that record rather than counted from the log,
+so drawing the chart is one point read whatever the log holds; a window longer than the
+record keeps is counted from the log instead. A `Usage` row carries a `repo_at` secondary key
+- the repository id in big-endian bytes followed by the row's RFC 3339 time - so the recent
+pulls are the tail of one range read backwards. A writer of a usage row that skips the record
+leaves the client count and the chart behind.
+
+The triage threshold a scan ran with is stored in the manifest, and every writer that counts
+an artifact into the summary counts against the stored value rather than against its own
+configuration: `hoard doctor` on a catalog scanned at 0.5 recounts at 0.5. A rescan with a
+different configured value records it and counts the summary again; each artifact's own
+stored state is restated as that walk reaches it, not before.
 
 `refresh_search` replays the log after the durable cursor, one Tantivy commit per batch,
 deleting an artifact's documents by term and re-adding its entries, then prunes what it
@@ -609,18 +642,100 @@ Three routes are slower by more than the spread of their own runs.
   read and pays for two scans and a lookup instead of one scan. What it buys is the
   asymptote: the old route was O(rows of the repository) for a count it can now read.
 - `GET /api/models/org0/repo000`, 2.79 to 4.55 ms, lists 1,000 siblings. The handler is
-  byte-identical between the columns, the response body is byte-identical at 33,288 bytes,
-  and the added 1.76 ms is therefore below it, in what the catalog answers a repository and
-  its entries with. Which of waves 5a, 5b and 7 spent it is not established here.
+  byte-identical between the columns and the response body is byte-identical at 33,288 bytes.
+  **Not a regression:** wave 9 re-measured it paired and warm and the difference between the
+  two columns is +0.12 ms in one dataset and -1.19 ms in the other. See "The fix wave's
+  rows".
 - `GET /api/v1/search?q=`, 3.71 to 5.58 ms, is the default page of 100 rows. The response is
   byte-identical at 72,082 bytes and the same query through the harness at 100k costs the
-  same in both columns (2.72 against 2.65 ms), so the difference is in what the route does
-  around the query, not in the selection. It is not established either.
+  same in both columns (2.72 against 2.65 ms). **Not a regression either:** paired and warm
+  it reads +0.01 and -1.99 ms across two datasets, inside the round-to-round swing of the
+  control-normalised numbers. Both rows above were taken as three unwarmed runs per start
+  over two server starts, in a session of their own per column; that protocol carries about
+  a millisecond of drift, which is more than the difference it reported.
 
 The reading at `64e11af` is history from a tree built the same way but before the tally
 wave, and its query rows were 13.7, 41.6, 16.1 and 9.35 ms where this tree reads 3.7, 11.7,
 5.1 and 3.4; only the two slower rows above are within reach of it, at +1.17 ms for the
 model route and +0.93 ms for the usage route.
+
+### The fix wave's rows, commits `3a9fa1f`, `7a57762` and `2c866f5`
+
+Wave 9 re-measures the rows wave 8 could not accept, and only those: the deep offset at 1M,
+the three routes at 100k, the five 1M rows that were 1.5 to 3.6 per cent slower, and the
+workstation shutdown. Every column below was built, scanned, served and timed in this one
+session on this one machine over one tree, release, foreground, one process at a time, no
+`RUSTFLAGS`.
+
+**At 1M.** One run of `crates/hoard-index/tests/scale.rs` per column over the same tree, in
+the order `3a9fa1f`, `7a57762`, head, then the head again after its last commit. The two head
+runs bound the run-to-run spread at about 1 per cent.
+
+| row | `3a9fa1f` | `7a57762` | head, first run | head, final |
+| --- | --- | --- | --- | --- |
+| query empty by name | 21.082 ms | 21.333 ms | 21.230 ms | 21.046 ms |
+| query deep offset | 21.405 ms | 38.566 ms | 21.604 ms | 21.453 ms |
+| query midpoint offset | 71.842 ms | 73.008 ms | 72.923 ms | 71.800 ms |
+| query midpoint offset by size | 58.097 ms | 59.389 ms | 59.266 ms | 58.600 ms |
+| query role:lora with facets | 23.969 ms | 24.574 ms | 24.024 ms | 23.763 ms |
+| query filtered | 38.023 ms | 39.365 ms | 38.371 ms | 37.993 ms |
+| query node:self with facets | 152.699 ms | 50.605 ms | 50.650 ms | 50.149 ms |
+| query node:self deep offset | not measured | 74.674 ms | 53.712 ms | 53.107 ms |
+| peak rss growth during rescan and refresh | 58,093,568 | 286,826,496 | 60,870,656 | 58,257,408 |
+| scan wall | 75.657 s | 74.689 s | 76.349 s | 74.786 s |
+| rebuild wall | 7.676 s | 8.620 s | 7.189 s | 8.463 s |
+| allocated disk after the rebuild | 1,398,951,936 | 1,396,858,880 | 1,396,785,152 | 1,397,518,336 |
+
+The deep offset is the row wave 2 of this document's thresholds table missed: 38.566 ms at
+`7a57762` against 21.405 ms at `3a9fa1f` measured beside it, and 21.453 ms at the head. The
+count pass in front of a deep window restores it, and it takes the collapse path's far end
+with it, 74.674 to 53.107 ms. The five rows that were 1.5 to 3.6 per cent slower are inside
+1 per cent of the `3a9fa1f` column in the final run and inside the spread of the two head
+runs; no collector was monomorphised to get there. The rescan and refresh hold 226 MB less
+than `7a57762` did, which is the per-repository path index and the 48-byte `Known` row.
+
+**Routes at 100k.** The same tree, catalog and seeded usage log for each column, servers
+started one at a time under `timeout`, five warm-up rounds discarded, then ten timed rounds
+of each route per start, six starts per column, the columns interleaved so a drift in the
+machine hits all three. Two independent datasets of six rounds each were taken, the second
+after 600 GB had passed through the page cache.
+
+| route | `3a9fa1f` | `7a57762` | head | paired `7a57762` - `3a9fa1f` | paired head - `3a9fa1f` |
+| --- | --- | --- | --- | --- | --- |
+| `GET /api/models/org0/repo000` | 2.715 / 3.950 ms | 2.815 / 2.721 ms | 1.699 / 1.766 ms | +0.12 / -1.19 ms | -0.99 / -1.62 ms |
+| `GET /api/v1/search?q=` | 3.458 / 5.397 ms | 3.508 / 3.436 ms | 3.373 / 3.390 ms | +0.01 / -1.99 ms | -0.10 / -0.15 ms |
+| `GET /api/v1/repos/.../usage` | 1.523 / 2.047 ms | 1.733 / 1.672 ms | 1.039 / 1.042 ms | +0.19 / -0.41 ms | -0.45 / -0.82 ms |
+| `GET /healthz`, the control | 0.376 / 0.416 ms | 0.434 / 0.409 ms | 0.400 / 0.387 ms | +0.05 / +0.02 ms | 0.00 / -0.03 ms |
+
+The paired columns are the median over six rounds of the per-round difference, each round
+being one server start of each column in turn. **The two routes wave 8 could not attribute
+did not slow.** Between `3a9fa1f` and `7a57762` the model route reads +0.12 ms in one dataset
+and -1.19 ms in the other, and the default search page +0.01 and -1.99 ms; the per-round
+differences run from -2.2 to +2.1 ms in both directions while the `/healthz` control stays
+inside 0.05 ms. Wave 8's +1.76 and +1.87 ms were two unpaired sessions of three unwarmed runs
+each, which is a protocol whose own noise is larger than the effect it reported. Nothing in
+the delta had to be found, and no bisection was run: the hypothesis the closing review asked
+to test first, that the gap is page layout, needs a gap.
+
+Both routes are nevertheless faster at the head than at either earlier column, in every round
+of both datasets, and each has a mechanism: the model route no longer reads one artifact
+record per file to resolve a `deduped` mark the Hub routes throw away, about 1,000 random
+point reads per request; the usage route reads its chart off the repository's own record
+rather than decoding every row of the seven-day window.
+
+**The workstation shutdown.** The three configured sources of this workstation, 728 entries
+over 1.6 TB, scanned with `--hash never` into the scratchpad, then served under
+`hash_policy = "background"` with the watcher on, so the startup reconciliation runs the
+hashing pass the scan skipped. Measured at the head, with `discovery = "static"` and
+`offline = true` so nothing but the disk is in the number.
+
+| measure | at `7bb681f` | at the head |
+| --- | --- | --- |
+| SIGTERM to exit with a hashing pass in flight | about 4.5 minutes | 0.040 s |
+| SIGTERM to exit with nothing left to hash | 15 ms | 0.019 s |
+| what the interrupted pass left | not measured | 213 of 237 files still owing a hash |
+| the job row it settled with | not measured | done, phase `interrupted by shutdown; resumes on the next scan` |
+| the next start | not measured | hashed the remaining 213 files in 336 s, then `hoard doctor` reads `ok` on every check |
 
 ### The scale harness
 
@@ -1014,6 +1129,14 @@ first run of two, with the second beside it where the two differ.
 | every page of the default order under 500 ms | 21.524 first, 72.995 middle, 38.807 last, 76.693 after a refresh | met, by 423.3 ms |
 | no route of the eleven slower than the column beside it | the model route +1.76 ms, the default search page +1.87 ms, the usage route +0.82 ms | **missed** on three, two of them unexplained |
 
+Wave 9 answered that last row and the deep page beside it, over the same trees, at the head:
+
+| gate | measured at `2c866f5` | verdict |
+| --- | --- | --- |
+| the last page of the default order at 1M | 21.453 ms, against 21.405 ms at `3a9fa1f` and 38.566 ms at `7a57762` | met; the row wave 8 missed |
+| no route slower than the column beside it | paired and warm, the model route -0.99 ms, the search page -0.10 ms and the usage route -0.45 ms against `3a9fa1f`, with the `/healthz` control flat | met; the two unexplained rows were the protocol, not the code |
+| an orderly shutdown does not wait for a hashing pass | 0.040 s from SIGTERM to exit with the reconciliation's hashing in flight, against about 4.5 minutes | met |
+
 The disk gate's margin is the number to watch and it has not moved: the resting figure is
 102.8 MB inside it, and a rebuild that replaces a published index holds two search
 directories for as long as it runs and comes to 38.5 MB inside it. That transient is one
@@ -1184,11 +1307,15 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
   offset means paging there or forging a cursor. Accepted as the price of dropping the
   `Count` pass, which every query paid. The fix, if a measurement ever asks for it, is to run
   the `Count` only when the offset is above some fraction of the shallow bound, so the
-  common page keeps its one pass and the deep one buys its reversal. A measurement now asks:
-  at `7bb681f` the last page of a million costs 38.807 ms against 21.337 ms at `3a9fa1f`, and
-  at 100k 4.684 against 2.958 ms. The reversal still happens; what a deep page pays for now
-  is the sampling pass that learns the total, where a `Count` reading no column learned it
-  before.
+  common page keeps its one pass and the deep one buys its reversal. A measurement asked:
+  at `7bb681f` the last page of a million cost 38.807 ms against 21.337 ms at `3a9fa1f`, and
+  at 100k 4.684 against 2.958 ms. **Closed in wave 9**, and not by a fraction of the bound: a
+  window inside the shallow bound is still one heap pass, and a window outside it pays one
+  `Count` that reads no column and then decides. A window the count puts near the far end is
+  a reversed heap and costs two passes, the cost it had before; a window in the middle pays
+  the count, the sampling pass, the bucket pass and the window pass, four. The last page of a
+  million is 21.453 ms again, and a page past the end costs the count plus the pass that
+  tallies the facets rather than the sampling pass alone.
 - **The index writer's pipeline is bounded in artifacts, not documents.** `build_index` and
   `refresh_search` send one `IndexWriter::run` group per artifact, which is what puts an
   artifact's documents in one segment and lets the query path fold them as a run. tantivy's
@@ -1241,11 +1368,14 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
   byte-exact, but `Repository.root_path` and `Entry.placed` hold `to_string_lossy` text, the
   walker drops a relative path that is not UTF-8, and `SourceConfig` cannot serialise a root
   that is not, so such a path never reaches a row. Storing the bytes is the remaining half.
-- **A revision the walk no longer finds keeps its slot forever.** The slot is what makes an
-  entry's ordinal an identity, so it cannot be reclaimed while any entry names it; a
-  repository whose branch moves on every scan therefore grows one stored revision per head.
-  Reclaiming an empty slot needs the entries of a retired revision to be removed rather than
-  marked absent, which is the same decision as pruning a deleted path's row.
+- **A revision the walk no longer finds keeps its slot, and now nothing else.** The slot is
+  what makes an entry's ordinal an identity, so it cannot be reclaimed while any entry names
+  it. Wave 9 empties it instead: a revision no ref reaches and no entry names is written back
+  as a tombstone and its `RevisionText` card is dropped in the same transaction, so a
+  repository whose branch moves on every scan grows one empty slot per old head rather than a
+  card, a commit and a title per old head. Reclaiming the slot itself still needs the entries
+  of a retired revision to be removed rather than marked absent, which is the same decision
+  as pruning a deleted path's row, and is not taken.
 - **Add a read-only open** once redb offers one, so searches can run beside a rebuild.
 
 ## Dependency and serialization findings

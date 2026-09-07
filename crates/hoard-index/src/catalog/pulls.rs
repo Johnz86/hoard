@@ -4,7 +4,7 @@ use native_db::transaction::RwTransaction;
 
 use hoard_core::{ArtifactId, CommitSha, EntryId, GitSha1, RepoId, RepoRowId, Sha256, State};
 
-use crate::config::{IndexConfig, SourceConfig, SourceKind};
+use crate::config::{SourceConfig, SourceKind};
 use crate::error::{IndexError, Result};
 use crate::infer::Inference;
 use crate::sniff::SniffResult;
@@ -63,8 +63,7 @@ impl Catalog {
     /// The repository and revision a pull of `repo` at `revision` lands in, created under
     /// the pull source when absent.
     pub fn pull_slot(&self, repo: &RepoId, revision: CommitSha, root: &Path) -> Result<PullSlot> {
-        let mut counters =
-            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
+        let mut counters = Counters::load(&self.database, self.stored_triage()?)?;
         let transaction = self.database.rw_transaction()?;
         pull_source(&transaction, root)?;
         let repo_id = pull_repository(&transaction, &mut counters, repo, root)?;
@@ -81,8 +80,7 @@ impl Catalog {
     /// the bytes are landing. The hashes and the record the path already carries are left
     /// alone, because nothing has verified the new bytes yet.
     pub fn mark_pull(&self, mark: &PullMark<'_>) -> Result<EntryId> {
-        let mut counters =
-            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
+        let mut counters = Counters::load(&self.database, self.stored_triage()?)?;
         let transaction = self.database.rw_transaction()?;
         let previous = entry_of_slot(&transaction, mark.slot, mark.rel_path)?;
         let id = match &previous {
@@ -124,9 +122,8 @@ impl Catalog {
     /// Files a verified pull as a present entry with its hashes and a classified record,
     /// sharing the record of any copy the catalog already holds by content.
     pub fn file_pulled(&self, file: &PulledFile<'_>) -> Result<IngestRecord> {
-        let threshold = IndexConfig::default().triage_confidence;
-        let mut counters =
-            Counters::load(&self.database, IndexConfig::default().triage_confidence)?;
+        let threshold = self.stored_triage()?;
+        let mut counters = Counters::load(&self.database, threshold)?;
         let transaction = self.database.rw_transaction()?;
         let identity = content_key(&file.sha256);
         let (artifact_id, created) = filed_artifact(&transaction, &mut counters, file, identity)?;
@@ -352,6 +349,7 @@ fn pull_revision(
         title: None,
         author: None,
         committed: None,
+        retired: false,
     });
     transaction.upsert(Repository {
         revisions,

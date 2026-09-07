@@ -136,6 +136,7 @@ async fn hash_entry(entry: &mut CacheEntry, size: u64) -> Result<EntryHashes> {
 
 #[cfg(test)]
 mod tests {
+    use hoard_index::catalog::Dedupe;
     use std::sync::Arc;
 
     use hoard_core::{ArtifactFormat, RepoType, State};
@@ -172,7 +173,7 @@ mod tests {
         assert_eq!(record.revisions.len(), 1);
         assert_eq!(record.revisions[0].sha, Some(commit()));
         catalog
-            .revision_entries(record.id, record.revisions[0].ordinal)
+            .revision_entries(record.id, record.revisions[0].ordinal, Dedupe::Ignore)
             .expect("entries read")
     }
 

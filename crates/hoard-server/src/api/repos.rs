@@ -12,7 +12,7 @@ use hoard_core::{
 };
 use hoard_index::IndexError;
 use hoard_index::catalog::{
-    Catalog, EntryDetail, RepositoryDetail, RepositoryFilter, RevisionDetail,
+    Catalog, Dedupe, EntryDetail, RepositoryDetail, RepositoryFilter, RevisionDetail,
 };
 use hoard_index::catalog::{PullRow, UsageDay};
 use hoard_index::discover::RefKind;
@@ -296,7 +296,7 @@ fn describe(
     let revision = require_revision(catalog, &record, &header.wanted)?;
     let rows = catalog.repository_rows(record.id, REPO_ARTIFACTS)?;
     let primary = pick_primary(&rows);
-    let entries = catalog.revision_entries(record.id, revision.ordinal)?;
+    let entries = catalog.revision_entries(record.id, revision.ordinal, Dedupe::Ignore)?;
     let refs = ref_views(&record, &revision, now);
     let paths = match primary {
         Some(row) => entry_views(&catalog.entries_of(row.artifact_id)?, &header.host),
@@ -344,7 +344,7 @@ pub async fn files(
     let view = blocking(move || {
         let record = require_repository(&catalog, &repo)?;
         let revision = require_revision(&catalog, &record, &wanted)?;
-        let entries = catalog.revision_entries(record.id, revision.ordinal)?;
+        let entries = catalog.revision_entries(record.id, revision.ordinal, Dedupe::Resolve)?;
         let single = entries
             .iter()
             .filter(|entry| entry.artifact_id.is_some())
@@ -387,7 +387,7 @@ pub async fn readme(
     let (path, fallback) = blocking(move || {
         let record = require_repository(&catalog, &probe)?;
         let resolved = require_revision(&catalog, &record, &revision)?;
-        let entries = catalog.revision_entries(record.id, resolved.ordinal)?;
+        let entries = catalog.revision_entries(record.id, resolved.ordinal, Dedupe::Ignore)?;
         let path = entries
             .iter()
             .find(|entry| entry.rel_path.eq_ignore_ascii_case(README_PATH))
@@ -601,7 +601,7 @@ fn rows_in_revision(
     record: &RepositoryDetail,
     revision: u32,
 ) -> Result<Vec<SearchRow>, IndexError> {
-    let entries = catalog.revision_entries(record.id, revision)?;
+    let entries = catalog.revision_entries(record.id, revision, Dedupe::Ignore)?;
     let mut rows = catalog.repository_rows(record.id, REPO_ARTIFACTS)?;
     rows.retain(|row| {
         entries

@@ -199,12 +199,12 @@ impl AppState {
     }
 
     /// The one lane every scan under `serve` runs on: the scan route submits here rather
-    /// than spawning, and shutdown drains it.
+    /// than spawning, and shutdown stops it.
     pub fn coordinator(&self) -> &Arc<Coordinator> {
         &self.inner.coordinator
     }
 
-    /// Records the watcher this node started. [`crate::serve`] joins it before draining the
+    /// Records the watcher this node started. [`crate::serve`] joins it before stopping the
     /// lane it feeds, and `/healthz` reports what it watches until then.
     pub fn hold_watcher(&self, watcher: Watcher) {
         *self.inner.watch.lock() = Watch::Running(watcher);
