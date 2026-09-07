@@ -25,7 +25,7 @@ use super::models::{
 use super::scan::{Presence, identity, location_hash, preference};
 use super::search::{Cost, INDEX_FLUSH_BYTES, Paging, QueryPath};
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
-use super::usage::{HISTORY_DAYS, Window};
+use super::usage::{HISTORY_DAYS, Window, floored_minute};
 use super::{
     Catalog, Dedupe, DigestApplied, EntryDetail, FORMAT_VERSION, HashReport, JobProgress, JobState,
     MIRROR_SOURCE, NewProjection, PullMark, PullSlot, PulledFile, QueryPage, QueryRequest,
@@ -5117,8 +5117,7 @@ fn every_record_round_trips_through_the_compact_codec() -> Result<()> {
         written_at: "2026-09-07T08:03:00Z".to_owned(),
     };
     let usage = models::Usage {
-        seq: 9004,
-        repo_id: Some(4242),
+        key: models::UsageLogKey::at(4242, 9004),
         at: "2026-09-07T08:04:00Z".to_owned(),
         client: Some("10.0.0.9".to_owned()),
         artifact_id: Some(4243),
@@ -5210,7 +5209,10 @@ fn every_record_round_trips_through_the_compact_codec() -> Result<()> {
     assert_eq!(read.get().primary(9001_i64)?, Some(shelf));
     assert_eq!(read.get().primary(9002_i64)?, Some(noise));
     assert_eq!(read.get().primary(9003_i64)?, Some(projection));
-    assert_eq!(read.get().primary(9004_u64)?, Some(usage));
+    assert_eq!(
+        read.get().primary(models::UsageLogKey::at(4242, 9004))?,
+        Some(usage)
+    );
     assert_eq!(read.get().primary(4242_i64)?, Some(repo_usage));
     assert_eq!(read.get().primary(4243_i64)?, Some(artifact_use));
     assert_eq!(read.get().primary(9006_i64)?, Some(loadout));
@@ -9235,7 +9237,8 @@ fn a_usage_batch_writes_every_row_and_one_change_per_artifact() -> Result<()> {
     let ckpt = catalog
         .artifact_row(ids.ckpt)?
         .ok_or_else(|| IndexError::Catalog("ckpt".into()))?;
-    let now = jiff::Timestamp::now();
+    let now = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() / 60 * 60)
+        .map_err(|error| IndexError::Catalog(format!("floor to the minute: {error}")))?;
     let earlier = now - std::time::Duration::from_secs(60);
     let event = |row: &SearchRow, at: jiff::Timestamp| UsageEvent {
         client: Some("10.0.0.4".to_owned()),
@@ -9259,6 +9262,331 @@ fn a_usage_batch_writes_every_row_and_one_change_per_artifact() -> Result<()> {
         catalog.pending_changes()?,
         2,
         "one search change per distinct artifact"
+    );
+
+    catalog.refresh_search(|_| {})?;
+    let still_this_minute = now + std::time::Duration::from_secs(30);
+    catalog.log_usage_batch(&[
+        event(&lora, still_this_minute),
+        event(&ckpt, still_this_minute),
+    ])?;
+    assert_eq!(
+        catalog.pending_changes()?,
+        0,
+        "a second batch inside the same minute reindexes neither artifact"
+    );
+    assert_eq!(
+        catalog.artifact_usage(ids.lora)?.pulls,
+        3,
+        "the count still moves even where the index is not touched"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_artifact_served_all_minute_is_logged_for_the_index_once_a_minute() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    catalog.refresh_search(|_| {})?;
+    let lora = catalog
+        .artifact_row(ids.lora)?
+        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
+    let base = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() / 60 * 60)
+        .map_err(|error| IndexError::Catalog(format!("floor to the minute: {error}")))?;
+    let event = |at: jiff::Timestamp| UsageEvent {
+        repo: Some(lora.repo_id),
+        artifact: Some(lora.artifact_id),
+        ..UsageEvent::new(lora.path.clone(), at)
+    };
+
+    catalog.log_usage_batch(&[event(base)])?;
+    assert_eq!(catalog.pending_changes()?, 1, "the first batch always logs");
+    catalog.refresh_search(|_| {})?;
+
+    for offset in [1, 2, 30, 59] {
+        catalog.log_usage_batch(&[event(base + std::time::Duration::from_secs(offset))])?;
+        assert_eq!(
+            catalog.pending_changes()?,
+            0,
+            "still inside the same minute at +{offset}s"
+        );
+    }
+
+    let next_minute = base + std::time::Duration::from_secs(61);
+    catalog.log_usage_batch(&[event(next_minute)])?;
+    assert_eq!(catalog.pending_changes()?, 1, "a new minute logs once more");
+
+    let usage = catalog.artifact_usage(ids.lora)?;
+    assert_eq!(usage.pulls, 6, "every event counted");
+    assert_eq!(
+        usage.last_used,
+        Some(next_minute),
+        "the exact last instant is kept, not the floored one"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_indexed_last_used_is_the_floored_minute() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    catalog.refresh_search(|_| {})?;
+    let lora = catalog
+        .artifact_row(ids.lora)?
+        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
+    let at = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() / 60 * 60 + 45)
+        .map_err(|error| IndexError::Catalog(format!("build a timestamp: {error}")))?;
+    catalog.log_usage_batch(&[UsageEvent {
+        repo: Some(lora.repo_id),
+        artifact: Some(lora.artifact_id),
+        ..UsageEvent::new(lora.path.clone(), at)
+    }])?;
+    catalog.refresh_search(|_| {})?;
+
+    let indexed = catalog
+        .indexed_last_used(ids.lora.get())?
+        .ok_or_else(|| IndexError::Catalog("the row is indexed".into()))?;
+    assert_eq!(
+        indexed,
+        floored_minute(at),
+        "the index carries the floored minute, not the exact second"
+    );
+    assert_eq!(
+        search(&catalog, "used:<1d")?.total,
+        1,
+        "used: is coarse enough that the minute grain never matters"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_newest_pulls_of_a_repository_read_only_the_page_they_return() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    let lora = catalog
+        .artifact_row(ids.lora)?
+        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
+    let ckpt = catalog
+        .artifact_row(ids.ckpt)?
+        .ok_or_else(|| IndexError::Catalog("ckpt".into()))?;
+    let base = jiff::Timestamp::now() - std::time::Duration::from_secs(10_000);
+    let heavy: Vec<UsageEvent> = (0..5_000_u32)
+        .map(|index| UsageEvent {
+            repo: Some(lora.repo_id),
+            ..UsageEvent::new(
+                format!("f{index}.safetensors"),
+                base + std::time::Duration::from_secs(u64::from(index)),
+            )
+        })
+        .collect();
+    catalog.log_usage_batch(&heavy)?;
+    let light: Vec<UsageEvent> = (0..10_u32)
+        .map(|index| UsageEvent {
+            repo: Some(ckpt.repo_id),
+            ..UsageEvent::new(
+                format!("c{index}.safetensors"),
+                base + std::time::Duration::from_secs(u64::from(index)),
+            )
+        })
+        .collect();
+    catalog.log_usage_batch(&light)?;
+
+    let first_page = catalog.recent_pulls(lora.repo_id, 20)?;
+    assert_eq!(
+        first_page.len(),
+        20,
+        "the page is bounded to the limit asked for"
+    );
+    assert_eq!(
+        first_page[0].what, "f4999.safetensors",
+        "the newest of the 5,000 events is first"
+    );
+    assert!(
+        first_page.iter().all(|pull| pull.what.starts_with('f')),
+        "the first repository's page names only its own paths: {first_page:?}"
+    );
+
+    let second_page = catalog.recent_pulls(ckpt.repo_id, 20)?;
+    assert_eq!(
+        second_page.len(),
+        10,
+        "the second repository served only 10"
+    );
+    assert!(
+        second_page.iter().all(|pull| pull.what.starts_with('c')),
+        "the second repository's page names only its own paths: {second_page:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_response_naming_no_repository_is_still_logged_and_ordered() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    let lora = catalog
+        .artifact_row(ids.lora)?
+        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
+    let now = jiff::Timestamp::now();
+    let events: Vec<UsageEvent> = (0..3_u32)
+        .map(|index| {
+            UsageEvent::new(
+                format!("orphan{index}.bin"),
+                now + std::time::Duration::from_secs(u64::from(index)),
+            )
+        })
+        .collect();
+    let sequences: Vec<u64> = events
+        .iter()
+        .map(|event| catalog.log_usage(event))
+        .collect::<Result<_>>()?;
+    assert_eq!(
+        sequences,
+        vec![1, 2, 3],
+        "each unattributed row gets a distinct, ordered sequence"
+    );
+    assert!(
+        catalog.recent_pulls(lora.repo_id, 10)?.is_empty(),
+        "no repository's page holds a row naming none"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_usage_log_survives_a_repository_id_above_one_byte() -> Result<()> {
+    let (_directory, catalog, _ids) = seeded_catalog()?;
+    let repo_id = 70_000_i64;
+    let base = jiff::Timestamp::now();
+    let transaction = catalog.database.rw_transaction()?;
+    for seq in 1..=5_u64 {
+        transaction.insert(models::Usage {
+            key: models::UsageLogKey::at(repo_id, seq),
+            at: format!("{:.9}", base + std::time::Duration::from_secs(seq)),
+            client: None,
+            artifact_id: None,
+            path: format!("row{seq}.bin"),
+            bytes: 0,
+            rate_bps: None,
+            status: 200,
+        })?;
+    }
+    transaction.commit()?;
+
+    let pulls = catalog.recent_pulls(RepoRowId::new(repo_id), 10)?;
+    assert_eq!(pulls.len(), 5);
+    assert!(
+        pulls.windows(2).all(|pair| pair[0].when >= pair[1].when),
+        "the page orders by sequence, not by the key's text: {pulls:?}"
+    );
+    assert_eq!(pulls[0].what, "row5.bin");
+    assert_eq!(pulls[4].what, "row1.bin");
+    Ok(())
+}
+
+#[test]
+fn a_repository_whose_record_was_removed_does_not_reuse_a_sequence() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    let lora = catalog
+        .artifact_row(ids.lora)?
+        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
+    let now = jiff::Timestamp::now();
+    let first: Vec<UsageEvent> = (0..10_u32)
+        .map(|index| UsageEvent {
+            repo: Some(lora.repo_id),
+            ..UsageEvent::new(
+                format!("first{index}.safetensors"),
+                now + std::time::Duration::from_secs(u64::from(index)),
+            )
+        })
+        .collect();
+    catalog.log_usage_batch(&first)?;
+    assert_eq!(catalog.recent_pulls(lora.repo_id, 20)?.len(), 10);
+
+    let transaction = catalog.database.rw_transaction()?;
+    if let Some(stored) = transaction
+        .get()
+        .primary::<models::RepoUsage>(lora.repo_id.get())?
+    {
+        transaction.remove(stored)?;
+    }
+    transaction.commit()?;
+    assert!(
+        catalog.repo_usage(lora.repo_id)?.is_none(),
+        "the record is gone but the rows are not"
+    );
+
+    let second: Vec<UsageEvent> = (0..5_u32)
+        .map(|index| UsageEvent {
+            repo: Some(lora.repo_id),
+            ..UsageEvent::new(
+                format!("second{index}.safetensors"),
+                now + std::time::Duration::from_secs(100 + u64::from(index)),
+            )
+        })
+        .collect();
+    catalog.log_usage_batch(&second)?;
+
+    let all = catalog.recent_pulls(lora.repo_id, 20)?;
+    assert_eq!(
+        all.len(),
+        15,
+        "every row from both batches is still present"
+    );
+    let names: std::collections::HashSet<&str> =
+        all.iter().map(|pull| pull.what.as_str()).collect();
+    assert_eq!(
+        names.len(),
+        15,
+        "no key was reused, so no row overwrote another: {all:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_window_longer_than_the_history_reads_only_the_window() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    let lora = catalog
+        .artifact_row(ids.lora)?
+        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
+    let midday = jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date()
+        .at(12, 0, 0, 0)
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .map_err(|error| IndexError::Catalog(format!("noon: {error}")))?
+        .timestamp();
+    let events: Vec<UsageEvent> = (0..90_u32)
+        .map(|day| UsageEvent {
+            repo: Some(lora.repo_id),
+            ..UsageEvent::new(
+                format!("d{day}.safetensors"),
+                midday - std::time::Duration::from_secs(u64::from(day) * 86_400),
+            )
+        })
+        .collect();
+    catalog.log_usage_batch(&events)?;
+
+    let window_days = 40_u32;
+    assert!(
+        window_days as usize > HISTORY_DAYS,
+        "the window must outrun what the record keeps"
+    );
+    let charted = catalog.usage_days(lora.repo_id, window_days)?;
+    assert_eq!(charted.len(), window_days as usize);
+    assert!(
+        charted.iter().all(|day| day.pulls == 1),
+        "every day inside the window, including the oldest, holds its own pull: {charted:?}"
+    );
+
+    let outside = catalog
+        .artifact_row(ids.ckpt)?
+        .ok_or_else(|| IndexError::Catalog("ckpt".into()))?;
+    catalog.log_usage_batch(&[UsageEvent {
+        repo: Some(outside.repo_id),
+        ..UsageEvent::new(
+            "old.safetensors",
+            midday - std::time::Duration::from_secs(89 * 86_400),
+        )
+    }])?;
+    let empty = catalog.usage_days(outside.repo_id, window_days)?;
+    assert!(
+        empty.iter().all(|day| day.pulls == 0),
+        "a repository whose rows are all outside the window reads all-zero bars: {empty:?}"
     );
     Ok(())
 }

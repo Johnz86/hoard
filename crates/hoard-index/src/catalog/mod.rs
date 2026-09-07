@@ -49,13 +49,15 @@ pub use self::scan::{RescanReport, RescanScope};
 pub use self::search::{QueryPage, QueryRequest, RefreshReport};
 #[cfg(any(test, feature = "fixtures"))]
 pub use self::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
-pub use self::usage::{ArtifactUsage, PullRow, UsageDay, UsageEvent, UsageReport};
+pub use self::usage::{
+    ArtifactOverflow, ArtifactUsage, PullRow, RepoTally, UsageDay, UsageEvent, UsageReport,
+};
 pub use self::userdata::{NewProjection, NoiseRecord, ProjectionRecord, ShelfRecord};
 pub use self::verdict::OverrideRecord;
 
 /// The one shape this build reads and writes. A catalog whose manifest names another is
 /// rebuilt from disk rather than converted.
-pub const FORMAT_VERSION: u32 = 7;
+pub const FORMAT_VERSION: u32 = 8;
 
 /// One redb table's share of the catalog file: the rows it holds, the payload bytes those
 /// rows spend, the btree pages holding them, and the space inside those pages that holds

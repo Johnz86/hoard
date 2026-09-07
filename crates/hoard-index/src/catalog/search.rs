@@ -4,6 +4,8 @@ use std::path::Path;
 use std::sync::{Arc, RwLockReadGuard};
 
 use serde::Serialize;
+#[cfg(test)]
+use tantivy::collector::TopDocs;
 use tantivy::collector::{Collector, Count, SegmentCollector};
 use tantivy::columnar::StrColumn;
 use tantivy::fastfield::Column;
@@ -36,7 +38,7 @@ use crate::error::{IndexError, Result};
 
 use super::query::{self, QueryFields};
 use super::scan::collapse_key;
-use super::usage::last_used_in;
+use super::usage::{floored_minute, last_used_in};
 use super::{Catalog, OpenIndex};
 
 const WRITER_BUDGET: usize = 32 * 1024 * 1024;
@@ -908,6 +910,39 @@ impl Catalog {
         let query = TermQuery::new(Term::from_field_u64(field, value), IndexRecordOption::Basic);
         let counted = open.reader.searcher().search(&query, &Count)?;
         Ok(counted as u64)
+    }
+
+    /// The `last_used` fast field of one artifact's first indexed document, read straight
+    /// off the published index rather than through a query result, so a test can tell the
+    /// floored value the writer stored from the exact one [`Catalog::artifact_usage`] keeps.
+    #[cfg(test)]
+    pub(super) fn indexed_last_used(&self, artifact_id: i64) -> Result<Option<i64>> {
+        let directory = self
+            .manifest()?
+            .search_directory
+            .ok_or_else(|| IndexError::Catalog("search index needs building".into()))?;
+        let guard = self.open_index(&directory)?;
+        let open = guard
+            .as_ref()
+            .ok_or_else(|| IndexError::Catalog("search index was closed".into()))?;
+        let artifact_field = open.index.schema().get_field("artifact_id")?;
+        let query = TermQuery::new(
+            Term::from_field_i64(artifact_field, artifact_id),
+            IndexRecordOption::Basic,
+        );
+        let searcher = open.reader.searcher();
+        let Some((_, address)) = searcher
+            .search(&query, &TopDocs::with_limit(1).order_by_score())?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let column = searcher
+            .segment_reader(address.segment_ord)
+            .fast_fields()
+            .i64(LAST_USED_COLUMN)?;
+        Ok(column.first(address.doc_id))
     }
 }
 
@@ -1882,7 +1917,7 @@ impl Fields {
         document.add_u64(self.dupe, u64::from(artifact.path_count > 1));
         document.add_u64(self.primary, u64::from(*primary));
         if let Some(used) = last_used {
-            document.add_i64(self.last_used, used.as_second());
+            document.add_i64(self.last_used, floored_minute(*used));
         }
         if let Some(trigger) = inferred.trigger.as_deref() {
             document.add_text(self.trigger_text, trigger);

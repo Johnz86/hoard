@@ -260,10 +260,38 @@ The usage log carries a second discipline of the same shape. `log_usage` and
 list, its last pull and how many pulls each of the last 31 UTC days holds. The USAGE tab's
 client count and its chart are both read from that record rather than counted from the log,
 so drawing the chart is one point read whatever the log holds; a window longer than the
-record keeps is counted from the log instead. A `Usage` row carries a `repo_at` secondary key
-- the repository id in big-endian bytes followed by the row's RFC 3339 time - so the recent
-pulls are the tail of one range read backwards. A writer of a usage row that skips the record
-leaves the client count and the chart behind.
+record keeps is counted from the log instead. A `Usage` row's primary key is `UsageLogKey`,
+the repository id in big-endian bytes followed by the row's sequence inside that repository's
+log, also big-endian, in one `Vec<u8>` - the same construction `LocationKey::revision`
+already builds a revision's own key from, an id followed by one more big-endian
+discriminator; there is no secondary key. The repository's newest pulls are then a lazy
+reverse range of its own primary keys, `take(limit)` included, rather than a secondary scan
+that would materialise every row the repository ever served before it could be trimmed, and
+a repository's whole history is one 8-byte prefix. A window longer than 31 days is answered
+the same way: a lazy reverse range stopped a minute earlier than the window's own opening
+day, rather than a scan of the whole log, because the key orders by insertion and not
+strictly by time across two batches, so a minute of slack is cheaper than risking a row that
+belongs inside the window. `recent_pulls` itself still sorts the small page it reads by its
+own `when`, for the same reason.
+
+The sequence is per repository, seeded from the higher of `RepoUsage.pulls` and the highest
+key the repository's own rows already carry - the same high-water-mark defence
+`Counters::load` gives every other id in the catalog - read once, before the write that both
+numbers rows from it and moves it, rather than decoded twice. A repository whose record was
+removed in a transaction separate from its rows, as `retire_source` does, cannot then have a
+later batch reuse a key a row already holds. A response naming no repository is numbered the
+same way under repository id 0, which the allocator never hands out and which no maintained
+record is ever kept for. A writer of a usage row that skips the record leaves the client
+count and the chart behind.
+
+`ArtifactUse.last_used` keeps the exact instant a response landed, because `artifact_usage`
+and the inspector show it, but the value the search index carries is that instant floored to
+the minute (`usage::floored_minute`), and a writer logs the artifact for the index only when
+the floored value moves. An artifact served continuously used to be reindexed once per sink
+batch - its whole card included, since a revision's card is indexed into every entry document
+of the artifacts that hold it - which at a two-request-per-second pace was once every couple
+of seconds; it is now reindexed once a minute. `used:` compares an age in days and `sort=used`
+orders by the column, so neither notices the coarser grain.
 
 The triage threshold a scan ran with is stored in the manifest, and every writer that counts
 an artifact into the summary counts against the stored value rather than against its own

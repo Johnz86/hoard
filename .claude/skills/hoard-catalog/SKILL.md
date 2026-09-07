@@ -36,7 +36,8 @@ One line per file in `crates/hoard-index/src/catalog/`:
 - `verdict.rs` a user's override of what an artifact is, re-applied after a rescan.
 - `seed.rs` synthetic records for tests, behind `cfg(test)` or the `fixtures` feature.
 - `userdata.rs` shelves, settings, the noise list, projections.
-- `usage.rs` the served-response log and per-artifact use counts.
+- `usage.rs` the served-response log, keyed by repository and sequence, and per-artifact use
+  counts indexed at a floored-minute grain.
 - `loadouts.rs` loadout documents and pin resolution.
 - `jobs.rs` scan, apply and pull job rows.
 - `hashing.rs` sha256 and git blob sha1 per file, content identities, merges, and the

@@ -591,56 +591,70 @@ pub(super) struct Projection {
     pub(super) written_at: String,
 }
 
-/// Where one served response sits in a repository's log: the repository id in big-endian
-/// bytes followed by the row's RFC 3339 time. Ids come from the allocator and are positive,
-/// which is what makes the big-endian order the numeric one, so the first 8 bytes are
-/// exactly one repository and a day window is one range rather than a scan of the log. The
-/// time is compared as the text the row stores, which is the order the pull list already
-/// read the log in.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct RepoAtKey(Vec<u8>);
+/// Where one served response sits: the repository that served it, then its sequence inside
+/// that repository's log. Both big-endian, so a repository's log is one 8-byte prefix and
+/// the sequence orders inside it. Ids come from the allocator and are positive, which is
+/// what makes the big-endian order the numeric one. A response naming no repository sits
+/// under 0, which the allocator never hands out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct UsageLogKey(Vec<u8>);
 
-impl RepoAtKey {
+/// Everything a usage log key holds before the sequence.
+const USAGE_LOG_PREFIX: usize = size_of::<i64>();
+
+impl UsageLogKey {
     /// One row of one repository's log.
-    pub(super) fn at(repo_id: i64, at: &str) -> Self {
-        let mut key = Vec::with_capacity(size_of::<i64>() + at.len());
+    pub(super) fn at(repo_id: i64, seq: u64) -> Self {
+        let mut key = Vec::with_capacity(USAGE_LOG_PREFIX + size_of::<u64>());
         key.extend_from_slice(&repo_id.to_be_bytes());
-        key.extend_from_slice(at.as_bytes());
+        key.extend_from_slice(&seq.to_be_bytes());
         Self(key)
     }
 
-    /// What every row of one repository shares, which is where its log starts.
+    /// Where one repository's log starts.
     pub(super) fn repository(repo_id: i64) -> Self {
         Self(repo_id.to_be_bytes().to_vec())
     }
 
-    /// The first key past one repository's log, which bounds a range exclusively.
+    /// The first key past it, which bounds a range exclusively.
     pub(super) fn after(repo_id: i64) -> Self {
         Self::repository(repo_id.saturating_add(1))
     }
+
+    /// The sequence this key orders inside its repository's log, recovered from the eight
+    /// bytes after the repository id: what a `Usage` row's own key already carries, so the
+    /// row does not repeat it.
+    pub(super) fn sequence(&self) -> u64 {
+        let mut bytes = [0_u8; size_of::<u64>()];
+        bytes.copy_from_slice(&self.0[USAGE_LOG_PREFIX..]);
+        u64::from_be_bytes(bytes)
+    }
 }
 
-impl ToKey for RepoAtKey {
+impl ToKey for UsageLogKey {
     fn to_key(&self) -> native_db::db_type::Key {
         native_db::db_type::Key::new(self.0.clone())
     }
 
     fn key_names() -> Vec<String> {
-        vec!["RepoAtKey".to_owned()]
+        vec!["UsageLogKey".to_owned()]
     }
 }
 
 /// One response this node served, which is what the USAGE tab reads back.
 ///
-/// The repository is indexed with the time beside it rather than alone, so a window reads
-/// the rows inside it instead of every row the repository ever served.
+/// The primary key is a repository's log and the sequence inside it, so a repository's
+/// newest pulls are a lazy reverse range of its own keys and its whole history is one
+/// prefix, rather than a secondary scan that materialises every matching key before it can
+/// be trimmed. The repository and the sequence are not repeated as fields: both are
+/// recoverable from the key, the former by nothing in this crate and the latter by
+/// [`UsageLogKey::sequence`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 17, version = 1, with = super::codec::Compact)]
-#[native_db(secondary_key(repo_at -> RepoAtKey, optional))]
+#[native_db]
 pub(super) struct Usage {
     #[primary_key]
-    pub(super) seq: u64,
-    pub(super) repo_id: Option<i64>,
+    pub(super) key: UsageLogKey,
     pub(super) at: String,
     pub(super) client: Option<String>,
     pub(super) artifact_id: Option<i64>,
@@ -648,15 +662,6 @@ pub(super) struct Usage {
     pub(super) bytes: u64,
     pub(super) rate_bps: Option<u64>,
     pub(super) status: u16,
-}
-
-impl Usage {
-    /// The index native_db maintains over this row, read from the two fields that say
-    /// which log it belongs to and where in it. A row that names no repository is not
-    /// indexed.
-    pub(super) fn repo_at(&self) -> Option<RepoAtKey> {
-        self.repo_id.map(|repo_id| RepoAtKey::at(repo_id, &self.at))
-    }
 }
 
 /// What the USAGE tab shows above its chart, maintained by every usage write rather than
