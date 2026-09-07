@@ -271,9 +271,11 @@ configuration: `hoard doctor` on a catalog scanned at 0.5 recounts at 0.5. A res
 different configured value records it and counts the summary again; each artifact's own
 stored state is restated as that walk reaches it, not before.
 
-`refresh_search` replays the log after the durable cursor, one Tantivy commit per batch,
-deleting an artifact's documents by term and re-adding its entries, then prunes what it
-applied. A rescan followed by a refresh updates search without a rebuild. A query answers
+`refresh_search` replays the log after the durable cursor, at least one Tantivy commit per
+batch (a budget commit may land inside one; the cursor still advances and the batch is
+pruned exactly once, after it), deleting an artifact's documents by term and re-adding its
+entries, then prunes what it applied. A rescan followed by a refresh updates search without a
+rebuild. A query answers
 from the published index even when a rescan has logged changes no refresh has applied, and
 says so with `stale`; only a catalog with no index at all is refused. A candidate on the page
 whose entry, or the artifact that entry named, the rescan replaced is skipped and counted,
@@ -327,9 +329,14 @@ completes. What each stage leaves:
   term and adds them again, so it changes nothing. A kill between the cursor and the prune
   leaves rows the cursor has passed, which are what `pending_changes` counts: a refresh drops
   them before it reads, because otherwise the catalog reports a staleness no refresh clears.
-  Both of those points are inside one batch and the callback fires after all three steps, so
-  the test stages them by hand - it rewinds the cursor and puts the pruned rows back, and it
-  writes a row at the cursor - rather than adding a hook to reach them.
+  A third point sits inside the batch itself: `Metered` may commit Tantivy once the budget
+  has gone by before the batch's own artifacts are all applied, with the cursor still behind
+  the whole batch. A kill there replays the whole batch from the cursor, not just what was
+  left; the committed prefix is deleted by term and re-added exactly as the rest is, so the
+  replay changes nothing. All three points are inside one batch and the callback fires after
+  all three steps, so the test stages them by hand - it rewinds the cursor and puts the
+  pruned rows back, and it writes a row at the cursor - rather than adding a hook to reach
+  them.
 - **A rebuild** publishes nothing until Tantivy has committed, so a killed one leaves the
   previous index serving and a `search-v1-*` directory the manifest does not name. Publishing
   was the only thing that removed a superseded directory, so `Catalog::open` now removes every
@@ -463,7 +470,13 @@ bucket by folding the artifact id alone, with no tallies and no row.
 
 Free text indexes names, organizations, bases, triggers, tensor key prefixes and the body of
 the shallowest README in each revision. Tantivy uses one writer thread with a 32 MiB indexing
-budget; nothing larger than a unit is held in memory or in an open transaction.
+budget and commits whenever 128 MiB of estimated document bytes have been handed to it since
+the last commit, on the rebuild and on the refresh, so what the writer's pipeline holds ahead
+of the indexing thread is bounded to the larger of that budget and one artifact's documents.
+One artifact's documents are not themselves bounded: a revision's card is indexed into every
+entry document of it, so an artifact reachable from many revisions hands the writer a
+multiple of the card's bytes in one group. Nothing larger than a unit is held in memory or in
+an open transaction.
 
 ## Running it
 
@@ -1329,15 +1342,21 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
   the count, the sampling pass, the bucket pass and the window pass, four. The last page of a
   million is 21.453 ms again, and a page past the end costs the count plus the pass that
   tallies the facets rather than the sampling pass alone.
-- **The index writer's pipeline is bounded in artifacts, not documents.** `build_index` and
-  `refresh_search` send one `IndexWriter::run` group per artifact, which is what puts an
-  artifact's documents in one segment and lets the query path fold them as a run. tantivy's
-  operation channel is `bounded(PIPELINE_MAX_SIZE_IN_DOCS)`, 10,000 items, and an item was
-  one document and is now one artifact's whole set, so the documents in flight ahead of the
-  indexing thread scale with entries per artifact times the size of a document, which the
-  revision card dominates: the card is stored once per revision but is still indexed into
-  every document of it. The synthetic tree has few entries per artifact and a small card,
-  so the harness cannot show this; read the rebuild RSS row with it in mind.
+- **The index writer's pipeline is bounded to the larger of the budget and one artifact's
+  documents.** `Metered` wraps the writer `build_index` and `refresh_search` create and
+  commits whenever `INDEX_FLUSH_BYTES` (128 MiB) of estimated document bytes would go by,
+  checked before the group that would cross it is handed to the writer rather than after, so
+  what tantivy's operation channel holds ahead of the indexing thread never exceeds the
+  budget by more than one artifact's group; an artifact's documents are still one
+  `IndexWriter::run` group and one run in one segment. That group is not itself bounded: a
+  revision's card is indexed into every entry document of it, so an artifact reachable from
+  many revisions hands the writer a multiple of the card's bytes in one group. Not repeating
+  the card in every entry document would change what a non-primary entry document matches,
+  which is a design decision for a later wave, not this one. The estimate `document_bytes`
+  computes is the fixed per-document heap `CompactDoc::with_capacity` reserves (1,024
+  bytes), plus eight bytes for every value the document carries, plus every text value's
+  length, not the bytes tantivy itself allocates for postings, fast fields and merges, so it
+  is a lower bound the budget commits against rather than a measurement of peak memory.
 - **A collapsed pass reads a chosen row's facet ordinals one document at a time.** The
   primary path reads the five facet columns and the base label per block through
   `first_vals`; `HitColumns::hit_of` reads them per artifact through `first_ord` instead,

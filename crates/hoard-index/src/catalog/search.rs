@@ -11,10 +11,11 @@ use tantivy::indexer::UserOperation;
 use tantivy::query::{BooleanQuery, Query, QueryClone, TermQuery, Weight};
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, Schema, TEXT, TantivyDocument, TextFieldIndexing,
-    TextOptions,
+    TextOptions, Value,
 };
 use tantivy::{
-    COLLECT_BLOCK_BUFFER_LEN, DocId, Index, Score, Searcher, SegmentOrdinal, SegmentReader, Term,
+    COLLECT_BLOCK_BUFFER_LEN, DocId, Index, IndexWriter, Score, Searcher, SegmentOrdinal,
+    SegmentReader, Term,
 };
 
 use hoard_core::{EntryId, RepoRowId};
@@ -39,8 +40,12 @@ use super::usage::last_used_in;
 use super::{Catalog, OpenIndex};
 
 const WRITER_BUDGET: usize = 32 * 1024 * 1024;
-/// How many logged changes one Tantivy commit and one prune transaction cover.
+/// How many logged changes at least one Tantivy commit and exactly one prune transaction
+/// cover: a budget commit may land inside the batch, but the cursor still advances and the
+/// batch is pruned exactly once, after it.
 const REFRESH_BATCH: usize = 4096;
+/// How many estimated document bytes the writer is handed between two commits.
+pub(super) const INDEX_FLUSH_BYTES: usize = 128 * 1024 * 1024;
 /// The largest page one query may ask for.
 const PAGE_LIMIT: u32 = 1000;
 /// How many rows a `compat:` probe reads before choosing a target.
@@ -135,18 +140,57 @@ pub struct QueryPage {
     pub skipped: u64,
 }
 
+/// What one refresh did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RefreshReport {
+    /// Logged changes applied and pruned.
+    pub applied: u64,
+    /// Documents handed to the writer.
+    pub documents: u64,
+    /// The estimated bytes of those documents.
+    pub bytes: u64,
+    /// Tantivy commits made, at least one per batch.
+    pub commits: u64,
+}
+
 impl Catalog {
     /// Builds a fresh index using only native records and publishes it after a durable commit.
     /// An interrupted rebuild publishes nothing, so the last usable index keeps answering.
     /// The callback receives the number of entries indexed.
     pub fn rebuild_search(&self, progress: impl FnMut(u64)) -> Result<()> {
+        self.rebuild_search_inner(INDEX_FLUSH_BYTES, progress)?;
+        Ok(())
+    }
+
+    /// The same, reporting the Tantivy commits the writer made rather than nothing: a
+    /// rebuild's own budget commits are otherwise invisible outside this crate, which is
+    /// what says whether a shape seeded to be large actually reached the budget or whether
+    /// the cost beside it says nothing about the writer's pipeline.
+    pub fn rebuild_search_commits(&self, progress: impl FnMut(u64)) -> Result<u64> {
+        self.rebuild_search_inner(INDEX_FLUSH_BYTES, progress)
+    }
+
+    /// The same, under a caller-chosen commit budget rather than [`INDEX_FLUSH_BYTES`], so a
+    /// test can force more than one segment out of a fixture too small to reach the default.
+    #[cfg(test)]
+    pub(super) fn rebuild_search_with_budget(
+        &self,
+        budget: usize,
+        progress: impl FnMut(u64),
+    ) -> Result<()> {
+        self.rebuild_search_inner(budget, progress)?;
+        Ok(())
+    }
+
+    fn rebuild_search_inner(&self, budget: usize, progress: impl FnMut(u64)) -> Result<u64> {
         let _lane = self.search_lane.lock();
         let drained_through = self.indexable_through()?;
         let directory_name = format!("search-v1-{}", jiff::Timestamp::now().as_nanosecond());
         let directory = self.directory.join(&directory_name);
         std::fs::create_dir(&directory)?;
-        self.build_index(&directory, progress)?;
-        self.publish(directory_name, drained_through)
+        let commits = self.build_index(&directory, budget, progress)?;
+        self.publish(directory_name, drained_through)?;
+        Ok(commits)
     }
 
     fn indexable_through(&self) -> Result<u64> {
@@ -154,15 +198,20 @@ impl Catalog {
     }
 
     /// Writes every artifact's documents as one writer group, so they land in one segment
-    /// as consecutive doc ids. [`Collapsing`] folds that run and depends on it.
+    /// as consecutive doc ids. [`Collapsing`] folds that run and depends on it. Commits
+    /// whenever `budget` estimated document bytes have gone by since the last commit, so the
+    /// documents waiting ahead of the indexing thread are bounded in bytes. Returns how many
+    /// commits that made.
     pub(super) fn build_index(
         &self,
         directory: &Path,
+        budget: usize,
         mut progress: impl FnMut(u64),
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let (schema, fields) = Fields::build();
         let index = Index::create_in_dir(directory, schema)?;
-        let mut writer = index.writer_with_num_threads(1, WRITER_BUDGET)?;
+        let writer = index.writer_with_num_threads(1, WRITER_BUDGET)?;
+        let mut metered = Metered::new(writer, budget);
         let snapshot = self.database.r_transaction()?;
         let names = self.node_names(&snapshot)?;
         progress(0);
@@ -175,25 +224,23 @@ impl Catalog {
         };
         let mut indexed = 0_u64;
         let mut reported = 0_u64;
-        let mut operations: Vec<UserOperation> = Vec::new();
         for artifact in snapshot.scan().primary::<ArtifactRecord>()?.all()? {
             let artifact = artifact?;
-            operations.extend(
-                documents_of(&mut indexing, &artifact)?
-                    .into_iter()
-                    .map(UserOperation::Add),
-            );
+            let operations: Vec<UserOperation> = documents_of(&mut indexing, &artifact)?
+                .into_iter()
+                .map(UserOperation::Add)
+                .collect();
             indexed += operations.len() as u64;
-            writer.run(operations.drain(..))?;
+            metered.run(operations)?;
             if indexed - reported >= 512 {
                 reported = indexed;
                 progress(indexed);
             }
         }
-        writer.commit()?;
-        writer.wait_merging_threads()?;
+        metered.commit()?;
+        let (_, _, commits) = metered.finish()?;
         progress(indexed);
-        Ok(())
+        Ok(commits)
     }
 
     /// Switches the manifest to `directory_name` in one transaction, touching only the two
@@ -220,10 +267,10 @@ impl Catalog {
         self.prune_changes(drained_through)
     }
 
-    /// Applies the logged changes after the manifest's cursor to the published index, one
-    /// Tantivy commit per batch, then advances the cursor and prunes what it applied. Returns
-    /// how many changes were applied. Needs a published index; a catalog without one must
-    /// `rebuild_search` first.
+    /// Applies the logged changes after the manifest's cursor to the published index, at
+    /// least one Tantivy commit per batch, then advances the cursor and prunes what it
+    /// applied. Returns how many changes were applied. Needs a published index; a catalog
+    /// without one must `rebuild_search` first.
     ///
     /// The drain is bounded by the highest sequence the log held when it started, so a
     /// refresh running beside a writer returns rather than chasing the writer's new rows;
@@ -232,7 +279,34 @@ impl Catalog {
     /// An artifact's delete and its new documents are one writer group, so the documents it
     /// leaves alive are one run of consecutive doc ids in one segment, which is what the
     /// collapsed query path folds.
-    pub fn refresh_search(&self, mut progress: impl FnMut(u64)) -> Result<u64> {
+    pub fn refresh_search(&self, progress: impl FnMut(u64)) -> Result<u64> {
+        self.refresh_search_reporting(progress)
+            .map(|report| report.applied)
+    }
+
+    /// The same, reporting the changes applied, the documents and bytes handed to the writer
+    /// and the commits made, rather than only the applied count.
+    pub fn refresh_search_reporting(&self, progress: impl FnMut(u64)) -> Result<RefreshReport> {
+        self.refresh_search_inner(INDEX_FLUSH_BYTES, progress)
+    }
+
+    /// The same, under a caller-chosen commit budget rather than [`INDEX_FLUSH_BYTES`], so a
+    /// test can force more than one commit inside a batch out of a fixture too small to
+    /// reach the default.
+    #[cfg(test)]
+    pub(super) fn refresh_with_budget(
+        &self,
+        budget: usize,
+        progress: impl FnMut(u64),
+    ) -> Result<RefreshReport> {
+        self.refresh_search_inner(budget, progress)
+    }
+
+    fn refresh_search_inner(
+        &self,
+        budget: usize,
+        mut progress: impl FnMut(u64),
+    ) -> Result<RefreshReport> {
         let _lane = self.search_lane.lock();
         let manifest = self.manifest()?;
         let directory = manifest
@@ -242,14 +316,15 @@ impl Catalog {
         let bound = self.highest_change_seq()?;
         let mut batch = self.changes_up_to(manifest.search_seq, bound)?;
         if batch.is_empty() {
-            return Ok(0);
+            return Ok(RefreshReport::default());
         }
         let guard = self.open_index(&directory)?;
         let open = guard
             .as_ref()
             .ok_or_else(|| IndexError::Catalog("search index was closed".into()))?;
         let (_, fields) = Fields::build();
-        let mut writer = open.index.writer_with_num_threads(1, WRITER_BUDGET)?;
+        let writer = open.index.writer_with_num_threads(1, WRITER_BUDGET)?;
+        let mut metered = Metered::new(writer, budget);
         let mut applied = 0_u64;
         while let Some(cursor) = batch.last().map(|change| change.seq) {
             let mut ids: Vec<i64> = batch.iter().map(|change| change.artifact_id).collect();
@@ -264,23 +339,22 @@ impl Catalog {
                 repository: None,
                 card: None,
             };
-            let mut operations: Vec<UserOperation> = Vec::new();
             for id in ids {
-                operations.push(UserOperation::Delete(Term::from_field_i64(
+                let mut operations = vec![UserOperation::Delete(Term::from_field_i64(
                     fields.artifact,
                     id,
-                )));
+                ))];
                 operations.extend(
                     documents_of_artifact(&mut indexing, id)?
                         .into_iter()
                         .map(UserOperation::Add),
                 );
-                writer.run(operations.drain(..))?;
+                metered.run(operations)?;
             }
             drop(indexing);
             drop(names);
             drop(snapshot);
-            writer.commit()?;
+            metered.commit()?;
             open.reader.reload()?;
             self.advance_cursor(cursor)?;
             self.prune_changes(cursor)?;
@@ -288,8 +362,13 @@ impl Catalog {
             progress(applied);
             batch = self.changes_up_to(cursor, bound)?;
         }
-        writer.wait_merging_threads()?;
-        Ok(applied)
+        let (documents, bytes, commits) = metered.finish()?;
+        Ok(RefreshReport {
+            applied,
+            documents,
+            bytes,
+            commits,
+        })
     }
 
     /// Changes logged after the cursor, which is what makes `search_ready` false.
@@ -1823,6 +1902,112 @@ impl Fields {
             document.add_text(self.text, card);
         }
         document
+    }
+}
+
+/// `CompactDoc::with_capacity`'s fixed reservation: `TantivyDocument::new()` is
+/// `CompactDoc::with_capacity(1024)`, so `node_data` reserves 1,024 bytes and `field_values`
+/// starts at capacity 4 and grows from there. Tantivy defines `shrink_to_fit` but never
+/// calls it, and neither do we, so a document queued ahead of the indexing thread holds at
+/// least this much for as long as it waits, however little text it carries.
+const DOCUMENT_HEAP_BYTES: usize = 1024;
+/// `FieldValueAddr`'s packed size, one per value a document carries
+/// (`TantivyDocument::len()`).
+const FIELD_VALUE_BYTES: usize = 8;
+
+/// The bytes one document is estimated to hold in the writer's pipeline: the fixed heap
+/// [`DOCUMENT_HEAP_BYTES`] reserves, plus [`FIELD_VALUE_BYTES`] for every value the document
+/// carries, plus every text value's length. This is a lower bound on one document, not an
+/// upper bound on one artifact's group: an artifact reachable from many revisions hands the
+/// writer many documents in one `run` call before this estimate is ever consulted again.
+fn document_bytes(document: &TantivyDocument) -> usize {
+    let text_bytes: usize = document
+        .field_values()
+        .filter_map(|(_, value)| value.as_str())
+        .map(str::len)
+        .sum();
+    DOCUMENT_HEAP_BYTES + FIELD_VALUE_BYTES * document.len() + text_bytes
+}
+
+/// The index writer with the bytes it has been handed since its last commit. `run` hands one
+/// artifact's operations to the writer as one group, so the run invariant [`Collapsing`]
+/// depends on holds whether or not that group happens to cross a commit; `commit` only ever
+/// falls between two artifacts' groups, never inside one.
+struct Metered {
+    writer: IndexWriter,
+    budget: usize,
+    since_commit: usize,
+    documents: u64,
+    bytes: u64,
+    commits: u64,
+    /// Whether anything has been handed to the writer since the last commit. The byte
+    /// counter `since_commit` is the wrong predicate for whether a commit is needed: an
+    /// artifact whose last entry went away produces a group of one `Delete` and no `Add`,
+    /// which estimates zero bytes, so a batch ending on nothing but deletions would leave
+    /// `since_commit == 0` while a real, uncommitted delete is still pending. Guarding the
+    /// end-of-batch commit on `since_commit > 0` would skip it, and the caller's
+    /// `advance_cursor` would then move the cursor past a deletion that was never made
+    /// durable, losing it for good.
+    dirty: bool,
+}
+
+impl Metered {
+    fn new(writer: IndexWriter, budget: usize) -> Self {
+        Self {
+            writer,
+            budget,
+            since_commit: 0,
+            documents: 0,
+            bytes: 0,
+            commits: 0,
+            dirty: false,
+        }
+    }
+
+    /// Hands one artifact's operations to the writer as one group, committing first if the
+    /// group's estimate would take the budget's ceiling: the ceiling is then the larger of
+    /// the budget and one artifact's group, rather than the budget plus one whole group.
+    fn run(&mut self, operations: Vec<UserOperation>) -> Result<()> {
+        let mut added = 0_u64;
+        let mut estimate = 0_usize;
+        for operation in &operations {
+            if let UserOperation::Add(document) = operation {
+                added += 1;
+                estimate += document_bytes(document);
+            }
+        }
+        if self.since_commit + estimate >= self.budget {
+            self.commit()?;
+        }
+        let handed_something = !operations.is_empty();
+        self.writer.run(operations)?;
+        if handed_something {
+            self.dirty = true;
+        }
+        self.documents += added;
+        self.bytes += estimate as u64;
+        self.since_commit += estimate;
+        Ok(())
+    }
+
+    /// Commits what is pending, whatever the budget says. A no-op when nothing has been
+    /// handed to the writer since the last commit.
+    fn commit(&mut self) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        self.writer.commit()?;
+        self.commits += 1;
+        self.since_commit = 0;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Waits for the writer's merges and returns the documents, bytes and commits tallied
+    /// since it was created.
+    fn finish(self) -> Result<(u64, u64, u64)> {
+        self.writer.wait_merging_threads()?;
+        Ok((self.documents, self.bytes, self.commits))
     }
 }
 
@@ -3414,7 +3599,7 @@ mod tests {
         PRECISION_FIELD, Paging, PrimaryCollector, PrimarySegmentCollector, QueryPath, REPO_FIELD,
         REVISION_FIELD, ROLE_FIELD, Retained, SAMPLE_FLOOR, SOURCE_FIELD, STATE_FIELD,
         SUB_ROLE_FIELD, SegmentBoundary, Selection, SortColumn, TRIGGER_FIELD, WRITER_BUDGET,
-        Window, bucket_of, order_of, ordinal_key,
+        Window, bucket_of, document_bytes, order_of, ordinal_key,
     };
 
     /// One indexed document as the columns a tallying collector reads: the five facet terms
@@ -3892,5 +4077,33 @@ mod tests {
         for (index, name) in positions {
             assert_eq!(KEYWORD_FIELDS[index], name);
         }
+    }
+
+    #[test]
+    fn a_documents_bytes_grow_with_its_card_and_its_values() {
+        let (_, fields) = Fields::build();
+        let mut small = TantivyDocument::new();
+        small.add_text(fields.text, "x".repeat(1_000));
+        let small_bytes = document_bytes(&small);
+        assert!(small_bytes >= 1_000, "a 1,000-byte card: {small_bytes}");
+
+        let mut large = TantivyDocument::new();
+        large.add_text(fields.text, "x".repeat(5_000));
+        let large_bytes = document_bytes(&large);
+        assert!(
+            large_bytes >= small_bytes + 4_000,
+            "a 5,000-byte card grows by at least 4,000 over the 1,000-byte one: \
+             {small_bytes} -> {large_bytes}"
+        );
+
+        let mut untexted = TantivyDocument::new();
+        untexted.add_i64(fields.artifact, 1);
+        untexted.add_u64(fields.size, 2);
+        let untexted_bytes = document_bytes(&untexted);
+        assert!(
+            untexted_bytes >= 1_024,
+            "a document with no text at all still holds the fixed per-document heap: \
+             {untexted_bytes}"
+        );
     }
 }

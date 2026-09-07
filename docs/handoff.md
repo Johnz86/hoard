@@ -19,8 +19,8 @@ first; this document assumes it.
   that follows it: predictable memory under unusual workloads, background work that yields
   and writes that are not repeated. It names its waves, the decisions the dispatcher took so
   no wave waits on one, the rule that every wave's implementer is a Sonnet
-  `wave-implementer`, and its finish condition. Wave 1, hash-dispatch, has landed; wave 2 is
-  index-bytes.
+  `wave-implementer`, and its finish condition. Wave 2, index-bytes, has landed; wave 3 is
+  usage-bounds.
 - The native_db (redb) plus Tantivy catalog replaced the SQLite index and is merged. Every
   command, every route, both faces and gossip read and write it, and no SQLite code remains.
   `docs/native-catalog.md` is the current-state document;
@@ -34,8 +34,8 @@ first; this document assumes it.
 - Phases 0 to 11 are done. `docs/feature-plan.md` holds the table. The TREE and DISK views
   are not an unfinished phase: they wait on a design decision and are recorded under that
   document's "Risks and open decisions".
-- At the head of `master` after the hash-dispatch wave all four checks pass:
-  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 882 passed,
+- At the head of `master` after the index-bytes wave all four checks pass:
+  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 888 passed,
   0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness and its supplemental
   fixture, the mDNS test that needs a multicast route and the sniffer test that reads the
   local model caches. `cargo doc --workspace --no-deps` emits no warning, and

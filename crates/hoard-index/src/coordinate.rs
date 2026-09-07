@@ -343,7 +343,17 @@ fn run_scan(
         (HashPolicy::Now | HashPolicy::Background, true) | (HashPolicy::Never, _) => false,
     };
     phase(catalog, item.job, "refreshing search")?;
-    catalog.refresh_search(|_| {})?;
+    let refreshed = catalog.refresh_search_reporting(|_| {})?;
+    if refreshed.applied > 0 {
+        tracing::info!(
+            job = %item.job,
+            applied = refreshed.applied,
+            documents = refreshed.documents,
+            bytes = refreshed.bytes,
+            commits = refreshed.commits,
+            "search refreshed"
+        );
+    }
     if report.interrupted || hashing {
         phase(catalog, item.job, INTERRUPTED)?;
     }

@@ -171,7 +171,16 @@ impl SearchRefresher {
     pub fn spawn(catalog: Arc<Catalog>, interval: Duration) -> Self {
         Self {
             sink: Debounced::spawn(interval, usize::MAX, move |_: Vec<()>| {
-                catalog.refresh_search(|_| {})?;
+                let refreshed = catalog.refresh_search_reporting(|_| {})?;
+                if refreshed.applied > 0 {
+                    tracing::debug!(
+                        applied = refreshed.applied,
+                        documents = refreshed.documents,
+                        bytes = refreshed.bytes,
+                        commits = refreshed.commits,
+                        "search refreshed"
+                    );
+                }
                 Ok(())
             }),
         }

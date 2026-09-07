@@ -528,6 +528,7 @@ fn native_catalog_at_scale() {
 mod supplemental {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::path::{Path, PathBuf};
 
     use hoard_core::{
         Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, Evidence, EvidenceSource,
@@ -539,7 +540,10 @@ mod supplemental {
     use hoard_index::config::{HashPolicy, IndexConfig, SourceKind};
     use hoard_index::discover::RefKind;
 
-    use super::{allocated, apparent, bytes, directory_size, report, scale_dir, timed};
+    use super::{
+        allocated, apparent, bytes, directory_size, kb_between, peak_rss_kb, report, scale_dir,
+        timed,
+    };
 
     const REVISIONS: usize = 3;
     const FILES_PER_REVISION: usize = 50;
@@ -760,6 +764,151 @@ mod supplemental {
         report.tables.iter().map(|table| table.stored_bytes).sum()
     }
 
+    /// How many artifacts the wide-card phase below seeds. Absent, that phase does not run
+    /// and this ordinary supplemental report is unaffected: the budget only binds once one
+    /// artifact's group exceeds about 13 KiB of estimate, which neither this fixture's
+    /// small cards nor the gate tree's cardless entries ever reach.
+    fn wide_card_artifacts() -> Option<usize> {
+        std::env::var("HOARD_SCALE_WIDE_CARD_ARTIFACTS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+    }
+
+    /// How many entries one wide-card artifact is reachable from, 50 to 100, so its whole
+    /// group is 50 to 100 times its card rather than a small multiple of it.
+    fn wide_card_entries(index: usize) -> usize {
+        50 + index % 51
+    }
+
+    /// A card near the 4 MiB `INDEX_DOCUMENT_BYTES` cap a real README can run to: `naming.rs`
+    /// reads a `*.index.json` no larger than that, and this is sized to match it, so one
+    /// entry's document alone is close to the cap and one artifact's whole group is far past
+    /// it before the writer's budget is ever reconsidered.
+    fn wide_card(name: &str) -> String {
+        let mut text = format!(
+            "---\nlicense: apache-2.0\ntags:\n- text-to-image\n- lora\nbase_model: sdxl-1.0\n---\n\n\
+             # {name}\n\n"
+        );
+        let paragraph = "This adapter was trained on a curated set of images at 1024 by 1024 \
+                          with a constant learning rate and a cosine schedule. Use the trigger \
+                          word to invoke the style, and keep the weight between 0.6 and 0.9 for \
+                          portraits.\n\n";
+        while text.len() < 4 * 1024 * 1024 {
+            text.push_str(paragraph);
+        }
+        text
+    }
+
+    /// One repository per artifact, each reachable from [`wide_card_entries`] entries in one
+    /// revision, that revision's card [`wide_card`]. This is the shape the writer's budget
+    /// binds on: [`seed_repositories`] above never approaches it, so a rebuild of it alone
+    /// cannot show what this wave changed.
+    fn wide_card_repositories(count: usize) -> Vec<SeedRepository> {
+        (0..count)
+            .map(|index| {
+                let artifact = SeedArtifact {
+                    identity: index as u128,
+                    artifact: artifact(index),
+                    name: format!("wide-{index:04}.safetensors"),
+                    org: Some(format!("org{:02}", index % 32)),
+                    tensors: Some(tensors(index)),
+                    evidence: evidence(),
+                    card: Some(wide_card(&format!("wide-{index:04}"))),
+                    group_bytes: None,
+                    shard_count: None,
+                };
+                let root_path = PathBuf::from(format!("/synthetic/wide/wide{index:04}"));
+                SeedRepository {
+                    repo: RepoId::new(
+                        RepoType::Models,
+                        Some(format!("org{:02}", index % 32)),
+                        format!("wide{index:04}"),
+                    ),
+                    source: "loose".to_owned(),
+                    kind: SourceKind::Loose,
+                    root_path: root_path.clone(),
+                    git_dir: None,
+                    revisions: vec![SeedRevision {
+                        name: "main".to_owned(),
+                        sha: Some(commit(index as u64)),
+                        refs: vec![("main".to_owned(), RefKind::Branch)],
+                        title: None,
+                        author: None,
+                        committed: Some(jiff::Timestamp::UNIX_EPOCH),
+                        entries: (0..wide_card_entries(index))
+                            .map(|shard| {
+                                let rel_path = format!("shard-{shard:03}.safetensors");
+                                SeedEntry {
+                                    abs_path: Some(
+                                        root_path.join(&rel_path).to_string_lossy().into_owned(),
+                                    ),
+                                    rel_path,
+                                    node: 1,
+                                    size: 1_073_741_824,
+                                    state: State::Local,
+                                    is_symlink: false,
+                                    sha256: Some(sha256(index as u64)),
+                                    git_sha1: Some(commit((index * 1_000 + shard) as u64)),
+                                    artifact: Some(artifact.clone()),
+                                }
+                            })
+                            .collect(),
+                    }],
+                }
+            })
+            .collect()
+    }
+
+    /// A second shape beside [`supplemental_catalog_costs`]'s: a few hundred artifacts each
+    /// reachable from 50 to 100 entries, each revision's card near the 4 MiB cap, so one
+    /// artifact's group alone is tens to hundreds of megabytes and the writer's budget
+    /// actually binds on it. Runs only when `HOARD_SCALE_WIDE_CARD_ARTIFACTS` is set, so the
+    /// ordinary run above is unchanged when it is absent. The rebuild's commit count is
+    /// reported, not asserted: a count of 1 would mean the budget never fired and the RSS
+    /// row beside it says nothing about this wave.
+    fn wide_card_phase(root: &Path) {
+        let Some(count) = wide_card_artifacts() else {
+            return;
+        };
+        let wide_root = root.join("wide");
+        if wide_root.exists() {
+            fs::remove_dir_all(&wide_root).expect("old wide-card tree is removable");
+        }
+        fs::create_dir_all(&wide_root).expect("wide-card root is creatable");
+        let output = wide_root.join("native");
+        let config = IndexConfig {
+            data_dir: wide_root.clone(),
+            hash_policy: HashPolicy::Never,
+            sources: Vec::new(),
+            ..IndexConfig::default()
+        };
+        let catalog =
+            Catalog::scan_sources(&output, "scale", &config, HashPolicy::Never, |_, _| {})
+                .expect("an empty wide-card catalog is creatable");
+        let seeds = wide_card_repositories(count);
+        let (written, seed_time) = timed(|| catalog.seed(&seeds).expect("seeding succeeds"));
+
+        let rss_before_rebuild = peak_rss_kb();
+        let (commits, rebuild_time) = timed(|| {
+            catalog
+                .rebuild_search_commits(|_| {})
+                .expect("the wide-card rebuild succeeds")
+        });
+        let rss_after_rebuild = peak_rss_kb();
+
+        report(&[
+            ("wide-card artifacts", count.to_string()),
+            ("wide-card artifacts written", written.len().to_string()),
+            ("wide-card seed wall", format!("{seed_time:?}")),
+            ("wide-card rebuild wall", format!("{rebuild_time:?}")),
+            (
+                "wide-card peak rss growth during rebuild",
+                kb_between(rss_before_rebuild, rss_after_rebuild),
+            ),
+            ("wide-card rebuild commits", commits.to_string()),
+        ]);
+    }
+
     #[test]
     #[ignore]
     fn supplemental_catalog_costs() {
@@ -782,8 +931,10 @@ mod supplemental {
         let seeds = seed_repositories(&root, count);
         let entries = count * REVISIONS * FILES_PER_REVISION;
         let (written, seed_time) = timed(|| catalog.seed(&seeds).expect("seeding succeeds"));
+        let rss_before_rebuild = peak_rss_kb();
         let ((), rebuild_time) =
             timed(|| catalog.rebuild_search(|_| {}).expect("rebuild succeeds"));
+        let rss_after_rebuild = peak_rss_kb();
 
         let subject = written.first().map(|(_, id)| *id).expect("an artifact");
         let (_, detail_time) = timed(|| {
@@ -833,6 +984,10 @@ mod supplemental {
             ),
             ("seed wall", format!("{seed_time:?}")),
             ("rebuild wall", format!("{rebuild_time:?}")),
+            (
+                "peak rss growth during rebuild",
+                kb_between(rss_before_rebuild, rss_after_rebuild),
+            ),
             ("on disk, apparent", bytes(disk_apparent)),
             ("on disk, allocated", bytes(disk_allocated)),
             ("record payload", bytes(payload_total(&storage))),
@@ -853,5 +1008,7 @@ mod supplemental {
             ("inspector entries_of", format!("{entries_time:?}")),
             ("inspector repository", format!("{repository_time:?}")),
         ]);
+
+        wide_card_phase(&root);
     }
 }

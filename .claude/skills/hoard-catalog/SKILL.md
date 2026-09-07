@@ -119,16 +119,23 @@ are the facts that have caught agents out:
 - The collectors keep **term ordinals**, not terms. Ordinals are lexicographic inside a
   segment and meaningless across segments, so a cross-segment order merges on spelled terms.
 - The outbox is the `SearchChange` table plus `Manifest.search_seq`. `refresh_search` replays
-  the log after the durable cursor, one Tantivy commit per batch, deleting an artifact's
-  documents by term and re-adding its entries, then prunes what it applied. It also prunes
-  what the cursor has already passed, which is what a refresh killed before its own prune
-  leaves behind.
+  the log after the durable cursor, at least one Tantivy commit per batch (a budget commit
+  may land inside one; the cursor still advances and the batch is pruned exactly once, after
+  it), deleting an artifact's documents by term and re-adding its entries, then prunes what
+  it applied. It also prunes what the cursor has already passed, which is what a refresh
+  killed before its own prune leaves behind.
 - A rebuild writes a fresh `search-v1-<nanos>` directory and publishes its name in a redb
   transaction only after Tantivy commits; publishing then removes every superseded
   directory, and so does `Catalog::open`, because a killed build publishes nothing and would
   otherwise leave its directory for good. An unpublished build leaves the previous one
   serving.
-- The writer is one thread with a 32 MiB budget.
+- The writer is one thread with a 32 MiB budget. `Metered` wraps it and commits, before
+  handing over the group that would cross the budget, whenever 128 MiB of estimated document
+  bytes would go by since the last commit, on the rebuild and on the refresh, so what the
+  writer's pipeline holds ahead of the indexing thread is bounded to the larger of the budget
+  and one artifact's documents; an artifact's documents are still one `IndexWriter::run`
+  group and one run in one segment. That group is not itself bounded, because a revision's
+  card is indexed into every entry document of it.
 
 ## Before you change anything here
 
