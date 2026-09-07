@@ -124,16 +124,42 @@ squashed commit on `master`, in this order.
    Every recovery, refile and revision-identity test keeps its assertions. The gate tree is
    a loose source, so the 1M scan RSS row reads the first and third changes and almost
    nothing of the second.
-5. **budgets-measured.** The harness gains what this run must measure: a deletion phase
-   that removes a tenth of the tree and rescans, reporting wall and peak RSS growth; a
-   concurrent-search phase that runs eight midpoint queries at once and reports peak RSS
-   growth over them; a mixed-size hashing row with one multi-gigabyte sparse file beside a
-   thousand small ones. Then the whole protocol of `.claude/skills/hoard-measure/SKILL.md`
-   against `9979f7b` rebuilt in the same session, the supplemental fixture with cards and
-   many entries per artifact, and a fresh scan of this workstation's disks with `hoard
-   doctor` after it. Every threshold stated as met or missed with the number, in
-   `docs/native-catalog.md`. A miss produces a fix wave and a re-measurement of the missed
-   rows only.
+5. **budgets-measured.** The harness gains what this run must measure. From the goal as it
+   was set: a deletion phase that removes a tenth of the tree and rescans, reporting wall and
+   peak RSS growth; a concurrent-search phase that runs eight midpoint queries at once and
+   reports peak RSS growth over them; a mixed-size hashing row with one multi-gigabyte sparse
+   file beside a thousand small ones. From what waves 2 and 3 and their reviews established,
+   because without these the run's two largest changes are invisible:
+
+   - **A usage workload**, which the harness has none of today. Seed about a million rows
+     through `log_usage_batch` across a hundred repositories, skewed so one holds about half
+     of them, then report the newest-pulls read and the usage report on that heavy
+     repository, each with its wall and its peak RSS growth. This is the only thing that
+     makes wave 3's central claim visible: before it, that read was proportional to the
+     repository's whole history.
+   - **Retiring that heavy repository, timed.** This is the largest asymptotic change in the
+     run and wave 3 did not claim it: the old secondary scan re-materialised every remaining
+     key on each chunk, so forgetting a repository's log was quadratic in its length, and it
+     is now linear. It belongs in the deletion phase this wave already adds.
+   - **The reindex grain as a count, not a timing.** Log one artifact in a hundred and twenty
+     batches spanning sixty-one seconds and report the changes logged and the refresh's
+     applied, documents and commits. The document work falls about thirtyfold and the row
+     churn about a hundredfold; a count says so on any machine and competes with nothing.
+   - **A usage log worth timing on the route list.** The fixed route list seeds about two
+     thousand responses, which the previous run's own review called too small to establish
+     anything. Raise it to at least two hundred thousand spread over more than a month, add a
+     second usage row against a repository with a short log so the table shows the route is
+     flat in the log's size, and say that the row changed so it is not comparable with the
+     history above it.
+
+   Then the whole protocol of `.claude/skills/hoard-measure/SKILL.md` against `9979f7b`
+   rebuilt in the same session, the fan-out fixture wave 2 added, and a fresh scan of this
+   workstation's disks with `hoard doctor` after it. **A like-for-like warning specific to
+   this run:** wave 3 changed a record's shape and bumped the format, so the `9979f7b` column
+   cannot share a catalog directory with the head. Each column seeds its own usage log
+   through the public API, in its own tree, in the one session, and the table says so. Every
+   threshold stated as met or missed with the number, in `docs/native-catalog.md`. A miss
+   produces a fix wave and a re-measurement of the missed rows only.
 6. **fix-wave**, if the measurement asks for one: the missed rows, and what the closing
    reviews find across the whole delta, fixed or recorded.
 
