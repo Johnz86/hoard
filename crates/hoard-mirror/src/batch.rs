@@ -5,8 +5,8 @@
 //! memory and hands the whole of it to one call, at most once per interval while pokes keep
 //! arriving, or immediately once enough has piled up.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use hoard_index::catalog::Catalog;
@@ -19,33 +19,20 @@ use crate::error::{MirrorError, Result};
 /// open a transaction.
 type Writer<T> = Arc<dyn Fn(Vec<T>) -> Result<()> + Send + Sync>;
 
-/// What a batch does with an item recorded past its bound, in place of holding it. Runs
-/// under the same lock `record` takes, so it must not block.
-type Fold<T> = Arc<dyn Fn(&T) + Send + Sync>;
-
-/// Items waiting to be written together, the writer that takes them, and what a bound past
-/// `capacity` does with an item the writer has not caught up to.
+/// Items waiting to be written together, and the writer that takes them.
 struct Batch<T> {
     pending: Mutex<Vec<T>>,
     ready: Notify,
     capacity: usize,
-    bound: usize,
-    folded: AtomicU64,
     write: Writer<T>,
-    fold: Fold<T>,
-}
-
-impl<T> Batch<T> {
-    fn lock(&self) -> MutexGuard<'_, Vec<T>> {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
-    }
 }
 
 impl<T: Send + 'static> Batch<T> {
     fn take(&self) -> Vec<T> {
-        let mut pending = self.lock();
-        self.folded.store(0, Ordering::Relaxed);
-        std::mem::take(&mut *pending)
+        match self.pending.lock() {
+            Ok(mut pending) => std::mem::take(&mut *pending),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        }
     }
 
     async fn drain(self: &Arc<Self>) -> Result<()> {
@@ -84,7 +71,10 @@ impl<T> std::fmt::Debug for Debounced<T> {
 
 impl<T> Debounced<T> {
     fn pending_len(&self) -> usize {
-        self.batch.lock().len()
+        match self.batch.pending.lock() {
+            Ok(pending) => pending.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
     }
 }
 
@@ -96,31 +86,11 @@ impl<T: Send + 'static> Debounced<T> {
     where
         F: Fn(Vec<T>) -> Result<()> + Send + Sync + 'static,
     {
-        Self::spawn_bounded(interval, capacity, usize::MAX, write, |_: &T| {})
-    }
-
-    /// As [`Debounced::spawn`], with a hard bound past which a recorded item is handed to
-    /// `fold` instead of held: what accumulates while a writer falls behind is bounded to
-    /// `bound` items rather than growing with every response that arrives.
-    pub fn spawn_bounded<F, G>(
-        interval: Duration,
-        capacity: usize,
-        bound: usize,
-        write: F,
-        fold: G,
-    ) -> Self
-    where
-        F: Fn(Vec<T>) -> Result<()> + Send + Sync + 'static,
-        G: Fn(&T) + Send + Sync + 'static,
-    {
         let batch = Arc::new(Batch {
             pending: Mutex::new(Vec::new()),
             ready: Notify::new(),
             capacity: capacity.max(1),
-            bound,
-            folded: AtomicU64::new(0),
             write: Arc::new(write),
-            fold: Arc::new(fold),
         });
         let stop = Arc::new(Notify::new());
         let task = tokio::runtime::Handle::try_current().ok().map(|runtime| {
@@ -131,20 +101,19 @@ impl<T: Send + 'static> Debounced<T> {
         Self { batch, stop, task }
     }
 
-    /// Adds one item to what is waiting, and wakes the writer when enough has piled up. Past
-    /// the bound, the item is folded instead of held.
+    /// Adds one item to what is waiting, and wakes the writer when enough has piled up.
     pub fn record(&self, item: T) {
-        let mut pending = self.batch.lock();
-        if pending.len() >= self.batch.bound {
-            (self.batch.fold)(&item);
-            self.batch.folded.fetch_add(1, Ordering::Relaxed);
-            drop(pending);
-            self.batch.ready.notify_one();
-            return;
-        }
-        pending.push(item);
-        let full = pending.len() >= self.batch.capacity;
-        drop(pending);
+        let full = match self.batch.pending.lock() {
+            Ok(mut pending) => {
+                pending.push(item);
+                pending.len() >= self.batch.capacity
+            }
+            Err(poisoned) => {
+                let mut pending = poisoned.into_inner();
+                pending.push(item);
+                pending.len() >= self.batch.capacity
+            }
+        };
         if full {
             self.batch.ready.notify_one();
         }
@@ -153,13 +122,6 @@ impl<T: Send + 'static> Debounced<T> {
     /// How many items are waiting to be written.
     pub fn pending(&self) -> usize {
         self.pending_len()
-    }
-
-    /// How many items have been folded rather than held since the last take, reset in the
-    /// same critical section a drain takes what was pending so a fold racing between the
-    /// two is never lost from the count.
-    pub fn folded(&self) -> u64 {
-        self.batch.folded.load(Ordering::Relaxed)
     }
 
     /// Writes what is waiting now.
@@ -209,16 +171,7 @@ impl SearchRefresher {
     pub fn spawn(catalog: Arc<Catalog>, interval: Duration) -> Self {
         Self {
             sink: Debounced::spawn(interval, usize::MAX, move |_: Vec<()>| {
-                let refreshed = catalog.refresh_search_reporting(|_| {})?;
-                if refreshed.applied > 0 {
-                    tracing::debug!(
-                        applied = refreshed.applied,
-                        documents = refreshed.documents,
-                        bytes = refreshed.bytes,
-                        commits = refreshed.commits,
-                        "search refreshed"
-                    );
-                }
+                catalog.refresh_search(|_| {})?;
                 Ok(())
             }),
         }
@@ -309,51 +262,5 @@ mod tests {
         sink.record(3);
         sink.shutdown().await.expect("shutdown writes");
         assert_eq!(written.load(Ordering::Relaxed), 3);
-    }
-
-    #[tokio::test]
-    async fn a_sink_past_its_bound_folds_instead_of_growing() {
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
-        let release_rx = Mutex::new(release_rx);
-        let written = Arc::new(AtomicUsize::new(0));
-        let sink = {
-            let written = Arc::clone(&written);
-            Debounced::spawn_bounded(
-                Duration::from_secs(3600),
-                4,
-                8,
-                move |items: Vec<u8>| {
-                    release_rx.lock().expect("lock").recv().expect("released");
-                    written.fetch_add(items.len(), Ordering::Relaxed);
-                    Ok(())
-                },
-                |_: &u8| {},
-            )
-        };
-
-        for value in 0..40_u8 {
-            sink.record(value);
-        }
-
-        assert!(sink.pending() <= 8, "pending held at {}", sink.pending());
-        let folded_before = sink.folded();
-        assert_eq!(
-            sink.pending() as u64 + folded_before,
-            40,
-            "every recorded item is either pending or folded"
-        );
-        assert!(folded_before > 0, "the burst overran the bound");
-
-        let release = std::thread::spawn(move || {
-            release_tx.send(()).expect("release sent");
-        });
-        sink.flush().await.expect("flush writes what is pending");
-        release.join().expect("the release thread finished");
-
-        assert_eq!(
-            written.load(Ordering::Relaxed) as u64 + folded_before,
-            40,
-            "what was written plus what was folded accounts for every item"
-        );
     }
 }

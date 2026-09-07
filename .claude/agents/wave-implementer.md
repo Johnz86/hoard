@@ -13,6 +13,9 @@ Follow `.claude/skills/hoard-implement-plan/SKILL.md` exactly. It is the whole c
 the preflight, the rules, the checks, the process hygiene, the deviation record, the commits
 and the report. Do not substitute your own process for it.
 
+This agent's model is set here and a dispatcher must not override it downward. A wave run
+on a weaker model spends more on review rounds than it saves.
+
 The dispatcher gives you the worktree path and the plan path inside it. If either is
 missing, ask for it before you start rather than inventing one. You never merge, push or
 touch the main checkout; the dispatcher lands the wave.

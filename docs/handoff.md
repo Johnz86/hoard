@@ -15,17 +15,14 @@ first; this document assumes it.
   The run is finished: `docs/superpowers/history/2026-09-remaining-work-review.md` is the
   review of what each wave changed, the final numbers, what the closing reviews found and
   the recommendations for what comes next.
-- `docs/superpowers/specs/2026-09-07-predictable-memory-goal.md` is the brief for the run
-  that follows it: predictable memory under unusual workloads, background work that yields
-  and writes that are not repeated. It names its waves, the decisions the dispatcher took so
-  no wave waits on one, the rule that every wave's implementer is a Sonnet
-  `wave-implementer`, and its finish condition. Wave 3, usage-bounds, and wave 4, scan-scope,
-  have landed; wave 5 is budgets-measured. Scan-scope folds the summary difference into the
-  stored totals in the transaction that made it rather than keeping one entry per touched
-  artifact until the pass ends, walks an hf-cache or a git source in groups of 64
-  repositories with the known-path map scoped to one group rather than the whole source (a
-  loose source cannot be split and takes the same one-group path), and turns the redb page
-  cache into `[index] cache_mib`. Not measured: wave 5 measures the run once.
+- **The predictable-memory run of 2026-09-07 is reverted.** It set five waves and landed
+  four, measured nothing, and was halted by the owner. Its code is gone from `master`; the
+  commits stay reachable at the tag `reverted/2026-09-07-predictable-memory`.
+  `docs/superpowers/history/2026-09-07-predictable-memory-reverted.md` says why, what the
+  process got wrong, and - the part worth keeping - the facts its reviews established about
+  tantivy's per-document allocation, native_db's scan semantics, what the gate tree cannot
+  show, and the hazards any future batching of a source's repositories has to respect. Read
+  it before planning optimisation work on this catalog.
 - The native_db (redb) plus Tantivy catalog replaced the SQLite index and is merged. Every
   command, every route, both faces and gossip read and write it, and no SQLite code remains.
   `docs/native-catalog.md` is the current-state document;
@@ -39,12 +36,10 @@ first; this document assumes it.
 - Phases 0 to 11 are done. `docs/feature-plan.md` holds the table. The TREE and DISK views
   are not an unfinished phase: they wait on a design decision and are recorded under that
   document's "Risks and open decisions".
-- At the head of `master` after the scan-scope wave all four checks pass:
-  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 908 passed,
-  0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness and its supplemental
-  fixture, the mDNS test that needs a multicast route and the sniffer test that reads the
-  local model caches. `cargo doc --workspace --no-deps` emits no warning, and
-  `cargo test --release -p hoard-server --lib assets::` passes 5.
+- At the head of `master`, which is the code of `9979f7b` again, the check suite is what
+  that commit recorded: `cargo fmt --check`, clippy with `-D warnings`, `cargo test
+  --workspace`, `cargo build --workspace`, `cargo doc --workspace --no-deps` and the release
+  asset test.
 - Waves 1 to 9 of the goal are on `master` and the run is measured. The measurement is in
   `docs/native-catalog.md` under "Measured": the whole scale harness at 100k and 1M against
   a `3a9fa1f` column rebuilt and run in the same session over the same tree, the eleven
@@ -72,12 +67,17 @@ them.
    task relies on, name the file and function that enforces it. Name the pinned tests: the
    tests of the waves this one builds on that must keep their assertions.
 2. **Dispatch the implementer.** The `wave-implementer` agent, given the worktree path and
-   the plan path, and nothing else, with the model override the goal names (`sonnet` for the
-   predictable-memory goal). It follows `.claude/skills/hoard-implement-plan/SKILL.md`:
+   the plan path, and nothing else. **Do not downgrade the model.** The reverted run of
+   2026-09-07 ran every wave on `sonnet` to save tokens and spent far more of them on review
+   rounds than it saved; the agent definitions carry the model and the dispatcher does not
+   override it. It follows `.claude/skills/hoard-implement-plan/SKILL.md`:
    preflight in the worktree, the AGENTS.md rules, the checks, foreground-only process
    hygiene, a record of every deviation from the plan, one checkpoint commit per task, and a
-   report. A fix a review asks for is a task appended to the same wave for the same
-   implementer, not a new wave.
+   report. **A review finding is not automatically a task.** A small correction can be
+   appended to the wave; anything larger means the plan was wrong, and a wrong plan is
+   rewritten rather than patched by appending tasks to the agent that followed it. Appending
+   round after round is what makes one transcript write something and then delete it, which
+   is what the owner saw and stopped in the reverted run.
 
    The report is written so you can verify without reading the transcript, and section 7 of
    that skill fixes what it contains: the commit hashes and subjects in order, every
@@ -105,6 +105,21 @@ them.
    this change set builds on, not only `master`. Do not run a build while a reviewer is
    measuring, or dispatch a measuring reviewer beside anything else that uses the disk.
    Fixes from the review go on the same branch, as more checkpoints, before landing.
+3b. **Halt and ask, do not push through.** Stop the run and put it to the owner, with the
+   numbers, when any of these is true. Each one was true in the reverted run of 2026-09-07
+   and none of them stopped it:
+
+   - a review finds more than it found on the previous wave, rather than fewer;
+   - a wave introduces a defect that did not exist before it, especially one that can lose
+     data;
+   - a wave lands with nothing measured, on a run whose purpose is a measurable property;
+   - the goal document needs correcting for a second time.
+
+   **Report the trend, not the events.** "Review found things and we fixed them" reads as a
+   healthy loop and hides a rising defect rate. Say how many findings this wave drew against
+   the last, and say plainly when a wave introduced a defect rather than only that it was
+   closed.
+
 4. **Land the wave.** From the main checkout on `master`:
    `git merge --squash wave/<name>`, then one commit whose subject and body are the plan's
    wave commit, ending with the two attribution trailer lines this session was given. Then

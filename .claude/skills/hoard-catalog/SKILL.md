@@ -36,12 +36,10 @@ One line per file in `crates/hoard-index/src/catalog/`:
 - `verdict.rs` a user's override of what an artifact is, re-applied after a rescan.
 - `seed.rs` synthetic records for tests, behind `cfg(test)` or the `fixtures` feature.
 - `userdata.rs` shelves, settings, the noise list, projections.
-- `usage.rs` the served-response log, keyed by repository and sequence, and per-artifact use
-  counts indexed at a floored-minute grain.
+- `usage.rs` the served-response log and per-artifact use counts.
 - `loadouts.rs` loadout documents and pin resolution.
 - `jobs.rs` scan, apply and pull job rows.
-- `hashing.rs` sha256 and git blob sha1 per file, content identities, merges, and the
-  bounded worker dispatch a hashing pass reads through.
+- `hashing.rs` sha256 and git blob sha1 per file, content identities, merges.
 - `ingest.rs` a file the mirror fetched, filed as a served entry.
 - `nodes.rs` this machine and every peer it knows.
 - `digest.rs` the rows this node offers and the rows a peer advertises.
@@ -56,16 +54,8 @@ Every writer of an entry commits through `scan::Counters`:
   helpers hand out ids from it, starting from the higher of what it holds and the highest id
   each table holds, so a pass killed before it saved cannot have an id handed out twice.
 - `Counters::touch(transaction, artifact_id)` is called *before* an artifact record is
-  written. It keeps what the record contributed to the summary beforehand, in a map that
-  holds only the transaction in flight: `Counters::settle_summary(transaction)`, called
-  wherever `DerivedShift::flush` already runs, reads each touched id's record as that same
-  transaction leaves it, shifts the stored `Summary` by the difference and clears the map. The
-  fold telescopes - shifting `a -> b` then `b -> c` equals shifting `a -> c` - so an artifact
-  touched again once an earlier transaction has settled it still settles exactly, and a kill
-  leaves no count behind a row that already committed. `Counters::touched`, the set a sweep at
-  the pass's end still rechecks, is not folded the same way and spans the whole pass: the
-  hashing pass merges two artifacts without an in-transaction sweep and relies on that sweep,
-  and a retirement recounts what it touched across several transactions the same way.
+  written. It keeps what the record contributed to the summary beforehand, so the pass moves
+  the summary by a difference rather than recounting every record.
 - `Counters::derived` is a `DerivedShift`. Call `added(&entry)` before writing an entry and
   `removed(&entry)` before removing one or moving it out of presence. It accumulates each
   repository's present files and bytes, each source's owed hashes and each node's filed
@@ -77,28 +67,13 @@ Every writer of an entry commits through `scan::Counters`:
   the highest key the log holds and `Manifest.search_seq`. It writes nothing while no search
   directory is published: a build reads the artifact records, not the log, and publishing
   prunes the whole log unread. `Counters::load` reads that flag once per pass.
-- `Counters::save(transaction)` flushes whatever `DerivedShift` is left, settles the summary
-  the same way, and writes the allocator back.
+- `Counters::save(transaction)` flushes whatever `DerivedShift` is left and writes the
+  allocator back.
 - A pass that commits more than once sets `Manifest.pass_open` before its first commit and
-  clears it in its last, because each scanned source's files and bytes are what a pass settles
-  at its end. A run that finds the mark set recounts both first, unconditionally: the totals
-  no longer need that recount to stay exact, since every transaction that moves them settles
-  itself, so this makes the recount cheaper to find nothing to do rather than redundant to run
-  at all. `docs/native-catalog.md` under "Recovery" says what a kill at each stage leaves and
-  what is accepted.
-- `discover::discover` reads a source whole - every repository, every file - before
-  `Catalog::walk` sees any of it; discovery itself is not grouped. What is grouped is what
-  runs after: `Catalog::walk` takes the already-discovered repositories in `REPO_GROUP` (64)
-  at a time for storing, walking and retracting. A group is stored, `known_stamps_of` reads
-  only that group's repository ids, the group is walked, and a rescan retracts that group's
-  absent paths before the next group of the same list is taken, so one group's known-path
-  map is the most a rescan ever holds, though the discovered repositories and their files
-  stay in memory for the whole source until every group of it is done. A repository no group
-  named this pass is retracted the same way once every group has been walked. A loose source
-  cannot be split even after discovery, because its walk collects every file before any
-  repository exists to chunk, so it takes the one-group path the same code gives any source
-  whose whole repository list already
-  fits in one.
+  clears it in its last, because the totals and each scanned source's files and bytes are what
+  a pass settles at its end. A run that finds the mark set counts both again first.
+  `docs/native-catalog.md` under "Recovery" says what a kill at each stage leaves and what is
+  accepted.
 - A transaction that takes an artifact's last path calls `sweep_artifact` for it before it
   commits, so no committed state counts a path no entry backs. The sweep at the end of the
   pass is then a repeat.
@@ -143,23 +118,16 @@ are the facts that have caught agents out:
 - The collectors keep **term ordinals**, not terms. Ordinals are lexicographic inside a
   segment and meaningless across segments, so a cross-segment order merges on spelled terms.
 - The outbox is the `SearchChange` table plus `Manifest.search_seq`. `refresh_search` replays
-  the log after the durable cursor, at least one Tantivy commit per batch (a budget commit
-  may land inside one; the cursor still advances and the batch is pruned exactly once, after
-  it), deleting an artifact's documents by term and re-adding its entries, then prunes what
-  it applied. It also prunes what the cursor has already passed, which is what a refresh
-  killed before its own prune leaves behind.
+  the log after the durable cursor, one Tantivy commit per batch, deleting an artifact's
+  documents by term and re-adding its entries, then prunes what it applied. It also prunes
+  what the cursor has already passed, which is what a refresh killed before its own prune
+  leaves behind.
 - A rebuild writes a fresh `search-v1-<nanos>` directory and publishes its name in a redb
   transaction only after Tantivy commits; publishing then removes every superseded
   directory, and so does `Catalog::open`, because a killed build publishes nothing and would
   otherwise leave its directory for good. An unpublished build leaves the previous one
   serving.
-- The writer is one thread with a 32 MiB budget. `Metered` wraps it and commits, before
-  handing over the group that would cross the budget, whenever 128 MiB of estimated document
-  bytes would go by since the last commit, on the rebuild and on the refresh, so what the
-  writer's pipeline holds ahead of the indexing thread is bounded to the larger of the budget
-  and one artifact's documents; an artifact's documents are still one `IndexWriter::run`
-  group and one run in one segment. That group is not itself bounded, because a revision's
-  card is indexed into every entry document of it.
+- The writer is one thread with a 32 MiB budget.
 
 ## Before you change anything here
 

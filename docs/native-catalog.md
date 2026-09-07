@@ -106,8 +106,7 @@ the catalog at `<data_dir>/native`.
 - `usage.rs` the served-response log and per-artifact use counts.
 - `loadouts.rs` loadout documents and pin resolution.
 - `jobs.rs` scan, apply and pull job rows.
-- `hashing.rs` sha256 and git blob sha1 per file, content identities, merges, and the
-  bounded worker dispatch a hashing pass reads through.
+- `hashing.rs` sha256 and git blob sha1 per file, content identities, merges.
 - `ingest.rs` a file the mirror fetched, filed as a served entry.
 - `nodes.rs` this machine and every peer it knows.
 - `digest.rs` the rows this node offers and the rows a peer advertises.
@@ -181,20 +180,8 @@ Every writer of an entry commits through `scan::Counters`:
   higher of what the allocator holds and the highest id each table holds, so a pass killed
   before it wrote the allocator back cannot have its ids handed out a second time.
 - `Counters::touch(transaction, id)` is called before an artifact record is written and keeps
-  what the record contributed to the summary beforehand. `Counters::settle_summary(transaction)`
-  is called wherever `DerivedShift::flush` already runs, in the same transaction: it reads
-  each touched id's record as that transaction leaves it, shifts the stored `Summary` by the
-  difference, and clears the map. The fold telescopes - shifting `a -> b` in one transaction
-  and `b -> c` in the next equals shifting `a -> c` - so an artifact touched again once an
-  earlier transaction has settled it still settles exactly, and the map never holds more than
-  the transaction in flight. `Counters::touched`, the set of ids a sweep at the pass's end
-  must still recheck, is not folded the same way and stays for the whole pass: the hashing
-  pass merges two artifacts into one without an in-transaction sweep and relies on the sweep
-  at the end, and a retirement recounts what it touched across several transactions the same
-  way. `Counters::summarise` no longer touches an artifact at all; every artifact difference
-  is already folded by the time it runs, and its only remaining job is the repository count,
-  read fresh because a pass has no per-repository `Counters` entry the way it has one per
-  artifact.
+  what the record contributed to the summary beforehand, so a pass moves the summary by a
+  difference rather than recounting every record.
 - `Counters::derived` is a `DerivedShift`: `added(&entry)` before writing an entry,
   `removed(&entry)` before removing one or moving it out of presence. It accumulates each
   repository's present files and bytes, each source's owed hashes and each node's filed
@@ -205,35 +192,16 @@ Every writer of an entry commits through `scan::Counters`:
   the transaction that made the change, and writes nothing while no search directory is
   published. The sequence continues past both the highest key the log holds and
   `Manifest.search_seq`.
-- `Counters::save(transaction)` flushes whatever shift is left, settles the summary the same
-  way, and writes the allocator back.
+- `Counters::save(transaction)` flushes whatever shift is left and writes the allocator back.
 
-A rescan recognises a stored row by where it is filed. `known_stamps_of(repo_ids)` keys the
-map it hands the walk by a hash of the location - the repository id, the revision ordinal and
-the relative path - and not by the absolute path the row's bytes were last found at. The two
-are not the same identity: an hf-cache entry sits at a blob under `blobs/`, so a file rewritten
-in place is discovered at a new absolute path, its stored row would never be recognised, and
-the row written for it would collide on the unique `location` key. The location is what the
-catalog itself files an entry under, so the walk and the index agree on what one row is, and
-it costs one hash of a relative path where the absolute path cost one of a longer string.
-
-`discover::discover` still reads a source whole: one call enumerates every repository
-directory and reads every file of it, for every layout, before any group exists. What
-`Catalog::walk` bounds is what happens *after* that: it takes the already-discovered
-repositories in groups of `REPO_GROUP` (64) for storing, walking and retracting, rather than
-storing the whole source, walking it and retracting once at the end. A group is stored,
-`known_stamps_of` is read for only that group's repository ids, the group is walked, and a
-rescan retracts that group's absent paths before the next group is taken from the same list,
-so no more than one group's known-path map is ever in memory, and no more than one group's
-absences are looked for in a transaction, though the discovered repositories and the files
-`discover` read for them stay in memory, for the whole source, until every group of it is
-done. A repository the catalog holds for a source that no group named this pass - one gone
-from disk since the last one - is retracted the same way once every group has been walked. A
-loose source is discovered as one group regardless, because its walk collects every file and
-only then groups the flat list by organisation, so no repository of it exists to chunk even
-after discovery; it takes the same code every source does, with the group size set to the
-whole list. Reading a source's files a group at a time, so a rescan of a very large source
-also bounds what discovery itself holds, is not what this does and remains open work.
+A rescan recognises a stored row by where it is filed. `known_stamps` keys the map it hands
+the walk by a hash of the location - the repository id, the revision ordinal and the relative
+path - and not by the absolute path the row's bytes were last found at. The two are not the
+same identity: an hf-cache entry sits at a blob under `blobs/`, so a file rewritten in place
+is discovered at a new absolute path, its stored row would never be recognised, and the row
+written for it would collide on the unique `location` key. The location is what the catalog
+itself files an entry under, so the walk and the index agree on what one row is, and it costs
+one hash of a relative path where the absolute path cost one of a longer string.
 
 A location is an ordinal, so a revision the walk finds at a fresh slot matches nothing under
 that key though every file it holds is a file the catalog already read. The walk therefore
@@ -248,27 +216,22 @@ moved, which is what two hf-cache snapshots linking one blob look like.
 
 That index is built one repository at a time, as the walk reaches a revision the catalog
 holds no rows for, and not for every source before the walk starts: only a repository with a
-fresh slot pays for it and only one repository's worth is held. The map of stored rows itself,
-48 bytes a row, is bounded the same way: `known_stamps_of` reads it one `REPO_GROUP` at a
-time rather than for the whole source.
+fresh slot pays for it and only one repository's worth is held. The map of stored rows
+itself is unavoidable and is 48 bytes a row.
 
 A pass that commits many times can also be asked to stop. `Catalog::rescan_until` checks a
 `Stop` before each source it discovers and between the units of the one it is inside, and
-`Catalog::hash_pending_until` checks it before the pass opens, before each file is handed to a
-worker and once per megabyte of every file being read, so a shutdown costs a megabyte rather
-than an 80 GB checkpoint. A hashing pass hands files to `[index] hash_threads` workers (the
-rayon pool's size by default) through a bounded queue rather than in batches of 64; the writer
-still commits every 64 digests it receives, however many workers are reading at once. What
-discovery cannot cut short is the walk of the source it is already inside, so a rescan's exit
-costs a unit or one source's discovery; a hashing pass's exit costs at most one file per
-worker still reading when the stop was raised, never a whole pass. Both passes leave the pass
-mark set and retire nothing: an interrupted walk never looked for the paths it did not reach,
-so it must not retract them, and the next pass settles the counts and finishes the hashing. A
-hashing pass is not started behind an interrupted walk at all, since opening a pass whose mark
-is held counts every artifact record before its first file would break on the same stop. The
-scan lane raises that stop when it closes, finishes the job that was running with its phase
-set to `interrupted by shutdown; resumes on the next scan`, and cancels the requests that had
-not started.
+`Catalog::hash_pending_until` checks it before the pass opens, before each batch and once per
+megabyte of every file it reads, so a shutdown costs a megabyte rather than an 80 GB
+checkpoint. What it cannot cut short is the discovery walk of the source it is already
+inside, so an exit costs a batch, a unit or one source's discovery, never a whole pass. Both
+passes leave the pass mark set and retire nothing: an interrupted walk never looked for the
+paths it did not reach, so it must not retract them, and the next pass settles the counts and
+finishes the hashing. A hashing pass is not started behind an interrupted walk at all, since
+opening a pass whose mark is held counts every artifact record before its first batch would
+break on the same stop. The scan lane raises that stop when it closes, finishes the job that
+was running with its phase set to `interrupted by shutdown; resumes on the next scan`, and
+cancels the requests that had not started.
 
 `Known`, the row that map holds, is 48 bytes: an entry id, an artifact id, a stamp, an
 ordinal and a shard count, with the two absent cases spelled as zero rather than as an
@@ -292,38 +255,10 @@ The usage log carries a second discipline of the same shape. `log_usage` and
 list, its last pull and how many pulls each of the last 31 UTC days holds. The USAGE tab's
 client count and its chart are both read from that record rather than counted from the log,
 so drawing the chart is one point read whatever the log holds; a window longer than the
-record keeps is counted from the log instead. A `Usage` row's primary key is `UsageLogKey`,
-the repository id in big-endian bytes followed by the row's sequence inside that repository's
-log, also big-endian, in one `Vec<u8>` - the same construction `LocationKey::revision`
-already builds a revision's own key from, an id followed by one more big-endian
-discriminator; there is no secondary key. The repository's newest pulls are then a lazy
-reverse range of its own primary keys, `take(limit)` included, rather than a secondary scan
-that would materialise every row the repository ever served before it could be trimmed, and
-a repository's whole history is one 8-byte prefix. A window longer than 31 days is answered
-the same way: a lazy reverse range stopped a minute earlier than the window's own opening
-day, rather than a scan of the whole log, because the key orders by insertion and not
-strictly by time across two batches, so a minute of slack is cheaper than risking a row that
-belongs inside the window. `recent_pulls` itself still sorts the small page it reads by its
-own `when`, for the same reason.
-
-The sequence is per repository, seeded from the higher of `RepoUsage.pulls` and the highest
-key the repository's own rows already carry - the same high-water-mark defence
-`Counters::load` gives every other id in the catalog - read once, before the write that both
-numbers rows from it and moves it, rather than decoded twice. A repository whose record was
-removed in a transaction separate from its rows, as `retire_source` does, cannot then have a
-later batch reuse a key a row already holds. A response naming no repository is numbered the
-same way under repository id 0, which the allocator never hands out and which no maintained
-record is ever kept for. A writer of a usage row that skips the record leaves the client
-count and the chart behind.
-
-`ArtifactUse.last_used` keeps the exact instant a response landed, because `artifact_usage`
-and the inspector show it, but the value the search index carries is that instant floored to
-the minute (`usage::floored_minute`), and a writer logs the artifact for the index only when
-the floored value moves. An artifact served continuously used to be reindexed once per sink
-batch - its whole card included, since a revision's card is indexed into every entry document
-of the artifacts that hold it - which at a two-request-per-second pace was once every couple
-of seconds; it is now reindexed once a minute. `used:` compares an age in days and `sort=used`
-orders by the column, so neither notices the coarser grain.
+record keeps is counted from the log instead. A `Usage` row carries a `repo_at` secondary key
+- the repository id in big-endian bytes followed by the row's RFC 3339 time - so the recent
+pulls are the tail of one range read backwards. A writer of a usage row that skips the record
+leaves the client count and the chart behind.
 
 The triage threshold a scan ran with is stored in the manifest, and every writer that counts
 an artifact into the summary counts against the stored value rather than against its own
@@ -331,11 +266,9 @@ configuration: `hoard doctor` on a catalog scanned at 0.5 recounts at 0.5. A res
 different configured value records it and counts the summary again; each artifact's own
 stored state is restated as that walk reaches it, not before.
 
-`refresh_search` replays the log after the durable cursor, at least one Tantivy commit per
-batch (a budget commit may land inside one; the cursor still advances and the batch is
-pruned exactly once, after it), deleting an artifact's documents by term and re-adding its
-entries, then prunes what it applied. A rescan followed by a refresh updates search without a
-rebuild. A query answers
+`refresh_search` replays the log after the durable cursor, one Tantivy commit per batch,
+deleting an artifact's documents by term and re-adding its entries, then prunes what it
+applied. A rescan followed by a refresh updates search without a rebuild. A query answers
 from the published index even when a rescan has logged changes no refresh has applied, and
 says so with `stale`; only a catalog with no index at all is refused. A candidate on the page
 whose entry, or the artifact that entry named, the rescan replaced is skipped and counted,
@@ -369,52 +302,35 @@ completes. What each stage leaves:
   file and no manifest is not a catalog. `Catalog::open` refuses it as `CatalogIncomplete`
   and `open_or_scan` removes the directory and scans a fresh one, which is what it already
   did for a catalog of another format.
-- **What each scanned source holds** is what a pass settles at its end rather than in the
-  transactions that earn it: `record_scan_stats` sums a source's held files and bytes from its
-  repositories once, after the walk has stored, walked and retracted every group. **The
-  totals** are not settled this way any more: `Counters::settle_summary` folds each
-  transaction's artifact difference into the stored `Summary` in that same transaction, and
-  `store_source` settles the repository count the same way in the transaction that may have
-  just written one, so a kill leaves the totals exactly what the rows it committed already
-  say. A pass that commits more than once still sets `Manifest.pass_open` before its first
-  commit and clears it in its last, because a source's held files and bytes are still settled
-  only at the end; a run that finds the mark set counts every artifact record again and each
-  source's files and bytes again from its repositories, before it starts, which the totals no
-  longer need but a killed source count still does. Only a kill pays for that; `Catalog::open`
-  pays it once for the process that died.
+- **The totals**, and what each scanned source holds, are what a pass settles at its end
+  rather than in the transactions that earn it. A pass that commits more than once sets
+  `Manifest.pass_open` before its first commit and clears it in its last, and a run that finds
+  the mark set counts every artifact record again, and each source's files and bytes again
+  from its repositories, before it starts. Only a kill pays for that; `Catalog::open` pays it
+  once for the process that died.
 - **An artifact the pass takes a path from** is recounted in the transaction that took it, so
   a record counting a path no entry backs is never committed. The sweep at the end of the pass
   repeats it and finds nothing, and a kill in between leaves nothing to find: the next walk
   skips the rows the killed pass wrote, so it would never look at that artifact again.
 - **The hash pass** commits every 64 digests with the derived counts in the same transaction,
-  so the next pass reads the files still owing a hash and no others. A kill mid-pass leaves
-  whatever the workers had already finished: the writer drains behind them and commits it, so
-  a file a worker was still reading when the kill landed is the only kind of file left owing
-  that a clean pass would not also have read.
+  so the next pass reads the files still owing a hash and no others.
 - **The refresh** commits Tantivy, advances the cursor and then prunes what it applied. A
   kill before the cursor replays the batch, and a replay deletes an artifact's documents by
   term and adds them again, so it changes nothing. A kill between the cursor and the prune
   leaves rows the cursor has passed, which are what `pending_changes` counts: a refresh drops
   them before it reads, because otherwise the catalog reports a staleness no refresh clears.
-  A third point sits inside the batch itself: `Metered` may commit Tantivy once the budget
-  has gone by before the batch's own artifacts are all applied, with the cursor still behind
-  the whole batch. A kill there replays the whole batch from the cursor, not just what was
-  left; the committed prefix is deleted by term and re-added exactly as the rest is, so the
-  replay changes nothing. All three points are inside one batch and the callback fires after
-  all three steps, so the test stages them by hand - it rewinds the cursor and puts the
-  pruned rows back, and it writes a row at the cursor - rather than adding a hook to reach
-  them.
+  Both of those points are inside one batch and the callback fires after all three steps, so
+  the test stages them by hand - it rewinds the cursor and puts the pruned rows back, and it
+  writes a row at the cursor - rather than adding a hook to reach them.
 - **A rebuild** publishes nothing until Tantivy has committed, so a killed one leaves the
   previous index serving and a `search-v1-*` directory the manifest does not name. Publishing
   was the only thing that removed a superseded directory, so `Catalog::open` now removes every
   one the manifest does not name.
 
 What this does not cover, and is accepted: a redb file torn by a power loss is redb's own
-recovery. `retire_entries` and `retract_digest` are still multi-transaction writers that never
-set `Manifest.pass_open`, but that no longer matters for the totals: every transaction of
-either settles its own artifact difference through `Counters::settle_summary`, the same as a
-walk's units do, so a kill inside one leaves the totals exactly what the rows it committed
-already say, with no recount owed to `hoard doctor`.
+recovery; and `retire_entries` and `retract_digest` settle the totals at the end of their own
+multi-transaction passes without the mark, so a kill inside one of those leaves the totals to
+`hoard doctor`.
 
 The `recovery` module of `catalog/tests.rs` holds the proof. It interrupts a stage from the
 progress callback the stage already takes - counting the calls, panicking on a chosen one and
@@ -539,13 +455,7 @@ bucket by folding the artifact id alone, with no tallies and no row.
 
 Free text indexes names, organizations, bases, triggers, tensor key prefixes and the body of
 the shallowest README in each revision. Tantivy uses one writer thread with a 32 MiB indexing
-budget and commits whenever 128 MiB of estimated document bytes have been handed to it since
-the last commit, on the rebuild and on the refresh, so what the writer's pipeline holds ahead
-of the indexing thread is bounded to the larger of that budget and one artifact's documents.
-One artifact's documents are not themselves bounded: a revision's card is indexed into every
-entry document of it, so an artifact reachable from many revisions hands the writer a
-multiple of the card's bytes in one group. Nothing larger than a unit is held in memory or in
-an open transaction.
+budget; nothing larger than a unit is held in memory or in an open transaction.
 
 ## Running it
 
@@ -589,16 +499,6 @@ a rescan of a source they sit under. Every one of those roots and every source r
 resolved to the absolute path an event carries first, because a root spelled relative to the
 working directory would match nothing. Every one of these is a request on the same lane
 `POST /api/v1/scan` uses, so a watched scan and a manual one never run at once.
-
-`[index] hash_threads` is an integer, 0 by default, meaning the rayon pool's size; any other
-value pins a hashing pass to that many workers instead. It is the setting an HDD or NAS owner
-turns down, because a hashing pass otherwise reads as many files at once as the pool has
-threads for, and a spinning disk answers concurrent reads worse than one at a time.
-
-`[index] cache_mib` is an integer, 256 by default, the redb page cache `builder()` opens the
-catalog with. Turning it down bounds what one open catalog holds in memory for pages it has
-already read, at the cost of rereading them from disk more often; `Catalog::open`, which has
-no `IndexConfig` to read a configured value from, always opens with the default.
 
 `compact` is the only thing that compacts a catalog on demand. A scan compacts at the end of
 building one, because that is bulk construction; a rescan never does, so a shared catalog
@@ -1416,21 +1316,15 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
   the count, the sampling pass, the bucket pass and the window pass, four. The last page of a
   million is 21.453 ms again, and a page past the end costs the count plus the pass that
   tallies the facets rather than the sampling pass alone.
-- **The index writer's pipeline is bounded to the larger of the budget and one artifact's
-  documents.** `Metered` wraps the writer `build_index` and `refresh_search` create and
-  commits whenever `INDEX_FLUSH_BYTES` (128 MiB) of estimated document bytes would go by,
-  checked before the group that would cross it is handed to the writer rather than after, so
-  what tantivy's operation channel holds ahead of the indexing thread never exceeds the
-  budget by more than one artifact's group; an artifact's documents are still one
-  `IndexWriter::run` group and one run in one segment. That group is not itself bounded: a
-  revision's card is indexed into every entry document of it, so an artifact reachable from
-  many revisions hands the writer a multiple of the card's bytes in one group. Not repeating
-  the card in every entry document would change what a non-primary entry document matches,
-  which is a design decision for a later wave, not this one. The estimate `document_bytes`
-  computes is the fixed per-document heap `CompactDoc::with_capacity` reserves (1,024
-  bytes), plus eight bytes for every value the document carries, plus every text value's
-  length, not the bytes tantivy itself allocates for postings, fast fields and merges, so it
-  is a lower bound the budget commits against rather than a measurement of peak memory.
+- **The index writer's pipeline is bounded in artifacts, not documents.** `build_index` and
+  `refresh_search` send one `IndexWriter::run` group per artifact, which is what puts an
+  artifact's documents in one segment and lets the query path fold them as a run. tantivy's
+  operation channel is `bounded(PIPELINE_MAX_SIZE_IN_DOCS)`, 10,000 items, and an item was
+  one document and is now one artifact's whole set, so the documents in flight ahead of the
+  indexing thread scale with entries per artifact times the size of a document, which the
+  revision card dominates: the card is stored once per revision but is still indexed into
+  every document of it. The synthetic tree has few entries per artifact and a small card,
+  so the harness cannot show this; read the rebuild RSS row with it in mind.
 - **A collapsed pass reads a chosen row's facet ordinals one document at a time.** The
   primary path reads the five facet columns and the base label per block through
   `first_vals`; `HitColumns::hit_of` reads them per artifact through `first_ord` instead,

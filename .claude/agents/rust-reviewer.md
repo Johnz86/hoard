@@ -2,7 +2,7 @@
 name: rust-reviewer
 description: Reviews a hoard change set against AGENTS.md, the crate boundaries and the Hub contract before it is committed. Use after finishing a phase or a large edit. Performance at scale is the perf-reviewer's job, not this one's.
 tools: Read, Grep, Glob, Bash
-model: inherit
+model: opus
 effort: high
 color: orange
 ---

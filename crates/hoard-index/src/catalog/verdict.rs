@@ -66,8 +66,8 @@ impl Catalog {
         transaction.upsert(verdict)?;
         counters.pending.push(id.get());
         log_changes(&transaction, &mut counters)?;
-        counters.settle_summary(&transaction)?;
         transaction.commit()?;
+        self.summarise(&counters)?;
         self.refresh_search(|_| {})?;
         Ok(())
     }
@@ -104,8 +104,8 @@ impl Catalog {
         transaction.upsert(record)?;
         counters.pending.push(id.get());
         log_changes(&transaction, &mut counters)?;
-        counters.settle_summary(&transaction)?;
         transaction.commit()?;
+        self.summarise(&counters)?;
         self.refresh_search(|_| {})?;
         Ok(())
     }

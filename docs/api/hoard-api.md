@@ -118,12 +118,8 @@ short. The server logs the window at `debug`; nothing in the response names it.
   behind it. `days` is the seven day window, read off the repository's own record,
   which every usage write moves, rather than from its log; `clients` is the distinct clients over the whole history, as
   the repository's own record has counted them, exact up to a cap of 4,096 addresses and
-  reported as that cap beyond it; `pulls` is the newest twenty rows, newest first, read as a
-  bounded range of the repository's own log rather than a scan of its whole history. Under
-  sustained overload the usage sink bounds what it holds and folds a response arriving past
-  that bound into `days` and `clients` instead of a row, so `pulls` may be missing that
-  response's line while `days`, `clients` and the artifact counts `used:` reads stay exact.
-  A client is the first `x-forwarded-for` or `x-real-ip` value that parses as an IP address,
+  reported as that cap beyond it; `pulls` is the newest twenty rows, newest first. A client
+  is the first `x-forwarded-for` or `x-real-ip` value that parses as an IP address,
   otherwise the socket the request arrived on.
 
 ## Shelves

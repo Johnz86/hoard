@@ -22,15 +22,15 @@ use super::models::{
     Allocator, ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE,
     LocationKey, Manifest, Node, Placement, Repository, RepositoryKey, SearchChange, Shelf, Source,
 };
-use super::scan::{Counters, Presence, REPO_GROUP, identity, location_hash, preference};
-use super::search::{Cost, INDEX_FLUSH_BYTES, Paging, QueryPath};
+use super::scan::{Presence, identity, location_hash, preference};
+use super::search::{Cost, Paging, QueryPath};
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
-use super::usage::{HISTORY_DAYS, Window, floored_minute};
+use super::usage::{HISTORY_DAYS, Window};
 use super::{
-    Catalog, Dedupe, DigestApplied, EntryDetail, FORMAT_VERSION, HashReport, JobProgress, JobState,
+    Catalog, Dedupe, DigestApplied, EntryDetail, FORMAT_VERSION, JobProgress, JobState,
     MIRROR_SOURCE, NewProjection, PullMark, PullSlot, PulledFile, QueryPage, QueryRequest,
-    RefreshReport, RemoteEntry, RepositoryDetail, RepositoryFilter, RescanReport, RescanScope,
-    ServedFile, Stop, Totals, TriageItem, UsageEvent, builder, models, query,
+    RemoteEntry, RepositoryDetail, RepositoryFilter, RescanReport, RescanScope, ServedFile, Stop,
+    Totals, TriageItem, UsageEvent, builder, models, query,
 };
 
 fn running_as_root() -> bool {
@@ -129,10 +129,7 @@ fn sources_scan_into_typed_records_that_survive_a_reopen() -> Result<()> {
     assert_eq!(found.rows[0].name, "training.csv");
     assert_eq!(found.rows[0].node, "test-node");
     drop(catalog);
-    let mut reopened = Catalog::open(
-        &directory.path().join("native"),
-        IndexConfig::default().cache_mib,
-    )?;
+    let mut reopened = Catalog::open(&directory.path().join("native"))?;
     assert!(reopened.check_integrity()?);
     assert!(reopened.status()?.search_ready);
     assert_eq!(search(&reopened, "")?.total, 2);
@@ -501,7 +498,7 @@ fn incomplete_or_unknown_catalogs_are_refused() -> Result<()> {
     let database =
         native_db::Builder::new().create(models()?, directory.path().join("catalog.redb"))?;
     drop(database);
-    assert!(Catalog::open(directory.path(), IndexConfig::default().cache_mib).is_err());
+    assert!(Catalog::open(directory.path()).is_err());
     let (_directory, catalog) = fixture()?;
     let mut manifest = catalog.manifest()?;
     manifest.format_version = 999;
@@ -510,7 +507,7 @@ fn incomplete_or_unknown_catalogs_are_refused() -> Result<()> {
     transaction.commit()?;
     let path = catalog.directory.clone();
     drop(catalog);
-    assert!(Catalog::open(&path, IndexConfig::default().cache_mib).is_err());
+    assert!(Catalog::open(&path).is_err());
     Ok(())
 }
 
@@ -568,7 +565,7 @@ fn an_unpublished_build_leaves_the_previous_index_serving() -> Result<()> {
     let before = catalog.manifest()?;
     let staged = catalog.directory.join("search-v1-staged");
     fs::create_dir(&staged)?;
-    catalog.build_index(&staged, INDEX_FLUSH_BYTES, |_| {})?;
+    catalog.build_index(&staged, |_| {})?;
     assert_eq!(catalog.manifest()?, before, "building publishes nothing");
     assert_eq!(
         search(&catalog, "")?.total,
@@ -722,10 +719,7 @@ fn a_rebuild_keeps_manifest_fields_it_does_not_own() -> Result<()> {
 #[test]
 fn a_catalog_open_elsewhere_reports_the_lock_plainly() -> Result<()> {
     let (directory, catalog) = fixture()?;
-    let second = Catalog::open(
-        &directory.path().join("native"),
-        IndexConfig::default().cache_mib,
-    );
+    let second = Catalog::open(&directory.path().join("native"));
     let message = match second {
         Err(error @ IndexError::CatalogBusy) => error.to_string(),
         other => panic!("expected the catalog to report its lock, got {other:?}"),
@@ -998,54 +992,6 @@ fn hf_cache_repo(root: &Path, org: &str, name: &str, files: &[(&str, Vec<u8>)]) 
         }
         std::os::unix::fs::symlink(&blob, &link)?;
     }
-    Ok(())
-}
-
-/// One repository of one file, whose blob is named `hash` rather than by its position among
-/// a call's files: [`hf_cache_repo`] names every first file's blob the same way, which is
-/// exactly wrong for a fixture of many repositories that must not collide on identity.
-fn hf_cache_repo_named(
-    root: &Path,
-    org: &str,
-    name: &str,
-    rel_path: &str,
-    hash: &str,
-    content: &[u8],
-) -> Result<()> {
-    let repo = root.join(format!("models--{org}--{name}"));
-    let commit = "b".repeat(40);
-    let snapshot = repo.join("snapshots").join(&commit);
-    fs::create_dir_all(&snapshot)?;
-    fs::create_dir_all(repo.join("blobs"))?;
-    fs::create_dir_all(repo.join("refs"))?;
-    fs::write(repo.join("refs/main"), &commit)?;
-    let blob = repo.join("blobs").join(hash);
-    fs::write(&blob, content)?;
-    let link = snapshot.join(rel_path);
-    if let Some(parent) = link.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    std::os::unix::fs::symlink(&blob, &link)?;
-    Ok(())
-}
-
-/// Rewrites one file of an [`hf_cache_repo`] fixture in place: a new blob is written under
-/// `blob_prefix`, repeated to a full hash, and the snapshot's symlink is retargeted to it, the
-/// way an hf-cache download replaces a blob without touching the path it is filed at.
-fn rewrite_hf_cache_file(
-    root: &Path,
-    org: &str,
-    name: &str,
-    rel_path: &str,
-    blob_prefix: &str,
-    content: &[u8],
-) -> Result<()> {
-    let repo = root.join(format!("models--{org}--{name}"));
-    let blob = repo.join("blobs").join(blob_prefix.repeat(64));
-    fs::write(&blob, content)?;
-    let link = repo.join("snapshots").join("b".repeat(40)).join(rel_path);
-    fs::remove_file(&link)?;
-    std::os::unix::fs::symlink(&blob, &link)?;
     Ok(())
 }
 
@@ -2132,7 +2078,7 @@ fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
         .find(|table| table.name.starts_with("7_1_id"))
         .map(|table| table.entries);
     assert_eq!(entries, Some(2));
-    let reopened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
+    let reopened = Catalog::open(&native)?;
     assert_eq!(search(&reopened, "")?.total, 2);
     Ok(())
 }
@@ -3873,7 +3819,7 @@ fn inspect_opens_without_seeding_shelves_or_a_self_row() -> Result<()> {
     );
     drop(inspected);
 
-    let opened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
+    let opened = Catalog::open(&native)?;
     assert!(
         !opened.list_shelves()?.is_empty(),
         "opening restores the shelves"
@@ -3882,54 +3828,6 @@ fn inspect_opens_without_seeding_shelves_or_a_self_row() -> Result<()> {
         opened.list_nodes()?.len(),
         1,
         "and records this machine again"
-    );
-    Ok(())
-}
-
-#[test]
-fn a_configured_cache_mib_reaches_a_freshly_scanned_and_a_reopened_catalog() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let input = directory.path().join("models");
-    fs::create_dir_all(&input)?;
-    fs::write(input.join("w.safetensors"), lora_header())?;
-    let config = IndexConfig {
-        data_dir: directory.path().to_path_buf(),
-        sources: vec![source(&input, "comfy")],
-        cache_mib: 42,
-        ..IndexConfig::default()
-    };
-    let native = directory.path().join("native");
-    let scanned = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
-    assert_eq!(
-        scanned.opened_cache_mib(),
-        42,
-        "a fresh scan opens with the configured value"
-    );
-    drop(scanned);
-
-    let reopened = Catalog::open(&native, config.cache_mib_or_default())?;
-    assert_eq!(
-        reopened.opened_cache_mib(),
-        42,
-        "reopening an existing catalog still carries the configured value, not the default"
-    );
-    drop(reopened);
-
-    let via_open_or_scan = Catalog::open_or_scan(&config, "n", |_, _| {})?;
-    assert_eq!(
-        via_open_or_scan.opened_cache_mib(),
-        42,
-        "open_or_scan reopens the same catalog it just scanned with the configured value"
-    );
-
-    let zeroed = IndexConfig {
-        cache_mib: 0,
-        ..config
-    };
-    assert_eq!(
-        zeroed.cache_mib_or_default(),
-        256,
-        "and zero means the default rather than a zero-sized cache"
     );
     Ok(())
 }
@@ -4106,104 +4004,6 @@ fn the_summary_is_exact_after_incremental_passes() -> Result<()> {
         "a rescan that changed nothing changes nothing"
     );
     exact("a rescan that touched nothing")?;
-    Ok(())
-}
-
-#[test]
-fn the_summary_is_exact_when_a_pass_touches_an_artifact_more_than_once() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let hub = directory.path().join("hub");
-    fs::create_dir(&hub)?;
-    let shared = lora_header_named("shared");
-    hf_cache_repo(
-        &hub,
-        "acme",
-        "one",
-        &[("adapter.safetensors", shared.clone())],
-    )?;
-    hf_cache_repo(
-        &hub,
-        "acme",
-        "two",
-        &[("adapter.safetensors", shared.clone())],
-    )?;
-    let config = hub_config(&hub);
-    let catalog = Catalog::scan_sources(
-        &directory.path().join("native"),
-        "n",
-        &config,
-        HashPolicy::Never,
-        |_, _| {},
-    )?;
-    assert_eq!(
-        catalog.totals()?,
-        catalog.count_summary()?,
-        "two copies discovered by one pass, in two transactions, telescope to the same total"
-    );
-    catalog.rebuild_search(|_| {})?;
-    let rows = search(&catalog, "")?;
-    assert_eq!(rows.total, 1, "identical content is one artifact");
-    assert_eq!(rows.rows[0].path_count, 2);
-
-    let moved = lora_header_named("moved");
-    rewrite_hf_cache_file(&hub, "acme", "one", "adapter.safetensors", "e", &moved)?;
-    rewrite_hf_cache_file(&hub, "acme", "two", "adapter.safetensors", "e", &moved)?;
-    let report = catalog.rescan(
-        &config,
-        HashPolicy::Never,
-        RescanScope::Configured,
-        |_, _| {},
-    )?;
-    assert_eq!(report.changed, 2, "both copies were rewritten");
-
-    assert_eq!(
-        catalog.totals()?,
-        catalog.count_summary()?,
-        "the old artifact lost its second and then its last path in two transactions of one rescan"
-    );
-    catalog.rebuild_search(|_| {})?;
-    let rows = search(&catalog, "")?;
-    assert_eq!(rows.total, 1, "the rewritten copies are one artifact again");
-    assert_eq!(rows.rows[0].path_count, 2);
-    Ok(())
-}
-
-#[test]
-fn a_pass_holds_no_summary_snapshot_once_its_transaction_commits() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let input = directory.path().join("models");
-    fs::create_dir_all(&input)?;
-    for index in 0..4 {
-        fs::write(
-            input.join(format!("w{index}.safetensors")),
-            lora_header_named(&format!("t{index}")),
-        )?;
-    }
-    let config = IndexConfig {
-        sources: vec![source(&input, "comfy")],
-        ..IndexConfig::default()
-    };
-    let catalog = Catalog::scan_sources(
-        &directory.path().join("native"),
-        "n",
-        &config,
-        HashPolicy::Never,
-        |_, _| {},
-    )?;
-    let ids = artifact_ids(&catalog)?;
-    assert!(ids.len() >= 2, "the fixture needs more than one artifact");
-    let triage = catalog.stored_triage()?;
-    let mut counters = Counters::load(&catalog.database, triage)?;
-    for id in &ids {
-        let transaction = catalog.database.rw_transaction()?;
-        counters.touch(&transaction, *id)?;
-        counters.settle_summary(&transaction)?;
-        transaction.commit()?;
-        assert!(
-            counters.holds_no_summary_snapshot(),
-            "the snapshot for artifact {id} outlived the transaction that settled it"
-        );
-    }
     Ok(())
 }
 
@@ -4491,7 +4291,7 @@ fn computed_location_keys_follow_entry_updates() -> Result<()> {
     transaction.abort()?;
 
     drop(catalog);
-    let reopened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
+    let reopened = Catalog::open(&native)?;
     let read = reopened.database.r_transaction()?;
     let after: Option<Entry> = read.get().secondary(
         EntryKey::location,
@@ -4852,7 +4652,7 @@ fn compact_records_round_trip_without_changing_public_views() -> Result<()> {
     );
     drop(catalog);
 
-    let reopened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
+    let reopened = Catalog::open(&native)?;
     let after = search(&reopened, "")?;
     assert_eq!(
         after.rows, before.rows,
@@ -4931,8 +4731,7 @@ fn a_catalog_of_another_format_is_rebuilt_before_a_changed_record_is_decoded() -
     drop(catalog);
 
     {
-        let database = builder(IndexConfig::default().cache_mib)
-            .open(models()?, native.join("catalog.redb"))?;
+        let database = builder().open(models()?, native.join("catalog.redb"))?;
         let transaction = database.rw_transaction()?;
         let manifest: Manifest = transaction
             .get()
@@ -5095,7 +4894,7 @@ fn cold_records_read_back_through_the_inspector() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     drop(catalog);
 
-    let reopened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
+    let reopened = Catalog::open(&native)?;
     let after: Vec<_> = ids
         .iter()
         .map(|id| reopened.artifact_detail(*id))
@@ -5318,7 +5117,8 @@ fn every_record_round_trips_through_the_compact_codec() -> Result<()> {
         written_at: "2026-09-07T08:03:00Z".to_owned(),
     };
     let usage = models::Usage {
-        key: models::UsageLogKey::at(4242, 9004),
+        seq: 9004,
+        repo_id: Some(4242),
         at: "2026-09-07T08:04:00Z".to_owned(),
         client: Some("10.0.0.9".to_owned()),
         artifact_id: Some(4243),
@@ -5395,7 +5195,7 @@ fn every_record_round_trips_through_the_compact_codec() -> Result<()> {
     transaction.commit()?;
     drop(catalog);
 
-    let reopened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
+    let reopened = Catalog::open(&native)?;
     let read = reopened.database.r_transaction()?;
     assert_eq!(read.get().primary("codec".to_owned())?, Some(source));
     assert_eq!(read.get().primary(4242_i64)?, Some(repository));
@@ -5410,10 +5210,7 @@ fn every_record_round_trips_through_the_compact_codec() -> Result<()> {
     assert_eq!(read.get().primary(9001_i64)?, Some(shelf));
     assert_eq!(read.get().primary(9002_i64)?, Some(noise));
     assert_eq!(read.get().primary(9003_i64)?, Some(projection));
-    assert_eq!(
-        read.get().primary(models::UsageLogKey::at(4242, 9004))?,
-        Some(usage)
-    );
+    assert_eq!(read.get().primary(9004_u64)?, Some(usage));
     assert_eq!(read.get().primary(4242_i64)?, Some(repo_usage));
     assert_eq!(read.get().primary(4243_i64)?, Some(artifact_use));
     assert_eq!(read.get().primary(9006_i64)?, Some(loadout));
@@ -6226,239 +6023,6 @@ fn an_unchanged_rescan_reads_no_headers_and_a_deleted_file_is_marked_absent() ->
 }
 
 #[test]
-fn a_rescan_in_groups_retracts_a_deleted_repository_and_keeps_the_rest() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let hub = directory.path().join("hub");
-    fs::create_dir(&hub)?;
-    const REPOS: usize = 70;
-    for index in 0..REPOS {
-        hf_cache_repo_named(
-            &hub,
-            "acme",
-            &format!("repo-{index:03}"),
-            "weights.safetensors",
-            &format!("{index:064x}"),
-            &lora_header_named(&format!("t{index}")),
-        )?;
-    }
-    let config = hub_config(&hub);
-    let catalog = Catalog::scan_sources(
-        &directory.path().join("native"),
-        "n",
-        &config,
-        HashPolicy::Never,
-        |_, _| {},
-    )?;
-    assert_eq!(catalog.totals()?.artifacts, REPOS as u64);
-    assert_eq!(
-        catalog.totals()?,
-        catalog.count_summary()?,
-        "more than one group's worth of repositories still settles exactly"
-    );
-
-    let deleted = RepoId::parse_ref(RepoType::Models, "acme/repo-005")?;
-    let deleted_id = repository_of(&catalog, &deleted)?.id;
-    fs::remove_dir_all(hub.join("models--acme--repo-005"))?;
-
-    let report = catalog.rescan(
-        &config,
-        HashPolicy::Never,
-        RescanScope::Configured,
-        |_, _| {},
-    )?;
-    assert_eq!(
-        report.absent, 1,
-        "the deleted repository's one file is the only absence"
-    );
-    assert_eq!(
-        report.unchanged,
-        REPOS as u64 - 1,
-        "every other repository's file was rediscovered unchanged"
-    );
-
-    let entries = catalog.revision_entries(deleted_id, 0, Dedupe::Ignore)?;
-    assert_eq!(entries.len(), 1);
-    assert_eq!(
-        entries[0].state,
-        State::Remote,
-        "a repository no group named is retracted like a path within one"
-    );
-
-    for index in (0..REPOS).filter(|&index| index != 5) {
-        let repo = RepoId::parse_ref(RepoType::Models, &format!("acme/repo-{index:03}"))?;
-        let kept = repository_of(&catalog, &repo)?;
-        let entries = catalog.revision_entries(kept.id, 0, Dedupe::Ignore)?;
-        assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].state,
-            State::Local,
-            "repository {index} is untouched by another group's retraction"
-        );
-    }
-
-    assert_eq!(
-        catalog.totals()?,
-        catalog.count_summary()?,
-        "the group that named nothing for the deleted repository still settles exactly"
-    );
-    Ok(())
-}
-
-#[test]
-fn a_stop_raised_between_groups_retracts_the_finished_group_and_keeps_the_rest() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let hub = directory.path().join("hub");
-    fs::create_dir(&hub)?;
-    let repos = REPO_GROUP + 6;
-    for index in 0..repos {
-        hf_cache_repo_named(
-            &hub,
-            "acme",
-            &format!("repo-{index:03}"),
-            "weights.safetensors",
-            &format!("{index:064x}"),
-            &lora_header_named(&format!("t{index}")),
-        )?;
-    }
-    let config = hub_config(&hub);
-    let catalog = Catalog::scan_sources(
-        &directory.path().join("native"),
-        "n",
-        &config,
-        HashPolicy::Never,
-        |_, _| {},
-    )?;
-    assert_eq!(catalog.totals()?.artifacts, repos as u64);
-
-    let first_group_gone = RepoId::parse_ref(RepoType::Models, "acme/repo-005")?;
-    let first_group_gone_id = repository_of(&catalog, &first_group_gone)?.id;
-    fs::remove_file(
-        hub.join("models--acme--repo-005")
-            .join("snapshots")
-            .join("b".repeat(40))
-            .join("weights.safetensors"),
-    )?;
-
-    let second_group_gone =
-        RepoId::parse_ref(RepoType::Models, &format!("acme/repo-{:03}", repos - 1))?;
-    let second_group_gone_id = repository_of(&catalog, &second_group_gone)?.id;
-    fs::remove_dir_all(hub.join(format!("models--acme--repo-{:03}", repos - 1)))?;
-
-    let moved = lora_header_named("moved");
-    rewrite_hf_cache_file(&hub, "acme", "repo-010", "weights.safetensors", "e", &moved)?;
-
-    let stop = Stop::default();
-    let flip = stop.clone();
-    let report = catalog.rescan_until(
-        &config,
-        HashPolicy::Never,
-        RescanScope::Configured,
-        &stop,
-        |phase, _| {
-            if phase == "hub" {
-                flip.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        },
-    )?;
-    assert!(
-        report.interrupted,
-        "the stop raised once the first group's one changed file committed ended the walk"
-    );
-
-    let finished_group = catalog.revision_entries(first_group_gone_id, 0, Dedupe::Ignore)?;
-    assert_eq!(finished_group.len(), 1);
-    assert_eq!(
-        finished_group[0].state,
-        State::Remote,
-        "the first group finished, so the repository it never rediscovered is retracted"
-    );
-
-    let untouched_group = catalog.revision_entries(second_group_gone_id, 0, Dedupe::Ignore)?;
-    assert_eq!(untouched_group.len(), 1);
-    assert_eq!(
-        untouched_group[0].state,
-        State::Local,
-        "the second group was never reached, so its row is exactly as the fresh scan left it"
-    );
-
-    for index in (0..repos).filter(|&index| index != 5 && index != repos - 1 && index != 10) {
-        let repo = RepoId::parse_ref(RepoType::Models, &format!("acme/repo-{index:03}"))?;
-        let kept = repository_of(&catalog, &repo)?;
-        let entries = catalog.revision_entries(kept.id, 0, Dedupe::Ignore)?;
-        assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].state,
-            State::Local,
-            "repository {index} is untouched by the interruption"
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn a_loose_source_is_one_group_and_scans_the_same() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let (input, config) = loose_fixture(directory.path())?;
-    let catalog = Catalog::scan_sources(
-        &directory.path().join("native"),
-        "n",
-        &config,
-        HashPolicy::Never,
-        |_, _| {},
-    )?;
-    let repo = only_repository(&catalog)?;
-    let before = catalog.revision_entries(repo.id, 0, Dedupe::Ignore)?;
-    assert_eq!(
-        before.len(),
-        2,
-        "a loose source's whole file list is discovered before any repository exists"
-    );
-
-    let report = catalog.rescan(
-        &config,
-        HashPolicy::Never,
-        RescanScope::Configured,
-        |_, _| {},
-    )?;
-    assert_eq!(
-        report,
-        RescanReport {
-            unchanged: 2,
-            changed: 0,
-            added: 0,
-            absent: 0,
-            interrupted: false,
-        },
-        "a loose source takes the one-group path every rescan, not a chunk of it"
-    );
-    let after = catalog.revision_entries(repo.id, 0, Dedupe::Ignore)?;
-    assert_eq!(
-        after, before,
-        "the one group leaves the same rows a plain rescan would"
-    );
-    assert_eq!(
-        catalog.totals()?,
-        catalog.count_summary()?,
-        "the one group settles exactly"
-    );
-
-    fs::remove_file(input.join("loras/gone.safetensors"))?;
-    let retracted = catalog.rescan(
-        &config,
-        HashPolicy::Never,
-        RescanScope::Configured,
-        |_, _| {},
-    )?;
-    assert_eq!(retracted.absent, 1);
-    assert_eq!(
-        catalog.totals()?,
-        catalog.count_summary()?,
-        "retracting within the one group still settles exactly"
-    );
-    Ok(())
-}
-
-#[test]
 fn a_changed_file_is_reread_and_a_new_file_continues_the_ids() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
@@ -6705,34 +6269,6 @@ fn a_moved_file_under_a_loose_root_is_replaced_not_duplicated() -> Result<()> {
         .find(|entry| entry.rel_path.ends_with("keep.safetensors"))
         .ok_or_else(|| IndexError::Catalog("the old location is kept".into()))?;
     assert_eq!(left.state, State::Remote);
-    Ok(())
-}
-
-#[test]
-fn a_pull_that_creates_a_repository_settles_the_count_in_the_same_transaction() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let catalog = Catalog::open_or_scan(
-        &IndexConfig {
-            data_dir: directory.path().join("native"),
-            ..IndexConfig::default()
-        },
-        "workstation",
-        |_, _| {},
-    )?;
-    let before = catalog.totals()?.repositories;
-    let repo = RepoId::parse_ref(RepoType::Models, "kohya/film-grain")?;
-    let root = directory.path().join("pulled");
-    catalog.pull_slot(&repo, CommitSha::from_bytes([0x22; 20]), &root)?;
-    assert_eq!(
-        catalog.totals()?.repositories,
-        before + 1,
-        "the repository the pull created moved the stored count in its own transaction"
-    );
-    assert_eq!(
-        catalog.totals()?,
-        catalog.count_summary()?,
-        "no pass ran between the pull and this read to settle it another way"
-    );
     Ok(())
 }
 
@@ -8660,179 +8196,6 @@ fn collapse_fixture() -> Result<(TempDir, Catalog)> {
     Ok((directory, catalog))
 }
 
-/// Forty artifacts, each its own repository and revision, each with 8 entries and a 16 KiB
-/// card, so a commit budget far below their combined bytes is crossed more than once whether
-/// they are indexed by a rebuild or a refresh.
-fn wide_card_fixture(catalog: &Catalog) -> Result<Vec<ArtifactId>> {
-    let mut repositories = Vec::with_capacity(40);
-    for index in 0_u128..40 {
-        let card = format!(
-            "---\ntitle: wide-{index:03}\n---\n{}",
-            "x".repeat(16 * 1024)
-        );
-        let artifact = SeedArtifact {
-            card: Some(card),
-            ..seeded_artifact(
-                0x6000 + index,
-                &format!("wide-{index:03}"),
-                Some("acme"),
-                Artifact {
-                    size: 4_096,
-                    ..seeded_facts()
-                },
-            )
-        };
-        let entries = (0..8)
-            .map(|shard| {
-                seeded_entry(
-                    &format!("wide-{index:03}/shard-{shard}.safetensors"),
-                    4_096,
-                    Some(artifact.clone()),
-                )
-            })
-            .collect();
-        repositories.push(seeded_revision(
-            seeded_repo(&format!("acme/wide-{index:03}"), RepoType::Models),
-            0x30 + index as u8,
-            entries,
-        ));
-    }
-    let written = catalog.seed(&repositories)?;
-    Ok(written.into_iter().map(|(_, id)| id).collect())
-}
-
-#[test]
-fn a_rebuild_over_the_budget_lands_in_more_than_one_segment_and_answers_the_same() -> Result<()> {
-    let (_directory, catalog) = paging_fixture(0)?;
-    let ids = wide_card_fixture(&catalog)?;
-    assert_eq!(ids.len(), 40, "every artifact was written");
-
-    catalog.rebuild_search_with_budget(1024 * 1024, |_| {})?;
-    assert!(
-        catalog.search_segments()? >= 2,
-        "a 1 MiB budget against 40 artifacts of 16 KiB cards forces more than one segment"
-    );
-    assert_eq!(search(&catalog, "")?.total, 40);
-    let budgeted_page = search(&catalog, "node:self")?;
-    assert_eq!(budgeted_page.total, 40);
-    assert_eq!(budgeted_page.rows.len(), 40);
-    for raw in ["node:self", "state:local"] {
-        let context = catalog.compile_context(raw, jiff::Timestamp::now(), Vec::new())?;
-        let (folded, tallied) = catalog.collapsed_counts(raw, &context)?;
-        assert_eq!(folded, tallied, "{raw}");
-        assert_eq!(folded, 40, "{raw}");
-    }
-    let budgeted_order: Vec<ArtifactId> = budgeted_page
-        .rows
-        .iter()
-        .map(|row| row.artifact_id)
-        .collect();
-
-    catalog.rebuild_search(|_| {})?;
-    let default_order: Vec<ArtifactId> = search(&catalog, "node:self")?
-        .rows
-        .iter()
-        .map(|row| row.artifact_id)
-        .collect();
-    assert_eq!(
-        default_order, budgeted_order,
-        "the default budget answers the same order as the budgeted rebuild"
-    );
-    Ok(())
-}
-
-#[test]
-fn a_rebuild_reports_the_commits_it_made() -> Result<()> {
-    let (_directory, catalog) = paging_fixture(0)?;
-    let ids = wide_card_fixture(&catalog)?;
-    assert_eq!(ids.len(), 40, "every artifact was written");
-
-    let commits = catalog.rebuild_search_commits(|_| {})?;
-    assert!(
-        commits >= 1,
-        "a rebuild always commits at least once: {commits}"
-    );
-    assert_eq!(
-        search(&catalog, "")?.total,
-        40,
-        "the reporting rebuild indexes exactly what the plain one does"
-    );
-    Ok(())
-}
-
-#[test]
-fn a_refresh_over_the_budget_commits_more_than_once_and_keeps_one_run_per_artifact() -> Result<()> {
-    let (_directory, catalog) = paging_fixture(0)?;
-    let ids = wide_card_fixture(&catalog)?;
-    catalog.rebuild_search(|_| {})?;
-    let segments_before = catalog.search_segments()?;
-
-    let now = jiff::Timestamp::now();
-    for id in &ids {
-        catalog.bump_artifact_use(*id, now)?;
-    }
-    assert_eq!(
-        catalog.pending_changes()?,
-        40,
-        "each bump logged its artifact"
-    );
-
-    let report = catalog.refresh_with_budget(1024 * 1024, |_| {})?;
-    assert_eq!(report.applied, 40);
-    assert!(
-        report.commits >= 2,
-        "a 1 MiB budget against 40 artifacts of 16 KiB cards commits more than once: {}",
-        report.commits
-    );
-    assert_eq!(catalog.pending_changes()?, 0);
-    // `report.commits` above is the claim to trust: it counts what `Metered` actually did.
-    // `search_segments()` is the weaker of the two, because `LogMergePolicy` merges once a
-    // segment count reaches its minimum of eight; a future estimate change that happened to
-    // leave exactly eight segments here would merge them away and fail this assertion while
-    // the refresh still committed more than once.
-    assert!(
-        catalog.search_segments()? > segments_before,
-        "the extra commits leave more segments than the rebuild published"
-    );
-
-    let refreshed_page = search(&catalog, "node:self")?;
-    assert_eq!(refreshed_page.total, 40);
-    assert_eq!(refreshed_page.rows.len(), 40);
-    for raw in ["node:self", "state:local"] {
-        let context = catalog.compile_context(raw, jiff::Timestamp::now(), Vec::new())?;
-        let (folded, tallied) = catalog.collapsed_counts(raw, &context)?;
-        assert_eq!(folded, tallied, "{raw}");
-        assert_eq!(folded, 40, "{raw}");
-    }
-    Ok(())
-}
-
-#[test]
-fn a_refresh_reports_the_documents_and_bytes_it_wrote() -> Result<()> {
-    let (_directory, catalog) = paging_fixture(0)?;
-    let ids = wide_card_fixture(&catalog)?;
-    catalog.rebuild_search(|_| {})?;
-
-    let now = jiff::Timestamp::now();
-    for id in ids.iter().take(5) {
-        catalog.bump_artifact_use(*id, now)?;
-    }
-
-    let report = catalog.refresh_search_reporting(|_| {})?;
-    assert_eq!(report.applied, 5);
-    assert_eq!(report.documents, 40, "5 artifacts of 8 entries each");
-    assert!(
-        report.bytes >= 5 * 8 * 16 * 1024,
-        "each of the 40 documents carries the 16 KiB card: {}",
-        report.bytes
-    );
-    assert_eq!(report.commits, 1);
-
-    let again = catalog.refresh_search_reporting(|_| {})?;
-    assert_eq!(again, RefreshReport::default(), "nothing left to apply");
-    Ok(())
-}
-
 /// The entry of each artifact a collapse would keep among the entries a query admits,
 /// computed from the records the index was built from rather than from the index.
 fn preferred_by(
@@ -9300,7 +8663,7 @@ fn open_refuses_another_format() -> Result<()> {
     let native = directory.path().join("native");
     drop(catalog);
     stamp_format(&native, super::FORMAT_VERSION + 1)?;
-    match Catalog::open(&native, IndexConfig::default().cache_mib) {
+    match Catalog::open(&native) {
         Err(IndexError::CatalogFormat {
             directory: named,
             found,
@@ -9316,8 +8679,7 @@ fn open_refuses_another_format() -> Result<()> {
 }
 
 fn stamp_format(directory: &Path, format_version: u32) -> Result<()> {
-    let database = builder(IndexConfig::default().cache_mib)
-        .open(models()?, directory.join("catalog.redb"))?;
+    let database = builder().open(models()?, directory.join("catalog.redb"))?;
     let transaction = database.rw_transaction()?;
     let manifest: Manifest = transaction
         .get()
@@ -9700,8 +9062,7 @@ fn a_usage_batch_writes_every_row_and_one_change_per_artifact() -> Result<()> {
     let ckpt = catalog
         .artifact_row(ids.ckpt)?
         .ok_or_else(|| IndexError::Catalog("ckpt".into()))?;
-    let now = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() / 60 * 60)
-        .map_err(|error| IndexError::Catalog(format!("floor to the minute: {error}")))?;
+    let now = jiff::Timestamp::now();
     let earlier = now - std::time::Duration::from_secs(60);
     let event = |row: &SearchRow, at: jiff::Timestamp| UsageEvent {
         client: Some("10.0.0.4".to_owned()),
@@ -9725,331 +9086,6 @@ fn a_usage_batch_writes_every_row_and_one_change_per_artifact() -> Result<()> {
         catalog.pending_changes()?,
         2,
         "one search change per distinct artifact"
-    );
-
-    catalog.refresh_search(|_| {})?;
-    let still_this_minute = now + std::time::Duration::from_secs(30);
-    catalog.log_usage_batch(&[
-        event(&lora, still_this_minute),
-        event(&ckpt, still_this_minute),
-    ])?;
-    assert_eq!(
-        catalog.pending_changes()?,
-        0,
-        "a second batch inside the same minute reindexes neither artifact"
-    );
-    assert_eq!(
-        catalog.artifact_usage(ids.lora)?.pulls,
-        3,
-        "the count still moves even where the index is not touched"
-    );
-    Ok(())
-}
-
-#[test]
-fn an_artifact_served_all_minute_is_logged_for_the_index_once_a_minute() -> Result<()> {
-    let (_directory, catalog, ids) = seeded_catalog()?;
-    catalog.refresh_search(|_| {})?;
-    let lora = catalog
-        .artifact_row(ids.lora)?
-        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
-    let base = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() / 60 * 60)
-        .map_err(|error| IndexError::Catalog(format!("floor to the minute: {error}")))?;
-    let event = |at: jiff::Timestamp| UsageEvent {
-        repo: Some(lora.repo_id),
-        artifact: Some(lora.artifact_id),
-        ..UsageEvent::new(lora.path.clone(), at)
-    };
-
-    catalog.log_usage_batch(&[event(base)])?;
-    assert_eq!(catalog.pending_changes()?, 1, "the first batch always logs");
-    catalog.refresh_search(|_| {})?;
-
-    for offset in [1, 2, 30, 59] {
-        catalog.log_usage_batch(&[event(base + std::time::Duration::from_secs(offset))])?;
-        assert_eq!(
-            catalog.pending_changes()?,
-            0,
-            "still inside the same minute at +{offset}s"
-        );
-    }
-
-    let next_minute = base + std::time::Duration::from_secs(61);
-    catalog.log_usage_batch(&[event(next_minute)])?;
-    assert_eq!(catalog.pending_changes()?, 1, "a new minute logs once more");
-
-    let usage = catalog.artifact_usage(ids.lora)?;
-    assert_eq!(usage.pulls, 6, "every event counted");
-    assert_eq!(
-        usage.last_used,
-        Some(next_minute),
-        "the exact last instant is kept, not the floored one"
-    );
-    Ok(())
-}
-
-#[test]
-fn the_indexed_last_used_is_the_floored_minute() -> Result<()> {
-    let (_directory, catalog, ids) = seeded_catalog()?;
-    catalog.refresh_search(|_| {})?;
-    let lora = catalog
-        .artifact_row(ids.lora)?
-        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
-    let at = jiff::Timestamp::from_second(jiff::Timestamp::now().as_second() / 60 * 60 + 45)
-        .map_err(|error| IndexError::Catalog(format!("build a timestamp: {error}")))?;
-    catalog.log_usage_batch(&[UsageEvent {
-        repo: Some(lora.repo_id),
-        artifact: Some(lora.artifact_id),
-        ..UsageEvent::new(lora.path.clone(), at)
-    }])?;
-    catalog.refresh_search(|_| {})?;
-
-    let indexed = catalog
-        .indexed_last_used(ids.lora.get())?
-        .ok_or_else(|| IndexError::Catalog("the row is indexed".into()))?;
-    assert_eq!(
-        indexed,
-        floored_minute(at),
-        "the index carries the floored minute, not the exact second"
-    );
-    assert_eq!(
-        search(&catalog, "used:<1d")?.total,
-        1,
-        "used: is coarse enough that the minute grain never matters"
-    );
-    Ok(())
-}
-
-#[test]
-fn the_newest_pulls_of_a_repository_read_only_the_page_they_return() -> Result<()> {
-    let (_directory, catalog, ids) = seeded_catalog()?;
-    let lora = catalog
-        .artifact_row(ids.lora)?
-        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
-    let ckpt = catalog
-        .artifact_row(ids.ckpt)?
-        .ok_or_else(|| IndexError::Catalog("ckpt".into()))?;
-    let base = jiff::Timestamp::now() - std::time::Duration::from_secs(10_000);
-    let heavy: Vec<UsageEvent> = (0..5_000_u32)
-        .map(|index| UsageEvent {
-            repo: Some(lora.repo_id),
-            ..UsageEvent::new(
-                format!("f{index}.safetensors"),
-                base + std::time::Duration::from_secs(u64::from(index)),
-            )
-        })
-        .collect();
-    catalog.log_usage_batch(&heavy)?;
-    let light: Vec<UsageEvent> = (0..10_u32)
-        .map(|index| UsageEvent {
-            repo: Some(ckpt.repo_id),
-            ..UsageEvent::new(
-                format!("c{index}.safetensors"),
-                base + std::time::Duration::from_secs(u64::from(index)),
-            )
-        })
-        .collect();
-    catalog.log_usage_batch(&light)?;
-
-    let first_page = catalog.recent_pulls(lora.repo_id, 20)?;
-    assert_eq!(
-        first_page.len(),
-        20,
-        "the page is bounded to the limit asked for"
-    );
-    assert_eq!(
-        first_page[0].what, "f4999.safetensors",
-        "the newest of the 5,000 events is first"
-    );
-    assert!(
-        first_page.iter().all(|pull| pull.what.starts_with('f')),
-        "the first repository's page names only its own paths: {first_page:?}"
-    );
-
-    let second_page = catalog.recent_pulls(ckpt.repo_id, 20)?;
-    assert_eq!(
-        second_page.len(),
-        10,
-        "the second repository served only 10"
-    );
-    assert!(
-        second_page.iter().all(|pull| pull.what.starts_with('c')),
-        "the second repository's page names only its own paths: {second_page:?}"
-    );
-    Ok(())
-}
-
-#[test]
-fn a_response_naming_no_repository_is_still_logged_and_ordered() -> Result<()> {
-    let (_directory, catalog, ids) = seeded_catalog()?;
-    let lora = catalog
-        .artifact_row(ids.lora)?
-        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
-    let now = jiff::Timestamp::now();
-    let events: Vec<UsageEvent> = (0..3_u32)
-        .map(|index| {
-            UsageEvent::new(
-                format!("orphan{index}.bin"),
-                now + std::time::Duration::from_secs(u64::from(index)),
-            )
-        })
-        .collect();
-    let sequences: Vec<u64> = events
-        .iter()
-        .map(|event| catalog.log_usage(event))
-        .collect::<Result<_>>()?;
-    assert_eq!(
-        sequences,
-        vec![1, 2, 3],
-        "each unattributed row gets a distinct, ordered sequence"
-    );
-    assert!(
-        catalog.recent_pulls(lora.repo_id, 10)?.is_empty(),
-        "no repository's page holds a row naming none"
-    );
-    Ok(())
-}
-
-#[test]
-fn the_usage_log_survives_a_repository_id_above_one_byte() -> Result<()> {
-    let (_directory, catalog, _ids) = seeded_catalog()?;
-    let repo_id = 70_000_i64;
-    let base = jiff::Timestamp::now();
-    let transaction = catalog.database.rw_transaction()?;
-    for seq in 1..=5_u64 {
-        transaction.insert(models::Usage {
-            key: models::UsageLogKey::at(repo_id, seq),
-            at: format!("{:.9}", base + std::time::Duration::from_secs(seq)),
-            client: None,
-            artifact_id: None,
-            path: format!("row{seq}.bin"),
-            bytes: 0,
-            rate_bps: None,
-            status: 200,
-        })?;
-    }
-    transaction.commit()?;
-
-    let pulls = catalog.recent_pulls(RepoRowId::new(repo_id), 10)?;
-    assert_eq!(pulls.len(), 5);
-    assert!(
-        pulls.windows(2).all(|pair| pair[0].when >= pair[1].when),
-        "the page orders by sequence, not by the key's text: {pulls:?}"
-    );
-    assert_eq!(pulls[0].what, "row5.bin");
-    assert_eq!(pulls[4].what, "row1.bin");
-    Ok(())
-}
-
-#[test]
-fn a_repository_whose_record_was_removed_does_not_reuse_a_sequence() -> Result<()> {
-    let (_directory, catalog, ids) = seeded_catalog()?;
-    let lora = catalog
-        .artifact_row(ids.lora)?
-        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
-    let now = jiff::Timestamp::now();
-    let first: Vec<UsageEvent> = (0..10_u32)
-        .map(|index| UsageEvent {
-            repo: Some(lora.repo_id),
-            ..UsageEvent::new(
-                format!("first{index}.safetensors"),
-                now + std::time::Duration::from_secs(u64::from(index)),
-            )
-        })
-        .collect();
-    catalog.log_usage_batch(&first)?;
-    assert_eq!(catalog.recent_pulls(lora.repo_id, 20)?.len(), 10);
-
-    let transaction = catalog.database.rw_transaction()?;
-    if let Some(stored) = transaction
-        .get()
-        .primary::<models::RepoUsage>(lora.repo_id.get())?
-    {
-        transaction.remove(stored)?;
-    }
-    transaction.commit()?;
-    assert!(
-        catalog.repo_usage(lora.repo_id)?.is_none(),
-        "the record is gone but the rows are not"
-    );
-
-    let second: Vec<UsageEvent> = (0..5_u32)
-        .map(|index| UsageEvent {
-            repo: Some(lora.repo_id),
-            ..UsageEvent::new(
-                format!("second{index}.safetensors"),
-                now + std::time::Duration::from_secs(100 + u64::from(index)),
-            )
-        })
-        .collect();
-    catalog.log_usage_batch(&second)?;
-
-    let all = catalog.recent_pulls(lora.repo_id, 20)?;
-    assert_eq!(
-        all.len(),
-        15,
-        "every row from both batches is still present"
-    );
-    let names: std::collections::HashSet<&str> =
-        all.iter().map(|pull| pull.what.as_str()).collect();
-    assert_eq!(
-        names.len(),
-        15,
-        "no key was reused, so no row overwrote another: {all:?}"
-    );
-    Ok(())
-}
-
-#[test]
-fn a_window_longer_than_the_history_reads_only_the_window() -> Result<()> {
-    let (_directory, catalog, ids) = seeded_catalog()?;
-    let lora = catalog
-        .artifact_row(ids.lora)?
-        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
-    let midday = jiff::Timestamp::now()
-        .to_zoned(jiff::tz::TimeZone::UTC)
-        .date()
-        .at(12, 0, 0, 0)
-        .to_zoned(jiff::tz::TimeZone::UTC)
-        .map_err(|error| IndexError::Catalog(format!("noon: {error}")))?
-        .timestamp();
-    let events: Vec<UsageEvent> = (0..90_u32)
-        .map(|day| UsageEvent {
-            repo: Some(lora.repo_id),
-            ..UsageEvent::new(
-                format!("d{day}.safetensors"),
-                midday - std::time::Duration::from_secs(u64::from(day) * 86_400),
-            )
-        })
-        .collect();
-    catalog.log_usage_batch(&events)?;
-
-    let window_days = 40_u32;
-    assert!(
-        window_days as usize > HISTORY_DAYS,
-        "the window must outrun what the record keeps"
-    );
-    let charted = catalog.usage_days(lora.repo_id, window_days)?;
-    assert_eq!(charted.len(), window_days as usize);
-    assert!(
-        charted.iter().all(|day| day.pulls == 1),
-        "every day inside the window, including the oldest, holds its own pull: {charted:?}"
-    );
-
-    let outside = catalog
-        .artifact_row(ids.ckpt)?
-        .ok_or_else(|| IndexError::Catalog("ckpt".into()))?;
-    catalog.log_usage_batch(&[UsageEvent {
-        repo: Some(outside.repo_id),
-        ..UsageEvent::new(
-            "old.safetensors",
-            midday - std::time::Duration::from_secs(89 * 86_400),
-        )
-    }])?;
-    let empty = catalog.usage_days(outside.repo_id, window_days)?;
-    assert!(
-        empty.iter().all(|day| day.pulls == 0),
-        "a repository whose rows are all outside the window reads all-zero bars: {empty:?}"
     );
     Ok(())
 }
@@ -10215,173 +9251,6 @@ fn hashing_now_gives_content_identities_from_the_first_scan() -> Result<()> {
     )?;
     assert_eq!(never.pending_hashes()?, 2);
     assert_eq!(never.totals()?.artifacts, 2);
-    Ok(())
-}
-
-#[test]
-fn a_file_that_blocks_holds_no_other_file_back() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let empty = directory.path().join("empty");
-    fs::create_dir_all(&empty)?;
-    let config = IndexConfig {
-        sources: vec![source(&empty, "files")],
-        hash_threads: 2,
-        ..IndexConfig::default()
-    };
-    let catalog = Catalog::scan_sources(
-        &directory.path().join("native"),
-        "n",
-        &config,
-        HashPolicy::Never,
-        |_, _| {},
-    )?;
-
-    let storage = directory.path().join("files");
-    fs::create_dir_all(&storage)?;
-    let fifo = storage.join("blocked.bin");
-    let status = std::process::Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
-        .map_err(|error| IndexError::Catalog(format!("mkfifo is unavailable: {error}")))?;
-    assert!(status.success(), "mkfifo did not create the fifo");
-
-    let mut entries = vec![SeedEntry {
-        node: LOCAL_NODE,
-        abs_path: Some(fifo.to_string_lossy().into_owned()),
-        rel_path: "blocked.bin".to_owned(),
-        size: 20 * 1024 * 1024,
-        state: State::Local,
-        is_symlink: false,
-        sha256: None,
-        git_sha1: None,
-        artifact: None,
-    }];
-    for index in 0..300_u32 {
-        let name = format!("f{index:03}.bin");
-        let path = storage.join(&name);
-        fs::write(&path, format!("payload-{index}\n"))?;
-        entries.push(SeedEntry {
-            node: LOCAL_NODE,
-            abs_path: Some(path.to_string_lossy().into_owned()),
-            rel_path: name,
-            size: fs::metadata(&path)?.len(),
-            state: State::Local,
-            is_symlink: false,
-            sha256: None,
-            git_sha1: None,
-            artifact: None,
-        });
-    }
-    catalog.seed(&[SeedRepository {
-        repo: RepoId::parse_ref(RepoType::Models, "acme/blocked").expect("a valid reference"),
-        source: "files".to_owned(),
-        kind: SourceKind::Loose,
-        root_path: storage.clone(),
-        git_dir: None,
-        revisions: vec![SeedRevision {
-            name: "main".to_owned(),
-            sha: None,
-            refs: Vec::new(),
-            title: None,
-            author: None,
-            committed: None,
-            entries,
-        }],
-    }])?;
-    assert_eq!(catalog.pending_hashes()?, 301);
-
-    let mut fifo_writer = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&fifo)?;
-
-    let report = std::thread::scope(|scope| -> Result<HashReport> {
-        let handle = scope.spawn(|| catalog.hash_pending(&config, |_| {}));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        loop {
-            if catalog.pending_hashes()? == 1 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the blocked file held the rest back"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        std::io::Write::write_all(&mut fifo_writer, b"abc")?;
-        drop(fifo_writer);
-        handle
-            .join()
-            .map_err(|_| IndexError::Catalog("the hashing pass panicked".into()))?
-    })?;
-
-    assert_eq!(report.hashed, 301);
-    assert_eq!(report.unreadable, 0);
-    assert!(!report.interrupted);
-    assert_eq!(catalog.pending_hashes()?, 0);
-    let read = catalog.database.r_transaction()?;
-    let entries: Vec<Entry> = read
-        .scan()
-        .primary()?
-        .all()?
-        .collect::<native_db::db_type::Result<_>>()?;
-    drop(read);
-    let fifo_entry = entries
-        .iter()
-        .find(|entry| entry.rel_path == "blocked.bin")
-        .ok_or_else(|| IndexError::Catalog("the fifo entry vanished".into()))?;
-    assert_eq!(
-        fifo_entry.sha256,
-        Some(crate::hash::sha256_bytes(b"abc")),
-        "the fifo's entry carries the hash of what was written to it"
-    );
-    Ok(())
-}
-
-#[test]
-fn hash_threads_of_one_hashes_in_primary_key_order() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let input = directory.path().join("files");
-    fs::create_dir_all(&input)?;
-    for index in 0..130_u32 {
-        fs::write(
-            input.join(format!("f{index:03}.bin")),
-            format!("payload-{index}\n"),
-        )?;
-    }
-    let config = IndexConfig {
-        sources: vec![source(&input, "files")],
-        hash_threads: 1,
-        ..IndexConfig::default()
-    };
-    let catalog = Catalog::scan_sources(
-        &directory.path().join("native"),
-        "n",
-        &config,
-        HashPolicy::Never,
-        |_, _| {},
-    )?;
-    assert_eq!(catalog.pending_hashes()?, 130);
-
-    let mut counts = Vec::new();
-    let report = catalog.hash_pending(&config, |hashed| counts.push(hashed))?;
-
-    assert_eq!(report.hashed, 130);
-    assert!(
-        counts.windows(2).all(|pair| pair[0] <= pair[1]),
-        "the progress counts never go backwards: {counts:?}"
-    );
-    assert_eq!(counts.last().copied(), Some(130));
-    let read = catalog.database.r_transaction()?;
-    let entries: Vec<Entry> = read
-        .scan()
-        .primary()?
-        .all()?
-        .collect::<native_db::db_type::Result<_>>()?;
-    assert!(
-        entries.iter().all(|entry| entry.sha256.is_some()),
-        "every entry has a sha256 after the pass"
-    );
     Ok(())
 }
 
@@ -10779,7 +9648,7 @@ mod recovery {
             });
             assert!(text.contains(KILLED), "the harness killed the walk at {at}");
             assert!(
-                Catalog::open(&native, IndexConfig::default().cache_mib).is_err(),
+                Catalog::open(&native).is_err(),
                 "a walk that never wrote a manifest is not a catalog"
             );
 
@@ -10839,7 +9708,7 @@ mod recovery {
             );
             drop(catalog);
 
-            let resumed = Catalog::open(&native, IndexConfig::default().cache_mib)?;
+            let resumed = Catalog::open(&native)?;
             rescanned(&resumed, &config)?;
             is_consistent(&resumed)?;
             assert_eq!(
@@ -10854,7 +9723,7 @@ mod recovery {
             );
             drop(resumed);
 
-            let copied = Catalog::open(&snapshot, IndexConfig::default().cache_mib)?;
+            let copied = Catalog::open(&snapshot)?;
             rescanned(&copied, &config)?;
             is_consistent(&copied)?;
             assert_eq!(
@@ -10933,7 +9802,7 @@ mod recovery {
         assert!(text.contains(KILLED), "the harness killed the hash pass");
         drop(catalog);
 
-        let resumed = Catalog::open(&native, IndexConfig::default().cache_mib)?;
+        let resumed = Catalog::open(&native)?;
         owed_hashes_match_the_entries(&resumed)?;
         let left = resumed.pending_hashes()?;
         assert!(
@@ -10986,7 +9855,7 @@ mod recovery {
         );
         drop(catalog);
 
-        let resumed = Catalog::open(&native, IndexConfig::default().cache_mib)?;
+        let resumed = Catalog::open(&native)?;
         assert_eq!(
             resumed.refresh_search(|_| {})?,
             0,
@@ -11034,53 +9903,6 @@ mod recovery {
         assert!(
             resumed.status()?.search_ready,
             "and the catalog stops reporting a staleness no refresh would clear"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn a_cursor_left_behind_a_mid_batch_budget_commit_replays_the_whole_batch() -> Result<()> {
-        let (_directory, catalog) = paging_fixture(0)?;
-        let ids = super::wide_card_fixture(&catalog)?;
-        catalog.rebuild_search(|_| {})?;
-        let cursor = catalog.manifest()?.search_seq;
-
-        let now = jiff::Timestamp::now();
-        for id in &ids {
-            catalog.bump_artifact_use(*id, now)?;
-        }
-        let logged = changes(&catalog)?;
-        assert_eq!(logged.len(), 40, "each bump logged its artifact");
-
-        let report = catalog.refresh_with_budget(1024 * 1024, |_| {})?;
-        assert_eq!(report.applied, 40);
-        assert!(
-            report.commits >= 2,
-            "a 1 MiB budget against 40 artifacts of 16 KiB cards commits several times mid \
-             batch: {}",
-            report.commits
-        );
-        assert_eq!(catalog.pending_changes()?, 0);
-        let expected = fingerprint(&catalog)?;
-
-        rewind_cursor(&catalog, cursor, &logged)?;
-        assert_eq!(
-            catalog.pending_changes()?,
-            40,
-            "the rewound cursor and the restored rows are the state a kill leaves between a \
-             budget commit inside the batch and the cursor advancing past it"
-        );
-        assert_eq!(
-            catalog.refresh_with_budget(1024 * 1024, |_| {})?.applied,
-            40,
-            "the whole batch replays, not just what a mid-batch commit left uncommitted"
-        );
-        assert_eq!(catalog.pending_changes()?, 0);
-        assert_eq!(
-            fingerprint(&catalog)?,
-            expected,
-            "the committed prefix is deleted by term and re-added exactly as the rest of the \
-             batch is, so replaying it changes nothing"
         );
         Ok(())
     }
@@ -11139,7 +9961,7 @@ mod recovery {
             );
             drop(catalog);
 
-            let reopened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
+            let reopened = Catalog::open(&native)?;
             assert_eq!(
                 index_directories(&native)?,
                 vec![published.clone().unwrap_or_default()],
@@ -11246,13 +10068,13 @@ mod recovery {
             killed.entries.len() > before.entries.len(),
             "the commits the walk made before the kill are on record"
         );
-        assert_eq!(
+        assert_ne!(
             killed.totals, killed.counted,
-            "each transaction folded its own difference, so the kill leaves nothing behind"
+            "the totals are behind the records the kill left"
         );
         drop(catalog);
 
-        let reopened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
+        let reopened = Catalog::open(&native)?;
         let settled = fingerprint(&reopened)?;
         assert_eq!(
             settled.entries, killed.entries,
@@ -11265,7 +10087,7 @@ mod recovery {
         owed_hashes_match_the_entries(&reopened)?;
         drop(reopened);
 
-        let copied = Catalog::open(&snapshot, IndexConfig::default().cache_mib)?;
+        let copied = Catalog::open(&snapshot)?;
         assert_eq!(
             fingerprint(&copied)?.entries.len(),
             killed.entries.len(),
@@ -11284,7 +10106,7 @@ fn pass_is_open(catalog: &Catalog) -> Result<bool> {
 }
 
 #[test]
-fn a_raised_stop_ends_a_hashing_pass_within_a_queue_of_files_and_the_next_pass_finishes_it()
+fn a_raised_stop_ends_a_hashing_pass_at_a_batch_boundary_and_the_next_pass_finishes_it()
 -> Result<()> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("files");
@@ -11299,7 +10121,6 @@ fn a_raised_stop_ends_a_hashing_pass_within_a_queue_of_files_and_the_next_pass_f
     }
     let config = IndexConfig {
         sources: vec![source(&input, "files")],
-        hash_threads: 2,
         ..IndexConfig::default()
     };
     let catalog = Catalog::scan_sources(
@@ -11319,20 +10140,11 @@ fn a_raised_stop_ends_a_hashing_pass_within_a_queue_of_files_and_the_next_pass_f
     })?;
 
     assert!(report.interrupted, "the raised stop ended the pass early");
-    assert!(
-        report.hashed >= batch,
-        "the pass ran at least until the stop was observed, got {}",
-        report.hashed
-    );
-    assert!(
-        report.hashed < total,
-        "the pass did not reach every file, got {}",
-        report.hashed
-    );
+    assert_eq!(report.hashed, batch, "the pass stopped at a batch boundary");
     let left = catalog.pending_hashes()?;
     assert_eq!(
         left,
-        total - report.hashed,
+        total - batch,
         "what it did not reach still owes a hash"
     );
     assert!(
@@ -11347,114 +10159,6 @@ fn a_raised_stop_ends_a_hashing_pass_within_a_queue_of_files_and_the_next_pass_f
     assert!(
         !pass_is_open(&catalog)?,
         "a pass that ran to its end clears the mark"
-    );
-    Ok(())
-}
-
-/// Seeded, not scanned, so the large file gets the lowest id and is the first the producer
-/// pages, regardless of what order a walker would have found these paths in.
-#[test]
-fn a_stop_raised_while_a_file_is_being_read_leaves_that_file_owing() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    let empty = directory.path().join("empty");
-    fs::create_dir_all(&empty)?;
-    let config = IndexConfig {
-        sources: vec![source(&empty, "files")],
-        hash_threads: 1,
-        ..IndexConfig::default()
-    };
-    let catalog = Catalog::scan_sources(
-        &directory.path().join("native"),
-        "n",
-        &config,
-        HashPolicy::Never,
-        |_, _| {},
-    )?;
-
-    let storage = directory.path().join("files");
-    fs::create_dir_all(&storage)?;
-    let large_path = storage.join("large.bin");
-    let large_file = fs::File::create(&large_path)?;
-    large_file.set_len(64 * 1024 * 1024)?;
-    drop(large_file);
-
-    let mut entries = vec![SeedEntry {
-        node: LOCAL_NODE,
-        abs_path: Some(large_path.to_string_lossy().into_owned()),
-        rel_path: "large.bin".to_owned(),
-        size: 64 * 1024 * 1024,
-        state: State::Local,
-        is_symlink: false,
-        sha256: None,
-        git_sha1: None,
-        artifact: None,
-    }];
-    for index in 0..8_u32 {
-        let name = format!("f{index}.bin");
-        let path = storage.join(&name);
-        fs::write(&path, format!("payload-{index}\n"))?;
-        entries.push(SeedEntry {
-            node: LOCAL_NODE,
-            abs_path: Some(path.to_string_lossy().into_owned()),
-            rel_path: name,
-            size: fs::metadata(&path)?.len(),
-            state: State::Local,
-            is_symlink: false,
-            sha256: None,
-            git_sha1: None,
-            artifact: None,
-        });
-    }
-    catalog.seed(&[SeedRepository {
-        repo: RepoId::parse_ref(RepoType::Models, "acme/large").expect("a valid reference"),
-        source: "files".to_owned(),
-        kind: SourceKind::Loose,
-        root_path: storage.clone(),
-        git_dir: None,
-        revisions: vec![SeedRevision {
-            name: "main".to_owned(),
-            sha: None,
-            refs: Vec::new(),
-            title: None,
-            author: None,
-            committed: None,
-            entries,
-        }],
-    }])?;
-    assert_eq!(catalog.pending_hashes()?, 9);
-
-    let stop = Stop::default();
-    let report = catalog.hash_pending_until(&config, &stop, |_| {
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    })?;
-    assert!(report.interrupted, "the raised stop ended the pass early");
-
-    let read = catalog.database.r_transaction()?;
-    let seeded: Vec<Entry> = read
-        .scan()
-        .primary()?
-        .all()?
-        .collect::<native_db::db_type::Result<_>>()?;
-    drop(read);
-    let large_entry = seeded
-        .iter()
-        .find(|entry| entry.rel_path == "large.bin")
-        .ok_or_else(|| IndexError::Catalog("the large file's entry vanished".into()))?;
-    assert!(
-        large_entry.sha256.is_none(),
-        "the stop was raised while the large file was still being read"
-    );
-    assert!(
-        catalog.pending_hashes()? >= 1,
-        "the file the stop caught mid-read still owes a hash"
-    );
-
-    let finished = catalog.hash_pending(&config, |_| {})?;
-    assert!(!finished.interrupted);
-    assert_eq!(
-        catalog.pending_hashes()?,
-        0,
-        "a fresh pass finishes what is left"
     );
     Ok(())
 }

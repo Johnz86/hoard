@@ -8,6 +8,27 @@ A wave plan is the whole brief for one implementer session. It is written by a d
 has read the code, and executed by an agent that has not. Everything the implementer would
 otherwise have to ask for is in the file.
 
+## Before you write a plan at all
+
+Answer these three in the plan's header, in one sentence each, or do not write the plan.
+The run of 2026-09-07 failed on every one of them and is reverted; see
+`docs/superpowers/history/2026-09-07-predictable-memory-reverted.md`.
+
+1. **What number says this problem exists?** For a performance or memory wave this is a
+   measurement taken before the plan, on a workload that reaches the code being changed. "The
+   code reads as if it could be slow" is not a number. If no workload reaches it, the wave is
+   to build the workload, and it ends there.
+2. **What number will say this wave worked?** Name the row and the fixture. **If no
+   measurement available today can show the change, the wave does not ship** - build the
+   fixture first, in its own wave, and let it tell you whether the change is worth making.
+   Three of the reverted run's four waves could not be shown by any fixture that existed, and
+   two of those turned out not to be worth doing.
+3. **What is the smallest change that gets that number?** A wave that touches more than one
+   subsystem is two waves. A wave that is about the scan does not change the mirror's write
+   path.
+
+A plan that cannot answer 1 and 2 is a plan to find out, not a plan to build.
+
 A wave runs in its own worktree on its own branch, and lands on `master` as one squashed
 commit. The dispatcher creates both before writing the plan:
 
@@ -104,6 +125,13 @@ bullets carry only what changes per wave.
 
 7. **Pinned tests.** The pinned tests are the tests of the waves this one builds on that
    must keep their assertions, with the wave named.
+
+8. **Where new code goes.** Name the file for every new item, and apply the rule: a file over
+   1,500 lines takes no new item, so a new constant, type or function goes in a new module
+   beside it. Constants go at the top of their file with the others, never beside their first
+   use. Doc comments only where `AGENTS.md` permits them, which is a public API contract and
+   nothing else; a `///` on a private function narrating what it does is a violation, and so
+   is any `//` comment at all, including in tests.
 
 Add, when the wave calls for it: a scope fence naming exactly what stays behind and what may
 not be called; numeric thresholds to beat, quoted with their previous numbers; a scratchpad

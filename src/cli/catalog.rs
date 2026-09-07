@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use hoard_index::catalog::{Catalog, QueryRequest, RescanScope, StorageReport};
-use hoard_index::config::{HashPolicy, IndexConfig};
+use hoard_index::config::HashPolicy;
 use hoard_index::search::{SortKey, SortSpec};
 
 use super::HashWhen;
@@ -78,8 +78,7 @@ fn compact(directory: &Path) -> Result<Compaction> {
     let before = Catalog::storage(directory)
         .context("measuring the catalog before compaction")?
         .allocated_bytes;
-    let mut catalog = Catalog::open(directory, IndexConfig::default().cache_mib)
-        .context("opening native catalog")?;
+    let mut catalog = Catalog::open(directory).context("opening native catalog")?;
     catalog.compact().context("compacting native catalog")?;
     drop(catalog);
     let storage = Catalog::storage(directory).context("measuring the catalog after compaction")?;
@@ -129,8 +128,7 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
             progress.set_message("Scanning native catalog");
             let rescanned = directory.join("catalog.redb").exists();
             let mut catalog = match rescanned {
-                true => Catalog::open(&directory, config.index.cache_mib_or_default())
-                    .context("opening native catalog")?,
+                true => Catalog::open(&directory).context("opening native catalog")?,
                 false => Catalog::scan_sources(
                     &directory,
                     &config.node.name,
@@ -193,7 +191,7 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
             limit,
             offset,
         } => {
-            let catalog = Catalog::open(&directory, IndexConfig::default().cache_mib)?;
+            let catalog = Catalog::open(&directory)?;
             let context = catalog
                 .compile_context(&query, jiff::Timestamp::now(), Vec::new())
                 .context("resolving the query context")?;
@@ -207,7 +205,7 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
             report(&result)?;
         }
         CatalogCommand::Rebuild { directory } => {
-            let catalog = Catalog::open(&directory, IndexConfig::default().cache_mib)?;
+            let catalog = Catalog::open(&directory)?;
             let progress = progress_bar();
             progress.set_message("Rebuilding Tantivy index");
             catalog.rebuild_search(|count| {
@@ -220,7 +218,7 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
             report(&compact(&directory)?)?;
         }
         CatalogCommand::Status { directory } => {
-            let mut catalog = Catalog::open(&directory, IndexConfig::default().cache_mib)?;
+            let mut catalog = Catalog::open(&directory)?;
             anyhow::ensure!(
                 catalog.check_integrity()?,
                 "native database integrity check failed"

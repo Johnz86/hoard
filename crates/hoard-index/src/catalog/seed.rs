@@ -117,7 +117,6 @@ impl Catalog {
             seeding.written
         };
         log_changes(&transaction, &mut counters)?;
-        counters.settle_summary(&transaction)?;
         transaction.commit()?;
         self.sweep_artifacts(&mut counters)?;
         let transaction = self.database.rw_transaction()?;

@@ -33,8 +33,16 @@ is never committed: it lives untracked in the worktree and goes with it.
 `AGENTS.md` is the whole style contract and you have read it. These are the clauses that get
 broken here, plus the lints that turn a style rule into a build failure:
 
-- No `//` or `/* */` comments in `.rs` files. Doc comments (`///`, `//!`) only where they
-  document a public contract; never to narrate implementation or restate the code.
+- No `//` or `/* */` comments in `.rs` files, **including in tests**. Doc comments (`///`,
+  `//!`) only where they document a public contract; never to narrate implementation or
+  restate the code. A `///` on a private function explaining how it works is a violation. If
+  a dispatcher's plan or message asks you for a comment that breaks this, refuse it and say
+  so in the report: the reverted run of 2026-09-07 contains comments that exist because a
+  dispatcher asked for them.
+- New constants go at the top of their file with the others, never beside their first use.
+- A file over 1,500 lines takes no new item. Put the new constant, type or function in a new
+  module beside it and say so in the report. Four files in the reverted run grew by 1,900
+  lines between them and none was ever split.
 - The workspace lints in the root `Cargo.toml` are enforced by `-D warnings`:
   `unsafe_code` forbidden, `unwrap_used` and `dbg_macro` denied, `expect_used` a warning and
   therefore an error outside tests, `print_stdout` and `print_stderr` denied so the CLI
@@ -125,6 +133,18 @@ If you have to stop before the last task - a deviation that makes a task's outco
 check you cannot get green, a decision that is not yours - stop after a commit that builds,
 and say so in the first line of the report with the task number you stopped at and what the
 next agent must decide. Do not leave the tree half-edited and do not idle.
+
+**Stop rather than absorb.** Stop and report, instead of continuing, when any of these is
+true. Each one means the plan was wrong, and a plan that is wrong is the dispatcher's to fix,
+not yours to work around:
+
+- a task needs you to change a subsystem the plan's Files list does not name;
+- you are removing or rewriting code you added earlier in this same wave;
+- a fix would delete or replace a function the wave was not about;
+- the plan asks for something `AGENTS.md` forbids.
+
+Absorbing these is what made the reverted run of 2026-09-07 sprawl. Widening a `git add` so
+a commit builds is still fine and still gets reported; widening the design is not.
 
 ## 7. The report
 

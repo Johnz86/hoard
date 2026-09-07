@@ -15,9 +15,7 @@ use hoard_core::{
 };
 
 use crate::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
-use crate::discover::{
-    self, Discovered, DiscoveredEntry, DiscoveredRepo, DiscoveredRevision, RevisionName,
-};
+use crate::discover::{self, DiscoveredEntry, DiscoveredRepo, DiscoveredRevision, RevisionName};
 use crate::hash::FileStamp;
 use crate::infer::{self, InferInput, Inference};
 use crate::shard::{self, ShardCandidate, ShardSet, file_name};
@@ -52,7 +50,7 @@ impl Catalog {
         progress: impl FnMut(&str, u64),
     ) -> Result<Self> {
         let (directory, sources) = validate_output(directory, config)?;
-        let mut catalog = Self::create(directory, config.cache_mib_or_default())?;
+        let mut catalog = Self::create(directory)?;
         match catalog
             .fill(node, &sources, ScanSettings::new(config, policy), progress)
             .and_then(|()| catalog.compact())
@@ -91,15 +89,11 @@ impl Catalog {
     }
 
     /// Walks the configured sources again, stopping once `stop` is raised: before each
-    /// source is discovered, before each group of it, and between the units of the group it
-    /// is inside.
+    /// source is discovered, and between the units of the one it is inside.
     ///
-    /// An interrupted walk keeps every unit it committed and retires nothing beyond what a
-    /// group it finished walking already had retracted: a group the walk completed had its
-    /// absent paths genuinely looked for, so that retraction stands, but a group it never
-    /// reached, or left mid-way, is untouched, because the paths beyond the stop are paths
-    /// this pass never looked for, not paths this node stopped holding. It leaves the pass
-    /// mark set, so the next walk settles the counts it did not.
+    /// An interrupted walk keeps every unit it committed and retires nothing: the paths it
+    /// never reached are paths it never looked for, not paths this node stopped holding. It
+    /// leaves the pass mark set, so the next walk settles the counts it did not.
     pub fn rescan_until(
         &self,
         config: &IndexConfig,
@@ -112,12 +106,13 @@ impl Catalog {
         self.open_pass()?;
         let restated = self.stored_triage()? != config.triage_confidence;
         let mut counters = Counters::load(&self.database, config.triage_confidence)?;
+        let KnownRows { known, sizes } = self.known_stamps(&sources)?;
         let mut walk = Walk {
             settings: ScanSettings::new(config, policy),
-            known: HashMap::new(),
+            known,
             paths: HashMap::new(),
             paths_of: None,
-            sizes: HashMap::new(),
+            sizes,
             discovered: HashSet::new(),
             seen: HashSet::new(),
             moved: Vec::new(),
@@ -153,16 +148,15 @@ impl Catalog {
     }
 
     /// Claims a fresh directory, leaving nothing behind if the database cannot be created.
-    fn create(directory: PathBuf, cache_mib: usize) -> Result<Self> {
+    fn create(directory: PathBuf) -> Result<Self> {
         std::fs::create_dir(&directory)?;
-        match builder(cache_mib).create(models()?, directory.join("catalog.redb")) {
+        match builder().create(models()?, directory.join("catalog.redb")) {
             Ok(database) => {
                 let catalog = Self {
                     database,
                     directory,
                     search_cache: std::sync::RwLock::new(None),
                     search_lane: parking_lot::Mutex::new(()),
-                    cache_mib,
                 };
                 catalog.seed_builtin_shelves()?;
                 Ok(catalog)
@@ -224,18 +218,6 @@ impl Catalog {
 
     /// The one pass a fresh scan and a rescan share. A fresh scan starts with nothing known,
     /// so every unit is prepared; a rescan starts with the stamps it stored last time.
-    ///
-    /// A source is discovered whole - `discover::discover` reads every repository and every
-    /// file of it before this method sees any of them - but its repositories are then taken
-    /// in groups of [`REPO_GROUP`] for storing, walking and retracting: a group is stored,
-    /// walked and, for a rescan, has its absent paths retracted before the next group of the
-    /// same already-discovered list is taken, so no more than one group's known-path map is
-    /// ever held and no more than one group's absences are looked for in a transaction. A
-    /// repository the catalog holds for this source that no group named - one gone from disk
-    /// since the last pass - is retracted once every group has been walked, the way a path
-    /// within a walked repository already is. A loose source is the one group its own
-    /// discovery already read whole, because it groups by organisation only after it has
-    /// walked every file, so no repository of it exists to chunk even after discovery.
     fn walk(
         &self,
         sources: &[&SourceConfig],
@@ -253,125 +235,100 @@ impl Catalog {
             progress(&format!("discovering {}", source.name), counters.entries);
             let discovered = discover::discover(source, &noise)?;
             let kind = discovered.kind();
-            let group_size = match &discovered {
-                Discovered::Loose(_) => discovered.repos().len().max(1),
-                Discovered::HfCache(_) | Discovered::Git(_) => REPO_GROUP,
-            };
-            let repos = group_by_repository(source, discovered.into_repos());
-            let mut named: HashSet<i64> = HashSet::new();
-            for group in repos.chunks(group_size) {
-                if stop.load(Ordering::Relaxed) {
-                    walk.report.interrupted = true;
-                    break 'walking;
-                }
-                walk.discovered.clear();
-                let walked = self.store_source(source, kind, group, counters)?;
-                walk.discovered.extend(
-                    walked
-                        .iter()
-                        .flat_map(|repo| repo.ordinals.iter().map(|ordinal| (repo.id, *ordinal))),
-                );
-                named.extend(walked.iter().map(|repo| repo.id));
-                let group_ids: Vec<i64> = walked.iter().map(|repo| repo.id).collect();
-                let KnownRows { known, sizes } = self.known_stamps_of(&group_ids)?;
-                walk.known = known;
-                walk.sizes = sizes;
-                walk.seen.clear();
-                'group: for (repo, walked) in group.iter().zip(walked) {
-                    for (revision, ordinal) in repo.revisions.iter().zip(walked.ordinals) {
-                        let found = RevisionEntries {
-                            repo_id: walked.id,
-                            ordinal,
-                            entries: &revision.entries,
-                        };
-                        if unchanged_revision(walk, found) {
-                            mark_unchanged(walk, found, 0..revision.entries.len());
-                            continue;
+            let walked = self.store_source(source, kind, discovered.repos(), counters)?;
+            walk.discovered.extend(
+                walked
+                    .iter()
+                    .flat_map(|repo| repo.ordinals.iter().map(|ordinal| (repo.id, *ordinal))),
+            );
+            for (repo, walked) in discovered.repos().iter().zip(walked) {
+                for (revision, ordinal) in repo.revisions.iter().zip(walked.ordinals) {
+                    let found = RevisionEntries {
+                        repo_id: walked.id,
+                        ordinal,
+                        entries: &revision.entries,
+                    };
+                    if unchanged_revision(walk, found) {
+                        mark_unchanged(walk, found, 0..revision.entries.len());
+                        continue;
+                    }
+                    if !walk.sizes.contains_key(&(walked.id, ordinal))
+                        && walk.paths_of != Some(walked.id)
+                    {
+                        walk.paths = self.repository_paths(walked.id)?;
+                        walk.paths_of = Some(walked.id);
+                    }
+                    let context = EntryContext {
+                        repo,
+                        repo_id: walked.id,
+                        revision,
+                        settings: walk.settings,
+                        kind,
+                        ordinal,
+                    };
+                    let documents = revision_documents(&revision.entries);
+                    let sets = shard_sets_by_name(&revision.entries, &documents);
+                    let units = revision_units(&revision.entries, sets);
+                    let plan = revision_plan(&context, documents, &units);
+                    let labels = set_labels(&plan.naming, &units);
+                    let mut card_written = false;
+                    for (unit, label) in units.iter().zip(labels) {
+                        if stop.load(Ordering::Relaxed) {
+                            walk.report.interrupted = true;
+                            break 'walking;
                         }
-                        if !walk.sizes.contains_key(&(walked.id, ordinal))
-                            && walk.paths_of != Some(walked.id)
-                        {
-                            walk.paths = self.repository_paths(walked.id)?;
-                            walk.paths_of = Some(walked.id);
-                        }
-                        let context = EntryContext {
-                            repo,
-                            repo_id: walked.id,
-                            revision,
-                            settings: walk.settings,
-                            kind,
-                            ordinal,
-                        };
-                        let documents = revision_documents(&revision.entries);
-                        let sets = shard_sets_by_name(&revision.entries, &documents);
-                        let units = revision_units(&revision.entries, sets);
-                        let plan = revision_plan(&context, documents, &units);
-                        let labels = set_labels(&plan.naming, &units);
-                        let mut card_written = false;
-                        for (unit, label) in units.iter().zip(labels) {
-                            if stop.load(Ordering::Relaxed) {
-                                walk.report.interrupted = true;
-                                break 'group;
-                            }
-                            let prepare = match decide_unit(walk, found, unit) {
-                                UnitDecision::Skip => {
-                                    mark_unchanged(walk, found, unit.positions().iter().copied());
-                                    continue;
-                                }
-                                UnitDecision::Prepare { prepare, unchanged } => {
-                                    mark_unchanged(walk, found, unchanged);
-                                    prepare
-                                }
-                            };
-                            let narrowed = match unit {
-                                Unit::Set(_) => None,
-                                Unit::Chunk(_) => Some(Unit::Chunk(prepare.clone())),
-                            };
-                            let prepared = prepare_unit(
-                                &context,
-                                &plan,
-                                narrowed.as_ref().unwrap_or(unit),
-                                label.as_deref(),
-                                stop,
-                            )?;
-                            if changed_while_prepared(&prepared) {
-                                mark_unchanged(walk, found, prepare.iter().copied());
+                        let prepare = match decide_unit(walk, found, unit) {
+                            UnitDecision::Skip => {
+                                mark_unchanged(walk, found, unit.positions().iter().copied());
                                 continue;
                             }
-                            let transaction = self.database.rw_transaction()?;
-                            if !std::mem::replace(&mut card_written, true)
-                                && store_revision_card(
-                                    &transaction,
-                                    walked.id,
-                                    ordinal,
-                                    plan.context.card().unwrap_or_default(),
-                                )?
-                            {
-                                log_revision_artifacts(&transaction, walked.id, ordinal, counters)?;
+                            UnitDecision::Prepare { prepare, unchanged } => {
+                                mark_unchanged(walk, found, unchanged);
+                                prepare
                             }
-                            let taken =
-                                replace_known(&transaction, walk, counters, found, &prepare)?;
-                            store_unit(&transaction, &context, prepared, counters)?;
-                            sweep_taken(&transaction, taken, counters)?;
-                            log_changes(&transaction, counters)?;
-                            counters.derived.flush(&transaction)?;
-                            counters.settle_summary(&transaction)?;
-                            transaction.commit()?;
-                            progress(&source.name, counters.entries);
+                        };
+                        let narrowed = match unit {
+                            Unit::Set(_) => None,
+                            Unit::Chunk(_) => Some(Unit::Chunk(prepare.clone())),
+                        };
+                        let prepared = prepare_unit(
+                            &context,
+                            &plan,
+                            narrowed.as_ref().unwrap_or(unit),
+                            label.as_deref(),
+                            stop,
+                        )?;
+                        if changed_while_prepared(&prepared) {
+                            mark_unchanged(walk, found, prepare.iter().copied());
+                            continue;
                         }
+                        let transaction = self.database.rw_transaction()?;
+                        if !std::mem::replace(&mut card_written, true)
+                            && store_revision_card(
+                                &transaction,
+                                walked.id,
+                                ordinal,
+                                plan.context.card().unwrap_or_default(),
+                            )?
+                        {
+                            log_revision_artifacts(&transaction, walked.id, ordinal, counters)?;
+                        }
+                        let taken = replace_known(&transaction, walk, counters, found, &prepare)?;
+                        store_unit(&transaction, &context, prepared, counters)?;
+                        sweep_taken(&transaction, taken, counters)?;
+                        log_changes(&transaction, counters)?;
+                        counters.derived.flush(&transaction)?;
+                        transaction.commit()?;
+                        progress(&source.name, counters.entries);
                     }
                 }
-                self.settle_moved(walk, counters)?;
-                if walk.report.interrupted {
-                    break 'walking;
-                }
-                self.retract_absent(walk, counters)?;
             }
-            self.retract_ungrouped(source, &named, walk, counters)?;
         }
+        self.settle_moved(walk, counters)?;
         if walk.report.interrupted {
             return Ok(());
         }
+        self.retract_absent(walk, counters)?;
         self.record_scan_stats(sources, counters)
     }
 
@@ -469,8 +426,12 @@ impl Catalog {
         let at = jiff::Timestamp::now().to_string();
         let transaction = self.database.rw_transaction()?;
         counters.derived.flush(&transaction)?;
-        counters.settle_summary(&transaction)?;
-        let held = held_by_source(transaction.scan().primary::<Repository>()?.all()?)?;
+        let repositories: Vec<Repository> = transaction
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
+        let held = held_by_source(&repositories);
         for source in sources {
             let Some(stored) = transaction.get().primary::<Source>(source.name.clone())? else {
                 continue;
@@ -494,7 +455,12 @@ impl Catalog {
     /// either, because the scan it names did not finish.
     fn recount_source_counts(&self) -> Result<()> {
         let transaction = self.database.rw_transaction()?;
-        let held = held_by_source(transaction.scan().primary::<Repository>()?.all()?)?;
+        let repositories: Vec<Repository> = transaction
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
+        let held = held_by_source(&repositories);
         let sources: Vec<Source> = transaction
             .scan()
             .primary()?
@@ -571,7 +537,6 @@ impl Catalog {
             transaction.upsert(repository(id, &source.name, repo, present, revisions))?;
             walked.push(WalkedRepo { id, ordinals });
         }
-        settle_repositories(&transaction)?;
         transaction.commit()?;
         Ok(walked)
     }
@@ -659,7 +624,6 @@ impl Catalog {
                 sweep_taken(&transaction, taken, counters)?;
                 log_changes(&transaction, counters)?;
                 counters.derived.flush(&transaction)?;
-                counters.settle_summary(&transaction)?;
                 transaction.commit()?;
             }
             self.forget_usage_of(repo_id)?;
@@ -679,25 +643,32 @@ impl Catalog {
         Ok(())
     }
 
-    /// Every path the catalog already holds for one group of repositories, with the stamp
-    /// that proves it unchanged and the facts a decision needs before any file is opened,
-    /// and how many of them each stored revision holds.
+    /// Every path the catalog already holds for the selected sources, with the stamp that
+    /// proves it unchanged and the facts a decision needs before any file is opened, and how
+    /// many of them each stored revision holds.
     ///
     /// Keyed by [`location_hash`] rather than by the location itself: a million relative
     /// paths held as text is the largest thing a rescan keeps in memory, and nothing here
-    /// reads a location back. Scoped to `repo_ids` - a group [`Catalog::walk`] just stored,
-    /// or the repositories of a source no group named - rather than every repository the
-    /// configured sources hold, so no more than one group's rows are ever in memory.
-    fn known_stamps_of(&self, repo_ids: &[i64]) -> Result<KnownRows> {
+    /// reads a location back.
+    fn known_stamps(&self, sources: &[&SourceConfig]) -> Result<KnownRows> {
+        let names: HashSet<&str> = sources.iter().map(|source| source.name.as_str()).collect();
         let read = self.database.r_transaction()?;
+        let repositories: Vec<Repository> = read
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
         let mut shards: HashMap<i64, Option<u32>> = HashMap::new();
         let mut known: KnownPaths = HashMap::new();
         let mut sizes: RevisionSizes = HashMap::new();
-        for &repo_id in repo_ids {
+        for repository in repositories
+            .iter()
+            .filter(|repository| names.contains(repository.source.as_str()))
+        {
             for entry in read
                 .scan()
                 .secondary::<Entry>(EntryKey::location)?
-                .start_with(LocationKey::repository(repo_id))?
+                .start_with(LocationKey::repository(repository.id))?
             {
                 let entry: Entry = entry?;
                 if entry.placed.is_absent() {
@@ -710,7 +681,7 @@ impl Catalog {
                     Some(id) => shard_count_of(&read, &mut shards, id)?,
                     None => None,
                 };
-                let location = location_hash(repo_id, entry.revision, &entry.rel_path);
+                let location = location_hash(repository.id, entry.revision, &entry.rel_path);
                 known.insert(
                     location,
                     Known {
@@ -725,7 +696,7 @@ impl Catalog {
                         shard_count: shard_count.unwrap_or_default(),
                     },
                 );
-                *sizes.entry((repo_id, entry.revision)).or_default() += 1;
+                *sizes.entry((repository.id, entry.revision)).or_default() += 1;
             }
         }
         Ok(KnownRows { known, sizes })
@@ -794,39 +765,7 @@ impl Catalog {
             sweep_taken(&transaction, taken, counters)?;
             log_changes(&transaction, counters)?;
             counters.derived.flush(&transaction)?;
-            counters.settle_summary(&transaction)?;
             transaction.commit()?;
-        }
-        Ok(())
-    }
-
-    /// Retracts a source's stored repositories that no group of this pass named: one gone
-    /// from disk since the last pass, so no group's discovery ever named a path of it
-    /// absent, because the repository itself was never walked. Called once every group of
-    /// the source has been walked without interruption; retracting per group is not
-    /// retiring, and a repository this misses is a repository a group did name.
-    ///
-    /// Chunked in `REPO_GROUP` at a time, the same as a named group, so an unmounted source -
-    /// the case this wave exists to bound - never puts more than one group's known-path map
-    /// in memory here either.
-    fn retract_ungrouped(
-        &self,
-        source: &SourceConfig,
-        named: &HashSet<i64>,
-        walk: &mut Walk,
-        counters: &mut Counters,
-    ) -> Result<()> {
-        let leftover: Vec<i64> = self
-            .repositories_of_source(&source.name)?
-            .into_iter()
-            .filter(|id| !named.contains(id))
-            .collect();
-        for chunk in leftover.chunks(REPO_GROUP) {
-            let KnownRows { known, sizes } = self.known_stamps_of(chunk)?;
-            walk.known = known;
-            walk.sizes = sizes;
-            walk.seen.clear();
-            self.retract_absent(walk, counters)?;
         }
         Ok(())
     }
@@ -835,35 +774,33 @@ impl Catalog {
     /// deletes the artifact and everything hanging off it once none does. A model split
     /// across shards is reached once per complete copy of its files, not once per file.
     /// The sweep commits in batches, because a fresh scan touches every artifact it wrote.
-    /// Sorted first, because `touched` is a hash set and an id order native_db never chose
-    /// makes every lookup here a random tree descent rather than a sequential walk.
     pub(super) fn sweep_artifacts(&self, counters: &mut Counters) -> Result<()> {
-        let mut ids: Vec<i64> = counters.touched.iter().copied().collect();
-        ids.sort_unstable();
+        let ids: Vec<i64> = counters.touched.iter().copied().collect();
         for batch in ids.chunks(CHUNK) {
             let transaction = self.database.rw_transaction()?;
             for id in batch {
-                counters.touch(&transaction, *id)?;
                 if sweep_artifact(&transaction, *id)? {
                     counters.pending.push(*id);
                 }
             }
             log_changes(&transaction, counters)?;
-            counters.settle_summary(&transaction)?;
             transaction.commit()?;
         }
-        self.summarise()
+        self.summarise(counters)
     }
 
-    /// Settles what a pass moves only at its end rather than in the transaction that earns
-    /// it: the repository count, read fresh because the walk has no `Counters` entry for a
-    /// repository row the way it has one for an artifact. Every artifact difference a pass
-    /// made is already folded by [`Counters::settle_summary`] in the transaction that made
-    /// it, so this reads and writes nothing about artifacts at all.
-    pub(super) fn summarise(&self) -> Result<()> {
+    /// Moves what the facet rail reads as DISK PRESSURE and what the stats route prints as
+    /// its totals by the difference this pass made, reading only the records it touched. A
+    /// pass that touched nothing writes nothing.
+    pub(super) fn summarise(&self, counters: &Counters) -> Result<()> {
         let read = self.database.r_transaction()?;
         let stored: Option<Summary> = read.get().primary(0_u8)?;
         let mut summary = stored.clone().unwrap_or_else(blank_summary);
+        for (id, before) in &counters.before {
+            let record: Option<ArtifactRecord> = read.get().primary(*id)?;
+            let after = SummaryPart::of(record.as_ref(), counters.triage);
+            shift_summary(&mut summary, *before, after);
+        }
         summary.repositories = read.len().primary::<Repository>()?;
         drop(read);
         if stored.as_ref() == Some(&summary) {
@@ -972,20 +909,15 @@ impl Catalog {
 }
 
 /// What each source holds, summed from the repositories under it: the files still on this
-/// disk and the bytes they occupy. Streamed from the primary scan directly, a lazy redb
-/// range, rather than collected into a `Vec` first: nothing here needs a repository once its
-/// three fields are folded into the map.
-fn held_by_source(
-    repositories: impl Iterator<Item = native_db::db_type::Result<Repository>>,
-) -> Result<HashMap<String, (u64, u64)>> {
-    let mut held: HashMap<String, (u64, u64)> = HashMap::new();
+/// disk and the bytes they occupy.
+fn held_by_source(repositories: &[Repository]) -> HashMap<&str, (u64, u64)> {
+    let mut held: HashMap<&str, (u64, u64)> = HashMap::new();
     for repository in repositories {
-        let repository = repository?;
-        let slot = held.entry(repository.source).or_default();
+        let slot = held.entry(repository.source.as_str()).or_default();
         slot.0 += u64::from(repository.present_files);
         slot.1 = slot.1.saturating_add(repository.present_bytes);
     }
-    Ok(held)
+    held
 }
 
 /// Whether the sweep changed what the search index should hold for this artifact.
@@ -1167,37 +1099,6 @@ fn available_sources(config: &IndexConfig) -> Result<Vec<&SourceConfig>> {
     Ok(selected)
 }
 
-/// Groups a source's discovered repositories so every one that shares a `repository_key`
-/// sits together, immediately after its first occurrence, rather than wherever discovery
-/// happened to find it.
-///
-/// A git clone's identity comes from its remote, so two clones of the same remote under one
-/// source root collapse onto a single stored `Repository` row. Left in discovery order, a
-/// group boundary could fall between them: the group that reaches only the first clone would
-/// retract the second clone's rows as absent - a path this pass never looked for, not one it
-/// found missing - and could sweep an artifact only the second clone still names a path for.
-/// Grouping by key first means a group boundary only ever falls between rows two different
-/// repositories own.
-fn group_by_repository(source: &SourceConfig, repos: Vec<DiscoveredRepo>) -> Vec<DiscoveredRepo> {
-    let mut order: Vec<String> = Vec::with_capacity(repos.len());
-    let mut buckets: HashMap<String, Vec<DiscoveredRepo>> = HashMap::with_capacity(repos.len());
-    for repo in repos {
-        let key = repository_key(&source.name, &repo.repo);
-        let bucket = match buckets.entry(key.clone()) {
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                order.push(key);
-                slot.insert(Vec::new())
-            }
-            std::collections::hash_map::Entry::Occupied(slot) => slot.into_mut(),
-        };
-        bucket.push(repo);
-    }
-    order
-        .into_iter()
-        .flat_map(|key| buckets.remove(&key).unwrap_or_default())
-        .collect()
-}
-
 /// What one pass over the sources has settled so far: which stored rows it recognised, and
 /// how many files it left alone, read again, added or retracted.
 struct Walk {
@@ -1208,18 +1109,12 @@ struct Walk {
     paths: PathIndex,
     paths_of: Option<i64>,
     sizes: RevisionSizes,
-    /// Every revision slot the current group discovered, by repository and ordinal, so a row
-    /// sitting on a revision the walk is about to reach is not refiled onto another. Cleared
-    /// at the top of each group and extended for the whole group before it is walked,
-    /// because a repository never spans two groups, so a later group never needs an earlier
-    /// one's entries here.
+    /// Every revision slot this walk discovered, by repository and ordinal, so a row
+    /// sitting on a revision the walk is about to reach is not refiled onto another.
     discovered: HashSet<(i64, u32)>,
     seen: HashSet<i64>,
     /// Entries whose revision moved to another ordinal under them, with the ordinal it
-    /// moved to. Settled once per group rather than once per unit, and regardless of whether
-    /// that group was interrupted: refiling relabels a row this pass already holds rather
-    /// than retiring one, so it is not gated on the group having finished the way retracting
-    /// absent paths is.
+    /// moved to. Written once at the end of the pass rather than once per unit.
     moved: Vec<(i64, u32)>,
     report: RescanReport,
 }
@@ -1628,21 +1523,6 @@ pub(super) fn blank_summary() -> Summary {
     }
 }
 
-/// Sets `Summary.repositories` from the count this transaction itself sees, in the
-/// transaction that may have just written a `Repository` row. `Counters::summarise` does the
-/// same thing across a read and a separate write transaction, which is a lost-update window
-/// for a writer that can run concurrently with another; a writer that already holds a
-/// transaction settles the count in it instead.
-pub(super) fn settle_repositories(transaction: &RwTransaction<'_>) -> Result<()> {
-    let stored: Option<Summary> = transaction.get().primary(0_u8)?;
-    let mut summary = stored.clone().unwrap_or_else(blank_summary);
-    summary.repositories = transaction.len().primary::<Repository>()?;
-    if stored.as_ref() != Some(&summary) {
-        transaction.upsert(summary)?;
-    }
-    Ok(())
-}
-
 /// What one entry contributes to the counts kept on the records above it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Contribution {
@@ -1795,37 +1675,10 @@ impl Counters {
         Ok(())
     }
 
-    /// Folds what this transaction changed into the stored totals and clears the snapshots
-    /// it kept to do so. Called wherever `DerivedShift::flush` is called, in the same
-    /// transaction, so a killed pass leaves no count behind the rows that moved it.
-    ///
-    /// Reads and writes the summary through `transaction` rather than a separate snapshot,
-    /// so a record `touch` saw before this transaction and a record this transaction itself
-    /// wrote both settle against what the row holds right now. Shifting `a -> b` in one
-    /// transaction and `b -> c` in the next equals shifting `a -> c`, so an artifact touched
-    /// again in a later transaction, once this one has cleared it, still settles exactly.
-    pub(super) fn settle_summary(&mut self, transaction: &RwTransaction<'_>) -> Result<()> {
-        if self.before.is_empty() {
-            return Ok(());
-        }
-        let stored: Option<Summary> = transaction.get().primary(0_u8)?;
-        let mut summary = stored.clone().unwrap_or_else(blank_summary);
-        for (id, before) in self.before.drain() {
-            let record: Option<ArtifactRecord> = transaction.get().primary(id)?;
-            let after = SummaryPart::of(record.as_ref(), self.triage);
-            shift_summary(&mut summary, before, after);
-        }
-        if stored.as_ref() != Some(&summary) {
-            transaction.upsert(summary)?;
-        }
-        Ok(())
-    }
-
     /// Writes the allocator and the present counts this pass moved, which is why every
     /// writer commits through it.
     pub(super) fn save(&mut self, transaction: &RwTransaction<'_>) -> Result<()> {
         self.derived.flush(transaction)?;
-        self.settle_summary(transaction)?;
         transaction.upsert(Allocator {
             id: 0,
             repos: self.repos,
@@ -1833,11 +1686,6 @@ impl Counters {
             entries: self.entries,
         })?;
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub(super) fn holds_no_summary_snapshot(&self) -> bool {
-        self.before.is_empty()
     }
 
     pub(super) fn next_repo(&mut self) -> Result<i64> {
@@ -2118,11 +1966,6 @@ pub(super) enum EntryRole {
 
 /// The largest number of standalone files one transaction covers.
 pub(super) const CHUNK: usize = 1024;
-
-/// The largest number of a source's repositories stored, walked and retracted before the
-/// next such group, so a rescan holds one group's known-path map rather than the whole
-/// source's.
-pub(super) const REPO_GROUP: usize = 64;
 
 /// Everything the per entry pass of one revision reads besides the entry itself.
 struct RevisionPlan<'a> {
