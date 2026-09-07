@@ -153,8 +153,19 @@ before its wave opens; after it lands, overturning is a wave of its own.
    would justify more.
 2. **The index writer's budget** is 128 MiB of estimated document bytes between commits, on
    both the rebuild and the refresh. The estimate is the sum of every text value a document
-   carries plus a fixed allowance per document; it does not need to be exact, it needs to be
-   monotone in the card and the entry count.
+   carries plus a fixed allowance per document and per value; it does not need to be exact,
+   but it must not undercount, and wave 2's review established that it easily can. A
+   `TantivyDocument` is created with 1,024 bytes of reserved capacity that nothing in tantivy
+   or in hoard ever shrinks, plus eight bytes per value, so an estimate of the text alone
+   reads about a fifth of what a small document really holds while it waits. Two consequences
+   the run carries from here: the budget binds only once one artifact's documents exceed
+   about 13 KiB of estimate, below which tantivy's own channel of 10,000 groups is the
+   tighter cap, so a fixture of one small entry per artifact cannot show this wave at all;
+   and one artifact's documents are admitted as a unit, so the ceiling is the larger of the
+   budget and one group. A group is not itself bounded, because a revision's card is indexed
+   into every entry document of that revision and a card may reach 4 MiB. Not repeating the
+   card per entry document would bound it, and that changes what a non-primary entry document
+   matches, so it is a later decision and not this run's.
 3. **The usage sink's bound** is sixteen times its flush capacity, 4,096 responses. Past it,
    a response is folded into counts and loses its pull row. Nothing is silently discarded:
    the fold is counted and warned about once per episode, and the counts the USAGE tab and
@@ -196,7 +207,10 @@ The run is finished when every line holds:
    rebuild no slower than the scan; no route of the eleven slower than the column beside it
    by more than its spread without a stated reason; and the new rows recorded with the
    number: the deletion phase's wall and RSS, the concurrent-search RSS, the mixed-size
-   hashing wall, the rebuild RSS with cards.
+   hashing wall, and, on the fan-out shape wave 2 added rather than on the gate tree, the
+   rebuild's peak RSS beside the commit count that says whether the writer's budget fired at
+   all. A commit count of one means the budget never bound and the memory row beside it is
+   evidence of nothing; record that as the finding rather than as a pass.
 5. `hoard doctor` passes every check on this workstation's catalog after the fresh scan of
    wave 5, and `--repair` reports no drift.
 6. The two reviewers report no finding ranked above minor that is not fixed or recorded with
