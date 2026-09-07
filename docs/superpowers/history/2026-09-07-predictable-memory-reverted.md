@@ -8,7 +8,8 @@ repeat the process that produced it.
 
 ## What happened
 
-`docs/superpowers/specs/2026-09-07-predictable-memory-goal.md` set five waves. Four landed:
+The goal document, deleted with the run and readable at the tag as
+`docs/superpowers/specs/2026-09-07-predictable-memory-goal.md`, set five waves. Four landed:
 a continuous hashing dispatch with a `hash_threads` setting; a byte-metered index writer; a
 usage log keyed by repository with a minute-grained reindex and a bounded sink; and a summary
 fold with a grouped walk and a `cache_mib` setting. The fifth, the measurement, was stopped
