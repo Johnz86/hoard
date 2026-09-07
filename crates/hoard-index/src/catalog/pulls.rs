@@ -266,6 +266,7 @@ fn pull_repository(
         root_path: root.to_string_lossy().into_owned(),
         git_dir: None,
         default_ref: crate::discover::DEFAULT_REF.to_owned(),
+        remote: None,
         revisions: Vec::new(),
         present_files: 0,
         present_bytes: 0,

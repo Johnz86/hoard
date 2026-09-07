@@ -1,7 +1,7 @@
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use jiff::{Span, Timestamp, tz::TimeZone};
+use native_db::transaction::RwTransaction;
 use serde::Serialize;
 
 use hoard_core::{ArtifactId, RepoRowId};
@@ -10,7 +10,7 @@ use crate::config::IndexConfig;
 use crate::error::{IndexError, Result};
 
 use super::Catalog;
-use super::models::{ArtifactUse, Usage, UsageKey};
+use super::models::{ArtifactUse, RepoAtKey, RepoUsage, Usage, UsageKey};
 use super::scan::{Counters, log_changes};
 use super::userdata::{Sequenced, next_key};
 
@@ -45,6 +45,11 @@ impl UsageEvent {
 /// The `YYYY-MM-DD` prefix a usage row's timestamp starts with, which is the day it counts
 /// towards.
 const DATE_WIDTH: usize = 10;
+
+/// How many distinct clients one repository's record keeps. A LAN holds far fewer, and the
+/// extractor only believes a forwarded address that parses, so the cap is what bounds the
+/// row when a source spoofs addresses rather than a limit a real network reaches.
+const CLIENT_CAP: usize = 4_096;
 
 /// One bar of the seven day usage chart.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -81,24 +86,16 @@ impl Catalog {
     pub fn log_usage(&self, event: &UsageEvent) -> Result<u64> {
         let transaction = self.database.rw_transaction()?;
         let seq = next_key::<Usage>(&transaction)?;
-        transaction.insert(Usage {
-            seq,
-            repo_id: event.repo.map(RepoRowId::get),
-            at: event.at.to_string(),
-            client: event.client.clone(),
-            artifact_id: event.artifact.map(ArtifactId::get),
-            path: event.path.clone(),
-            bytes: event.bytes,
-            rate_bps: event.rate_bps,
-            status: event.status,
-        })?;
+        transaction.insert(usage_row(seq, event))?;
+        write_repo_usage(&transaction, tally_repos(std::slice::from_ref(event)))?;
         transaction.commit()?;
         Ok(seq)
     }
 
-    /// Records many served responses in one transaction: every usage row, one use bump per
-    /// artifact carrying that artifact's count and latest time, and one search change per
-    /// distinct artifact. Returns how many rows were appended.
+    /// Records many served responses in one transaction: every usage row, the maintained
+    /// record of each repository they served, one use bump per artifact carrying that
+    /// artifact's count and latest time, and one search change per distinct artifact.
+    /// Returns how many rows were appended.
     pub fn log_usage_batch(&self, events: &[UsageEvent]) -> Result<u64> {
         if events.is_empty() {
             return Ok(0);
@@ -109,23 +106,14 @@ impl Catalog {
         let first = next_key::<Usage>(&transaction)?;
         let mut bumps: BTreeMap<i64, (u64, Timestamp)> = BTreeMap::new();
         for (seq, event) in (first..).zip(events) {
-            transaction.insert(Usage {
-                seq,
-                repo_id: event.repo.map(RepoRowId::get),
-                at: event.at.to_string(),
-                client: event.client.clone(),
-                artifact_id: event.artifact.map(ArtifactId::get),
-                path: event.path.clone(),
-                bytes: event.bytes,
-                rate_bps: event.rate_bps,
-                status: event.status,
-            })?;
+            transaction.insert(usage_row(seq, event))?;
             if let Some(artifact) = event.artifact {
                 let slot = bumps.entry(artifact.get()).or_insert((0, event.at));
                 slot.0 += 1;
                 slot.1 = slot.1.max(event.at);
             }
         }
+        write_repo_usage(&transaction, tally_repos(events))?;
         for (artifact_id, (count, last_used)) in bumps {
             let stored: Option<ArtifactUse> = transaction.get().primary(artifact_id)?;
             let latest = match &stored {
@@ -186,40 +174,158 @@ impl Catalog {
     /// Pull counts per UTC day for the last `days` days, ending today and including the
     /// days nobody pulled on, oldest first.
     pub fn usage_days(&self, repo: RepoRowId, days: u32) -> Result<Vec<UsageDay>> {
-        day_window(&self.usage_of(repo)?, days)
+        let window = Window::of(days)?;
+        Ok(window.count(&self.usage_in(repo, &window)?))
     }
 
     /// The most recent pulls of a repository, newest first.
     pub fn recent_pulls(&self, repo: RepoRowId, limit: u32) -> Result<Vec<PullRow>> {
-        newest_pulls(self.usage_of(repo)?, limit)
+        pull_rows(self.newest_usage(repo, limit)?)
     }
 
-    /// How many different clients pulled from a repository.
+    /// How many different clients pulled from a repository, as the repository's own record
+    /// has counted them.
     pub fn distinct_clients(&self, repo: RepoRowId) -> Result<u64> {
-        Ok(distinct_clients_of(&self.usage_of(repo)?))
+        Ok(self
+            .repo_usage(repo)?
+            .map_or(0, |stored| stored.clients.len() as u64))
     }
 
-    /// Everything the USAGE tab draws for one repository, from one read of its log rather
-    /// than the three the three views used to take separately.
+    /// Everything the USAGE tab draws for one repository: the window the chart shows, read
+    /// as one range of the log; the client count the repository's record maintains; and the
+    /// newest pulls, taken from the window when it already holds enough of them.
     pub fn usage_report(&self, repo: RepoRowId, days: u32, limit: u32) -> Result<UsageReport> {
-        let rows = self.usage_of(repo)?;
+        let window = Window::of(days)?;
+        let rows = self.usage_in(repo, &window)?;
+        let days = window.count(&rows);
+        let pulls = match rows.len() >= limit as usize {
+            true => pull_rows(newest_of(rows, limit))?,
+            false => self.recent_pulls(repo, limit)?,
+        };
         Ok(UsageReport {
-            days: day_window(&rows, days)?,
-            clients: distinct_clients_of(&rows),
-            pulls: newest_pulls(rows, limit)?,
+            days,
+            clients: self.distinct_clients(repo)?,
+            pulls,
         })
     }
 
-    fn usage_of(&self, repo: RepoRowId) -> Result<Vec<Usage>> {
-        let read = self.database.r_transaction()?;
-        let mut rows: Vec<Usage> = read
-            .scan()
-            .secondary(UsageKey::repo_id)?
-            .start_with(Some(repo.get()))?
-            .collect::<native_db::db_type::Result<_>>()?;
-        rows.retain(|row| row.repo_id == Some(repo.get()));
-        Ok(rows)
+    pub(super) fn repo_usage(&self, repo: RepoRowId) -> Result<Option<RepoUsage>> {
+        Ok(self.database.r_transaction()?.get().primary(repo.get())?)
     }
+
+    /// The rows one repository served inside a window, oldest first, as one range of the
+    /// `repo_at` key: the scan reads the window rather than the log.
+    pub(super) fn usage_in(&self, repo: RepoRowId, window: &Window) -> Result<Vec<Usage>> {
+        let read = self.database.r_transaction()?;
+        Ok(read
+            .scan()
+            .secondary(UsageKey::repo_at)?
+            .range(RepoAtKey::at(repo.get(), window.first())..RepoAtKey::after(repo.get()))?
+            .collect::<native_db::db_type::Result<_>>()?)
+    }
+
+    /// The newest `limit` rows of one repository's log, newest first. The range is the
+    /// repository's own keys and only the rows kept are decoded.
+    fn newest_usage(&self, repo: RepoRowId, limit: u32) -> Result<Vec<Usage>> {
+        let read = self.database.r_transaction()?;
+        Ok(read
+            .scan()
+            .secondary(UsageKey::repo_at)?
+            .range(RepoAtKey::repository(repo.get())..RepoAtKey::after(repo.get()))?
+            .rev()
+            .take(limit as usize)
+            .collect::<native_db::db_type::Result<_>>()?)
+    }
+}
+
+/// One served response as the log stores it.
+///
+/// `at` is written at fixed nanosecond precision rather than jiff's default, which trims
+/// trailing zeros: the `repo_at` key ends in this text, and a trimmed second sorts after a
+/// fractional one inside the same second, which would put the window and the pull list out
+/// of time order.
+fn usage_row(seq: u64, event: &UsageEvent) -> Usage {
+    Usage {
+        seq,
+        repo_id: event.repo.map(RepoRowId::get),
+        at: format!("{:.9}", event.at),
+        client: event.client.clone(),
+        artifact_id: event.artifact.map(ArtifactId::get),
+        path: event.path.clone(),
+        bytes: event.bytes,
+        rate_bps: event.rate_bps,
+        status: event.status,
+    }
+}
+
+/// What one write adds to one repository's maintained record.
+struct RepoTally {
+    pulls: u64,
+    clients: BTreeSet<String>,
+    last: Timestamp,
+}
+
+impl RepoTally {
+    fn add(&mut self, event: &UsageEvent) {
+        self.pulls += 1;
+        if let Some(client) = &event.client {
+            self.clients.insert(client.clone());
+        }
+        self.last = self.last.max(event.at);
+    }
+}
+
+fn tally_repos(events: &[UsageEvent]) -> BTreeMap<i64, RepoTally> {
+    let mut tallies: BTreeMap<i64, RepoTally> = BTreeMap::new();
+    for event in events {
+        let Some(repo) = event.repo else {
+            continue;
+        };
+        tallies
+            .entry(repo.get())
+            .or_insert_with(|| RepoTally {
+                pulls: 0,
+                clients: BTreeSet::new(),
+                last: event.at,
+            })
+            .add(event);
+    }
+    tallies
+}
+
+/// Moves each repository's record by what the write added, in the transaction that wrote
+/// the rows, so the count the USAGE tab reads is never derived from the log again.
+fn write_repo_usage(
+    transaction: &RwTransaction<'_>,
+    tallies: BTreeMap<i64, RepoTally>,
+) -> Result<()> {
+    for (repo_id, tally) in tallies {
+        let stored: Option<RepoUsage> = transaction.get().primary(repo_id)?;
+        let last_pull = match &stored {
+            Some(stored) => stored
+                .last_pull
+                .parse::<Timestamp>()
+                .map_or(tally.last, |seen| seen.max(tally.last)),
+            None => tally.last,
+        };
+        let (pulls, mut clients) =
+            stored.map_or((0, Vec::new()), |stored| (stored.pulls, stored.clients));
+        for client in tally.clients {
+            if clients.len() >= CLIENT_CAP {
+                break;
+            }
+            if let Err(slot) = clients.binary_search(&client) {
+                clients.insert(slot, client);
+            }
+        }
+        transaction.upsert(RepoUsage {
+            repo_id,
+            pulls: pulls + tally.pulls,
+            clients,
+            last_pull: last_pull.to_string(),
+        })?;
+    }
+    Ok(())
 }
 
 /// The pulls per day, the recent pulls and the client count of one repository, which is
@@ -231,62 +337,72 @@ pub struct UsageReport {
     pub clients: u64,
 }
 
-/// The last `days` UTC days, oldest first, counted in one pass over the log rather than one
-/// pass per day.
-fn day_window(rows: &[Usage], days: u32) -> Result<Vec<UsageDay>> {
-    let days = days.max(1);
-    let today = Timestamp::now().to_zoned(TimeZone::UTC).date();
-    let mut counted: HashMap<&str, u64> = HashMap::with_capacity(days as usize);
-    for row in rows {
-        let date = row.at.get(..DATE_WIDTH).unwrap_or(row.at.as_str());
-        *counted.entry(date).or_default() += 1;
-    }
-    let mut window = Vec::with_capacity(days as usize);
-    for offset in (0..days).rev() {
-        let date = today
-            .checked_sub(Span::new().days(i64::from(offset)))
-            .map_err(|error| IndexError::Catalog(format!("usage window: {error}")))?
-            .to_string();
-        let pulls = counted.get(date.as_str()).copied().unwrap_or_default();
-        window.push(UsageDay { date, pulls });
-    }
-    Ok(window)
+/// The UTC days the chart draws, oldest first: the dates a reader ranges the log from and
+/// the buckets it fills.
+pub(super) struct Window {
+    dates: Vec<String>,
 }
 
-/// The newest `limit` rows, newest first, kept in a heap so the whole log is never sorted.
-fn newest_pulls(rows: Vec<Usage>, limit: u32) -> Result<Vec<PullRow>> {
-    let limit = (limit as usize).min(rows.len());
-    let mut kept: BinaryHeap<Reverse<(String, u64, usize)>> = BinaryHeap::with_capacity(limit + 1);
-    for (index, row) in rows.iter().enumerate() {
-        kept.push(Reverse((row.at.clone(), row.seq, index)));
-        if kept.len() > limit {
-            kept.pop();
+impl Window {
+    pub(super) fn of(days: u32) -> Result<Self> {
+        let days = days.max(1);
+        let today = Timestamp::now().to_zoned(TimeZone::UTC).date();
+        let mut dates = Vec::with_capacity(days as usize);
+        for offset in (0..days).rev() {
+            let date = today
+                .checked_sub(Span::new().days(i64::from(offset)))
+                .map_err(|error| IndexError::Catalog(format!("usage window: {error}")))?;
+            dates.push(date.to_string());
         }
+        Ok(Self { dates })
     }
-    let mut ordered = kept.into_sorted_vec();
-    ordered.reverse();
-    ordered
-        .into_iter()
-        .map(|Reverse((_, seq, index))| {
-            let row = &rows[index];
+
+    /// The date the window opens on, which an RFC 3339 time inside it sorts at or after.
+    fn first(&self) -> &str {
+        self.dates.first().map_or("", String::as_str)
+    }
+
+    /// The rows the range read, counted into the days the chart draws. A row outside the
+    /// window fills no bucket, so a range wider than the window is still exact.
+    fn count(&self, rows: &[Usage]) -> Vec<UsageDay> {
+        let mut counted: HashMap<&str, u64> = HashMap::with_capacity(self.dates.len());
+        for row in rows {
+            let date = row.at.get(..DATE_WIDTH).unwrap_or(row.at.as_str());
+            *counted.entry(date).or_default() += 1;
+        }
+        self.dates
+            .iter()
+            .map(|date| UsageDay {
+                date: date.clone(),
+                pulls: counted.get(date.as_str()).copied().unwrap_or_default(),
+            })
+            .collect()
+    }
+}
+
+/// The newest `limit` of a window's rows, newest first. The range read them oldest first,
+/// so the newest are its tail read backwards.
+fn newest_of(rows: Vec<Usage>, limit: u32) -> Vec<Usage> {
+    let older = rows.len().saturating_sub(limit as usize);
+    rows.into_iter().skip(older).rev().collect()
+}
+
+/// The rows a reader already ordered, as the lines the USAGE tab prints.
+fn pull_rows(rows: Vec<Usage>) -> Result<Vec<PullRow>> {
+    rows.into_iter()
+        .map(|row| {
+            let when = row.at.parse().map_err(|error| {
+                IndexError::Catalog(format!("usage row {} has no time: {error}", row.seq))
+            })?;
             Ok(PullRow {
-                when: row.at.parse().map_err(|error| {
-                    IndexError::Catalog(format!("usage row {seq} has no time: {error}"))
-                })?,
-                who: row.client.clone(),
-                what: row.path.clone(),
+                when,
+                who: row.client,
+                what: row.path,
                 bytes: row.bytes,
                 rate_bps: row.rate_bps,
             })
         })
         .collect()
-}
-
-fn distinct_clients_of(rows: &[Usage]) -> u64 {
-    rows.iter()
-        .filter_map(|row| row.client.as_deref())
-        .collect::<HashSet<&str>>()
-        .len() as u64
 }
 
 /// When an artifact was last served, read from a snapshot a caller already holds.

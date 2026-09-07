@@ -13,7 +13,7 @@ pub(crate) mod proxy;
 mod tests;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::Router;
@@ -209,8 +209,13 @@ pub(crate) fn authorization(headers: &HeaderMap) -> Option<Authorization> {
     )
 }
 
-/// Who asked, as the usage log records it: the forwarded address when a proxy named one,
-/// otherwise the peer this connection came from.
+/// Who asked, as the usage log records it: the first forwarded address when a proxy named
+/// one, otherwise the peer this connection came from.
+///
+/// A forwarded header is only believed when it parses as an IP address; anything else is
+/// dropped in favour of the socket the request arrived on. The repository record the USAGE
+/// tab reads keeps one entry per distinct client, so a header a caller can spell freely
+/// would otherwise grow that row without bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Client(pub Option<String>);
 
@@ -224,15 +229,14 @@ impl<S: Send + Sync> FromRequestParts<S> for Client {
             .or_else(|| parts.headers.get("x-real-ip"))
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(',').next())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
-        Ok(Client(forwarded.or_else(|| {
+            .and_then(|value| value.trim().parse::<IpAddr>().ok());
+        let address = forwarded.or_else(|| {
             parts
                 .extensions
                 .get::<ConnectInfo<SocketAddr>>()
-                .map(|ConnectInfo(address)| address.ip().to_string())
-        })))
+                .map(|ConnectInfo(address)| address.ip())
+        });
+        Ok(Client(address.as_ref().map(IpAddr::to_string)))
     }
 }
 

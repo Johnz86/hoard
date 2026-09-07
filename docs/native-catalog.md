@@ -175,6 +175,15 @@ record, and publishing prunes the whole log unread. `Counters::load` reads wheth
 manifest names a published directory and `log_changes` returns early while it does not, so a
 fresh scan of a million artifacts no longer writes and then deletes a million rows.
 
+The usage log carries a second discipline of the same shape. `log_usage` and
+`log_usage_batch` write each served response and, in the transaction that wrote it, move the
+`RepoUsage` record of every repository the write served: its pull count, its sorted client
+list and its last pull. The USAGE tab's client count is read from that record rather than
+counted from the log, and a `Usage` row carries a `repo_at` secondary key - the repository id
+in big-endian bytes followed by the row's RFC 3339 time - so the chart's window is one range
+scan of the days it draws and the recent pulls are the tail of that range read backwards. A
+writer of a usage row that skips the record leaves the client count behind.
+
 `refresh_search` replays the log after the durable cursor, one Tantivy commit per batch,
 deleting an artifact's documents by term and re-adding its entries, then prunes what it
 applied. A rescan followed by a refresh updates search without a rebuild. A query answers
@@ -991,12 +1000,6 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
 - **`native_model::Model::native_model_decode` unwraps** a payload shorter than its eight
   byte header rather than returning an error, so a truncated row panics. `codec.rs` cannot
   see that byte range; it is reached before any codec is called.
-- **The USAGE tab reads a repository's whole log**, because the client count it shows is a
-  claim about every pull the repository ever served. Bounding the chart alone would not bound
-  the route: 20,000 rows cost 9.1 ms.
-- **`Catalog::triage_queue` now needs a search index** rather than only tolerating a stale
-  one. Every catalog a command or the server opens has one, but a catalog built by
-  `scan_sources` alone answers the queue with an error until one is built.
 - **A path outside UTF-8 is identified but not stored.** The identity a scan computes is
   byte-exact, but `Repository.root_path` and `Entry.placed` hold `to_string_lossy` text, the
   walker drops a relative path that is not UTF-8, and `SourceConfig` cannot serialise a root
@@ -1006,7 +1009,6 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
   repository whose branch moves on every scan therefore grows one stored revision per head.
   Reclaiming an empty slot needs the entries of a retired revision to be removed rather than
   marked absent, which is the same decision as pruning a deleted path's row.
-- **Preserve complete repository Git metadata** and add stable cross-scan identities.
 - **Add a read-only open** once redb offers one, so searches can run beside a rebuild.
 - **Add process-kill and power-loss recovery tests.** The current tests check transaction
   abort and publication boundaries, not power loss.

@@ -1,5 +1,3 @@
-use std::cmp::Reverse;
-
 use native_db::transaction::RwTransaction;
 
 use hoard_core::{
@@ -20,7 +18,9 @@ use super::models::{
 use super::nodes::PEER_SOURCE;
 use super::pulls::PULL_SOURCE;
 use super::read::Reader;
-use super::scan::{CHUNK, Counters, log_changes, next_id, preference, sweep_artifact};
+use super::scan::{
+    CHUNK, Counters, log_changes, next_id, preference, preferred_entry, sweep_artifact,
+};
 
 /// One artifact of this node, flattened to what a peer needs to find and fetch it.
 #[derive(Debug, Clone, PartialEq)]
@@ -86,10 +86,7 @@ impl Catalog {
             if record.artifact.sha256.is_none() {
                 continue;
             }
-            let Some(entry) = reader
-                .entries_of_artifact(record.id)?
-                .into_iter()
-                .max_by_key(|entry| (entry.preference, Reverse(entry.id)))
+            let Some(entry) = preferred_entry(reader.entries_of_artifact(record.id)?)
                 .filter(|entry| entry.node == LOCAL_NODE && entry.state != State::Remote)
             else {
                 continue;
@@ -426,6 +423,7 @@ impl Applying<'_, '_> {
             root_path: self.root.clone(),
             git_dir: None,
             default_ref: crate::discover::DEFAULT_REF.to_owned(),
+            remote: None,
             revisions: Vec::new(),
             present_files: 0,
             present_bytes: 0,

@@ -1,4 +1,4 @@
-use std::cmp::{Ordering, Reverse};
+use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLockReadGuard};
@@ -33,6 +33,7 @@ use super::nodes::NodeNames;
 use crate::error::{IndexError, Result};
 
 use super::query::{self, QueryFields};
+use super::scan::collapse_key;
 use super::usage::last_used_in;
 use super::{Catalog, OpenIndex};
 
@@ -1863,7 +1864,7 @@ fn documents_from(
     let last_used = last_used_in(snapshot, artifact_id)?;
     let preferred = entries
         .iter()
-        .max_by_key(|entry| (entry.preference, Reverse(entry.id)))
+        .max_by_key(|entry| collapse_key(entry.preference, entry.id))
         .map(|entry| entry.id);
     let mut documents = Vec::with_capacity(entries.len());
     for entry in &entries {
@@ -1984,12 +1985,11 @@ struct Retained {
     doc: DocId,
 }
 
-/// Whether one entry of an artifact is the one a collapse keeps over another: the higher
-/// availability preference, and on a tie the lower entry id, which is what the read API and
-/// the `primary` mark both collapse to.
+/// Whether one entry of an artifact is the one a collapse keeps over another, by the rule
+/// [`collapse_key`] states for every reader.
 #[inline]
 fn prefers(row: &Retained, over: &Retained) -> bool {
-    (row.preference, Reverse(row.entry_id)) > (over.preference, Reverse(over.entry_id))
+    collapse_key(row.preference, row.entry_id) > collapse_key(over.preference, over.entry_id)
 }
 
 /// Where one segment's walk is inside the run it is folding.

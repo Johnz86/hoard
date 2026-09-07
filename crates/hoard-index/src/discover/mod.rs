@@ -140,6 +140,9 @@ pub struct DiscoveredRepo {
     pub root_path: PathBuf,
     pub git_dir: Option<PathBuf>,
     pub default_ref: String,
+    /// The URL `origin` points at, for a clone that has one; nothing for a folder that is
+    /// not a clone or a clone with no remote.
+    pub remote: Option<String>,
     pub revisions: Vec<DiscoveredRevision>,
     pub refs: Vec<DiscoveredRef>,
 }
@@ -151,6 +154,7 @@ impl DiscoveredRepo {
             root_path,
             git_dir: None,
             default_ref: DEFAULT_REF.to_owned(),
+            remote: None,
             revisions: Vec::new(),
             refs: Vec::new(),
         }

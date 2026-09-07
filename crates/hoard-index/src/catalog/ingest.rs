@@ -13,7 +13,7 @@ use super::models::{
     ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, LocationKey, Placement,
     Repository, RepositoryKey, Revision, SearchText, Source, Summary, entry_at, repository_key,
 };
-use super::read::{Reader, repositories_of_source_in};
+use super::read::Reader;
 use super::scan::{
     CHUNK, Counters, RecordFacts, log_changes, next_id, paths_of_artifact, preference,
     present_paths, record_of, tensor_keys,
@@ -68,36 +68,51 @@ impl Catalog {
         Ok(record)
     }
 
-    /// Every path this node serves whose bytes live only in the block cache: a SERVED entry
-    /// of the local node with no file of its own on disk.
-    pub fn served_cache_entries(&self) -> Result<Vec<EntryDetail>> {
-        let snapshot = self.database.r_transaction()?;
-        let names = self.node_names(&snapshot)?;
-        let mut reader = Reader::new(&snapshot, &names);
-        let mut details = Vec::new();
-        for repo_id in repositories_of_source_in(&snapshot, MIRROR_SOURCE)? {
+    /// Visits every path this node serves whose bytes live only in the block cache - a
+    /// SERVED entry of the local node with no file of its own on disk - in chunks of at
+    /// most `chunk`, one repository at a time.
+    ///
+    /// Each repository is read in its own snapshot, so a sweep of the mirror holds one
+    /// repository's rows and one chunk of details rather than every served path the
+    /// catalog knows. The chunks of one repository arrive in entry id order, and the
+    /// repositories in repository id order.
+    pub fn served_cache_entries_in(
+        &self,
+        chunk: usize,
+        mut visit: impl FnMut(Vec<EntryDetail>) -> Result<()>,
+    ) -> Result<()> {
+        let chunk = chunk.max(1);
+        for repo_id in self.repositories_of_source(MIRROR_SOURCE)? {
+            let snapshot = self.database.r_transaction()?;
+            let names = self.node_names(&snapshot)?;
+            let mut reader = Reader::new(&snapshot, &names);
             let mut rows: Vec<Entry> = snapshot
                 .scan()
                 .secondary::<Entry>(EntryKey::location)?
                 .start_with(LocationKey::repository(repo_id))?
                 .collect::<native_db::db_type::Result<_>>()?;
-            rows.sort_unstable_by_key(|entry| entry.id);
-            for entry in rows.iter().filter(|entry| {
+            rows.retain(|entry| {
                 entry.repo_id == repo_id
                     && entry.node == LOCAL_NODE
                     && entry.state == State::Served
                     && entry.placed.is_absent()
-            }) {
-                let deduped = match entry.artifact_id {
-                    Some(id) => reader
-                        .record(id)?
-                        .is_some_and(|record| record.path_count > 1),
-                    None => false,
-                };
-                details.push(reader.detail(entry, deduped)?);
+            });
+            rows.sort_unstable_by_key(|entry| entry.id);
+            for batch in rows.chunks(chunk) {
+                let mut details = Vec::with_capacity(batch.len());
+                for entry in batch {
+                    let deduped = match entry.artifact_id {
+                        Some(id) => reader
+                            .record(id)?
+                            .is_some_and(|record| record.path_count > 1),
+                        None => false,
+                    };
+                    details.push(reader.detail(entry, deduped)?);
+                }
+                visit(details)?;
             }
         }
-        Ok(details)
+        Ok(())
     }
 
     /// Moves entries back to REMOTE with no pull in flight, keeping the rows so the catalog
@@ -288,6 +303,7 @@ impl Ingesting<'_, '_> {
             root_path: file.cache_root.to_string_lossy().into_owned(),
             git_dir: None,
             default_ref: crate::discover::DEFAULT_REF.to_owned(),
+            remote: None,
             revisions: Vec::new(),
             present_files: 0,
             present_bytes: 0,

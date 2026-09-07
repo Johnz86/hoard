@@ -20,9 +20,10 @@ use crate::triage::{TriageHeader, header_facts};
 
 use super::models::{
     ArtifactDetail, ArtifactRecord, Entry, EntryKey, LocationKey, Repository, RepositoryKey,
-    Revision, Source, repository_key,
+    Revision, Source, repository_key, source_prefix,
 };
 use super::nodes::NodeNames;
+use super::scan::preferred_entry;
 use super::search::{EntryFacts, assemble_row, revision_of};
 use super::usage::last_used_in;
 use super::{Catalog, QueryRequest};
@@ -87,6 +88,8 @@ pub struct RepositoryDetail {
     pub root_path: String,
     pub git_dir: Option<String>,
     pub default_ref: String,
+    /// The URL a clone's `origin` names, for a repository discovery read one from.
+    pub remote: Option<String>,
     pub node: String,
     pub revisions: Vec<RevisionDetail>,
     pub refs: Vec<RefDetail>,
@@ -138,21 +141,29 @@ impl SourceRecord {
     }
 }
 
-/// The repositories filed under one source, by id.
+/// The repositories filed under one source, by id, ascending.
 ///
 /// One row per repository is read however many files each holds, which is what every reader
-/// that used to reach for an index of entries by node walks instead.
+/// that used to reach for an index of entries by node walks instead. The identity key a
+/// repository keeps across scans starts with its source and a separator no name holds, so
+/// this is one prefix scan of that key rather than a walk of every repository the catalog
+/// knows.
 pub(super) fn repositories_of_source_in(
     snapshot: &RTransaction<'_>,
     source: &str,
 ) -> Result<Vec<i64>> {
     let mut ids = Vec::new();
-    for repository in snapshot.scan().primary::<Repository>()?.all()? {
+    for repository in snapshot
+        .scan()
+        .secondary::<Repository>(RepositoryKey::key)?
+        .start_with(source_prefix(source).as_str())?
+    {
         let repository: Repository = repository?;
         if repository.source == source {
             ids.push(repository.id);
         }
     }
+    ids.sort_unstable();
     Ok(ids)
 }
 
@@ -495,9 +506,13 @@ impl Catalog {
     /// The queue is a `state:triage` page of the search index in artifact id order, so a
     /// catalog holding a million settled artifacts pays for the page rather than for every
     /// record. A verdict clears the record without moving the entry, so each page row is
-    /// still measured against its record before it is kept.
+    /// still measured against its record before it is kept. A catalog with no search
+    /// directory answers the same rows from the records themselves rather than erroring.
     pub fn triage_queue(&self, limit: u32) -> Result<Vec<TriageItem>> {
         let threshold = IndexConfig::default().triage_confidence;
+        if !self.status()?.search_built {
+            return self.triage_queue_by_record(limit, threshold);
+        }
         let context = self.compile_context(TRIAGE_QUERY, jiff::Timestamp::now(), Vec::new())?;
         let snapshot = self.database.r_transaction()?;
         let mut items = Vec::with_capacity(limit as usize);
@@ -529,6 +544,38 @@ impl Catalog {
             if exhausted {
                 break;
             }
+        }
+        Ok(items)
+    }
+
+    /// The same queue read from the artifact records, for a catalog whose search directory
+    /// has not been built yet: a lazy primary scan in artifact id order that stops at
+    /// `limit`, keeping the record filter and the entry the indexed path would collapse to.
+    fn triage_queue_by_record(&self, limit: u32, threshold: f32) -> Result<Vec<TriageItem>> {
+        let snapshot = self.database.r_transaction()?;
+        let names = self.node_names(&snapshot)?;
+        let mut reader = Reader::new(&snapshot, &names);
+        let mut items = Vec::with_capacity(limit as usize);
+        for record in snapshot.scan().primary::<ArtifactRecord>()?.all()? {
+            if items.len() >= limit as usize {
+                break;
+            }
+            let record: ArtifactRecord = record?;
+            if record.triage_cleared || !record.artifact.needs_triage(threshold) {
+                continue;
+            }
+            let Some(entry) = preferred_entry(
+                reader
+                    .entries_of_artifact(record.id)?
+                    .into_iter()
+                    .filter(|entry| entry.state == State::Triage),
+            ) else {
+                continue;
+            };
+            let last_used = last_used_in(&snapshot, record.id)?;
+            let row = reader.row_of(&record, &entry, last_used)?;
+            let detail: Option<ArtifactDetail> = snapshot.get().primary(record.id)?;
+            items.push(triage_item(row, detail));
         }
         Ok(items)
     }
@@ -638,6 +685,7 @@ fn repository_detail(
         root_path: repository.root_path.clone(),
         git_dir: repository.git_dir.clone(),
         default_ref: repository.default_ref.clone(),
+        remote: repository.remote.clone(),
         node: names.of_source(&repository.source).to_owned(),
         revisions,
         refs,
@@ -724,11 +772,7 @@ impl<'a, 'db> Reader<'a, 'db> {
     }
 
     fn row(&mut self, record: &ArtifactRecord) -> Result<Option<SearchRow>> {
-        let Some(entry) = self
-            .entries_of_artifact(record.id)?
-            .into_iter()
-            .max_by_key(|entry| (entry.preference, Reverse(entry.id)))
-        else {
+        let Some(entry) = preferred_entry(self.entries_of_artifact(record.id)?) else {
             return Ok(None);
         };
         let last_used = last_used_in(self.snapshot, record.id)?;

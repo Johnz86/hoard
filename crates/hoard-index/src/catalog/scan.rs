@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -1347,6 +1348,7 @@ fn repository(
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
         default_ref: repo.default_ref.clone(),
+        remote: repo.remote.clone(),
         revisions,
     }
 }
@@ -2066,9 +2068,9 @@ fn names_better(candidate: &ArtifactRecord, stored: &ArtifactRecord) -> bool {
     naming_key(candidate) < naming_key(stored)
 }
 
-fn naming_key(record: &ArtifactRecord) -> (std::cmp::Reverse<u64>, &str, &str) {
+fn naming_key(record: &ArtifactRecord) -> (Reverse<u64>, &str, &str) {
     (
-        std::cmp::Reverse(record.group_bytes.unwrap_or(record.artifact.size)),
+        Reverse(record.group_bytes.unwrap_or(record.artifact.size)),
         record.name.as_str(),
         record.org.as_deref().unwrap_or_default(),
     )
@@ -2163,6 +2165,21 @@ pub(super) fn preference(state: State, present: bool) -> i64 {
         State::Pulling | State::Remote => 0,
     };
     (4 + weight + i64::from(present)) * 2 + 1
+}
+
+/// How one path of an artifact ranks against another when a reader keeps one of them: the
+/// higher availability preference, and on a tie the lower id. The read API, the search
+/// index's `primary` mark and the query path's fold all keep the same path because they all
+/// order by this.
+pub(super) fn collapse_key(preference: i64, id: i64) -> (i64, Reverse<i64>) {
+    (preference, Reverse(id))
+}
+
+/// The one entry a collapse keeps out of the entries of a single artifact.
+pub(super) fn preferred_entry(entries: impl IntoIterator<Item = Entry>) -> Option<Entry> {
+    entries
+        .into_iter()
+        .max_by_key(|entry| collapse_key(entry.preference, entry.id))
 }
 
 /// One artifact as the catalog is about to record it, whether a scan read its header or the

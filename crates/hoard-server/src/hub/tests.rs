@@ -1,7 +1,9 @@
+use std::net::SocketAddr;
 use std::path::Path;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
+use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use jiff::Timestamp;
 use serde_json::{Value, json};
@@ -792,6 +794,62 @@ async fn the_xet_routes_are_refused_rather_than_left_to_hang() {
     let bridge = get(&world.state, "/xet-bridge-us/repo-hash/file-hash").await;
     assert_eq!(bridge.status, StatusCode::NOT_FOUND);
     assert_eq!(bridge.header("x-error-code"), Some("EntryNotFound"));
+}
+
+/// Who the extractor names for one request, with the headers it carried and the socket it
+/// arrived on.
+async fn client_of(headers: &[(&str, &str)], peer: Option<SocketAddr>) -> Option<String> {
+    let mut builder = Request::builder().uri("/");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder.body(Body::empty()).expect("the request builds");
+    let (mut parts, _) = request.into_parts();
+    if let Some(peer) = peer {
+        parts.extensions.insert(ConnectInfo(peer));
+    }
+    let hub::Client(client) = hub::Client::from_request_parts(&mut parts, &())
+        .await
+        .expect("the extractor is infallible");
+    client
+}
+
+#[tokio::test]
+async fn a_forwarded_client_is_believed_only_when_it_names_an_address() {
+    let peer: SocketAddr = "192.0.2.7:41234".parse().expect("socket parses");
+
+    assert_eq!(
+        client_of(&[("x-forwarded-for", "10.0.0.4, 10.0.0.9")], Some(peer))
+            .await
+            .as_deref(),
+        Some("10.0.0.4"),
+        "the first forwarded address is the client"
+    );
+    assert_eq!(
+        client_of(&[("x-real-ip", "2001:db8::1")], None)
+            .await
+            .as_deref(),
+        Some("2001:db8::1"),
+        "an address the proxy named alone is taken as it stands"
+    );
+    assert_eq!(
+        client_of(&[("x-forwarded-for", "unbounded-nonsense")], None).await,
+        None,
+        "a header that is not an address names no client"
+    );
+    assert_eq!(
+        client_of(&[("x-forwarded-for", "unbounded-nonsense")], Some(peer))
+            .await
+            .as_deref(),
+        Some("192.0.2.7"),
+        "and the socket the request arrived on answers instead"
+    );
+    assert_eq!(
+        client_of(&[], Some(peer)).await.as_deref(),
+        Some("192.0.2.7"),
+        "a request no proxy touched is named by its peer"
+    );
+    assert_eq!(client_of(&[], None).await, None);
 }
 
 #[tokio::test]

@@ -1482,6 +1482,60 @@ async fn applying_a_loadout_starts_a_job() {
 }
 
 #[tokio::test]
+async fn an_apply_that_panics_fails_its_job_row() {
+    let world = seeded();
+    let panicked = world
+        .state
+        .catalog()
+        .create_job("apply", Some("apply-me -> workstation"))
+        .expect("a job starts");
+    let errored = world
+        .state
+        .catalog()
+        .create_job("apply", Some("apply-me -> laptop"))
+        .expect("a job starts");
+
+    let lost = tokio::spawn(async { panic!("the apply came apart") });
+    api::loadouts::settle_apply(&world.state, panicked, lost.await).await;
+    api::loadouts::settle_apply(
+        &world.state,
+        errored,
+        Ok(Err(ApiError::internal("the plan could not be read"))),
+    )
+    .await;
+
+    let row = get(&world.state, &format!("/api/v1/jobs/{panicked}")).await;
+    assert_eq!(row["state"], "failed", "a panic leaves no job running");
+    assert!(
+        row["error"]
+            .as_str()
+            .expect("the row carries the panic")
+            .contains("panic"),
+        "the row says what stopped it: {row}"
+    );
+    let row = get(&world.state, &format!("/api/v1/jobs/{errored}")).await;
+    assert_eq!(row["state"], "failed");
+    assert_eq!(row["error"], "the plan could not be read");
+
+    let finished = world
+        .state
+        .catalog()
+        .create_job("apply", Some("apply-me -> workstation"))
+        .expect("a job starts");
+    world
+        .state
+        .catalog()
+        .finish_job(finished)
+        .expect("the apply settles itself");
+    api::loadouts::settle_apply(&world.state, finished, Ok(Ok(()))).await;
+    assert_eq!(
+        get(&world.state, &format!("/api/v1/jobs/{finished}")).await["state"],
+        "done",
+        "an apply that settled itself is left alone"
+    );
+}
+
+#[tokio::test]
 async fn a_projection_writes_one_symlink_per_row() {
     let world = seeded();
     let body = post(

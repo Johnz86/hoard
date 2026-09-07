@@ -48,6 +48,8 @@ pub(super) struct Repository {
     pub(super) root_path: String,
     pub(super) git_dir: Option<String>,
     pub(super) default_ref: String,
+    /// The URL a clone's `origin` names, for a repository discovery read one from.
+    pub(super) remote: Option<String>,
     pub(super) revisions: Vec<Revision>,
     /// The entries of this repository whose bytes are on a node, and the bytes they hold.
     ///
@@ -78,7 +80,14 @@ pub(super) struct Revision {
 
 /// The identity a repository keeps across scans: its source and its qualified name.
 pub(super) fn repository_key(source: &str, repo: &RepoId) -> String {
-    format!("{source}\0{}", repo.qualified())
+    format!("{}{}", source_prefix(source), repo.qualified())
+}
+
+/// What every repository of one source shares, ending in a byte no source or repository
+/// name holds, so one source's repositories are a prefix of the identity key and no source
+/// is a prefix of another.
+pub(super) fn source_prefix(source: &str) -> String {
+    format!("{source}\0")
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -424,14 +433,55 @@ pub(super) struct Projection {
     pub(super) written_at: String,
 }
 
+/// Where one served response sits in a repository's log: the repository id in big-endian
+/// bytes followed by the row's RFC 3339 time. Ids come from the allocator and are positive,
+/// which is what makes the big-endian order the numeric one, so the first 8 bytes are
+/// exactly one repository and a day window is one range rather than a scan of the log. The
+/// time is compared as the text the row stores, which is the order the pull list already
+/// read the log in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RepoAtKey(Vec<u8>);
+
+impl RepoAtKey {
+    /// One row of one repository's log.
+    pub(super) fn at(repo_id: i64, at: &str) -> Self {
+        let mut key = Vec::with_capacity(size_of::<i64>() + at.len());
+        key.extend_from_slice(&repo_id.to_be_bytes());
+        key.extend_from_slice(at.as_bytes());
+        Self(key)
+    }
+
+    /// What every row of one repository shares, which is where its log starts.
+    pub(super) fn repository(repo_id: i64) -> Self {
+        Self(repo_id.to_be_bytes().to_vec())
+    }
+
+    /// The first key past one repository's log, which bounds a range exclusively.
+    pub(super) fn after(repo_id: i64) -> Self {
+        Self::repository(repo_id.saturating_add(1))
+    }
+}
+
+impl ToKey for RepoAtKey {
+    fn to_key(&self) -> native_db::db_type::Key {
+        native_db::db_type::Key::new(self.0.clone())
+    }
+
+    fn key_names() -> Vec<String> {
+        vec!["RepoAtKey".to_owned()]
+    }
+}
+
 /// One response this node served, which is what the USAGE tab reads back.
+///
+/// The repository is indexed with the time beside it rather than alone, so a window reads
+/// the rows inside it instead of every row the repository ever served.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[native_model(id = 17, version = 1)]
-#[native_db]
+#[native_db(secondary_key(repo_at -> RepoAtKey, optional))]
 pub(super) struct Usage {
     #[primary_key]
     pub(super) seq: u64,
-    #[secondary_key(optional)]
     pub(super) repo_id: Option<i64>,
     pub(super) at: String,
     pub(super) client: Option<String>,
@@ -440,6 +490,32 @@ pub(super) struct Usage {
     pub(super) bytes: u64,
     pub(super) rate_bps: Option<u64>,
     pub(super) status: u16,
+}
+
+impl Usage {
+    /// The index native_db maintains over this row, read from the two fields that say
+    /// which log it belongs to and where in it. A row that names no repository is not
+    /// indexed.
+    pub(super) fn repo_at(&self) -> Option<RepoAtKey> {
+        self.repo_id.map(|repo_id| RepoAtKey::at(repo_id, &self.at))
+    }
+}
+
+/// What the USAGE tab shows above its chart, maintained by every usage write rather than
+/// counted from the log: how often this node served one repository, which clients pulled
+/// it, and when the last pull was.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[native_model(id = 22, version = 1)]
+#[native_db]
+pub(super) struct RepoUsage {
+    #[primary_key]
+    pub(super) repo_id: i64,
+    pub(super) pulls: u64,
+    /// Sorted, so a client already counted is a binary search rather than a scan. The LAN's
+    /// clients bound it, not the log's rows, and `usage::CLIENT_CAP` bounds it absolutely at
+    /// 4,096 addresses, past which the count is that cap rather than the true one.
+    pub(super) clients: Vec<String>,
+    pub(super) last_pull: String,
 }
 
 /// How often one artifact has been served and when it last was, which is what `used:` and
@@ -536,6 +612,7 @@ pub(super) fn define_models() -> super::Result<Models> {
     models.define::<Noise>()?;
     models.define::<Projection>()?;
     models.define::<Usage>()?;
+    models.define::<RepoUsage>()?;
     models.define::<ArtifactUse>()?;
     models.define::<LoadoutDoc>()?;
     models.define::<Job>()?;

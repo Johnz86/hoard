@@ -170,6 +170,7 @@ impl Seeding<'_, '_> {
                 .first()
                 .map_or("main", |revision| revision.name.as_str())
                 .to_owned(),
+            remote: None,
             revisions: seed
                 .revisions
                 .iter()

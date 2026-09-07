@@ -281,11 +281,13 @@ mod tests {
             .expect("the row survives its bytes");
         assert!(!row.present, "nothing advertises bytes the cache dropped");
         assert_eq!(row.state, State::Remote);
-        assert!(
-            catalog
-                .served_cache_entries()
-                .expect("served rows read")
-                .is_empty()
-        );
+        let mut served = 0;
+        catalog
+            .served_cache_entries_in(64, |rows| {
+                served += rows.len();
+                Ok(())
+            })
+            .expect("served rows read");
+        assert_eq!(served, 0, "nothing is left serving out of the cache");
     }
 }

@@ -97,10 +97,12 @@ fn read_clone(root: &Path, path: &Path, options: &WalkOptions) -> Result<Discove
         .map_err(|error| IndexError::Git(format!("{} does not open: {error}", path.display())))?;
     let git_dir = repository.git_dir().to_path_buf();
     let work_dir = repository.workdir().map(Path::to_path_buf);
-    let id = repo_id(&repository, root, path);
+    let remote = remote_url(&repository);
+    let id = repo_id(remote.as_deref(), root, path);
 
     let mut discovered = DiscoveredRepo::new(id, path.to_path_buf());
     discovered.git_dir = Some(git_dir.clone());
+    discovered.remote = remote;
 
     let mut shas: Vec<CommitSha> = Vec::new();
     for (name, kind, sha) in read_refs(&repository)? {
@@ -134,13 +136,20 @@ fn read_clone(root: &Path, path: &Path, options: &WalkOptions) -> Result<Discove
     Ok(discovered)
 }
 
-/// The upstream identity when a remote names one, otherwise the directory layout below the
-/// source root.
-fn repo_id(repository: &gix::Repository, root: &Path, path: &Path) -> RepoId {
+/// Where a clone came from, which is both the upstream identity it carries and the URL the
+/// PULL box names.
+fn remote_url(repository: &gix::Repository) -> Option<String> {
     repository
         .config_snapshot()
         .string("remote.origin.url")
-        .and_then(|url| repo_from_url(&url.to_str_lossy()))
+        .map(|url| url.to_str_lossy().into_owned())
+}
+
+/// The upstream identity when a remote names one, otherwise the directory layout below the
+/// source root.
+fn repo_id(remote: Option<&str>, root: &Path, path: &Path) -> RepoId {
+    remote
+        .and_then(repo_from_url)
         .unwrap_or_else(|| repo_from_path(root, path))
 }
 
@@ -541,6 +550,40 @@ mod tests {
                 .abs_path
                 .as_ref()
                 .is_some_and(|path| path.starts_with(clone.join(".git/lfs")))
+        );
+    }
+
+    #[test]
+    fn a_clone_records_its_remote_url_and_a_bare_folder_records_none() {
+        const REMOTE: &str = "https://huggingface.co/hexgrad/Kokoro-82M.git";
+        let dir = TempDir::new().expect("temp dir");
+        build_clone(dir.path());
+
+        let mirrored = dir.path().join("mirrored");
+        fs::create_dir_all(&mirrored).expect("clone dir is creatable");
+        git(&mirrored, &["init", "--initial-branch=main", "--quiet"]);
+        git(&mirrored, &["remote", "add", "origin", REMOTE]);
+        fs::write(mirrored.join("config.json"), b"{\"n\": 2}").expect("file is writable");
+        git(&mirrored, &["add", "."]);
+        git(&mirrored, &["commit", "-m", "mirrored", "--quiet"]);
+
+        let repos = discover(dir.path(), &WalkOptions::default(), &NoiseFilter::default())
+            .expect("clones are readable");
+        let found = |qualified: &str| {
+            repos
+                .iter()
+                .find(|repo| repo.repo.qualified() == qualified)
+                .unwrap_or_else(|| panic!("{qualified} was discovered"))
+        };
+        assert_eq!(
+            found("models/hexgrad/Kokoro-82M").remote.as_deref(),
+            Some(REMOTE),
+            "a clone carries the url its origin names"
+        );
+        assert_eq!(
+            found("models/org/repo").remote,
+            None,
+            "a clone with no origin records none"
         );
     }
 

@@ -25,10 +25,12 @@ use super::models::{
 use super::scan::{Presence, identity, preference};
 use super::search::{Cost, Paging, QueryPath};
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
+use super::usage::Window;
 use super::{
     Catalog, DigestApplied, EntryDetail, FORMAT_VERSION, JobProgress, JobState, MIRROR_SOURCE,
     NewProjection, PullMark, PulledFile, QueryPage, QueryRequest, RemoteEntry, RepositoryDetail,
-    RepositoryFilter, RescanReport, RescanScope, ServedFile, UsageEvent, builder, models, query,
+    RepositoryFilter, RescanReport, RescanScope, ServedFile, TriageItem, UsageEvent, builder,
+    models, query,
 };
 
 fn running_as_root() -> bool {
@@ -931,9 +933,12 @@ fn a_fetched_lfs_weight_is_an_artifact_and_an_unfetched_pointer_is_not() -> Resu
 }
 
 fn plain_header() -> Vec<u8> {
-    crate::sniff::tests::safetensors_fixture(concat!(
-        r#"{"model.layers.0.mlp.down_proj.weight":"#,
-        r#"{"dtype":"F16","shape":[16,64],"data_offsets":[0,2048]}}"#
+    plain_header_named("model.layers.0.mlp.down_proj")
+}
+
+fn plain_header_named(tensor: &str) -> Vec<u8> {
+    crate::sniff::tests::safetensors_fixture(&format!(
+        "{{\"{tensor}.weight\":{{\"dtype\":\"F16\",\"shape\":[16,64],\"data_offsets\":[0,2048]}}}}"
     ))
 }
 
@@ -2524,6 +2529,66 @@ fn the_triage_queue_pages_in_artifact_order() -> Result<()> {
 }
 
 #[test]
+fn the_triage_queue_answers_from_the_catalog_when_no_index_exists() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("models");
+    fs::create_dir_all(&input)?;
+    for index in 0..3 {
+        fs::write(
+            input.join(format!("unknown{index}.safetensors")),
+            plain_header_named(&format!("block.{index}.mlp")),
+        )?;
+    }
+    for index in 0..2 {
+        fs::write(
+            input.join(format!("lora{index}.safetensors")),
+            lora_header_named(&format!("t{index}")),
+        )?;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    assert!(
+        !catalog.status()?.search_built,
+        "a scan alone publishes no search directory"
+    );
+
+    let queued = |items: &[TriageItem]| -> Vec<i64> {
+        items
+            .iter()
+            .map(|item| item.row.artifact_id.get())
+            .collect()
+    };
+    let unindexed = catalog.triage_queue(10)?;
+    assert_eq!(unindexed.len(), 3, "every unclassified file queues");
+    assert!(
+        unindexed.iter().all(|item| item.guess_role == Role::Unk),
+        "the queue carries the role the record holds"
+    );
+    assert_eq!(
+        queued(&catalog.triage_queue(2)?),
+        queued(&unindexed)[..2].to_vec(),
+        "a limit bounds the record scan"
+    );
+
+    catalog.rebuild_search(|_| {})?;
+    assert_eq!(
+        queued(&catalog.triage_queue(10)?),
+        queued(&unindexed),
+        "the index answers the same artifacts in the same order"
+    );
+    Ok(())
+}
+
+#[test]
 fn loadouts_are_stored_by_name_and_pins_resolve_through_the_catalog() -> Result<()> {
     let (_directory, catalog, ids) = seeded_catalog()?;
     let lora = catalog
@@ -2966,12 +3031,16 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
-/// One clone at `<input>/org/clone` holding a README committed as `first import`.
-fn git_fixture(directory: &Path) -> Result<(PathBuf, IndexConfig)> {
+/// One clone at `<input>/org/clone` holding a README committed as `first import`, with the
+/// origin the caller names, if any.
+fn git_fixture(directory: &Path, remote: Option<&str>) -> Result<(PathBuf, IndexConfig)> {
     let input = directory.join("clones");
     let clone = input.join("org").join("clone");
     fs::create_dir_all(&clone)?;
     git(&clone, &["init", "--initial-branch=main", "--quiet"]);
+    if let Some(remote) = remote {
+        git(&clone, &["remote", "add", "origin", remote]);
+    }
     fs::write(clone.join("README.md"), "# clone\n")?;
     git(&clone, &["add", "."]);
     git(&clone, &["commit", "-m", "first import", "--quiet"]);
@@ -2988,7 +3057,7 @@ fn git_fixture(directory: &Path) -> Result<(PathBuf, IndexConfig)> {
 #[test]
 fn a_git_clone_keeps_its_git_dir_and_commit_metadata() -> Result<()> {
     let directory = tempfile::tempdir()?;
-    let (input, config) = git_fixture(directory.path())?;
+    let (input, config) = git_fixture(directory.path(), None)?;
     let catalog = Catalog::scan_sources(
         &directory.path().join("native"),
         "n",
@@ -3004,6 +3073,7 @@ fn a_git_clone_keeps_its_git_dir_and_commit_metadata() -> Result<()> {
         detail.git_dir.as_deref(),
         Some(input.join("org/clone/.git").to_string_lossy().as_ref())
     );
+    assert_eq!(detail.remote, None, "a clone with no origin records none");
     let main = catalog
         .resolve_revision(&detail, "main")
         .ok_or_else(|| IndexError::Catalog("main".into()))?;
@@ -3023,9 +3093,32 @@ fn a_git_clone_keeps_its_git_dir_and_commit_metadata() -> Result<()> {
 }
 
 #[test]
+fn a_scanned_clone_records_the_remote_it_came_from() -> Result<()> {
+    const REMOTE: &str = "https://huggingface.co/org/clone.git";
+    let directory = tempfile::tempdir()?;
+    let (_input, config) = git_fixture(directory.path(), Some(REMOTE))?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let detail = catalog
+        .repository(&RepoId::parse_ref(RepoType::Models, "org/clone")?)?
+        .ok_or_else(|| IndexError::Catalog("repo".into()))?;
+    assert_eq!(
+        detail.remote.as_deref(),
+        Some(REMOTE),
+        "the url the clone came from reaches the repository record"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_clone_whose_branch_advanced_keeps_its_unchanged_files_on_the_branch() -> Result<()> {
     let directory = tempfile::tempdir()?;
-    let (input, config) = git_fixture(directory.path())?;
+    let (input, config) = git_fixture(directory.path(), None)?;
     let clone = input.join("org").join("clone");
     let catalog = Catalog::scan_sources(
         &directory.path().join("native"),
@@ -7713,6 +7806,154 @@ fn a_usage_window_counts_only_the_days_it_shows() -> Result<()> {
     assert_eq!(report.clients, catalog.distinct_clients(row.repo_id)?);
     assert_eq!(report.pulls, catalog.recent_pulls(row.repo_id, 20)?);
     assert_eq!(report.pulls.len(), 20);
+    Ok(())
+}
+
+#[test]
+fn the_usage_report_reads_a_window_and_a_maintained_count() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    let row = catalog
+        .artifact_row(ids.lora)?
+        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
+    let midday = jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date()
+        .at(12, 0, 0, 0)
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .map_err(|error| IndexError::Catalog(format!("noon: {error}")))?
+        .timestamp();
+    let events: Vec<UsageEvent> = (0..2_000_u32)
+        .map(|index| {
+            let at = midday - std::time::Duration::from_secs(u64::from(index % 40) * 86_400);
+            UsageEvent {
+                client: Some(format!("client{}", index % 7)),
+                repo: Some(row.repo_id),
+                artifact: Some(row.artifact_id),
+                bytes: u64::from(index),
+                ..UsageEvent::new(format!("f{index}.safetensors"), at)
+            }
+        })
+        .collect();
+    catalog.log_usage_batch(&events)?;
+
+    let inside = (0..2_000_u32).filter(|index| index % 40 < 30).count() as u64;
+    let report = catalog.usage_report(row.repo_id, 30, 20)?;
+    assert_eq!(report.days.len(), 30, "the window lists every day it draws");
+    assert_eq!(
+        report.days.iter().map(|day| day.pulls).sum::<u64>(),
+        inside,
+        "the window sums the events inside it: {:?}",
+        report.days
+    );
+    assert_eq!(
+        report.clients, 7,
+        "the maintained record counts the clients"
+    );
+    assert_eq!(
+        report.pulls.len(),
+        20,
+        "the newest rows are the limit the caller asked for"
+    );
+    assert_eq!(
+        report.pulls,
+        catalog.recent_pulls(row.repo_id, 20)?,
+        "the report and the standalone reader answer the same rows"
+    );
+    assert!(
+        report
+            .pulls
+            .windows(2)
+            .all(|pair| pair[0].when >= pair[1].when),
+        "the pulls are newest first: {:?}",
+        report.pulls
+    );
+    assert_eq!(report.pulls[0].when, midday, "the newest row is today's");
+
+    let touched = catalog.usage_in(row.repo_id, &Window::of(30)?)?.len() as u64;
+    assert_eq!(
+        touched, inside,
+        "the range reads the rows inside the window, not the 2000 the log holds"
+    );
+
+    let second = midday + std::time::Duration::from_secs(60);
+    let split = second + std::time::Duration::from_millis(500);
+    catalog.log_usage_batch(&[
+        UsageEvent {
+            client: Some("client0".to_owned()),
+            repo: Some(row.repo_id),
+            ..UsageEvent::new("whole.safetensors", second)
+        },
+        UsageEvent {
+            client: Some("client0".to_owned()),
+            repo: Some(row.repo_id),
+            ..UsageEvent::new("fractional.safetensors", split)
+        },
+    ])?;
+    let newest = catalog.recent_pulls(row.repo_id, 2)?;
+    assert_eq!(
+        newest
+            .iter()
+            .map(|pull| pull.what.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fractional.safetensors", "whole.safetensors"],
+        "a fractional second sorts after the whole second it follows: {newest:?}"
+    );
+    assert_eq!(newest[0].when, split);
+    Ok(())
+}
+
+#[test]
+fn a_usage_batch_maintains_the_repo_record_in_one_transaction() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    let lora = catalog
+        .artifact_row(ids.lora)?
+        .ok_or_else(|| IndexError::Catalog("lora".into()))?;
+    let ckpt = catalog
+        .artifact_row(ids.ckpt)?
+        .ok_or_else(|| IndexError::Catalog("ckpt".into()))?;
+    let now = jiff::Timestamp::now();
+    let earlier = now - std::time::Duration::from_secs(3_600);
+    let event = |row: &SearchRow, client: &str, at: jiff::Timestamp| UsageEvent {
+        client: Some(client.to_owned()),
+        repo: Some(row.repo_id),
+        artifact: Some(row.artifact_id),
+        bytes: 10,
+        ..UsageEvent::new(row.path.clone(), at)
+    };
+
+    catalog.log_usage_batch(&[
+        event(&lora, "10.0.0.4", earlier),
+        event(&lora, "10.0.0.5", now),
+        event(&lora, "10.0.0.4", now),
+        event(&ckpt, "10.0.0.9", earlier),
+    ])?;
+
+    let stored = catalog
+        .repo_usage(lora.repo_id)?
+        .ok_or_else(|| IndexError::Catalog("the batch wrote the record".into()))?;
+    assert_eq!(stored.pulls, 3, "one batch counts every row it wrote");
+    assert_eq!(
+        stored.clients,
+        vec!["10.0.0.4".to_owned(), "10.0.0.5".to_owned()],
+        "the clients are held once each, sorted"
+    );
+    assert_eq!(stored.last_pull, now.to_string(), "the latest time wins");
+    assert_eq!(
+        catalog.repo_usage(ckpt.repo_id)?.map(|stored| stored.pulls),
+        Some(1),
+        "each repository the batch served has its own record"
+    );
+
+    catalog.log_usage_batch(&[event(&lora, "10.0.0.6", earlier)])?;
+    let after = catalog
+        .repo_usage(lora.repo_id)?
+        .ok_or_else(|| IndexError::Catalog("the record survives a second batch".into()))?;
+    assert_eq!(after.pulls, 4, "a later batch adds to the count");
+    assert_eq!(catalog.distinct_clients(lora.repo_id)?, 3);
+    assert_eq!(
+        after.last_pull, stored.last_pull,
+        "an older row does not move the last pull"
+    );
     Ok(())
 }
 

@@ -92,7 +92,8 @@ and `query` is the whole query that selects exactly that bucket.
   `role_code`, `role_full`, `state`, `state_full`, `pull_progress`, `meta`, `revision`,
   `revision_sha`), `refs` (`name`, `sha`, `when`, `kind`, `current`), `revision_summary`
   (`14 files · 3 branches · 2 tags`), `facts`, `paths`, `pull` commands, and `rows` (every
-  artifact of the repo, in the search row shape).
+  artifact of the repo, in the search row shape). `remote` is the URL a clone's `origin`
+  names, or `null` for a repository the mirror, a peer or a bare folder filed.
 - `GET /api/v1/repos/{type}/{org}/{name}/files?revision=`: rows `path`, `kind` (config,
   weights, single-file, card, git, group), `size`, `state` (present, deduped, lfs_ptr, absent),
   `artifact_id`.
@@ -103,7 +104,12 @@ and `query` is the whole query that selects exactly that bucket.
 - `GET /api/v1/repos/{type}/{org}/{name}/usage`: `{ "days": [ { "date", "pulls" } ],
   "pulls": [ { "when", "at", "who", "what", "bytes", "rate_bps" } ], "clients": 3,
   "total": 41 }`. `when` is the relative spelling the design prints, `at` the instant
-  behind it.
+  behind it. `days` is the seven day window, read as one range of the repository's log
+  rather than a pass over it; `clients` is the distinct clients over the whole history, as
+  the repository's own record has counted them, exact up to a cap of 4,096 addresses and
+  reported as that cap beyond it; `pulls` is the newest twenty rows, newest first. A client
+  is the first `x-forwarded-for` or `x-real-ip` value that parses as an IP address,
+  otherwise the socket the request arrived on.
 
 ## Shelves
 

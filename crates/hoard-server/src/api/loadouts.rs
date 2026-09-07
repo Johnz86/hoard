@@ -298,20 +298,46 @@ pub async fn apply(
     let dir = link::projection_dir(&state, profile, None)?;
     let local = target == state.node_name();
     let background = state.clone();
+    let settling = state.clone();
     tokio::spawn(async move {
-        let settled = match local {
-            true => run_apply(&background, id, job_id, profile, &dir).await,
-            false => report_only(&background, job_id, &preview, profile).await,
-        };
-        if let Err(error) = settled {
-            tracing::error!(code = error.code(), "the apply job could not be settled");
-        }
+        let running = tokio::spawn(async move {
+            match local {
+                true => run_apply(&background, id, job_id, profile, &dir).await,
+                false => report_only(&background, job_id, &preview, profile).await,
+            }
+        });
+        settle_apply(&settling, job_id, running.await).await;
     });
     Ok(Json(ApplyStarted {
         job_id,
         node: target,
         apply_preview: view.apply_preview,
     }))
+}
+
+/// Fails an apply's job row on the two exit paths the apply itself does not settle: an
+/// error it returned before writing its own verdict, and a panic. One that settled itself
+/// is left alone.
+pub(super) async fn settle_apply(
+    state: &AppState,
+    job: JobId,
+    outcome: Result<ApiResult<()>, tokio::task::JoinError>,
+) {
+    let message = match outcome {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => {
+            tracing::error!(%job, code = error.code(), message = error.message(), "the apply failed");
+            error.message().to_owned()
+        }
+        Err(error) => {
+            tracing::error!(%job, %error, "the apply lost its task");
+            error.to_string()
+        }
+    };
+    let catalog = Arc::clone(state.catalog());
+    if let Err(error) = blocking(move || catalog.fail_job(job, &message)).await {
+        tracing::error!(%job, code = error.code(), "the apply job row could not be settled");
+    }
 }
 
 /// Applying a loadout to a different node is a resolution report: only the node that owns

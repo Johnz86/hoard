@@ -25,8 +25,8 @@ first; this document assumes it.
 - Phases 0 to 11 are done. `docs/feature-plan.md` holds the table. The TREE and DISK views
   are not an unfinished phase: they wait on a design decision and are recorded under that
   document's "Risks and open decisions".
-- At the head of `master` after the scan-correctness wave all four checks pass:
-  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 833 passed,
+- At the head of `master` after the bounded-readers wave all four checks pass:
+  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 841 passed,
   0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness
   and its supplemental fixture, the mDNS test that needs a multicast route and the sniffer
   test that reads the local model caches. `cargo doc --workspace --no-deps` emits no warning.
@@ -243,19 +243,22 @@ Decisions taken on 2026-09-06, by the project owner:
 
 Smaller things, each verified:
 
-- The hourly cache eviction sweep is O(the whole mirror). `hoard-mirror`'s
-  `cache/reconcile.rs` calls `Catalog::served_cache_entries`, which calls
-  `read.rs::repositories_of_source_in` to walk **every** `Repository` row looking for the
-  mirror source, then scans every entry of each and collects one `Vec<EntryDetail>` before
-  anything is stat-ed. It is off the request path and the mirror source is small today;
-  chunking it the way `scan.rs` chunks its passes is the fix if it ever is not.
+- The hourly cache eviction sweep walks the mirror in chunks. `hoard-mirror`'s
+  `cache/reconcile.rs` calls `Catalog::served_cache_entries_in`, which reads the mirror's
+  repositories through one prefix scan of the identity key and hands each repository's
+  served rows over in chunks of 1,024, measuring each chunk against the cache tree as it
+  arrives; the rows that are gone are retired once at the end. The residual is that one
+  repository's served rows are materialised at a time, which is what a location prefix scan
+  costs.
+- An entry re-served between the sweep's walk and its retire is retired anyway, and the next
+  serve of it files it again. Pre-existing: the walk and the retire were two catalog calls
+  before this wave and still are, and chunking the walk did not widen the gap.
 
 `docs/native-catalog.md` under "Remaining work" holds the rest: a truncated record panicking
 inside `native_model` before any hoard codec runs, `sweep_artifact` decompressing a cold row
-only to hand it back to `remove` because native_db 0.8.2 has no remove-by-key,
-`triage_queue` needing rather than tolerating a search index, storing a path whose bytes are
-outside UTF-8 now that its identity is byte-exact, reclaiming the slot of a revision the walk
-no longer finds, complete repository git metadata with stable cross-scan identities, a
-read-only redb open once one exists, and power-loss recovery tests. `docs/feature-plan.md`
+only to hand it back to `remove` because native_db 0.8.2 has no remove-by-key, storing a path
+whose bytes are outside UTF-8 now that its identity is byte-exact, reclaiming the slot of a
+revision the walk no longer finds, a read-only redb open once one exists, and power-loss
+recovery tests. `docs/feature-plan.md`
 under `### Phase 11` names which of them carry acceptance criteria as follow-ups of that
 phase.

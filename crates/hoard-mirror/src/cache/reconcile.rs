@@ -3,44 +3,47 @@
 use std::sync::Arc;
 
 use hoard_core::{EntryId, RepoId};
-use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, EntryDetail};
 
 use crate::batch::SearchRefresher;
 use crate::cache::layout::{CacheLayout, CacheScope, PEERS_DIR};
-use crate::error::{MirrorError, Result};
+use crate::error::Result;
 use crate::local::index_repo::on_catalog;
+
+/// How many served rows one pass of the sweep holds while it asks the disk about them.
+const SWEEP_CHUNK: usize = 1_024;
 
 /// Retires every SERVED row whose entry directory is gone from every upstream slot, and
 /// reports how many.
+///
+/// The mirror is measured chunk by chunk and the rows that are gone are retired once, after
+/// the walk.
 pub async fn reconcile_index(
     catalog: &Arc<Catalog>,
     layout: &CacheLayout,
     refresh: &SearchRefresher,
 ) -> Result<usize> {
-    let rows = on_catalog(catalog, |catalog| Ok(catalog.served_cache_entries()?)).await?;
-    if rows.is_empty() {
-        return Ok(0);
-    }
-    let gone = missing_entries(layout.clone(), rows).await?;
+    let layout = layout.clone();
+    let gone = on_catalog(catalog, move |catalog| {
+        let scopes = scope_layouts(&layout);
+        let mut gone: Vec<EntryId> = Vec::new();
+        catalog.served_cache_entries_in(SWEEP_CHUNK, |rows| {
+            gone.extend(
+                rows.iter()
+                    .filter(|row| !is_cached(&scopes, row))
+                    .map(|row| row.entry_id),
+            );
+            Ok(())
+        })?;
+        Ok(gone)
+    })
+    .await?;
     if gone.is_empty() {
         return Ok(0);
     }
     let retired = on_catalog(catalog, move |catalog| Ok(catalog.retire_entries(&gone)?)).await?;
     refresh.poke();
     Ok(retired)
-}
-
-async fn missing_entries(layout: CacheLayout, rows: Vec<EntryDetail>) -> Result<Vec<EntryId>> {
-    tokio::task::spawn_blocking(move || {
-        let scopes = scope_layouts(&layout);
-        rows.iter()
-            .filter(|row| !is_cached(&scopes, row))
-            .map(|row| row.entry_id)
-            .collect()
-    })
-    .await
-    .map_err(|_| MirrorError::Index(IndexError::TaskJoin))
 }
 
 fn is_cached(scopes: &[CacheLayout], row: &EntryDetail) -> bool {
@@ -200,6 +203,48 @@ mod tests {
 
         assert_eq!(retired, 0);
         assert!(rows(&catalog).iter().all(|row| row.present));
+    }
+
+    #[tokio::test]
+    async fn the_sweep_visits_the_mirror_in_chunks_and_retires_what_is_missing() {
+        let root = TempDir::new().expect("temp dir");
+        let layout = CacheLayout::new(root.path().join("repos"));
+        let paths: Vec<String> = (0..250)
+            .map(|index| format!("shard-{index:03}.safetensors"))
+            .collect();
+        let catalog = catalog(
+            &root.path().join("native"),
+            &paths.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        for path in paths.iter().take(150) {
+            cached(&layout, path);
+        }
+
+        let mut visits: Vec<usize> = Vec::new();
+        catalog
+            .served_cache_entries_in(100, |rows| {
+                visits.push(rows.len());
+                Ok(())
+            })
+            .expect("the mirror walks");
+        assert_eq!(
+            visits,
+            vec![100, 100, 50],
+            "250 served rows arrive in chunks of at most 100"
+        );
+
+        let retired = reconcile_index(&catalog, &layout, &test_refresher(&catalog))
+            .await
+            .expect("reconciliation runs");
+
+        assert_eq!(retired, 100, "every path the cache lost is retired");
+        let rows = rows(&catalog);
+        assert_eq!(rows.iter().filter(|row| row.present).count(), 150);
+        assert!(
+            rows.iter()
+                .filter(|row| !row.present)
+                .all(|row| row.state == State::Remote)
+        );
     }
 
     #[tokio::test]

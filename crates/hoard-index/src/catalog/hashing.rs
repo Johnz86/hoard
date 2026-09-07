@@ -18,7 +18,7 @@ use super::models::{
     SearchText, Source,
 };
 use super::naming::content_hashes;
-use super::scan::{Counters, log_changes, owes_a_hash};
+use super::scan::{Counters, log_changes, owes_a_hash, preferred_entry};
 use super::verdict::apply_override;
 
 /// How many files one hashing pass reads and records at a time.
@@ -167,10 +167,9 @@ impl Catalog {
                 .secondary::<Entry>(EntryKey::content)?
                 .start_with(Some(content_key(sha)))?
                 .collect::<native_db::db_type::Result<_>>()?;
-            let best = holders
-                .into_iter()
-                .filter(|entry| entry.sha256.as_ref() == Some(sha) && entry.state != State::Remote)
-                .max_by_key(|entry| (entry.preference, std::cmp::Reverse(entry.id)));
+            let best = preferred_entry(holders.into_iter().filter(|entry| {
+                entry.sha256.as_ref() == Some(sha) && entry.state != State::Remote
+            }));
             if let Some(entry) = best {
                 let deduped = match entry.artifact_id {
                     Some(id) => reader

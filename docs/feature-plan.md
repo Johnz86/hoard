@@ -374,7 +374,10 @@ store that already works, not the remainder of the phase.
 - Byte-exact path identities, so an identity is the path's bytes rather than its lossy string.
 - Revision ordinals stored rather than recomputed on every rescan.
 - Counting a revision's artifact units without counting content another revision claimed.
-- Complete repository git metadata with identities that are stable across scans.
+- Complete repository git metadata with identities that are stable across scans. **Done:**
+  wave 5a keeps revision ordinals, unit names and path identities stable across rescans, and
+  wave 5b records the remote URL a clone came from, which was the one fact discovery read
+  and dropped.
 
 `docs/native-catalog.md` under "Remaining work" holds each of these with its measured numbers.
 

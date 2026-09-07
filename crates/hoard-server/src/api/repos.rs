@@ -106,6 +106,9 @@ pub struct RepoView {
     pub org: Option<String>,
     pub name: String,
     pub node: String,
+    /// The URL a clone's `origin` names, so the PULL box can say where this copy came from.
+    /// A repository the mirror, a peer or a bare folder filed has none.
+    pub remote: Option<String>,
     pub artifact_id: Option<ArtifactId>,
     pub role: Role,
     pub role_code: String,
@@ -306,6 +309,7 @@ fn describe(
         org: record.repo.org().map(str::to_owned),
         name: record.repo.name().to_owned(),
         node: record.node.clone(),
+        remote: record.remote.clone(),
         artifact_id: primary.map(|row| row.artifact_id),
         role: primary.map_or(Role::Unk, |row| row.role),
         role_code: primary.map_or(Role::Unk, |row| row.role).code().to_owned(),
