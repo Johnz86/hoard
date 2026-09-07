@@ -55,7 +55,7 @@ pub use self::verdict::OverrideRecord;
 
 /// The one shape this build reads and writes. A catalog whose manifest names another is
 /// rebuilt from disk rather than converted.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// One redb table's share of the catalog file: the rows it holds, the payload bytes those
 /// rows spend, the btree pages holding them, and the space inside those pages that holds
@@ -148,11 +148,16 @@ impl std::fmt::Debug for Catalog {
 
 impl Catalog {
     /// Opens a completed scan; an incomplete scan and a catalog of another format are
-    /// rejected.
+    /// rejected. What the process before this one left unfinished is settled here: the
+    /// totals a killed pass left behind are counted again, and a search directory no
+    /// manifest names is removed, because only a publish ever removes one and a build that
+    /// was killed publishes nothing.
     pub fn open(directory: &Path) -> Result<Self> {
         let (catalog, manifest) = Self::open_checked(directory)?;
         catalog.seed_builtin_shelves()?;
         catalog.ensure_self_row(&manifest.node)?;
+        catalog.settle_interrupted_pass()?;
+        catalog.prune_search_directories(manifest.search_directory.as_deref().unwrap_or_default());
         Ok(catalog)
     }
 
@@ -199,16 +204,13 @@ impl Catalog {
         };
         let catalog = match opened {
             Some(Ok(catalog)) => catalog,
-            Some(Err(IndexError::CatalogFormat {
-                directory: named,
-                found,
-                expected,
-            })) => {
+            Some(Err(
+                error @ (IndexError::CatalogFormat { .. } | IndexError::CatalogIncomplete { .. }),
+            )) => {
                 tracing::warn!(
-                    directory = %named.display(),
-                    found,
-                    expected,
-                    "the catalog was written in another format; scanning a fresh one"
+                    directory = %directory.display(),
+                    %error,
+                    "the catalog on disk cannot be opened; scanning a fresh one"
                 );
                 std::fs::remove_dir_all(&directory)?;
                 Self::scan_fresh(&directory, node, config, &mut progress)?
@@ -325,8 +327,8 @@ impl Catalog {
             .r_transaction()?
             .get()
             .primary(0_u8)?
-            .ok_or_else(|| {
-                IndexError::Catalog("scan is incomplete; scan again into a new directory".into())
+            .ok_or_else(|| IndexError::CatalogIncomplete {
+                directory: self.directory.clone(),
             })
     }
 }

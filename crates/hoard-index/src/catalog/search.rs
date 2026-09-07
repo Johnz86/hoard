@@ -198,9 +198,13 @@ impl Catalog {
     /// stays above the cursor for the next refresh to apply.
     pub(super) fn publish(&self, directory_name: String, drained_through: u64) -> Result<()> {
         let transaction = self.database.rw_transaction()?;
-        let mut manifest: Manifest = transaction.get().primary(0_u8)?.ok_or_else(|| {
-            IndexError::Catalog("scan is incomplete; scan again into a new directory".into())
-        })?;
+        let mut manifest: Manifest =
+            transaction
+                .get()
+                .primary(0_u8)?
+                .ok_or_else(|| IndexError::CatalogIncomplete {
+                    directory: self.directory.clone(),
+                })?;
         manifest.search_directory = Some(directory_name.clone());
         manifest.search_generation = manifest.generation;
         manifest.search_seq = drained_through;
@@ -228,6 +232,7 @@ impl Catalog {
         let directory = manifest
             .search_directory
             .ok_or_else(|| IndexError::Catalog("search index needs building".into()))?;
+        self.prune_changes(manifest.search_seq)?;
         let bound = self.highest_change_seq()?;
         let mut batch = self.changes_up_to(manifest.search_seq, bound)?;
         if batch.is_empty() {
@@ -334,9 +339,13 @@ impl Catalog {
 
     fn advance_cursor(&self, cursor: u64) -> Result<()> {
         let transaction = self.database.rw_transaction()?;
-        let mut manifest: Manifest = transaction.get().primary(0_u8)?.ok_or_else(|| {
-            IndexError::Catalog("scan is incomplete; scan again into a new directory".into())
-        })?;
+        let mut manifest: Manifest =
+            transaction
+                .get()
+                .primary(0_u8)?
+                .ok_or_else(|| IndexError::CatalogIncomplete {
+                    directory: self.directory.clone(),
+                })?;
         manifest.search_seq = cursor;
         manifest.search_generation = manifest.generation;
         transaction.upsert(manifest)?;
@@ -344,8 +353,11 @@ impl Catalog {
         Ok(())
     }
 
-    /// Drops the log rows the cursor has passed. A crash here leaves rows a later refresh
-    /// skips, because the cursor is already past them.
+    /// Drops the log rows the cursor has passed, which is both what a refresh does with the
+    /// batch it has applied and what the next refresh clears up after a run killed between
+    /// advancing the cursor and pruning: rows below the cursor are applied to the index and
+    /// nothing else would ever read them, but they are what makes a catalog report a
+    /// staleness no refresh would clear.
     fn prune_changes(&self, through: u64) -> Result<()> {
         let end = through.saturating_add(1);
         loop {
@@ -368,7 +380,7 @@ impl Catalog {
         }
     }
 
-    fn prune_search_directories(&self, keep: &str) {
+    pub(super) fn prune_search_directories(&self, keep: &str) {
         let Ok(entries) = std::fs::read_dir(&self.directory) else {
             return;
         };

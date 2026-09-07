@@ -42,6 +42,9 @@ pub enum IndexError {
         expected: u32,
     },
 
+    #[error("catalog at {directory} holds no completed scan: scan again into a fresh directory")]
+    CatalogIncomplete { directory: PathBuf },
+
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 

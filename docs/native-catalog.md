@@ -150,19 +150,23 @@ the catalog at `<data_dir>/native`.
 
 Every writer of an entry commits through `scan::Counters`:
 
-- `Counters::load` reads the persisted `Allocator` and hands out ids.
+- `Counters::load` reads the persisted `Allocator` and hands out ids, starting from the
+  higher of what the allocator holds and the highest id each table holds, so a pass killed
+  before it wrote the allocator back cannot have its ids handed out a second time.
 - `Counters::touch(transaction, id)` is called before an artifact record is written and keeps
   what the record contributed to the summary beforehand, so a pass moves the summary by a
   difference rather than recounting every record.
 - `Counters::derived` is a `DerivedShift`: `added(&entry)` before writing an entry,
   `removed(&entry)` before removing one or moving it out of presence. It accumulates each
   repository's present files and bytes, each source's owed hashes and each node's filed
-  count, so a record above the entries is rewritten once per pass rather than once per entry.
+  count, and is flushed in the transaction that writes the entries it counted, so a record
+  above the entries is rewritten once per transaction rather than once per entry and a
+  killed pass leaves no count behind the rows that moved it.
 - `log_changes(transaction, counters)` writes one `SearchChange` row per touched artifact, in
   the transaction that made the change, and writes nothing while no search directory is
   published. The sequence continues past both the highest key the log holds and
   `Manifest.search_seq`.
-- `Counters::save(transaction)` flushes the shift and writes the allocator back.
+- `Counters::save(transaction)` flushes whatever shift is left and writes the allocator back.
 
 **Every writer of an entry moves the derived counts.** A writer that skips `DerivedShift`
 leaves `Repository::present_files`, `Repository::present_bytes`, `Source::pending_hashes` and
@@ -202,6 +206,57 @@ that number, so `publish` prunes only what the build actually indexed. A change 
 the build ran stays above the cursor and the next refresh applies it. Publishing with the
 highest sequence at publish time instead would drop that change unapplied with no record
 that it happened.
+
+### Recovery
+
+A pass is a sequence of commits and every one of them has to leave a catalog the next run
+completes. What each stage leaves:
+
+- **The walk** commits one transaction per unit, and every count derived from the entries in
+  it moves in that same transaction. A killed walk leaves the units it committed; the next
+  rescan skips them, because the stamps stored for them are the stamps the files still have,
+  and prepares the rest.
+- **A fresh scan** writes no manifest until it finishes, so a directory holding a catalog
+  file and no manifest is not a catalog. `Catalog::open` refuses it as `CatalogIncomplete`
+  and `open_or_scan` removes the directory and scans a fresh one, which is what it already
+  did for a catalog of another format.
+- **The totals**, and what each scanned source holds, are what a pass settles at its end
+  rather than in the transactions that earn it. A pass that commits more than once sets
+  `Manifest.pass_open` before its first commit and clears it in its last, and a run that finds
+  the mark set counts every artifact record again, and each source's files and bytes again
+  from its repositories, before it starts. Only a kill pays for that; `Catalog::open` pays it
+  once for the process that died.
+- **An artifact the pass takes a path from** is recounted in the transaction that took it, so
+  a record counting a path no entry backs is never committed. The sweep at the end of the pass
+  repeats it and finds nothing, and a kill in between leaves nothing to find: the next walk
+  skips the rows the killed pass wrote, so it would never look at that artifact again.
+- **The hash pass** commits every 64 digests with the derived counts in the same transaction,
+  so the next pass reads the files still owing a hash and no others.
+- **The refresh** commits Tantivy, advances the cursor and then prunes what it applied. A
+  kill before the cursor replays the batch, and a replay deletes an artifact's documents by
+  term and adds them again, so it changes nothing. A kill between the cursor and the prune
+  leaves rows the cursor has passed, which are what `pending_changes` counts: a refresh drops
+  them before it reads, because otherwise the catalog reports a staleness no refresh clears.
+  Both of those points are inside one batch and the callback fires after all three steps, so
+  the test stages them by hand - it rewinds the cursor and puts the pruned rows back, and it
+  writes a row at the cursor - rather than adding a hook to reach them.
+- **A rebuild** publishes nothing until Tantivy has committed, so a killed one leaves the
+  previous index serving and a `search-v1-*` directory the manifest does not name. Publishing
+  was the only thing that removed a superseded directory, so `Catalog::open` now removes every
+  one the manifest does not name.
+
+What this does not cover, and is accepted: a redb file torn by a power loss is redb's own
+recovery; and `retire_entries` and `retract_digest` settle the totals at the end of their own
+multi-transaction passes without the mark, so a kill inside one of those leaves the totals to
+`hoard doctor`.
+
+The `recovery` module of `catalog/tests.rs` holds the proof. It interrupts a stage from the
+progress callback the stage already takes - counting the calls, panicking on a chosen one and
+catching the unwind - and compares what the next run completes to against a clean run of the
+same fixture, through one fingerprint of the totals, the counts, every source, repository,
+node, artifact and entry, and the first page of the default query. On the same call it copies
+the catalog directory, which is what a power loss leaves for a stage whose writer is the
+calling thread: every redb commit fsyncs and the copy is taken between two of them.
 
 ## Search document shape
 
@@ -1010,8 +1065,6 @@ readings of the old threshold are 110 MB apart and the byte form is the one used
   Reclaiming an empty slot needs the entries of a retired revision to be removed rather than
   marked absent, which is the same decision as pruning a deleted path's row.
 - **Add a read-only open** once redb offers one, so searches can run beside a rebuild.
-- **Add process-kill and power-loss recovery tests.** The current tests check transaction
-  abort and publication boundaries, not power loss.
 
 ## Dependency and serialization findings
 

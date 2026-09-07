@@ -335,6 +335,11 @@ pub(super) struct Manifest {
     pub(super) search_directory: Option<String>,
     pub(super) search_generation: u64,
     pub(super) search_seq: u64,
+    /// Whether a pass that commits many times is running. The derived counts move in the
+    /// transaction that moves the entries behind them, but the totals are a running sum a
+    /// pass settles once at the end, so a pass that finds this set is resuming after one
+    /// that was killed and counts the totals again before it starts.
+    pub(super) pass_open: bool,
 }
 
 /// One artifact whose documents the published search index no longer matches. The sequence

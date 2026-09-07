@@ -55,6 +55,7 @@ impl Catalog {
         config: &IndexConfig,
         mut progress: impl FnMut(u64),
     ) -> Result<HashReport> {
+        self.open_pass()?;
         let mut counters = Counters::load(&self.database, config.triage_confidence)?;
         let mut report = HashReport::default();
         let (sender, receiver) = mpsc::sync_channel::<Digest>(DIGEST_QUEUE);
@@ -71,6 +72,7 @@ impl Catalog {
         })?;
         report.merged = merged;
         self.sweep_artifacts(&mut counters)?;
+        self.close_pass()?;
         Ok(report)
     }
 

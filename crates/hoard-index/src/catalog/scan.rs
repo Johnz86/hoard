@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use native_db::Database;
-use native_db::transaction::RwTransaction;
+use native_db::transaction::{RTransaction, RwTransaction};
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
@@ -78,6 +78,7 @@ impl Catalog {
         progress: impl FnMut(&str, u64),
     ) -> Result<RescanReport> {
         let sources = available_sources(config)?;
+        self.open_pass()?;
         let mut counters = Counters::load(&self.database, config.triage_confidence)?;
         let (known, sizes) = self.known_stamps(&sources)?;
         let mut walk = Walk {
@@ -105,6 +106,7 @@ impl Catalog {
         manifest.generation += 1;
         manifest.scanned_at = jiff::Timestamp::now().to_string();
         manifest.counts = counts(&transaction)?;
+        manifest.pass_open = false;
         transaction.upsert(manifest)?;
         transaction.commit()?;
         Ok(walk.report)
@@ -162,6 +164,7 @@ impl Catalog {
             search_directory: None,
             search_generation: 0,
             search_seq: 0,
+            pass_open: false,
         })?;
         transaction.commit()?;
         self.repair_summary()?;
@@ -238,9 +241,17 @@ impl Catalog {
                             continue;
                         }
                         let transaction = self.database.rw_transaction()?;
-                        replace_known(&transaction, walk, counters, &revision.entries, &prepare)?;
+                        let taken = replace_known(
+                            &transaction,
+                            walk,
+                            counters,
+                            &revision.entries,
+                            &prepare,
+                        )?;
                         store_unit(&transaction, &context, prepared, counters)?;
+                        sweep_taken(&transaction, taken, counters)?;
                         log_changes(&transaction, counters)?;
+                        counters.derived.flush(&transaction)?;
                         transaction.commit()?;
                         progress(&source.name, counters.entries);
                     }
@@ -293,23 +304,53 @@ impl Catalog {
             .primary()?
             .all()?
             .collect::<native_db::db_type::Result<_>>()?;
+        let held = held_by_source(&repositories);
         for source in sources {
             let Some(stored) = transaction.get().primary::<Source>(source.name.clone())? else {
                 continue;
             };
-            let mut file_count = 0;
-            let mut byte_count = 0u64;
-            for repository in repositories
-                .iter()
-                .filter(|repository| repository.source == source.name)
-            {
-                file_count += u64::from(repository.present_files);
-                byte_count = byte_count.saturating_add(repository.present_bytes);
-            }
+            let (file_count, byte_count) =
+                held.get(source.name.as_str()).copied().unwrap_or_default();
             transaction.upsert(Source {
                 file_count,
                 byte_count,
                 last_scan: Some(at.clone()),
+                ..stored
+            })?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Writes each scanned source's held files and bytes again, which the end of a walk does
+    /// and a walk that was killed did not reach. A source the mirror, the pull queue or a
+    /// peer owns keeps counts of its own and is left alone; `last_scan` is not written
+    /// either, because the scan it names did not finish.
+    fn recount_source_counts(&self) -> Result<()> {
+        let transaction = self.database.rw_transaction()?;
+        let repositories: Vec<Repository> = transaction
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
+        let held = held_by_source(&repositories);
+        let sources: Vec<Source> = transaction
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
+        for stored in sources {
+            if !is_scanned_source(&stored.name) {
+                continue;
+            }
+            let (file_count, byte_count) =
+                held.get(stored.name.as_str()).copied().unwrap_or_default();
+            if (file_count, byte_count) == (stored.file_count, stored.byte_count) {
+                continue;
+            }
+            transaction.upsert(Source {
+                file_count,
+                byte_count,
                 ..stored
             })?;
         }
@@ -438,6 +479,7 @@ impl Catalog {
             drop(read);
             for batch in ids.chunks(CHUNK) {
                 let transaction = self.database.rw_transaction()?;
+                let mut taken = Vec::new();
                 for id in batch {
                     let Some(entry) = transaction.get().primary::<Entry>(*id)? else {
                         continue;
@@ -446,15 +488,17 @@ impl Catalog {
                     if let Some(artifact) = entry.artifact_id {
                         counters.touch(&transaction, artifact)?;
                         counters.pending.push(artifact);
+                        taken.push(artifact);
                     }
                     transaction.remove(entry)?;
                     report.absent += 1;
                 }
+                sweep_taken(&transaction, taken, counters)?;
                 log_changes(&transaction, counters)?;
+                counters.derived.flush(&transaction)?;
                 transaction.commit()?;
             }
             let transaction = self.database.rw_transaction()?;
-            counters.derived.flush(&transaction)?;
             if let Some(stored) = transaction.get().primary::<Repository>(repo_id)? {
                 transaction.remove(stored)?;
             }
@@ -539,6 +583,7 @@ impl Catalog {
             return Ok(());
         }
         let transaction = self.database.rw_transaction()?;
+        let mut taken = Vec::new();
         for known in missing {
             let Some(entry) = transaction.get().primary::<Entry>(known.entry_id)? else {
                 continue;
@@ -554,10 +599,13 @@ impl Catalog {
             if let Some(id) = known.artifact_id {
                 counters.touch(&transaction, id)?;
                 counters.pending.push(id);
+                taken.push(id);
             }
             walk.report.absent += 1;
         }
+        sweep_taken(&transaction, taken, counters)?;
         log_changes(&transaction, counters)?;
+        counters.derived.flush(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -617,12 +665,68 @@ impl Catalog {
     /// now. Exclusive by signature: nothing else holds the catalog while it runs.
     pub fn repair_summary(&mut self) -> Result<(super::Totals, super::Totals)> {
         let before = self.totals()?;
+        let after = self.recount_summary()?;
+        Ok((before, after))
+    }
+
+    /// Replaces the running totals with a fresh count of every artifact record.
+    fn recount_summary(&self) -> Result<super::Totals> {
         let counted = self.counted_summary()?;
-        let after = super::totals_of(&counted);
+        let totals = super::totals_of(&counted);
         let transaction = self.database.rw_transaction()?;
         transaction.upsert(counted)?;
         transaction.commit()?;
-        Ok((before, after))
+        Ok(totals)
+    }
+
+    /// Counts again what the last pass to run did not finish settling, and clears the mark.
+    pub(super) fn settle_interrupted_pass(&self) -> Result<()> {
+        if !self.manifest()?.pass_open {
+            return Ok(());
+        }
+        self.settle_counts()?;
+        self.mark_pass(false).map(|_| ())
+    }
+
+    /// Marks a pass as running and settles what a pass killed before it left behind. Called
+    /// by every pass that commits more than once.
+    pub(super) fn open_pass(&self) -> Result<()> {
+        match self.mark_pass(true)? {
+            true => self.settle_counts(),
+            false => Ok(()),
+        }
+    }
+
+    /// What a pass settles at its end rather than in the transactions that earn it: the
+    /// totals, and what each scanned source holds. Every other count a pass moves is written
+    /// in the transaction that moves the rows behind it.
+    fn settle_counts(&self) -> Result<()> {
+        self.recount_summary()?;
+        self.recount_source_counts()
+    }
+
+    /// Clears the pass mark, for a pass whose last transaction is not the manifest's.
+    pub(super) fn close_pass(&self) -> Result<()> {
+        self.mark_pass(false).map(|_| ())
+    }
+
+    /// Writes the pass mark, returning what it held before.
+    fn mark_pass(&self, open: bool) -> Result<bool> {
+        let transaction = self.database.rw_transaction()?;
+        let manifest: Manifest =
+            transaction
+                .get()
+                .primary(0_u8)?
+                .ok_or_else(|| IndexError::CatalogIncomplete {
+                    directory: self.directory.clone(),
+                })?;
+        let held = manifest.pass_open;
+        transaction.upsert(Manifest {
+            pass_open: open,
+            ..manifest
+        })?;
+        transaction.commit()?;
+        Ok(held)
     }
 
     fn counted_summary(&self) -> Result<Summary> {
@@ -642,6 +746,18 @@ impl Catalog {
         }
         Ok(summary)
     }
+}
+
+/// What each source holds, summed from the repositories under it: the files still on this
+/// disk and the bytes they occupy.
+fn held_by_source(repositories: &[Repository]) -> HashMap<&str, (u64, u64)> {
+    let mut held: HashMap<&str, (u64, u64)> = HashMap::new();
+    for repository in repositories {
+        let slot = held.entry(repository.source.as_str()).or_default();
+        slot.0 += u64::from(repository.present_files);
+        slot.1 = slot.1.saturating_add(repository.present_bytes);
+    }
+    held
 }
 
 /// Whether the sweep changed what the search index should hold for this artifact.
@@ -992,14 +1108,17 @@ fn mark_unchanged(
 }
 
 /// Retires the rows the walk is about to write again, so a changed file keeps neither its
-/// old entry nor a claim on an artifact its new bytes may no longer establish.
+/// old entry nor a claim on an artifact its new bytes may no longer establish. Returns the
+/// artifacts a path was taken from, which the same transaction recounts once the rows that
+/// replace them are written.
 fn replace_known(
     transaction: &RwTransaction<'_>,
     walk: &mut Walk,
     counters: &mut Counters,
     entries: &[DiscoveredEntry],
     positions: &[usize],
-) -> Result<()> {
+) -> Result<Vec<i64>> {
+    let mut taken = Vec::new();
     for position in positions {
         let Some(known) = known_of(walk, &entries[*position]) else {
             walk.report.added += 1;
@@ -1009,10 +1128,31 @@ fn replace_known(
         walk.report.changed += 1;
         if let Some(id) = known.artifact_id {
             counters.touch(transaction, id)?;
+            taken.push(id);
         }
         if let Some(entry) = transaction.get().primary::<Entry>(known.entry_id)? {
             counters.derived.removed(&entry);
             transaction.remove(entry)?;
+        }
+    }
+    Ok(taken)
+}
+
+/// Recounts what each artifact a transaction took a path from still holds, in that same
+/// transaction. The sweep at the end of the pass would do it, but a pass killed before it
+/// reaches that sweep would leave a record counting a path no entry backs, and the next run
+/// has nothing to tell it to look: the rows the killed pass wrote are the rows the walk now
+/// skips. Sweeping here makes the sweep at the end of the pass a repeat that finds nothing.
+fn sweep_taken(
+    transaction: &RwTransaction<'_>,
+    mut taken: Vec<i64>,
+    counters: &mut Counters,
+) -> Result<()> {
+    taken.sort_unstable();
+    taken.dedup();
+    for id in taken {
+        if sweep_artifact(transaction, id)? {
+            counters.pending.push(id);
         }
     }
     Ok(())
@@ -1236,9 +1376,15 @@ impl Counters {
             entries: 0,
         });
         Ok(Self {
-            repos: allocator.repos,
-            artifacts: allocator.artifacts,
-            entries: allocator.entries,
+            repos: allocator
+                .repos
+                .max(highest_id(&read, |row: &Repository| row.id)?),
+            artifacts: allocator
+                .artifacts
+                .max(highest_id(&read, |row: &ArtifactRecord| row.id)?),
+            entries: allocator
+                .entries
+                .max(highest_id(&read, |row: &Entry| row.id)?),
             touched: HashSet::new(),
             pending: Vec::new(),
             derived: DerivedShift::default(),
@@ -1314,6 +1460,17 @@ pub(super) fn log_changes(transaction: &RwTransaction<'_>, counters: &mut Counte
         })?;
     }
     Ok(())
+}
+
+/// The highest id one table holds, which a pass killed before it saved the allocator left
+/// above the allocator. Handing that id out again would write over the row already holding
+/// it, so a pass starts from whichever of the two is higher.
+fn highest_id<T>(read: &RTransaction<'_>, id: fn(&T) -> i64) -> Result<u64>
+where
+    T: native_db::ToInput,
+{
+    let last: Option<T> = read.scan().primary()?.all()?.next_back().transpose()?;
+    Ok(last.map_or(0, |row| u64::try_from(id(&row)).unwrap_or(0)))
 }
 
 pub(super) fn next_id(counter: &mut u64) -> Result<i64> {

@@ -51,20 +51,32 @@ One line per file in `crates/hoard-index/src/catalog/`:
 Every writer of an entry commits through `scan::Counters`:
 
 - `Counters::load` reads the persisted `Allocator`; `next_repo` and the sibling id
-  helpers hand out ids from it.
+  helpers hand out ids from it, starting from the higher of what it holds and the highest id
+  each table holds, so a pass killed before it saved cannot have an id handed out twice.
 - `Counters::touch(transaction, artifact_id)` is called *before* an artifact record is
   written. It keeps what the record contributed to the summary beforehand, so the pass moves
   the summary by a difference rather than recounting every record.
 - `Counters::derived` is a `DerivedShift`. Call `added(&entry)` before writing an entry and
   `removed(&entry)` before removing one or moving it out of presence. It accumulates each
   repository's present files and bytes, each source's owed hashes and each node's filed
-  count, so a record above the entries is rewritten once per pass rather than once per entry.
+  count, and is flushed in the transaction that writes the entries it counted, so a record
+  above the entries is rewritten once per transaction rather than once per entry and a killed
+  pass leaves no count behind the rows that moved it.
 - `log_changes(transaction, counters)` writes one `SearchChange` row per artifact the pass
   touched, in the same transaction that made the change. The sequence continues past both
   the highest key the log holds and `Manifest.search_seq`. It writes nothing while no search
   directory is published: a build reads the artifact records, not the log, and publishing
   prunes the whole log unread. `Counters::load` reads that flag once per pass.
-- `Counters::save(transaction)` flushes the `DerivedShift` and writes the allocator back.
+- `Counters::save(transaction)` flushes whatever `DerivedShift` is left and writes the
+  allocator back.
+- A pass that commits more than once sets `Manifest.pass_open` before its first commit and
+  clears it in its last, because the totals and each scanned source's files and bytes are what
+  a pass settles at its end. A run that finds the mark set counts both again first.
+  `docs/native-catalog.md` under "Recovery" says what a kill at each stage leaves and what is
+  accepted.
+- A transaction that takes an artifact's last path calls `sweep_artifact` for it before it
+  commits, so no committed state counts a path no entry backs. The sweep at the end of the
+  pass is then a repeat.
 
 **Every writer of an entry moves the derived counts.** A new writer that skips
 `DerivedShift` leaves `Repository::present_files`, `Repository::present_bytes`,
@@ -107,10 +119,14 @@ are the facts that have caught agents out:
   segment and meaningless across segments, so a cross-segment order merges on spelled terms.
 - The outbox is the `SearchChange` table plus `Manifest.search_seq`. `refresh_search` replays
   the log after the durable cursor, one Tantivy commit per batch, deleting an artifact's
-  documents by term and re-adding its entries, then prunes what it applied.
+  documents by term and re-adding its entries, then prunes what it applied. It also prunes
+  what the cursor has already passed, which is what a refresh killed before its own prune
+  leaves behind.
 - A rebuild writes a fresh `search-v1-<nanos>` directory and publishes its name in a redb
   transaction only after Tantivy commits; publishing then removes every superseded
-  directory. An unpublished build leaves the previous one serving.
+  directory, and so does `Catalog::open`, because a killed build publishes nothing and would
+  otherwise leave its directory for good. An unpublished build leaves the previous one
+  serving.
 - The writer is one thread with a 32 MiB budget.
 
 ## Before you change anything here

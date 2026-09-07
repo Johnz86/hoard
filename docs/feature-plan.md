@@ -370,7 +370,12 @@ store that already works, not the remainder of the phase.
   Implemented in wave 4, which folds each artifact's run of entry documents inside the
   segment collectors; the acceptance is the final measurement's job in wave 8.
 - Power-loss and process-kill recovery tests. Accept: a catalog killed mid-scan reopens and
-  rescans to the same counts a clean run gives.
+  rescans to the same counts a clean run gives. **Done:** wave 6 interrupts the scan, the
+  hash pass, the refresh and the rebuild from the progress callback each already takes, and
+  completes each of them on both what the kill left and a byte copy taken at that instant. It
+  fixed what the tests found: a fresh scan with no manifest that no open would rebuild, ids
+  handed out twice after a kill, derived counts left behind by one, a log row the cursor had
+  passed that no refresh dropped, and the directory a killed rebuild left.
 - Byte-exact path identities, so an identity is the path's bytes rather than its lossy string.
 - Revision ordinals stored rather than recomputed on every rescan.
 - Counting a revision's artifact units without counting content another revision claimed.
