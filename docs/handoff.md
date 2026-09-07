@@ -19,8 +19,13 @@ first; this document assumes it.
   that follows it: predictable memory under unusual workloads, background work that yields
   and writes that are not repeated. It names its waves, the decisions the dispatcher took so
   no wave waits on one, the rule that every wave's implementer is a Sonnet
-  `wave-implementer`, and its finish condition. Wave 3, usage-bounds, has landed; wave 4 is
-  scan-scope.
+  `wave-implementer`, and its finish condition. Wave 3, usage-bounds, and wave 4, scan-scope,
+  have landed; wave 5 is budgets-measured. Scan-scope folds the summary difference into the
+  stored totals in the transaction that made it rather than keeping one entry per touched
+  artifact until the pass ends, walks an hf-cache or a git source in groups of 64
+  repositories with the known-path map scoped to one group rather than the whole source (a
+  loose source cannot be split and takes the same one-group path), and turns the redb page
+  cache into `[index] cache_mib`. Not measured: wave 5 measures the run once.
 - The native_db (redb) plus Tantivy catalog replaced the SQLite index and is merged. Every
   command, every route, both faces and gossip read and write it, and no SQLite code remains.
   `docs/native-catalog.md` is the current-state document;
@@ -34,8 +39,8 @@ first; this document assumes it.
 - Phases 0 to 11 are done. `docs/feature-plan.md` holds the table. The TREE and DISK views
   are not an unfinished phase: they wait on a design decision and are recorded under that
   document's "Risks and open decisions".
-- At the head of `master` after the usage-bounds wave all four checks pass:
-  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 899 passed,
+- At the head of `master` after the scan-scope wave all four checks pass:
+  `cargo fmt --check`, clippy with `-D warnings`, `cargo test --workspace` at 908 passed,
   0 failed, 4 ignored, and `cargo build --workspace`. The four ignored are the scale harness and its supplemental
   fixture, the mDNS test that needs a multicast route and the sniffer test that reads the
   local model caches. `cargo doc --workspace --no-deps` emits no warning, and

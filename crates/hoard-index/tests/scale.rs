@@ -224,7 +224,8 @@ fn snapshot(output: &Path, catalog: Catalog, phase: &str) -> (Catalog, StorageRe
         );
     }
     eprintln!();
-    let catalog = Catalog::open(output).expect("the catalog reopens");
+    let catalog =
+        Catalog::open(output, IndexConfig::default().cache_mib).expect("the catalog reopens");
     (catalog, report)
 }
 

@@ -25,6 +25,10 @@ reconcile_interval_secs = 3600
 # How many files a hashing pass reads at once. 0 means one worker per core; turn it down on
 # an HDD or a NAS.
 hash_threads = 0
+# The redb page cache, in mebibytes. Turning it down bounds what one open catalog holds in
+# memory for pages it has already read, at the cost of rereading them from disk more often.
+# 0 means the default, the same way hash_threads = 0 means one worker per core.
+cache_mib = 256
 
 [[index.sources]]
 name = "hf-cache"

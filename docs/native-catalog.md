@@ -181,8 +181,20 @@ Every writer of an entry commits through `scan::Counters`:
   higher of what the allocator holds and the highest id each table holds, so a pass killed
   before it wrote the allocator back cannot have its ids handed out a second time.
 - `Counters::touch(transaction, id)` is called before an artifact record is written and keeps
-  what the record contributed to the summary beforehand, so a pass moves the summary by a
-  difference rather than recounting every record.
+  what the record contributed to the summary beforehand. `Counters::settle_summary(transaction)`
+  is called wherever `DerivedShift::flush` already runs, in the same transaction: it reads
+  each touched id's record as that transaction leaves it, shifts the stored `Summary` by the
+  difference, and clears the map. The fold telescopes - shifting `a -> b` in one transaction
+  and `b -> c` in the next equals shifting `a -> c` - so an artifact touched again once an
+  earlier transaction has settled it still settles exactly, and the map never holds more than
+  the transaction in flight. `Counters::touched`, the set of ids a sweep at the pass's end
+  must still recheck, is not folded the same way and stays for the whole pass: the hashing
+  pass merges two artifacts into one without an in-transaction sweep and relies on the sweep
+  at the end, and a retirement recounts what it touched across several transactions the same
+  way. `Counters::summarise` no longer touches an artifact at all; every artifact difference
+  is already folded by the time it runs, and its only remaining job is the repository count,
+  read fresh because a pass has no per-repository `Counters` entry the way it has one per
+  artifact.
 - `Counters::derived` is a `DerivedShift`: `added(&entry)` before writing an entry,
   `removed(&entry)` before removing one or moving it out of presence. It accumulates each
   repository's present files and bytes, each source's owed hashes and each node's filed
@@ -193,16 +205,35 @@ Every writer of an entry commits through `scan::Counters`:
   the transaction that made the change, and writes nothing while no search directory is
   published. The sequence continues past both the highest key the log holds and
   `Manifest.search_seq`.
-- `Counters::save(transaction)` flushes whatever shift is left and writes the allocator back.
+- `Counters::save(transaction)` flushes whatever shift is left, settles the summary the same
+  way, and writes the allocator back.
 
-A rescan recognises a stored row by where it is filed. `known_stamps` keys the map it hands
-the walk by a hash of the location - the repository id, the revision ordinal and the relative
-path - and not by the absolute path the row's bytes were last found at. The two are not the
-same identity: an hf-cache entry sits at a blob under `blobs/`, so a file rewritten in place
-is discovered at a new absolute path, its stored row would never be recognised, and the row
-written for it would collide on the unique `location` key. The location is what the catalog
-itself files an entry under, so the walk and the index agree on what one row is, and it costs
-one hash of a relative path where the absolute path cost one of a longer string.
+A rescan recognises a stored row by where it is filed. `known_stamps_of(repo_ids)` keys the
+map it hands the walk by a hash of the location - the repository id, the revision ordinal and
+the relative path - and not by the absolute path the row's bytes were last found at. The two
+are not the same identity: an hf-cache entry sits at a blob under `blobs/`, so a file rewritten
+in place is discovered at a new absolute path, its stored row would never be recognised, and
+the row written for it would collide on the unique `location` key. The location is what the
+catalog itself files an entry under, so the walk and the index agree on what one row is, and
+it costs one hash of a relative path where the absolute path cost one of a longer string.
+
+`discover::discover` still reads a source whole: one call enumerates every repository
+directory and reads every file of it, for every layout, before any group exists. What
+`Catalog::walk` bounds is what happens *after* that: it takes the already-discovered
+repositories in groups of `REPO_GROUP` (64) for storing, walking and retracting, rather than
+storing the whole source, walking it and retracting once at the end. A group is stored,
+`known_stamps_of` is read for only that group's repository ids, the group is walked, and a
+rescan retracts that group's absent paths before the next group is taken from the same list,
+so no more than one group's known-path map is ever in memory, and no more than one group's
+absences are looked for in a transaction, though the discovered repositories and the files
+`discover` read for them stay in memory, for the whole source, until every group of it is
+done. A repository the catalog holds for a source that no group named this pass - one gone
+from disk since the last one - is retracted the same way once every group has been walked. A
+loose source is discovered as one group regardless, because its walk collects every file and
+only then groups the flat list by organisation, so no repository of it exists to chunk even
+after discovery; it takes the same code every source does, with the group size set to the
+whole list. Reading a source's files a group at a time, so a rescan of a very large source
+also bounds what discovery itself holds, is not what this does and remains open work.
 
 A location is an ordinal, so a revision the walk finds at a fresh slot matches nothing under
 that key though every file it holds is a file the catalog already read. The walk therefore
@@ -217,8 +248,9 @@ moved, which is what two hf-cache snapshots linking one blob look like.
 
 That index is built one repository at a time, as the walk reaches a revision the catalog
 holds no rows for, and not for every source before the walk starts: only a repository with a
-fresh slot pays for it and only one repository's worth is held. The map of stored rows
-itself is unavoidable and is 48 bytes a row.
+fresh slot pays for it and only one repository's worth is held. The map of stored rows itself,
+48 bytes a row, is bounded the same way: `known_stamps_of` reads it one `REPO_GROUP` at a
+time rather than for the whole source.
 
 A pass that commits many times can also be asked to stop. `Catalog::rescan_until` checks a
 `Stop` before each source it discovers and between the units of the one it is inside, and
@@ -337,12 +369,19 @@ completes. What each stage leaves:
   file and no manifest is not a catalog. `Catalog::open` refuses it as `CatalogIncomplete`
   and `open_or_scan` removes the directory and scans a fresh one, which is what it already
   did for a catalog of another format.
-- **The totals**, and what each scanned source holds, are what a pass settles at its end
-  rather than in the transactions that earn it. A pass that commits more than once sets
-  `Manifest.pass_open` before its first commit and clears it in its last, and a run that finds
-  the mark set counts every artifact record again, and each source's files and bytes again
-  from its repositories, before it starts. Only a kill pays for that; `Catalog::open` pays it
-  once for the process that died.
+- **What each scanned source holds** is what a pass settles at its end rather than in the
+  transactions that earn it: `record_scan_stats` sums a source's held files and bytes from its
+  repositories once, after the walk has stored, walked and retracted every group. **The
+  totals** are not settled this way any more: `Counters::settle_summary` folds each
+  transaction's artifact difference into the stored `Summary` in that same transaction, and
+  `store_source` settles the repository count the same way in the transaction that may have
+  just written one, so a kill leaves the totals exactly what the rows it committed already
+  say. A pass that commits more than once still sets `Manifest.pass_open` before its first
+  commit and clears it in its last, because a source's held files and bytes are still settled
+  only at the end; a run that finds the mark set counts every artifact record again and each
+  source's files and bytes again from its repositories, before it starts, which the totals no
+  longer need but a killed source count still does. Only a kill pays for that; `Catalog::open`
+  pays it once for the process that died.
 - **An artifact the pass takes a path from** is recounted in the transaction that took it, so
   a record counting a path no entry backs is never committed. The sweep at the end of the pass
   repeats it and finds nothing, and a kill in between leaves nothing to find: the next walk
@@ -371,9 +410,11 @@ completes. What each stage leaves:
   one the manifest does not name.
 
 What this does not cover, and is accepted: a redb file torn by a power loss is redb's own
-recovery; and `retire_entries` and `retract_digest` settle the totals at the end of their own
-multi-transaction passes without the mark, so a kill inside one of those leaves the totals to
-`hoard doctor`.
+recovery. `retire_entries` and `retract_digest` are still multi-transaction writers that never
+set `Manifest.pass_open`, but that no longer matters for the totals: every transaction of
+either settles its own artifact difference through `Counters::settle_summary`, the same as a
+walk's units do, so a kill inside one leaves the totals exactly what the rows it committed
+already say, with no recount owed to `hoard doctor`.
 
 The `recovery` module of `catalog/tests.rs` holds the proof. It interrupts a stage from the
 progress callback the stage already takes - counting the calls, panicking on a chosen one and
@@ -553,6 +594,11 @@ working directory would match nothing. Every one of these is a request on the sa
 value pins a hashing pass to that many workers instead. It is the setting an HDD or NAS owner
 turns down, because a hashing pass otherwise reads as many files at once as the pool has
 threads for, and a spinning disk answers concurrent reads worse than one at a time.
+
+`[index] cache_mib` is an integer, 256 by default, the redb page cache `builder()` opens the
+catalog with. Turning it down bounds what one open catalog holds in memory for pages it has
+already read, at the cost of rereading them from disk more often; `Catalog::open`, which has
+no `IndexConfig` to read a configured value from, always opens with the default.
 
 `compact` is the only thing that compacts a catalog on demand. A scan compacts at the end of
 building one, because that is bulk construction; a rescan never does, so a shared catalog

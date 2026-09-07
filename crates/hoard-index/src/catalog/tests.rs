@@ -22,7 +22,7 @@ use super::models::{
     Allocator, ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE,
     LocationKey, Manifest, Node, Placement, Repository, RepositoryKey, SearchChange, Shelf, Source,
 };
-use super::scan::{Presence, identity, location_hash, preference};
+use super::scan::{Counters, Presence, REPO_GROUP, identity, location_hash, preference};
 use super::search::{Cost, INDEX_FLUSH_BYTES, Paging, QueryPath};
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::usage::{HISTORY_DAYS, Window, floored_minute};
@@ -129,7 +129,10 @@ fn sources_scan_into_typed_records_that_survive_a_reopen() -> Result<()> {
     assert_eq!(found.rows[0].name, "training.csv");
     assert_eq!(found.rows[0].node, "test-node");
     drop(catalog);
-    let mut reopened = Catalog::open(&directory.path().join("native"))?;
+    let mut reopened = Catalog::open(
+        &directory.path().join("native"),
+        IndexConfig::default().cache_mib,
+    )?;
     assert!(reopened.check_integrity()?);
     assert!(reopened.status()?.search_ready);
     assert_eq!(search(&reopened, "")?.total, 2);
@@ -498,7 +501,7 @@ fn incomplete_or_unknown_catalogs_are_refused() -> Result<()> {
     let database =
         native_db::Builder::new().create(models()?, directory.path().join("catalog.redb"))?;
     drop(database);
-    assert!(Catalog::open(directory.path()).is_err());
+    assert!(Catalog::open(directory.path(), IndexConfig::default().cache_mib).is_err());
     let (_directory, catalog) = fixture()?;
     let mut manifest = catalog.manifest()?;
     manifest.format_version = 999;
@@ -507,7 +510,7 @@ fn incomplete_or_unknown_catalogs_are_refused() -> Result<()> {
     transaction.commit()?;
     let path = catalog.directory.clone();
     drop(catalog);
-    assert!(Catalog::open(&path).is_err());
+    assert!(Catalog::open(&path, IndexConfig::default().cache_mib).is_err());
     Ok(())
 }
 
@@ -719,7 +722,10 @@ fn a_rebuild_keeps_manifest_fields_it_does_not_own() -> Result<()> {
 #[test]
 fn a_catalog_open_elsewhere_reports_the_lock_plainly() -> Result<()> {
     let (directory, catalog) = fixture()?;
-    let second = Catalog::open(&directory.path().join("native"));
+    let second = Catalog::open(
+        &directory.path().join("native"),
+        IndexConfig::default().cache_mib,
+    );
     let message = match second {
         Err(error @ IndexError::CatalogBusy) => error.to_string(),
         other => panic!("expected the catalog to report its lock, got {other:?}"),
@@ -992,6 +998,54 @@ fn hf_cache_repo(root: &Path, org: &str, name: &str, files: &[(&str, Vec<u8>)]) 
         }
         std::os::unix::fs::symlink(&blob, &link)?;
     }
+    Ok(())
+}
+
+/// One repository of one file, whose blob is named `hash` rather than by its position among
+/// a call's files: [`hf_cache_repo`] names every first file's blob the same way, which is
+/// exactly wrong for a fixture of many repositories that must not collide on identity.
+fn hf_cache_repo_named(
+    root: &Path,
+    org: &str,
+    name: &str,
+    rel_path: &str,
+    hash: &str,
+    content: &[u8],
+) -> Result<()> {
+    let repo = root.join(format!("models--{org}--{name}"));
+    let commit = "b".repeat(40);
+    let snapshot = repo.join("snapshots").join(&commit);
+    fs::create_dir_all(&snapshot)?;
+    fs::create_dir_all(repo.join("blobs"))?;
+    fs::create_dir_all(repo.join("refs"))?;
+    fs::write(repo.join("refs/main"), &commit)?;
+    let blob = repo.join("blobs").join(hash);
+    fs::write(&blob, content)?;
+    let link = snapshot.join(rel_path);
+    if let Some(parent) = link.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    std::os::unix::fs::symlink(&blob, &link)?;
+    Ok(())
+}
+
+/// Rewrites one file of an [`hf_cache_repo`] fixture in place: a new blob is written under
+/// `blob_prefix`, repeated to a full hash, and the snapshot's symlink is retargeted to it, the
+/// way an hf-cache download replaces a blob without touching the path it is filed at.
+fn rewrite_hf_cache_file(
+    root: &Path,
+    org: &str,
+    name: &str,
+    rel_path: &str,
+    blob_prefix: &str,
+    content: &[u8],
+) -> Result<()> {
+    let repo = root.join(format!("models--{org}--{name}"));
+    let blob = repo.join("blobs").join(blob_prefix.repeat(64));
+    fs::write(&blob, content)?;
+    let link = repo.join("snapshots").join("b".repeat(40)).join(rel_path);
+    fs::remove_file(&link)?;
+    std::os::unix::fs::symlink(&blob, &link)?;
     Ok(())
 }
 
@@ -2078,7 +2132,7 @@ fn storage_reports_every_table_and_compaction_keeps_the_data() -> Result<()> {
         .find(|table| table.name.starts_with("7_1_id"))
         .map(|table| table.entries);
     assert_eq!(entries, Some(2));
-    let reopened = Catalog::open(&native)?;
+    let reopened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
     assert_eq!(search(&reopened, "")?.total, 2);
     Ok(())
 }
@@ -3819,7 +3873,7 @@ fn inspect_opens_without_seeding_shelves_or_a_self_row() -> Result<()> {
     );
     drop(inspected);
 
-    let opened = Catalog::open(&native)?;
+    let opened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
     assert!(
         !opened.list_shelves()?.is_empty(),
         "opening restores the shelves"
@@ -3828,6 +3882,54 @@ fn inspect_opens_without_seeding_shelves_or_a_self_row() -> Result<()> {
         opened.list_nodes()?.len(),
         1,
         "and records this machine again"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_configured_cache_mib_reaches_a_freshly_scanned_and_a_reopened_catalog() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("models");
+    fs::create_dir_all(&input)?;
+    fs::write(input.join("w.safetensors"), lora_header())?;
+    let config = IndexConfig {
+        data_dir: directory.path().to_path_buf(),
+        sources: vec![source(&input, "comfy")],
+        cache_mib: 42,
+        ..IndexConfig::default()
+    };
+    let native = directory.path().join("native");
+    let scanned = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
+    assert_eq!(
+        scanned.opened_cache_mib(),
+        42,
+        "a fresh scan opens with the configured value"
+    );
+    drop(scanned);
+
+    let reopened = Catalog::open(&native, config.cache_mib_or_default())?;
+    assert_eq!(
+        reopened.opened_cache_mib(),
+        42,
+        "reopening an existing catalog still carries the configured value, not the default"
+    );
+    drop(reopened);
+
+    let via_open_or_scan = Catalog::open_or_scan(&config, "n", |_, _| {})?;
+    assert_eq!(
+        via_open_or_scan.opened_cache_mib(),
+        42,
+        "open_or_scan reopens the same catalog it just scanned with the configured value"
+    );
+
+    let zeroed = IndexConfig {
+        cache_mib: 0,
+        ..config
+    };
+    assert_eq!(
+        zeroed.cache_mib_or_default(),
+        256,
+        "and zero means the default rather than a zero-sized cache"
     );
     Ok(())
 }
@@ -4004,6 +4106,104 @@ fn the_summary_is_exact_after_incremental_passes() -> Result<()> {
         "a rescan that changed nothing changes nothing"
     );
     exact("a rescan that touched nothing")?;
+    Ok(())
+}
+
+#[test]
+fn the_summary_is_exact_when_a_pass_touches_an_artifact_more_than_once() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let shared = lora_header_named("shared");
+    hf_cache_repo(
+        &hub,
+        "acme",
+        "one",
+        &[("adapter.safetensors", shared.clone())],
+    )?;
+    hf_cache_repo(
+        &hub,
+        "acme",
+        "two",
+        &[("adapter.safetensors", shared.clone())],
+    )?;
+    let config = hub_config(&hub);
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    assert_eq!(
+        catalog.totals()?,
+        catalog.count_summary()?,
+        "two copies discovered by one pass, in two transactions, telescope to the same total"
+    );
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "")?;
+    assert_eq!(rows.total, 1, "identical content is one artifact");
+    assert_eq!(rows.rows[0].path_count, 2);
+
+    let moved = lora_header_named("moved");
+    rewrite_hf_cache_file(&hub, "acme", "one", "adapter.safetensors", "e", &moved)?;
+    rewrite_hf_cache_file(&hub, "acme", "two", "adapter.safetensors", "e", &moved)?;
+    let report = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    assert_eq!(report.changed, 2, "both copies were rewritten");
+
+    assert_eq!(
+        catalog.totals()?,
+        catalog.count_summary()?,
+        "the old artifact lost its second and then its last path in two transactions of one rescan"
+    );
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "")?;
+    assert_eq!(rows.total, 1, "the rewritten copies are one artifact again");
+    assert_eq!(rows.rows[0].path_count, 2);
+    Ok(())
+}
+
+#[test]
+fn a_pass_holds_no_summary_snapshot_once_its_transaction_commits() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("models");
+    fs::create_dir_all(&input)?;
+    for index in 0..4 {
+        fs::write(
+            input.join(format!("w{index}.safetensors")),
+            lora_header_named(&format!("t{index}")),
+        )?;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let ids = artifact_ids(&catalog)?;
+    assert!(ids.len() >= 2, "the fixture needs more than one artifact");
+    let triage = catalog.stored_triage()?;
+    let mut counters = Counters::load(&catalog.database, triage)?;
+    for id in &ids {
+        let transaction = catalog.database.rw_transaction()?;
+        counters.touch(&transaction, *id)?;
+        counters.settle_summary(&transaction)?;
+        transaction.commit()?;
+        assert!(
+            counters.holds_no_summary_snapshot(),
+            "the snapshot for artifact {id} outlived the transaction that settled it"
+        );
+    }
     Ok(())
 }
 
@@ -4291,7 +4491,7 @@ fn computed_location_keys_follow_entry_updates() -> Result<()> {
     transaction.abort()?;
 
     drop(catalog);
-    let reopened = Catalog::open(&native)?;
+    let reopened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
     let read = reopened.database.r_transaction()?;
     let after: Option<Entry> = read.get().secondary(
         EntryKey::location,
@@ -4652,7 +4852,7 @@ fn compact_records_round_trip_without_changing_public_views() -> Result<()> {
     );
     drop(catalog);
 
-    let reopened = Catalog::open(&native)?;
+    let reopened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
     let after = search(&reopened, "")?;
     assert_eq!(
         after.rows, before.rows,
@@ -4731,7 +4931,8 @@ fn a_catalog_of_another_format_is_rebuilt_before_a_changed_record_is_decoded() -
     drop(catalog);
 
     {
-        let database = builder().open(models()?, native.join("catalog.redb"))?;
+        let database = builder(IndexConfig::default().cache_mib)
+            .open(models()?, native.join("catalog.redb"))?;
         let transaction = database.rw_transaction()?;
         let manifest: Manifest = transaction
             .get()
@@ -4894,7 +5095,7 @@ fn cold_records_read_back_through_the_inspector() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     drop(catalog);
 
-    let reopened = Catalog::open(&native)?;
+    let reopened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
     let after: Vec<_> = ids
         .iter()
         .map(|id| reopened.artifact_detail(*id))
@@ -5194,7 +5395,7 @@ fn every_record_round_trips_through_the_compact_codec() -> Result<()> {
     transaction.commit()?;
     drop(catalog);
 
-    let reopened = Catalog::open(&native)?;
+    let reopened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
     let read = reopened.database.r_transaction()?;
     assert_eq!(read.get().primary("codec".to_owned())?, Some(source));
     assert_eq!(read.get().primary(4242_i64)?, Some(repository));
@@ -6025,6 +6226,239 @@ fn an_unchanged_rescan_reads_no_headers_and_a_deleted_file_is_marked_absent() ->
 }
 
 #[test]
+fn a_rescan_in_groups_retracts_a_deleted_repository_and_keeps_the_rest() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    const REPOS: usize = 70;
+    for index in 0..REPOS {
+        hf_cache_repo_named(
+            &hub,
+            "acme",
+            &format!("repo-{index:03}"),
+            "weights.safetensors",
+            &format!("{index:064x}"),
+            &lora_header_named(&format!("t{index}")),
+        )?;
+    }
+    let config = hub_config(&hub);
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    assert_eq!(catalog.totals()?.artifacts, REPOS as u64);
+    assert_eq!(
+        catalog.totals()?,
+        catalog.count_summary()?,
+        "more than one group's worth of repositories still settles exactly"
+    );
+
+    let deleted = RepoId::parse_ref(RepoType::Models, "acme/repo-005")?;
+    let deleted_id = repository_of(&catalog, &deleted)?.id;
+    fs::remove_dir_all(hub.join("models--acme--repo-005"))?;
+
+    let report = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    assert_eq!(
+        report.absent, 1,
+        "the deleted repository's one file is the only absence"
+    );
+    assert_eq!(
+        report.unchanged,
+        REPOS as u64 - 1,
+        "every other repository's file was rediscovered unchanged"
+    );
+
+    let entries = catalog.revision_entries(deleted_id, 0, Dedupe::Ignore)?;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].state,
+        State::Remote,
+        "a repository no group named is retracted like a path within one"
+    );
+
+    for index in (0..REPOS).filter(|&index| index != 5) {
+        let repo = RepoId::parse_ref(RepoType::Models, &format!("acme/repo-{index:03}"))?;
+        let kept = repository_of(&catalog, &repo)?;
+        let entries = catalog.revision_entries(kept.id, 0, Dedupe::Ignore)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].state,
+            State::Local,
+            "repository {index} is untouched by another group's retraction"
+        );
+    }
+
+    assert_eq!(
+        catalog.totals()?,
+        catalog.count_summary()?,
+        "the group that named nothing for the deleted repository still settles exactly"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_stop_raised_between_groups_retracts_the_finished_group_and_keeps_the_rest() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let repos = REPO_GROUP + 6;
+    for index in 0..repos {
+        hf_cache_repo_named(
+            &hub,
+            "acme",
+            &format!("repo-{index:03}"),
+            "weights.safetensors",
+            &format!("{index:064x}"),
+            &lora_header_named(&format!("t{index}")),
+        )?;
+    }
+    let config = hub_config(&hub);
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    assert_eq!(catalog.totals()?.artifacts, repos as u64);
+
+    let first_group_gone = RepoId::parse_ref(RepoType::Models, "acme/repo-005")?;
+    let first_group_gone_id = repository_of(&catalog, &first_group_gone)?.id;
+    fs::remove_file(
+        hub.join("models--acme--repo-005")
+            .join("snapshots")
+            .join("b".repeat(40))
+            .join("weights.safetensors"),
+    )?;
+
+    let second_group_gone =
+        RepoId::parse_ref(RepoType::Models, &format!("acme/repo-{:03}", repos - 1))?;
+    let second_group_gone_id = repository_of(&catalog, &second_group_gone)?.id;
+    fs::remove_dir_all(hub.join(format!("models--acme--repo-{:03}", repos - 1)))?;
+
+    let moved = lora_header_named("moved");
+    rewrite_hf_cache_file(&hub, "acme", "repo-010", "weights.safetensors", "e", &moved)?;
+
+    let stop = Stop::default();
+    let flip = stop.clone();
+    let report = catalog.rescan_until(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        &stop,
+        |phase, _| {
+            if phase == "hub" {
+                flip.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        },
+    )?;
+    assert!(
+        report.interrupted,
+        "the stop raised once the first group's one changed file committed ended the walk"
+    );
+
+    let finished_group = catalog.revision_entries(first_group_gone_id, 0, Dedupe::Ignore)?;
+    assert_eq!(finished_group.len(), 1);
+    assert_eq!(
+        finished_group[0].state,
+        State::Remote,
+        "the first group finished, so the repository it never rediscovered is retracted"
+    );
+
+    let untouched_group = catalog.revision_entries(second_group_gone_id, 0, Dedupe::Ignore)?;
+    assert_eq!(untouched_group.len(), 1);
+    assert_eq!(
+        untouched_group[0].state,
+        State::Local,
+        "the second group was never reached, so its row is exactly as the fresh scan left it"
+    );
+
+    for index in (0..repos).filter(|&index| index != 5 && index != repos - 1 && index != 10) {
+        let repo = RepoId::parse_ref(RepoType::Models, &format!("acme/repo-{index:03}"))?;
+        let kept = repository_of(&catalog, &repo)?;
+        let entries = catalog.revision_entries(kept.id, 0, Dedupe::Ignore)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].state,
+            State::Local,
+            "repository {index} is untouched by the interruption"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_loose_source_is_one_group_and_scans_the_same() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_fixture(directory.path())?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let repo = only_repository(&catalog)?;
+    let before = catalog.revision_entries(repo.id, 0, Dedupe::Ignore)?;
+    assert_eq!(
+        before.len(),
+        2,
+        "a loose source's whole file list is discovered before any repository exists"
+    );
+
+    let report = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    assert_eq!(
+        report,
+        RescanReport {
+            unchanged: 2,
+            changed: 0,
+            added: 0,
+            absent: 0,
+            interrupted: false,
+        },
+        "a loose source takes the one-group path every rescan, not a chunk of it"
+    );
+    let after = catalog.revision_entries(repo.id, 0, Dedupe::Ignore)?;
+    assert_eq!(
+        after, before,
+        "the one group leaves the same rows a plain rescan would"
+    );
+    assert_eq!(
+        catalog.totals()?,
+        catalog.count_summary()?,
+        "the one group settles exactly"
+    );
+
+    fs::remove_file(input.join("loras/gone.safetensors"))?;
+    let retracted = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    assert_eq!(retracted.absent, 1);
+    assert_eq!(
+        catalog.totals()?,
+        catalog.count_summary()?,
+        "retracting within the one group still settles exactly"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_changed_file_is_reread_and_a_new_file_continues_the_ids() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;
@@ -6271,6 +6705,34 @@ fn a_moved_file_under_a_loose_root_is_replaced_not_duplicated() -> Result<()> {
         .find(|entry| entry.rel_path.ends_with("keep.safetensors"))
         .ok_or_else(|| IndexError::Catalog("the old location is kept".into()))?;
     assert_eq!(left.state, State::Remote);
+    Ok(())
+}
+
+#[test]
+fn a_pull_that_creates_a_repository_settles_the_count_in_the_same_transaction() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = Catalog::open_or_scan(
+        &IndexConfig {
+            data_dir: directory.path().join("native"),
+            ..IndexConfig::default()
+        },
+        "workstation",
+        |_, _| {},
+    )?;
+    let before = catalog.totals()?.repositories;
+    let repo = RepoId::parse_ref(RepoType::Models, "kohya/film-grain")?;
+    let root = directory.path().join("pulled");
+    catalog.pull_slot(&repo, CommitSha::from_bytes([0x22; 20]), &root)?;
+    assert_eq!(
+        catalog.totals()?.repositories,
+        before + 1,
+        "the repository the pull created moved the stored count in its own transaction"
+    );
+    assert_eq!(
+        catalog.totals()?,
+        catalog.count_summary()?,
+        "no pass ran between the pull and this read to settle it another way"
+    );
     Ok(())
 }
 
@@ -8838,7 +9300,7 @@ fn open_refuses_another_format() -> Result<()> {
     let native = directory.path().join("native");
     drop(catalog);
     stamp_format(&native, super::FORMAT_VERSION + 1)?;
-    match Catalog::open(&native) {
+    match Catalog::open(&native, IndexConfig::default().cache_mib) {
         Err(IndexError::CatalogFormat {
             directory: named,
             found,
@@ -8854,7 +9316,8 @@ fn open_refuses_another_format() -> Result<()> {
 }
 
 fn stamp_format(directory: &Path, format_version: u32) -> Result<()> {
-    let database = builder().open(models()?, directory.join("catalog.redb"))?;
+    let database = builder(IndexConfig::default().cache_mib)
+        .open(models()?, directory.join("catalog.redb"))?;
     let transaction = database.rw_transaction()?;
     let manifest: Manifest = transaction
         .get()
@@ -10316,7 +10779,7 @@ mod recovery {
             });
             assert!(text.contains(KILLED), "the harness killed the walk at {at}");
             assert!(
-                Catalog::open(&native).is_err(),
+                Catalog::open(&native, IndexConfig::default().cache_mib).is_err(),
                 "a walk that never wrote a manifest is not a catalog"
             );
 
@@ -10376,7 +10839,7 @@ mod recovery {
             );
             drop(catalog);
 
-            let resumed = Catalog::open(&native)?;
+            let resumed = Catalog::open(&native, IndexConfig::default().cache_mib)?;
             rescanned(&resumed, &config)?;
             is_consistent(&resumed)?;
             assert_eq!(
@@ -10391,7 +10854,7 @@ mod recovery {
             );
             drop(resumed);
 
-            let copied = Catalog::open(&snapshot)?;
+            let copied = Catalog::open(&snapshot, IndexConfig::default().cache_mib)?;
             rescanned(&copied, &config)?;
             is_consistent(&copied)?;
             assert_eq!(
@@ -10470,7 +10933,7 @@ mod recovery {
         assert!(text.contains(KILLED), "the harness killed the hash pass");
         drop(catalog);
 
-        let resumed = Catalog::open(&native)?;
+        let resumed = Catalog::open(&native, IndexConfig::default().cache_mib)?;
         owed_hashes_match_the_entries(&resumed)?;
         let left = resumed.pending_hashes()?;
         assert!(
@@ -10523,7 +10986,7 @@ mod recovery {
         );
         drop(catalog);
 
-        let resumed = Catalog::open(&native)?;
+        let resumed = Catalog::open(&native, IndexConfig::default().cache_mib)?;
         assert_eq!(
             resumed.refresh_search(|_| {})?,
             0,
@@ -10676,7 +11139,7 @@ mod recovery {
             );
             drop(catalog);
 
-            let reopened = Catalog::open(&native)?;
+            let reopened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
             assert_eq!(
                 index_directories(&native)?,
                 vec![published.clone().unwrap_or_default()],
@@ -10783,13 +11246,13 @@ mod recovery {
             killed.entries.len() > before.entries.len(),
             "the commits the walk made before the kill are on record"
         );
-        assert_ne!(
+        assert_eq!(
             killed.totals, killed.counted,
-            "the totals are behind the records the kill left"
+            "each transaction folded its own difference, so the kill leaves nothing behind"
         );
         drop(catalog);
 
-        let reopened = Catalog::open(&native)?;
+        let reopened = Catalog::open(&native, IndexConfig::default().cache_mib)?;
         let settled = fingerprint(&reopened)?;
         assert_eq!(
             settled.entries, killed.entries,
@@ -10802,7 +11265,7 @@ mod recovery {
         owed_hashes_match_the_entries(&reopened)?;
         drop(reopened);
 
-        let copied = Catalog::open(&snapshot)?;
+        let copied = Catalog::open(&snapshot, IndexConfig::default().cache_mib)?;
         assert_eq!(
             fingerprint(&copied)?.entries.len(),
             killed.entries.len(),

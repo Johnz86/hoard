@@ -346,6 +346,7 @@ impl Catalog {
         }
         log_changes(&transaction, counters)?;
         counters.derived.flush(&transaction)?;
+        counters.settle_summary(&transaction)?;
         transaction.commit()?;
         Ok(merged)
     }

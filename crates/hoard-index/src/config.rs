@@ -83,6 +83,10 @@ fn default_reconcile_interval() -> u64 {
     3600
 }
 
+pub(crate) fn default_cache_mib() -> usize {
+    256
+}
+
 /// The `[index]` section of `hoard.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexConfig {
@@ -109,6 +113,13 @@ pub struct IndexConfig {
     /// How many files a hashing pass reads at once. Zero means the rayon pool's size.
     #[serde(default)]
     pub hash_threads: usize,
+    /// The redb page cache, in mebibytes. Turning it down bounds what one open catalog
+    /// holds in memory for pages it has already read, at the cost of rereading them from
+    /// disk more often. Zero means the default, the same way `hash_threads = 0` means the
+    /// rayon pool's size; use [`IndexConfig::cache_mib_or_default`] rather than this field
+    /// wherever a catalog is opened.
+    #[serde(default = "default_cache_mib")]
+    pub cache_mib: usize,
     #[serde(default, rename = "sources")]
     pub sources: Vec<SourceConfig>,
 }
@@ -123,6 +134,7 @@ impl Default for IndexConfig {
             watch: true,
             reconcile_interval_secs: default_reconcile_interval(),
             hash_threads: 0,
+            cache_mib: default_cache_mib(),
             sources: Vec::new(),
         }
     }
@@ -180,6 +192,15 @@ impl IndexConfig {
             threads => threads,
         }
         .clamp(1, 256)
+    }
+
+    /// The redb page cache a catalog opens with: `cache_mib`, or the default when it is
+    /// zero. Every path that opens a catalog reads this rather than `cache_mib` directly.
+    pub fn cache_mib_or_default(&self) -> usize {
+        match self.cache_mib {
+            0 => default_cache_mib(),
+            mib => mib,
+        }
     }
 }
 
@@ -254,6 +275,48 @@ mod tests {
         assert_eq!(
             parsed.hash_threads, 0,
             "a config that names no hash_threads gets the serde default"
+        );
+    }
+
+    #[test]
+    fn cache_mib_defaults_to_256_and_is_taken_literally() {
+        assert_eq!(IndexConfig::default().cache_mib, 256);
+        let parsed: IndexConfig =
+            toml::from_str("hash_policy = \"never\"\n").expect("an [index] section parses");
+        assert_eq!(
+            parsed.cache_mib, 256,
+            "a config that names no cache_mib gets the serde default"
+        );
+
+        let sized: IndexConfig =
+            toml::from_str("cache_mib = 64\n").expect("an [index] section parses");
+        assert_eq!(sized.cache_mib, 64, "a configured value is taken as is");
+    }
+
+    #[test]
+    fn cache_mib_of_zero_means_the_default_like_hash_threads_does() {
+        assert_eq!(
+            IndexConfig::default().cache_mib_or_default(),
+            256,
+            "the default is 256 either way"
+        );
+        let zeroed: IndexConfig =
+            toml::from_str("cache_mib = 0\n").expect("an [index] section parses");
+        assert_eq!(zeroed.cache_mib, 0, "the raw field can be literally zero");
+        assert_eq!(
+            zeroed.cache_mib_or_default(),
+            256,
+            "zero means the default, not a zero-sized cache"
+        );
+
+        let sized = IndexConfig {
+            cache_mib: 64,
+            ..IndexConfig::default()
+        };
+        assert_eq!(
+            sized.cache_mib_or_default(),
+            64,
+            "a non-zero value is taken as is"
         );
     }
 

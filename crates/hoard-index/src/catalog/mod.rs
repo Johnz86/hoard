@@ -129,6 +129,9 @@ pub struct Catalog {
     directory: PathBuf,
     search_cache: RwLock<Option<OpenIndex>>,
     search_lane: parking_lot::Mutex<()>,
+    /// The redb page cache this catalog was opened with, in mebibytes. Read back only by
+    /// tests, to prove a configured value reaches an opened catalog rather than only parsing.
+    cache_mib: usize,
 }
 
 /// The Tantivy index a catalog is currently serving, kept open so a query does not pay for
@@ -144,6 +147,7 @@ impl std::fmt::Debug for Catalog {
         formatter
             .debug_struct("Catalog")
             .field("directory", &self.directory)
+            .field("cache_mib", &self.cache_mib)
             .finish_non_exhaustive()
     }
 }
@@ -153,9 +157,11 @@ impl Catalog {
     /// rejected. What the process before this one left unfinished is settled here: the
     /// totals a killed pass left behind are counted again, and a search directory no
     /// manifest names is removed, because only a publish ever removes one and a build that
-    /// was killed publishes nothing.
-    pub fn open(directory: &Path) -> Result<Self> {
-        let (catalog, manifest) = Self::open_checked(directory)?;
+    /// was killed publishes nothing. `cache_mib` is the redb page cache to open with; a
+    /// caller with an `IndexConfig` passes `config.cache_mib_or_default()`, and one with
+    /// none passes `IndexConfig::default().cache_mib`.
+    pub fn open(directory: &Path, cache_mib: usize) -> Result<Self> {
+        let (catalog, manifest) = Self::open_checked(directory, cache_mib)?;
         catalog.seed_builtin_shelves()?;
         catalog.ensure_self_row(&manifest.node)?;
         catalog.settle_interrupted_pass()?;
@@ -166,17 +172,20 @@ impl Catalog {
     /// Opens an existing catalog for inspection: the format is checked and no catalog row is
     /// written. native_db opens every table in a committed write transaction as it opens the
     /// file, so the file's transaction id advances; nothing this catalog stores changes.
+    /// Opens with the default `cache_mib`, because inspection is the one caller with
+    /// genuinely no `IndexConfig` to read a configured one from.
     pub fn inspect(directory: &Path) -> Result<Self> {
-        Ok(Self::open_checked(directory)?.0)
+        Ok(Self::open_checked(directory, IndexConfig::default().cache_mib)?.0)
     }
 
-    fn open_checked(directory: &Path) -> Result<(Self, Manifest)> {
-        let database = builder().open(models()?, directory.join("catalog.redb"))?;
+    fn open_checked(directory: &Path, cache_mib: usize) -> Result<(Self, Manifest)> {
+        let database = builder(cache_mib).open(models()?, directory.join("catalog.redb"))?;
         let catalog = Self {
             database,
             directory: directory.to_path_buf(),
             search_cache: RwLock::new(None),
             search_lane: parking_lot::Mutex::new(()),
+            cache_mib,
         };
         let manifest = catalog.manifest()?;
         if manifest.format_version != FORMAT_VERSION {
@@ -201,7 +210,7 @@ impl Catalog {
     ) -> Result<Self> {
         let directory = config.native_path();
         let opened = match directory.join("catalog.redb").exists() {
-            true => Some(Self::open(&directory)),
+            true => Some(Self::open(&directory, config.cache_mib_or_default())),
             false => None,
         };
         let catalog = match opened {
@@ -329,6 +338,13 @@ impl Catalog {
         Ok(self.manifest()?.triage_confidence)
     }
 
+    /// The redb page cache this catalog was opened with, to prove a configured value reaches
+    /// an opened catalog rather than only parsing.
+    #[cfg(test)]
+    pub(super) fn opened_cache_mib(&self) -> usize {
+        self.cache_mib
+    }
+
     fn manifest(&self) -> Result<Manifest> {
         self.database
             .r_transaction()?
@@ -410,12 +426,10 @@ fn allocated_bytes(metadata: &std::fs::Metadata) -> u64 {
 }
 
 /// redb's own default page cache is 1 GiB, which is most of what a large scan reports as
-/// resident; the catalog trades that for a quarter of it.
-const CACHE_BYTES: usize = 256 * 1024 * 1024;
-
-pub(super) fn builder() -> Builder {
+/// resident; `[index] cache_mib` trades that for however much of it a caller configures.
+pub(super) fn builder(cache_mib: usize) -> Builder {
     let mut builder = Builder::new();
-    builder.set_cache_size(CACHE_BYTES);
+    builder.set_cache_size(cache_mib.saturating_mul(1024 * 1024));
     builder
 }
 

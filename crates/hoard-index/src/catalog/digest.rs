@@ -144,7 +144,7 @@ impl Catalog {
         log_changes(&transaction, &mut counters)?;
         counters.save(&transaction)?;
         transaction.commit()?;
-        self.summarise(&counters)?;
+        self.summarise()?;
         Ok(applied)
     }
 
@@ -205,9 +205,6 @@ impl Catalog {
             log_changes(&transaction, &mut counters)?;
             counters.save(&transaction)?;
             transaction.commit()?;
-        }
-        if removed > 0 {
-            self.summarise(&counters)?;
         }
         Ok(removed)
     }
