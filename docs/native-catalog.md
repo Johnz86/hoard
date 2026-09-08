@@ -18,6 +18,20 @@ transactions and secondary indexes on redb, so Hoard does not have to own an ind
 maintenance layer. Tantivy replaced SQLite's FTS5 as a disposable search index that is
 rebuilt from the native records alone, without re-reading a single source file.
 
+## Follow-up: consume artifact cleanup work
+
+Artifact sweeping and retirement recounts now consume the existing touched-ID set directly
+in 1,024-item transactions. They no longer copy the entire set into an additional vector.
+Summary capture does not requeue the IDs being processed, and the set's allocation is
+released after cleanup. The initial touched-ID set still grows with the pass; this is not
+a strict bound on all scan memory. No public API or stored format changed.
+
+Focused tests cover deduplication, taking work once, independent summary capture, empty
+sweeps, and cleanup/retirement across transaction boundaries. The 895-test workspace suite,
+build, Clippy with warnings denied, and formatting pass. No new scale measurements
+or benchmark artifacts were added. Next slice: stream repository totals during scan-stat
+updates instead of collecting every repository into a vector.
+
 ## Follow-up: transaction summary folding
 
 Artifact summary deltas now commit in the transaction that changes the records. The

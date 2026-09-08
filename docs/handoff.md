@@ -3,7 +3,20 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
-## Latest slice: transaction summary folding
+## Latest slice: consume artifact cleanup work
+
+Sweeping and retirement recounts consume the existing touched-ID set in 1,024-item batches,
+removing both full-size ID-vector copies. Capturing summary deltas no longer requeues
+cleanup work. The initial pass-wide set remains; this slice does not claim bounded total
+scan memory. Tests cover deduplication, empty work, summary capture, and both cleanup paths
+across batch boundaries. No benchmarks, archives, worktrees, or persistent fixtures added.
+Validation: 895 workspace tests passed, along with the workspace build, warning-free
+Clippy, and formatting. The test adjusted for Clippy was rerun successfully.
+
+**Next slice:** stream repository totals in `record_scan_stats` and `recount_source_counts`,
+replacing their full repository vectors with per-source accumulators.
+
+## Previous slice: transaction summary folding
 
 Summary snapshots now last for one write transaction instead of the whole scan/hash pass.
 Artifact mutations and their summary deltas commit or roll back together. Ingest and pull

@@ -775,18 +775,14 @@ impl Catalog {
         Ok(())
     }
 
-    /// Recounts, for every artifact this walk touched, how many present paths reach it, and
-    /// deletes the artifact and everything hanging off it once none does. A model split
-    /// across shards is reached once per complete copy of its files, not once per file.
-    /// The sweep commits in batches, because a fresh scan touches every artifact it wrote.
     pub(super) fn sweep_artifacts(&self, counters: &mut Counters) -> Result<()> {
-        let ids: Vec<i64> = counters.touched.iter().copied().collect();
-        for batch in ids.chunks(CHUNK) {
+        let mut ids = counters.take_touched().into_iter();
+        while ids.len() > 0 {
             let transaction = self.database.rw_transaction()?;
-            for id in batch {
-                counters.touch(&transaction, *id)?;
-                if sweep_artifact(&transaction, *id)? {
-                    counters.pending.push(*id);
+            for id in ids.by_ref().take(CHUNK) {
+                counters.capture_summary(&transaction, id)?;
+                if sweep_artifact(&transaction, id)? {
+                    counters.pending.push(id);
                 }
             }
             log_changes(&transaction, counters)?;
@@ -1422,7 +1418,7 @@ pub(super) struct Counters {
     repos: u64,
     pub(super) artifacts: u64,
     pub(super) entries: u64,
-    pub(super) touched: HashSet<i64>,
+    touched: HashSet<i64>,
     pub(super) pending: Vec<i64>,
     pub(super) derived: DerivedShift,
     triage: f32,
@@ -1656,6 +1652,18 @@ impl Counters {
 
     pub(super) fn touch(&mut self, transaction: &RwTransaction<'_>, id: i64) -> Result<()> {
         self.touched.insert(id);
+        self.capture_summary(transaction, id)
+    }
+
+    pub(super) fn take_touched(&mut self) -> HashSet<i64> {
+        std::mem::take(&mut self.touched)
+    }
+
+    pub(super) fn capture_summary(
+        &mut self,
+        transaction: &RwTransaction<'_>,
+        id: i64,
+    ) -> Result<()> {
         if let std::collections::hash_map::Entry::Vacant(slot) = self.before.entry(id) {
             let record: Option<ArtifactRecord> = transaction.get().primary(id)?;
             slot.insert(SummaryPart::of(record.as_ref(), self.triage));

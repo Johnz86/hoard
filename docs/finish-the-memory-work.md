@@ -4,9 +4,12 @@ Continuous hashing and metered index commits are delivered with repeated measure
 correctness tests, and passing scale/concurrency gates. Read the current results in
 [the native catalog report](native-catalog.md).
 
-The next focused slice adds transaction-scoped summary folding, verified by rollback,
+The following focused slice adds transaction-scoped summary folding, verified by rollback,
 repeated-touch, snapshot-lifetime, and interrupted-recovery tests. It has no new scale
 measurements; the previous performance evidence belongs to `51418ad`.
+
+Cleanup now also consumes touched-ID sets directly, avoiding full-size vector copies and
+requeueing during summary capture. Next: stream repository totals during scan-stat updates.
 
 This does not complete a strict memory bound for every workload. The remaining limits are
 source-wide retirement bookkeeping, pending usage batches, and oversized artifact groups.

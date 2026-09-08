@@ -10833,12 +10833,10 @@ fn a_catalog_counts_triage_against_the_threshold_it_was_scanned_with() -> Result
     Ok(())
 }
 
-#[test]
-fn a_rescan_retracts_more_paths_than_one_transaction_holds() -> Result<()> {
+fn csv_catalog_with_entries(total: usize) -> Result<(TempDir, Catalog, IndexConfig)> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("files");
     fs::create_dir(&input)?;
-    let total = super::scan::CHUNK + 7;
     for index in 0..total {
         fs::write(
             input.join(format!("row{index:05}.csv")),
@@ -10856,6 +10854,14 @@ fn a_rescan_retracts_more_paths_than_one_transaction_holds() -> Result<()> {
         HashPolicy::Never,
         |_, _| {},
     )?;
+    Ok((directory, catalog, config))
+}
+
+#[test]
+fn a_rescan_retracts_more_paths_than_one_transaction_holds() -> Result<()> {
+    let total = super::scan::CHUNK + 7;
+    let (directory, catalog, config) = csv_catalog_with_entries(total)?;
+    let input = directory.path().join("files");
     assert_eq!(catalog.totals()?.present_artifacts, total as u64);
 
     for index in 0..total {
@@ -11443,5 +11449,98 @@ fn summary_changes_roll_back_with_the_artifact_transaction() -> Result<()> {
     drop(transaction);
     assert_eq!(catalog.totals()?, before);
     assert_eq!(catalog.count_summary()?, before);
+    Ok(())
+}
+
+#[test]
+fn taking_touched_artifacts_deduplicates_and_summary_capture_does_not_requeue() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    let before = catalog.totals()?;
+    let mut counters = Counters::load(&catalog.database, catalog.stored_triage()?)?;
+    assert!(counters.take_touched().is_empty());
+    let transaction = catalog.database.rw_transaction()?;
+    for id in [ids.lora, ids.lora, ids.ckpt] {
+        counters.touch(&transaction, id.get())?;
+    }
+    counters.save(&transaction)?;
+    transaction.commit()?;
+    let touched = counters.take_touched();
+    assert_eq!(touched.len(), 2);
+    assert!(touched.contains(&ids.lora.get()));
+    assert!(touched.contains(&ids.ckpt.get()));
+    assert!(counters.take_touched().is_empty());
+
+    let transaction = catalog.database.rw_transaction()?;
+    counters.capture_summary(&transaction, ids.lora.get())?;
+    let mut record: ArtifactRecord = transaction
+        .get()
+        .primary(ids.lora.get())?
+        .ok_or_else(|| IndexError::Catalog("the seeded artifact is missing".into()))?;
+    record.artifact.size += 1024;
+    transaction.upsert(record)?;
+    counters.capture_summary(&transaction, ids.lora.get())?;
+    counters.save(&transaction)?;
+    transaction.commit()?;
+    assert_eq!(catalog.totals()?.indexed_bytes, before.indexed_bytes + 1024);
+    assert_eq!(catalog.totals()?, catalog.count_summary()?);
+    assert!(counters.take_touched().is_empty());
+    assert!(counters.holds_no_summary_snapshot());
+
+    let transaction = catalog.database.rw_transaction()?;
+    counters.touch(&transaction, ids.lora.get())?;
+    counters.save(&transaction)?;
+    transaction.commit()?;
+    assert_eq!(counters.take_touched(), [ids.lora.get()].into());
+    Ok(())
+}
+
+#[test]
+fn sweeping_consumes_touched_work_across_transaction_boundaries() -> Result<()> {
+    let total = super::scan::CHUNK + 7;
+    let (_directory, catalog, _config) = csv_catalog_with_entries(total)?;
+    let before = catalog.totals()?;
+    let mut counters = Counters::load(&catalog.database, catalog.stored_triage()?)?;
+    let transaction = catalog.database.rw_transaction()?;
+    for id in artifact_ids(&catalog)? {
+        counters.touch(&transaction, id)?;
+    }
+    counters.save(&transaction)?;
+    transaction.commit()?;
+    catalog.sweep_artifacts(&mut counters)?;
+    assert!(counters.take_touched().is_empty());
+    assert!(counters.holds_no_summary_snapshot());
+    assert_eq!(catalog.totals()?, before);
+    assert_eq!(catalog.count_summary()?, before);
+    catalog.sweep_artifacts(&mut counters)?;
+    assert_eq!(catalog.totals()?, before);
+    Ok(())
+}
+
+#[test]
+fn retirement_recounts_every_artifact_across_transaction_boundaries() -> Result<()> {
+    let total = super::scan::CHUNK + 7;
+    let (_directory, catalog, _config) = csv_catalog_with_entries(total)?;
+    let read = catalog.database.r_transaction()?;
+    let ids = read
+        .scan()
+        .primary::<Entry>()?
+        .all()?
+        .map(|entry| Ok(EntryId::new(entry?.id)))
+        .collect::<Result<Vec<_>>>()?;
+    drop(read);
+    assert_eq!(ids.len(), total);
+    assert_eq!(catalog.retire_entries(&ids)?, total);
+    assert_eq!(catalog.totals()?.artifacts, total as u64);
+    assert_eq!(catalog.totals()?.present_artifacts, 0);
+    assert_eq!(catalog.totals()?, catalog.count_summary()?);
+    let read = catalog.database.r_transaction()?;
+    for entry in read.scan().primary::<Entry>()?.all()? {
+        assert_eq!(entry?.state, State::Remote);
+    }
+    for artifact in read.scan().primary::<ArtifactRecord>()?.all()? {
+        assert_eq!(artifact?.path_count, 0);
+    }
+    drop(read);
+    assert_eq!(catalog.retire_entries(&ids)?, 0);
     Ok(())
 }

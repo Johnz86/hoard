@@ -154,17 +154,13 @@ impl Catalog {
         Ok(retired)
     }
 
-    /// Recounts what each artifact a retirement touched still holds, and moves the totals by
-    /// the difference. The record stays whatever the count reaches: a retired path is a path
-    /// this catalog still remembers, which is the difference between evicting bytes and
-    /// forgetting a file.
     fn recount_retired_paths(&self, counters: &mut Counters) -> Result<()> {
-        let ids: Vec<i64> = counters.touched.iter().copied().collect();
-        for batch in ids.chunks(CHUNK) {
+        let mut ids = counters.take_touched().into_iter();
+        while ids.len() > 0 {
             let transaction = self.database.rw_transaction()?;
-            for id in batch {
-                counters.touch(&transaction, *id)?;
-                let stored: Option<ArtifactRecord> = transaction.get().primary(*id)?;
+            for id in ids.by_ref().take(CHUNK) {
+                counters.capture_summary(&transaction, id)?;
+                let stored: Option<ArtifactRecord> = transaction.get().primary(id)?;
                 let Some(record) = stored else {
                     continue;
                 };
