@@ -14,12 +14,12 @@ use super::hashing::content_key;
 use super::ingest::IngestRecord;
 use super::models::{
     ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, LocationKey, Placement,
-    Repository, RepositoryKey, Revision, SearchText, Source, Summary, entry_at, placement_in,
+    Repository, RepositoryKey, Revision, SearchText, Source, entry_at, placement_in,
     repository_key, store_revision_card,
 };
 use super::scan::{
     Counters, RecordFacts, log_changes, log_revision_artifacts, next_id, preference, record_of,
-    tensor_keys,
+    settle_repositories, tensor_keys,
 };
 
 /// The source every file pulled from a peer is filed under.
@@ -69,6 +69,7 @@ impl Catalog {
         let repo_id = pull_repository(&transaction, &mut counters, repo, root)?;
         let ordinal = pull_revision(&transaction, repo_id, revision)?;
         counters.save(&transaction)?;
+        settle_repositories(&transaction)?;
         transaction.commit()?;
         Ok(PullSlot {
             repo: RepoRowId::new(repo_id),
@@ -126,7 +127,7 @@ impl Catalog {
         let mut counters = Counters::load(&self.database, threshold)?;
         let transaction = self.database.rw_transaction()?;
         let identity = content_key(&file.sha256);
-        let (artifact_id, created) = filed_artifact(&transaction, &mut counters, file, identity)?;
+        let artifact_id = filed_artifact(&transaction, &mut counters, file, identity)?;
         if let Some(readme) = &file.sniff.readme
             && is_revision_card(&transaction, file.slot, file.rel_path)?
             && store_revision_card(
@@ -178,15 +179,9 @@ impl Catalog {
         };
         counters.derived.added(&entry);
         transaction.upsert(entry)?;
-        if created {
-            count_artifact(
-                &transaction,
-                file.sniff.size,
-                file.inference.role_confidence < threshold,
-            )?;
-        }
         log_changes(&transaction, &mut counters)?;
         counters.save(&transaction)?;
+        settle_repositories(&transaction)?;
         transaction.commit()?;
         Ok(IngestRecord {
             entry: EntryId::new(id),
@@ -364,19 +359,21 @@ fn filed_artifact(
     counters: &mut Counters,
     file: &PulledFile<'_>,
     identity: u128,
-) -> Result<(i64, bool)> {
+) -> Result<i64> {
     let stored: Option<ArtifactRecord> = transaction
         .get()
         .secondary(ArtifactRecordKey::identity, identity)?;
     if let Some(stored) = stored {
+        counters.touch(transaction, stored.id)?;
         let path_count = stored.path_count.saturating_add(1);
         transaction.upsert(ArtifactRecord {
             path_count,
             ..stored
         })?;
-        return Ok((stored.id, false));
+        return Ok(stored.id);
     }
     let id = next_id(&mut counters.artifacts)?;
+    counters.touch(transaction, id)?;
     let name = file
         .abs_path
         .file_name()
@@ -402,39 +399,12 @@ fn filed_artifact(
     })?;
     transaction.upsert(detail)?;
     transaction.upsert(record)?;
-    Ok((id, true))
+    Ok(id)
 }
 
 fn repo_of(transaction: &RwTransaction<'_>, slot: PullSlot) -> Result<Option<RepoId>> {
     let stored: Option<Repository> = transaction.get().primary(slot.repo.get())?;
     Ok(stored.map(|stored| stored.repo))
-}
-
-/// What the stats screen prints, moved by the one record this call wrote rather than
-/// recounted: a pull runs once per fetched file.
-fn count_artifact(transaction: &RwTransaction<'_>, size: u64, triage: bool) -> Result<()> {
-    let stored: Option<Summary> = transaction.get().primary(0_u8)?;
-    let mut summary = stored.unwrap_or(Summary {
-        id: 0,
-        reclaimable_bytes: 0,
-        duplicate_artifacts: 0,
-        artifacts: 0,
-        present_artifacts: 0,
-        triage_artifacts: 0,
-        indexed_bytes: 0,
-        repositories: 0,
-        advertised_artifacts: 0,
-    });
-    summary.artifacts += 1;
-    summary.present_artifacts += 1;
-    summary.advertised_artifacts += 1;
-    summary.indexed_bytes = summary.indexed_bytes.saturating_add(size);
-    if triage {
-        summary.triage_artifacts += 1;
-    }
-    summary.repositories = transaction.len().primary::<Repository>()?;
-    transaction.upsert(summary)?;
-    Ok(())
 }
 
 /// The row already at the path a pull is landing on.

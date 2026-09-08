@@ -318,6 +318,7 @@ impl Catalog {
                         sweep_taken(&transaction, taken, counters)?;
                         log_changes(&transaction, counters)?;
                         counters.derived.flush(&transaction)?;
+                        counters.settle_summary(&transaction)?;
                         transaction.commit()?;
                         progress(&source.name, counters.entries);
                     }
@@ -426,6 +427,7 @@ impl Catalog {
         let at = jiff::Timestamp::now().to_string();
         let transaction = self.database.rw_transaction()?;
         counters.derived.flush(&transaction)?;
+        counters.settle_summary(&transaction)?;
         let repositories: Vec<Repository> = transaction
             .scan()
             .primary()?
@@ -537,6 +539,7 @@ impl Catalog {
             transaction.upsert(repository(id, &source.name, repo, present, revisions))?;
             walked.push(WalkedRepo { id, ordinals });
         }
+        settle_repositories(&transaction)?;
         transaction.commit()?;
         Ok(walked)
     }
@@ -624,6 +627,7 @@ impl Catalog {
                 sweep_taken(&transaction, taken, counters)?;
                 log_changes(&transaction, counters)?;
                 counters.derived.flush(&transaction)?;
+                counters.settle_summary(&transaction)?;
                 transaction.commit()?;
             }
             self.forget_usage_of(repo_id)?;
@@ -765,6 +769,7 @@ impl Catalog {
             sweep_taken(&transaction, taken, counters)?;
             log_changes(&transaction, counters)?;
             counters.derived.flush(&transaction)?;
+            counters.settle_summary(&transaction)?;
             transaction.commit()?;
         }
         Ok(())
@@ -779,35 +784,21 @@ impl Catalog {
         for batch in ids.chunks(CHUNK) {
             let transaction = self.database.rw_transaction()?;
             for id in batch {
+                counters.touch(&transaction, *id)?;
                 if sweep_artifact(&transaction, *id)? {
                     counters.pending.push(*id);
                 }
             }
             log_changes(&transaction, counters)?;
+            counters.settle_summary(&transaction)?;
             transaction.commit()?;
         }
-        self.summarise(counters)
+        self.summarise()
     }
 
-    /// Moves what the facet rail reads as DISK PRESSURE and what the stats route prints as
-    /// its totals by the difference this pass made, reading only the records it touched. A
-    /// pass that touched nothing writes nothing.
-    pub(super) fn summarise(&self, counters: &Counters) -> Result<()> {
-        let read = self.database.r_transaction()?;
-        let stored: Option<Summary> = read.get().primary(0_u8)?;
-        let mut summary = stored.clone().unwrap_or_else(blank_summary);
-        for (id, before) in &counters.before {
-            let record: Option<ArtifactRecord> = read.get().primary(*id)?;
-            let after = SummaryPart::of(record.as_ref(), counters.triage);
-            shift_summary(&mut summary, *before, after);
-        }
-        summary.repositories = read.len().primary::<Repository>()?;
-        drop(read);
-        if stored.as_ref() == Some(&summary) {
-            return Ok(());
-        }
+    pub(super) fn summarise(&self) -> Result<()> {
         let transaction = self.database.rw_transaction()?;
-        transaction.upsert(summary)?;
+        settle_repositories(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -1663,9 +1654,6 @@ impl Counters {
         })
     }
 
-    /// Records that this pass is about to change an artifact, keeping what its record
-    /// contributed to the summary beforehand so the pass moves the summary by a difference
-    /// rather than counting every record again. Call it before the record is written.
     pub(super) fn touch(&mut self, transaction: &RwTransaction<'_>, id: i64) -> Result<()> {
         self.touched.insert(id);
         if let std::collections::hash_map::Entry::Vacant(slot) = self.before.entry(id) {
@@ -1675,10 +1663,31 @@ impl Counters {
         Ok(())
     }
 
-    /// Writes the allocator and the present counts this pass moved, which is why every
-    /// writer commits through it.
+    pub(super) fn settle_summary(&mut self, transaction: &RwTransaction<'_>) -> Result<()> {
+        if self.before.is_empty() {
+            return Ok(());
+        }
+        let stored: Option<Summary> = transaction.get().primary(0_u8)?;
+        let mut summary = stored.clone().unwrap_or_else(blank_summary);
+        for (id, before) in self.before.drain() {
+            let record: Option<ArtifactRecord> = transaction.get().primary(id)?;
+            let after = SummaryPart::of(record.as_ref(), self.triage);
+            shift_summary(&mut summary, before, after);
+        }
+        if stored.as_ref() != Some(&summary) {
+            transaction.upsert(summary)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn holds_no_summary_snapshot(&self) -> bool {
+        self.before.is_empty()
+    }
+
     pub(super) fn save(&mut self, transaction: &RwTransaction<'_>) -> Result<()> {
         self.derived.flush(transaction)?;
+        self.settle_summary(transaction)?;
         transaction.upsert(Allocator {
             id: 0,
             repos: self.repos,
@@ -2713,6 +2722,16 @@ pub(super) fn record_of(facts: RecordFacts<'_>) -> (ArtifactRecord, ArtifactDeta
     };
     let detail = ArtifactDetail::new(id, tensors, inference.evidence.clone());
     (record, detail)
+}
+
+pub(super) fn settle_repositories(transaction: &RwTransaction<'_>) -> Result<()> {
+    let stored: Option<Summary> = transaction.get().primary(0_u8)?;
+    let mut summary = stored.clone().unwrap_or_else(blank_summary);
+    summary.repositories = transaction.len().primary::<Repository>()?;
+    if stored.as_ref() != Some(&summary) {
+        transaction.upsert(summary)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

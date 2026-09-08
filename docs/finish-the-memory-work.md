@@ -2,7 +2,11 @@
 
 Continuous hashing and metered index commits are delivered with repeated measurements,
 correctness tests, and passing scale/concurrency gates. Read the current results in
-[the native catalog report](native-catalog.md#memory-verification-2026-09-08).
+[the native catalog report](native-catalog.md).
+
+The next focused slice adds transaction-scoped summary folding, verified by rollback,
+repeated-touch, snapshot-lifetime, and interrupted-recovery tests. It has no new scale
+measurements; the previous performance evidence belongs to `51418ad`.
 
 This does not complete a strict memory bound for every workload. The remaining limits are
 source-wide retirement bookkeeping, pending usage batches, and oversized artifact groups.
@@ -13,8 +17,8 @@ The immutable baseline is `bdf2964f954f2612c5a2a0ab4d33b9361aef8e00`. Recovery t
 `04adbd767d8cc9cbfbcf45ef1cf048bb168cba17`; it remains an experimental input.
 Its format-8 recovery cannot safely replace a populated format-7 catalog.
 
-Any further work must isolate its contribution before retention: summary folding separately
-from grouped discovery, and usage rekeying separately from reindex coalescing. Preserving
+Any further work must isolate its contribution: grouped discovery remains separate from
+summary folding, and usage rekeying from reindex coalescing. Preserving
 usage history, overrides, shelves, and pins is required before a schema change. Inconclusive
 or unmeasured components stay out. Never use the user's catalog for experiments.
 

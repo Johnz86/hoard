@@ -3,7 +3,21 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
-## Memory delivery, 2026-09-08
+## Latest slice: transaction summary folding
+
+Summary snapshots now last for one write transaction instead of the whole scan/hash pass.
+Artifact mutations and their summary deltas commit or roll back together. Ingest and pull
+writers share that path instead of maintaining separate artifact-counting implementations.
+Repository-count settlement uses one write transaction. No schema or public API changed.
+
+The full suite passes with 892 tests, including four new summary tests and stronger
+interrupted scan/hash assertions. Workspace build, Clippy with warnings denied, and
+formatting pass. This follow-up deliberately adds no scale benchmarks,
+archives, worktrees, or generated datasets. The measurements below belong to `51418ad`;
+they are not measurements of this slice. Grouped discovery, usage/schema work, pass-wide
+touched-ID bookkeeping, and oversized artifact groups remain unresolved.
+
+## Memory delivery, 2026-09-08 (commit `51418ad`)
 
 Delivered continuous hashing and metered index commits, recovered selectively from
 `fef969a` against immutable baseline `bdf2964`. Mixed-size hashing reaches its cancellation

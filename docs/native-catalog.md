@@ -18,6 +18,23 @@ transactions and secondary indexes on redb, so Hoard does not have to own an ind
 maintenance layer. Tantivy replaced SQLite's FTS5 as a disposable search index that is
 rebuilt from the native records alone, without re-reading a single source file.
 
+## Follow-up: transaction summary folding
+
+Artifact summary deltas now commit in the transaction that changes the records. The
+temporary `Counters::before` map is drained after each fold and reuses its allocation;
+its size follows the largest write transaction rather than every artifact in the pass.
+Scan, hash, ingest, pull, retirement, and override writers use the same folding path.
+Repository-count settlement reads and writes under one write transaction, avoiding a
+stale summary overwrite. Catalog format and public APIs remain unchanged.
+
+Four additional tests cover repeated touches across transactions, clearing the snapshot
+map, rollback of artifact and summary changes together, and repository creation by a pull.
+Interrupted scan/hash tests also check committed totals before recovery. The workspace
+suite passes (892 tests). This slice uses correctness checks and the directly tested map
+lifetime; no new scale measurements or performance percentage claims are made. The tables
+below describe commit `51418ad`, before this follow-up. Grouped discovery, usage changes,
+the pass-wide touched-ID set, and oversized index groups remain outside this slice.
+
 ## Memory verification, 2026-09-08
 
 Delivered **continuous hashing and metered index commits**. Summary folding, grouped

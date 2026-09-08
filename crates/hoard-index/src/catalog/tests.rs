@@ -22,7 +22,7 @@ use super::models::{
     Allocator, ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE,
     LocationKey, Manifest, Node, Placement, Repository, RepositoryKey, SearchChange, Shelf, Source,
 };
-use super::scan::{Presence, identity, location_hash, preference};
+use super::scan::{Counters, Presence, identity, location_hash, preference};
 use super::search::{Cost, INDEX_FLUSH_BYTES, Paging, QueryPath};
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::usage::{HISTORY_DAYS, Window};
@@ -10132,6 +10132,11 @@ mod recovery {
             catalog.hash_pending(&config, |_| progress())
         });
         assert!(text.contains(KILLED), "the harness killed the hash pass");
+        assert_eq!(
+            catalog.totals()?,
+            catalog.count_summary()?,
+            "committed hash merges have matching summary deltas before recovery"
+        );
         drop(catalog);
 
         let resumed = Catalog::open(&native)?;
@@ -10447,9 +10452,9 @@ mod recovery {
             killed.entries.len() > before.entries.len(),
             "the commits the walk made before the kill are on record"
         );
-        assert_ne!(
+        assert_eq!(
             killed.totals, killed.counted,
-            "the totals are behind the records the kill left"
+            "the totals are committed with the records the kill left"
         );
         drop(catalog);
 
@@ -11267,5 +11272,176 @@ fn a_retired_repository_forgets_more_pulls_than_one_transaction_holds() -> Resul
     drop(read);
     assert_eq!(catalog.distinct_clients(row.repo_id)?, 0);
     assert!(catalog.recent_pulls(row.repo_id, 20)?.is_empty());
+    Ok(())
+}
+
+fn rewrite_hf_cache_file(
+    root: &Path,
+    repository: (&str, &str),
+    rel_path: &str,
+    blob_prefix: &str,
+    content: &[u8],
+) -> Result<()> {
+    let (org, name) = repository;
+    let repo = root.join(format!("models--{org}--{name}"));
+    let blob = repo.join("blobs").join(blob_prefix.repeat(64));
+    fs::write(&blob, content)?;
+    let link = repo.join("snapshots").join("b".repeat(40)).join(rel_path);
+    fs::remove_file(&link)?;
+    std::os::unix::fs::symlink(&blob, &link)?;
+    Ok(())
+}
+
+#[test]
+
+fn the_summary_is_exact_when_a_pass_touches_an_artifact_more_than_once() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let shared = lora_header_named("shared");
+    hf_cache_repo(
+        &hub,
+        "acme",
+        "one",
+        &[("adapter.safetensors", shared.clone())],
+    )?;
+    hf_cache_repo(
+        &hub,
+        "acme",
+        "two",
+        &[("adapter.safetensors", shared.clone())],
+    )?;
+    let config = hub_config(&hub);
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    assert_eq!(
+        catalog.totals()?,
+        catalog.count_summary()?,
+        "two copies discovered by one pass, in two transactions, telescope to the same total"
+    );
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "")?;
+    assert_eq!(rows.total, 1, "identical content is one artifact");
+    assert_eq!(rows.rows[0].path_count, 2);
+
+    let moved = lora_header_named("moved");
+    rewrite_hf_cache_file(&hub, ("acme", "one"), "adapter.safetensors", "e", &moved)?;
+    rewrite_hf_cache_file(&hub, ("acme", "two"), "adapter.safetensors", "e", &moved)?;
+    let report = catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    assert_eq!(report.changed, 2, "both copies were rewritten");
+
+    assert_eq!(
+        catalog.totals()?,
+        catalog.count_summary()?,
+        "the old artifact lost its second and then its last path in two transactions of one rescan"
+    );
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "")?;
+    assert_eq!(rows.total, 1, "the rewritten copies are one artifact again");
+    assert_eq!(rows.rows[0].path_count, 2);
+    Ok(())
+}
+
+#[test]
+
+fn a_pass_holds_no_summary_snapshot_once_its_transaction_commits() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("models");
+    fs::create_dir_all(&input)?;
+    for index in 0..4 {
+        fs::write(
+            input.join(format!("w{index}.safetensors")),
+            lora_header_named(&format!("t{index}")),
+        )?;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let ids = artifact_ids(&catalog)?;
+    assert!(ids.len() >= 2, "the fixture needs more than one artifact");
+    let triage = catalog.stored_triage()?;
+    let mut counters = Counters::load(&catalog.database, triage)?;
+    for id in &ids {
+        let transaction = catalog.database.rw_transaction()?;
+        counters.touch(&transaction, *id)?;
+        counters.settle_summary(&transaction)?;
+        transaction.commit()?;
+        assert!(
+            counters.holds_no_summary_snapshot(),
+            "the snapshot for artifact {id} outlived the transaction that settled it"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+
+fn a_pull_that_creates_a_repository_settles_the_count_in_the_same_transaction() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = Catalog::open_or_scan(
+        &IndexConfig {
+            data_dir: directory.path().join("native"),
+            ..IndexConfig::default()
+        },
+        "workstation",
+        |_, _| {},
+    )?;
+    let before = catalog.totals()?.repositories;
+    let repo = RepoId::parse_ref(RepoType::Models, "kohya/film-grain")?;
+    let root = directory.path().join("pulled");
+    catalog.pull_slot(&repo, CommitSha::from_bytes([0x22; 20]), &root)?;
+    assert_eq!(
+        catalog.totals()?.repositories,
+        before + 1,
+        "the repository the pull created moved the stored count in its own transaction"
+    );
+    assert_eq!(
+        catalog.totals()?,
+        catalog.count_summary()?,
+        "no pass ran between the pull and this read to settle it another way"
+    );
+    Ok(())
+}
+
+#[test]
+fn summary_changes_roll_back_with_the_artifact_transaction() -> Result<()> {
+    let (_directory, catalog, ids) = seeded_catalog()?;
+    let before = catalog.totals()?;
+    let mut counters = Counters::load(&catalog.database, catalog.stored_triage()?)?;
+    let transaction = catalog.database.rw_transaction()?;
+    let mut record: ArtifactRecord = transaction
+        .get()
+        .primary(ids.lora.get())?
+        .ok_or_else(|| IndexError::Catalog("the seeded artifact is missing".into()))?;
+    counters.touch(&transaction, record.id)?;
+    record.artifact.size += 1024;
+    transaction.upsert(record)?;
+    counters.save(&transaction)?;
+    let staged: models::Summary = transaction
+        .get()
+        .primary(0_u8)?
+        .ok_or_else(|| IndexError::Catalog("the staged summary is missing".into()))?;
+    assert_eq!(staged.indexed_bytes, before.indexed_bytes + 1024);
+    drop(transaction);
+    assert_eq!(catalog.totals()?, before);
+    assert_eq!(catalog.count_summary()?, before);
     Ok(())
 }

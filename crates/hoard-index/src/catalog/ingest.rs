@@ -11,12 +11,12 @@ use crate::infer::{InferInput, infer};
 use super::hashing::content_key;
 use super::models::{
     ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, LocationKey, Placement,
-    Repository, RepositoryKey, Revision, SearchText, Source, Summary, entry_at, repository_key,
+    Repository, RepositoryKey, Revision, SearchText, Source, entry_at, repository_key,
 };
 use super::read::Reader;
 use super::scan::{
     CHUNK, Counters, RecordFacts, log_changes, next_id, paths_of_artifact, preference,
-    present_paths, record_of, tensor_keys,
+    present_paths, record_of, settle_repositories, tensor_keys,
 };
 use super::{Catalog, EntryDetail};
 
@@ -63,6 +63,7 @@ impl Catalog {
         };
         log_changes(&transaction, &mut counters)?;
         counters.save(&transaction)?;
+        settle_repositories(&transaction)?;
         transaction.commit()?;
         Ok(record)
     }
@@ -162,6 +163,7 @@ impl Catalog {
         for batch in ids.chunks(CHUNK) {
             let transaction = self.database.rw_transaction()?;
             for id in batch {
+                counters.touch(&transaction, *id)?;
                 let stored: Option<ArtifactRecord> = transaction.get().primary(*id)?;
                 let Some(record) = stored else {
                     continue;
@@ -177,9 +179,10 @@ impl Catalog {
                     })?;
                 }
             }
+            counters.settle_summary(&transaction)?;
             transaction.commit()?;
         }
-        self.summarise(counters)
+        self.summarise()
     }
 }
 
@@ -248,9 +251,6 @@ impl Ingesting<'_, '_> {
         }
         self.counters.derived.added(&entry);
         self.transaction.upsert(entry)?;
-        if let Some(found) = classified.as_ref().filter(|found| found.created) {
-            self.count_artifact(file.size, found.triage)?;
-        }
         Ok(IngestRecord {
             entry: EntryId::new(entry_id),
             artifact: artifact_id.map(ArtifactId::new),
@@ -417,33 +417,6 @@ impl Ingesting<'_, '_> {
             path_count,
             ..stored
         })?;
-        Ok(())
-    }
-
-    /// What the stats screen prints, moved by the one record this call wrote rather than
-    /// recounted: an ingest runs once per fetched file.
-    fn count_artifact(&mut self, size: u64, triage: bool) -> Result<()> {
-        let stored: Option<Summary> = self.transaction.get().primary(0_u8)?;
-        let mut summary = stored.unwrap_or(Summary {
-            id: 0,
-            reclaimable_bytes: 0,
-            duplicate_artifacts: 0,
-            artifacts: 0,
-            present_artifacts: 0,
-            triage_artifacts: 0,
-            indexed_bytes: 0,
-            repositories: 0,
-            advertised_artifacts: 0,
-        });
-        summary.artifacts += 1;
-        summary.present_artifacts += 1;
-        summary.advertised_artifacts += 1;
-        summary.indexed_bytes = summary.indexed_bytes.saturating_add(size);
-        if triage {
-            summary.triage_artifacts += 1;
-        }
-        summary.repositories = self.transaction.len().primary::<Repository>()?;
-        self.transaction.upsert(summary)?;
         Ok(())
     }
 
