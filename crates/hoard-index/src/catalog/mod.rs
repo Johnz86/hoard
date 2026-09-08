@@ -46,7 +46,7 @@ pub use self::read::{
     RepositoryPage, RevisionDetail, SourceRecord, TriageItem,
 };
 pub use self::scan::{RescanReport, RescanScope};
-pub use self::search::{QueryPage, QueryRequest};
+pub use self::search::{QueryPage, QueryRequest, RefreshReport};
 #[cfg(any(test, feature = "fixtures"))]
 pub use self::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 pub use self::usage::{ArtifactUsage, PullRow, UsageDay, UsageEvent, UsageReport};

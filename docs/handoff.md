@@ -3,26 +3,50 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Memory delivery, 2026-09-08
+
+Delivered continuous hashing and metered index commits, recovered selectively from
+`fef969a` against immutable baseline `bdf2964`. Mixed-size hashing reaches its cancellation
+checkpoint in 9.4 ms versus 570–574 ms; large-card rebuild memory is 350–382 MiB versus
+744–772 MiB. Metering adds some rebuild overhead on small records. All final 100k/1M
+measurements and the eight-request direct/HTTP gates pass; the selected HTTP maximum is
+102.93 ms. See [the report](native-catalog.md#memory-verification-2026-09-08) for boundaries,
+tradeoffs, exact source hashes, commands, and the single compressed evidence archive.
+
+Final checks: 888 tests passed, workspace build, warning-free Clippy, formatting, actual
+CLI/server smoke tests, cancellation/resume/hash equivalence, collapse/deletion refresh,
+and interrupted publication/replay. The ignored measurement fixtures actually ran.
+
+Format stays 7. No usage schema, event overload behavior, or source discovery change is
+retained. Summary folding lacks isolated evidence and was removed. Usage rekeying and
+writer/coalescing changes are deferred: format-8 recovery deletes and rescans rather than
+preserving the existing catalog. Source-wide retirement bookkeeping, pending usage batches,
+and oversized artifact groups remain unresolved; the full memory redesign is not complete.
+
+All task-created worktrees, binaries, synthetic catalogs, and the external
+`/home/johnz86/.cache/hoard-memory-evidence` directory have been removed. No experimental
+branch remains and nothing was pushed. No user's catalog was used. Lost measurements from
+the first interruption are excluded. Do not restart the restore-all-waves process; follow
+[the remaining acceptance requirements](finish-the-memory-work.md).
+
 ## The repository
 
-- One checkout, `/home/johnz86/GIT/hoard`, on branch `master`. There is no worktree and no
-  second clone. **Nothing has been pushed.** There is no remote work to reconcile with, and
-  no release and no user - see the "Compatibility" section of `CLAUDE.md` for what that
-  buys.
+- The main checkout is `/home/johnz86/GIT/hoard`, on branch `master`; no experiment worktrees
+  remain. **Nothing has been pushed.** The current memory task
+  requires preserving populated format-7 catalogs; older compatibility assumptions do not
+  waive that requirement.
 - `docs/superpowers/specs/2026-09-06-remaining-work-goal.md` is the brief every wave now
   follows: what "remaining work" means, the finish condition that ends the run, and the rule
   that performance is measured once, in the last wave, rather than in each one.
   The run is finished: `docs/superpowers/history/2026-09-remaining-work-review.md` is the
   review of what each wave changed, the final numbers, what the closing reviews found and
   the recommendations for what comes next.
-- **`docs/finish-the-memory-work.md` is the plan for finishing it, and it is short.** The
-  reverted waves are recoverable at the tag in their post-review state, so finishing means
-  restoring, measuring against the harness `master` now has, keeping only what the numbers
-  earn, and paying the code-quality debt on what survives. Do not write another goal document
-  and do not rebuild those waves from scratch.
-- **The predictable-memory run of 2026-09-07 is reverted.** It set five waves and landed
-  four, measured nothing, and was halted by the owner. Its code is gone from `master`; the
-  commits stay reachable at the tag `reverted/2026-09-07-predictable-memory`.
+- `docs/finish-the-memory-work.md` records the delivered scope and remaining acceptance
+  requirements. Only hashing and metered indexing were recovered; other waves stay deferred.
+- **The predictable-memory run of 2026-09-07 was reverted.** It set five waves and landed
+  four, measured nothing, and was halted by the owner. Only the two components documented
+  above have since been recovered. The original commits remain reachable at the tag
+  `reverted/2026-09-07-predictable-memory`.
   `docs/superpowers/history/2026-09-07-predictable-memory-reverted.md` says why, what the
   process got wrong, and - the part worth keeping - the facts its reviews established about
   tantivy's per-document allocation, native_db's scan semantics, what the gate tree cannot
@@ -41,10 +65,8 @@ first; this document assumes it.
 - Phases 0 to 11 are done. `docs/feature-plan.md` holds the table. The TREE and DISK views
   are not an unfinished phase: they wait on a design decision and are recorded under that
   document's "Risks and open decisions".
-- At the head of `master`, which is the code of `9979f7b` again, the check suite is what
-  that commit recorded: `cargo fmt --check`, clippy with `-D warnings`, `cargo test
-  --workspace`, `cargo build --workspace`, `cargo doc --workspace --no-deps` and the release
-  asset test.
+- Current memory-delivery checks are recorded above. Historical checks and measurements
+  below describe their original commits, not a fresh verification of this delivery.
 - Waves 1 to 9 of the goal are on `master` and the run is measured. The measurement is in
   `docs/native-catalog.md` under "Measured": the whole scale harness at 100k and 1M against
   a `3a9fa1f` column rebuilt and run in the same session over the same tree, the eleven

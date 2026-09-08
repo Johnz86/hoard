@@ -22,6 +22,9 @@ triage_confidence = 0.85
 watch = true
 # How often to rescan every source regardless of what the watch reported. 0 turns it off.
 reconcile_interval_secs = 3600
+# How many files a hashing pass reads at once. 0 means one worker per core; turn it down on
+# an HDD or a NAS.
+hash_threads = 0
 
 [[index.sources]]
 name = "hf-cache"

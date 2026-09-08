@@ -18,6 +18,147 @@ transactions and secondary indexes on redb, so Hoard does not have to own an ind
 maintenance layer. Tantivy replaced SQLite's FTS5 as a disposable search index that is
 rebuilt from the native records alone, without re-reading a single source file.
 
+## Memory verification, 2026-09-08
+
+Delivered **continuous hashing and metered index commits**. Summary folding, grouped
+source discovery, and usage changes are excluded. The full memory redesign is not complete;
+these two improvements have fresh attributable evidence and pass the applicable gates.
+
+The baseline is `bdf2964f954f2612c5a2a0ab4d33b9361aef8e00`. The selected production code
+recovers hashing and indexing from `fef969a`, with comment cleanup and constant relocation.
+The exact production patch, source/executable SHA256s, raw results, commands, and environment
+are in [the compressed evidence archive](evidence/memory-2026-09-08.tar.gz).
+Extract it with `tar -xzf docs/evidence/memory-2026-09-08.tar.gz -C <scratch>`.
+No temporary worktrees, synthetic catalogs, or benchmark executables are retained.
+
+### Retained results
+
+Two serial release runs per column, no `RUSTFLAGS`, ARM Cortex-X925/A725 workstation,
+20 CPUs, rustc 1.95.0. Each cell gives run 1 / run 2. Catalogs are independently seeded
+from the same restored synthetic files. All reported fixture tests actually executed.
+
+| Targeted workload | Baseline `bdf2964` | Selected `fef969a` production, cleaned |
+| --- | ---: | ---: |
+| Mixed hashing cancellation checkpoint, ms | 574.22 / 570.07 | 9.40 / 9.36 |
+| Four large-card artifacts: rebuild peak growth, MiB | 772.17 / 744.43 | 381.80 / 349.96 |
+| Same rebuild, seconds | 6.483 / 6.634 | 6.575 / 6.506 |
+| Same rebuild / refresh explicit commits | 1 / 1 | 4 / 4 |
+| Same refresh peak growth, MiB | 394.77 / 738.85 | 353.08 / 224.62 |
+| One oversized group: rebuild peak growth, MiB | 326.64 / 326.67 | 326.41 / 326.57 |
+
+The hashing fixture puts a sparse 1 GiB file before 255 small files, cancels after at least
+64 completions, resumes, and compares all 256 final hashes with `hash=now`. Continuous
+workers remove the 64-file completion barrier. Work dispatch holds at most one queued file
+per worker plus one 64-entry discovery page; the digest channel holds 256 results and the
+writer at most 64. `[index] hash_threads` defaults to zero, selecting the Rayon pool size;
+both automatic and explicit counts are clamped to 1–256. Full queues block producers.
+Cancellation is checked between files and per MiB read; queued writes and bookkeeping must
+finish before return. Existing configuration files remain valid.
+
+The fan-out fixture gives each artifact 50–100 file entries and a roughly 4 MiB card.
+Rebuild memory falls by about half, well beyond run spread, without a clear rebuild-time
+change on this shape. Refresh memory varies substantially: do not infer a stable percentage
+improvement from those two samples. Collapse answers, usage-linked refresh, and deletion-only
+refresh are asserted. Index commits occur between artifact groups at an estimated 128 MiB;
+**this is not a strict memory limit**. One group is constructed before submission and can
+exceed the threshold, as the single-group row demonstrates. Existing rebuild/refresh APIs
+remain; reporting APIs add explicit commit and document counts.
+
+### Final scale gates
+
+| 100k entries | Baseline `bdf2964` | Selected `fef969a` production, cleaned |
+| --- | ---: | ---: |
+| Scan, seconds | 4.998 / 5.083 | 5.005 / 5.050 |
+| Scan peak growth, MiB | 167.91 / 167.66 | 167.80 / 168.53 |
+| Rebuild, seconds | 0.660 / 0.667 | 0.705 / 0.681 |
+| Allocated disk, bytes | 142635008 / 142630912 | 142651392 / 142643200 |
+| Allocated disk, MiB | 136.03 / 136.02 | 136.04 / 136.04 |
+| Unchanged rescan, seconds | 0.378 / 0.393 | 0.380 / 0.389 |
+| Slowest of eight midpoint queries, ms | 13.96 / 13.98 | 14.69 / 14.78 |
+
+| 1M entries | Baseline `bdf2964` | Selected `fef969a` production, cleaned |
+| --- | ---: | ---: |
+| Scan, seconds | 74.523 / 73.271 | 75.381 / 73.130 |
+| Scan peak growth, MiB | 778.78 / 776.48 | 776.68 / 775.87 |
+| Rebuild, seconds | 7.009 / 8.207 | 8.492 / 8.280 |
+| Rebuild peak growth, MiB | 79.18 / 78.48 | 71.97 / 71.59 |
+| Allocated disk, bytes | 1397100544 / 1396887552 | 1396789248 / 1396641792 |
+| Allocated disk, MiB | 1332.38 / 1332.18 | 1332.08 / 1331.94 |
+| Unchanged rescan, seconds | 4.288 / 4.493 | 4.567 / 4.415 |
+| Rescan after 100k deletions, seconds | 16.161 / 16.879 | 16.014 / 16.295 |
+| Slowest of eight midpoint queries, ms | 95.22 / 93.58 | 99.20 / 98.50 |
+
+All gates pass: scan growth below 2 GB, allocated disk below 1,500,000,000 bytes, rebuild
+faster than scan, and every search below 500 ms. The selected column's slowest individual
+search, including collapse and post-refresh queries, is 114.31 ms. Metering adds rebuild
+work on small records; the table reports that cost rather than claiming a speedup. Scan,
+deletion, and disk differences are not attributed improvements. Raw logs include phase
+memory, apparent disk, facets, counts, changed rescans, and usage costs.
+
+### Concurrent latency diagnosis
+
+The 500 ms gate applies to the **slowest of eight simultaneous midpoint requests**. Both
+fixtures use a start barrier, page size 100, name ordering, midpoint 499950, and assert each
+answer against a reference. HTTP includes the complete response body. Watchers are disabled;
+controlled activity is a full rebuild started through the same barrier. Query-only checks
+reopen the same intact synthetic format-7 probe catalog, independently of the deletion runs.
+
+| Slowest request, ms | Baseline `bdf2964` | Selected `fef969a` production, cleaned |
+| --- | ---: | ---: |
+| Direct, idle | 99.42 / 91.06 | 93.39 / 96.60 |
+| Direct, background rebuild | 93.73 / 101.23 | 93.25 / 94.13 |
+| HTTP, idle | 100.78 / 106.52 | 102.28 / 99.81 |
+| HTTP, background rebuild | 104.07 / 99.76 | 102.26 / 102.93 |
+
+The historical 632–681 ms failure did not reproduce, including earlier fresh baseline
+repeats. Separate diagnostic HTTP runs attribute 71.127–99.520 ms to collection;
+blocking-pool waiting is 0.091–0.504 ms, shelves 0.011–0.033 ms, compile context
+0.002–0.008 ms, index acquisition 0.003–0.010 ms, query compilation 0.007–0.017 ms,
+facets 0.007–0.015 ms, page selection 0.836–0.870 ms, native reads 0.306–0.447 ms,
+assembly 0.050–0.107 ms, and serialization 0.050–0.115 ms. Diagnostic serialization is
+an extra serialization and is excluded from acceptance. No locking or scheduling change
+is justified. Raw logs record each latency, wall time, process CPU, and RSS; process totals
+include startup/reference queries and, where enabled, completion of the background rebuild.
+
+### Compatibility, validation, and excluded changes
+
+Catalog format stays **7**, with unchanged stored models and usage APIs. No migration,
+reset, event dropping, or overload-policy change is introduced. The selected CLI opened a
+baseline-created catalog after 2,000 served file responses and its `used:<1d` query, sorted
+by use, returned the one served artifact. Existing tests cover shared-remote clones,
+cross-revision refiling, hash merges, interrupted transactions, publication recovery,
+and exact `used:` filtering/sorting. New tests exercise blocked-file progress, worker
+limits, metered commits, collapse groups, deletion-only refresh, and interrupted replay.
+
+Final validation: **888 tests passed**, nine intentionally ignored fixture/helper tests;
+required ignored measurement fixtures were separately executed. Workspace build, Clippy
+with warnings denied, and formatting passed. Actual CLI scans/searches and timeout-bound
+servers passed all eleven HTTP routes, three times each, using 100k loose files plus a git
+source and 2,000 served responses. Route medians are smoke evidence, not attributed gains:
+
+| Route, ms | Baseline `bdf2964` | Selected `fef969a` production, cleaned |
+| --- | ---: | ---: |
+| Repositories, limit 1 / 100 | 0.463 / 0.775 | 0.311 / 0.361 |
+| Models list / git model detail | 0.409 / 0.161 | 0.259 / 0.277 |
+| HEAD git resolve | 0.483 | 0.479 |
+| Sources | 0.305 | 0.452 |
+| Search empty / node:self / role:lora | 3.371 / 6.293 / 3.434 | 3.568 / 6.244 / 3.798 |
+| Triage | 1.911 | 2.191 |
+| Populated repository usage | 0.774 | 1.063 |
+
+The full recovery (`04adbd767d8cc9cbfbcf45ef1cf048bb168cba17`, peeled recovery tag) was
+also measured twice. It reduced 1M scan growth from 775–779 MiB to 582–583 MiB, but did
+not isolate summary folding from grouped discovery/cache changes. Those changes are removed
+from delivery. It reduced retirement of 500k usage records from 38–40 s to 1.46–1.48 s,
+but its format-8 recovery deletes and rescans incompatible catalogs, without demonstrated
+preservation of history, overrides, shelves, and pins. Usage rekeying, reindex coalescing,
+and writer changes are deferred; the linked-event fixture produced 1,954 refresh changes
+in both columns and does not establish a coalescing benefit. Delayed-writer/backpressure
+experiments were not completed, so no usage implementation is retained on their basis.
+Source-wide retirement bookkeeping and pending usage-batch memory remain unresolved.
+No user's catalog was opened by any experiment. Lost results from the first interrupted
+session are excluded. Temporary checkouts and generated data have been removed.
+
 ## Compatibility
 
 Read the "Compatibility" section of `CLAUDE.md`. It is the only statement of the policy;

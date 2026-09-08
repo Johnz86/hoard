@@ -3,13 +3,14 @@
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Barrier;
 use std::time::{Duration, Instant};
 
-use hoard_core::RepoRowId;
 use hoard_index::catalog::{
     Catalog, QueryRequest, RepositoryFilter, RescanScope, StorageReport, UsageEvent,
 };
 use hoard_index::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
+use hoard_index::row::SearchRow;
 use hoard_index::search::{CompileContext, Facets, SortKey, SortSpec};
 
 const FILES_PER_DIRECTORY: usize = 1000;
@@ -80,6 +81,7 @@ fn synthetic_tree(root: &Path, count: usize) -> PathBuf {
     let tree = root.join(format!("tree-{count}"));
     let marker = root.join(format!("tree-{count}.ok"));
     if marker.exists() {
+        assert_eq!(directory_size(&tree, |_| 1), count as u64);
         return tree;
     }
     if tree.exists() {
@@ -324,10 +326,10 @@ fn measure<T>(work: impl FnOnce() -> T) -> Measured<T> {
 
 /// One served response, spread back over [`USAGE_SPREAD_DAYS`] days oldest first, with
 /// [`USAGE_SKEW`] of the rows on the first repository the tree holds.
-fn usage_event(repositories: &[RepoRowId], row: usize, now: jiff::Timestamp) -> UsageEvent {
-    let repo = match row.is_multiple_of(USAGE_SKEW) {
-        true => repositories[0],
-        false => repositories[row % repositories.len()],
+fn usage_event(subjects: &[SearchRow], row: usize, now: jiff::Timestamp) -> UsageEvent {
+    let subject = match row.is_multiple_of(USAGE_SKEW) {
+        true => &subjects[0],
+        false => &subjects[row % subjects.len()],
     };
     let age = (USAGE_ROWS - row) as i64 * USAGE_SPREAD_DAYS * 86_400 / USAGE_ROWS as i64;
     UsageEvent {
@@ -335,9 +337,9 @@ fn usage_event(repositories: &[RepoRowId], row: usize, now: jiff::Timestamp) -> 
             .checked_sub(jiff::Span::new().seconds(age))
             .expect("the seeded time is representable"),
         client: Some(format!("10.0.0.{}", row % USAGE_CLIENTS)),
-        repo: Some(repo),
-        artifact: None,
-        path: format!("d{}/w{row}.safetensors", row / FILES_PER_DIRECTORY),
+        repo: Some(subject.repo_id),
+        artifact: Some(subject.artifact_id),
+        path: subject.path.clone(),
         bytes: 1_073_741_824 + row as u64,
         rate_bps: Some(94_371_840),
         status: 200,
@@ -353,14 +355,27 @@ fn usage_phase(catalog: &Catalog) -> Vec<(&'static str, String)> {
     let listing = catalog
         .repositories(&RepositoryFilter::default(), None, USAGE_REPOSITORIES)
         .expect("the repositories listing answers");
-    let repositories: Vec<RepoRowId> = listing.rows.iter().map(|row| row.id).collect();
-    let busiest = *repositories.first().expect("the tree holds a repository");
-    let now = jiff::Timestamp::now();
+    let subjects: Vec<SearchRow> = listing
+        .rows
+        .iter()
+        .map(|row| {
+            catalog
+                .repository_rows(row.id, 1)
+                .expect("the repository has a readable artifact")
+                .pop()
+                .expect("the repository has an artifact")
+        })
+        .collect();
+    let busiest = subjects
+        .first()
+        .expect("the tree holds a repository")
+        .repo_id;
+    let now = jiff::Timestamp::from_second(1_788_739_200).expect("the fixture time is valid");
     let seeded = measure(|| {
         let mut written = 0_u64;
         let mut batch = Vec::with_capacity(USAGE_BATCH);
         for row in 0..USAGE_ROWS {
-            batch.push(usage_event(&repositories, row, now));
+            batch.push(usage_event(&subjects, row, now));
             if batch.len() == USAGE_BATCH {
                 written += catalog
                     .log_usage_batch(&batch)
@@ -388,13 +403,23 @@ fn usage_phase(catalog: &Catalog) -> Vec<(&'static str, String)> {
             .usage_days(busiest, USAGE_CHART_DAYS)
             .expect("the usage chart answers")
     });
+    assert_eq!(seeded.value, USAGE_ROWS as u64);
+    assert_eq!(pulls.value.len(), USAGE_PULL_LIMIT as usize);
+    let refreshed = measure(|| {
+        catalog
+            .refresh_search(|_| {})
+            .expect("usage refresh succeeds")
+    });
     vec![
         (
             "repositories the usage rows name",
-            repositories.len().to_string(),
+            subjects.len().to_string(),
         ),
         ("usage rows seeded", seeded.value.to_string()),
         ("usage seed wall", format!("{:?}", seeded.wall)),
+        ("usage refresh wall", format!("{:?}", refreshed.wall)),
+        ("usage refresh applied", format!("{:?}", refreshed.value)),
+        ("peak rss growth over usage refresh", refreshed.peak),
         ("peak rss growth while the log was seeded", seeded.peak),
         ("resident rss over the seeding", seeded.resident),
         ("recent_pulls at 20, wall", format!("{:?}", pulls.wall)),
@@ -439,14 +464,34 @@ fn concurrency_phase(
     if !phase_enabled("HOARD_SCALE_CONCURRENT") {
         return Vec::new();
     }
+    let background = phase_enabled("HOARD_SCALE_BACKGROUND");
+    let barrier = Barrier::new(CONCURRENT_QUERIES + usize::from(background));
+    let expected = catalog
+        .query(QueryRequest {
+            raw: "",
+            sort: SortSpec::new(SortKey::Name, false),
+            limit: PAGE,
+            offset,
+            context,
+        })
+        .expect("the reference concurrent page succeeds");
     let mark = reset_peak_rss();
     let resident_before = current_rss_kb();
     let (walls, wall) = timed(|| {
         std::thread::scope(|scope| {
+            if background {
+                scope.spawn(|| {
+                    barrier.wait();
+                    catalog
+                        .rebuild_search(|_| {})
+                        .expect("the background rebuild succeeds");
+                });
+            }
             let queries: Vec<_> = (0..CONCURRENT_QUERIES)
                 .map(|_| {
                     scope.spawn(|| {
-                        timed(|| {
+                        barrier.wait();
+                        let (page, elapsed) = timed(|| {
                             catalog
                                 .query(QueryRequest {
                                     raw: "",
@@ -456,8 +501,11 @@ fn concurrency_phase(
                                     context,
                                 })
                                 .expect("a concurrent query succeeds")
-                        })
-                        .1
+                        });
+                        assert_eq!(page.total, expected.total);
+                        assert_eq!(page.rows, expected.rows);
+                        assert_eq!(page.facets, expected.facets);
+                        elapsed
                     })
                 })
                 .collect();
@@ -487,7 +535,9 @@ fn concurrency_phase(
             "slowest of the concurrent queries",
             format!("{:?}", walls.iter().max().copied().unwrap_or_default()),
         ),
-        ("concurrent queries, wall to join", format!("{wall:?}")),
+        ("concurrent workers, wall to join", format!("{wall:?}")),
+        ("concurrent background rebuild", background.to_string()),
+        ("concurrent queries, individual walls", format!("{walls:?}")),
     ]
 }
 
@@ -519,6 +569,8 @@ fn deletion_phase(
     let peak = peak_rss_kb();
     let resident_after = current_rss_kb();
     rewrite(tree, first..count, 0);
+    assert_eq!(rescanned.absent, (count - first) as u64);
+    assert!(!rescanned.interrupted);
     let whole = directory_size(tree, |_| 1);
     assert_eq!(
         whole, count as u64,
@@ -557,11 +609,222 @@ fn report(rows: &[(&str, String)]) {
 
 #[test]
 #[ignore]
+fn concurrent_catalog_queries() {
+    let output = scale_dir().join(format!("native-{}", entries()));
+    let catalog = Catalog::open(&output).expect("the independently seeded catalog opens");
+    assert_eq!(
+        catalog
+            .totals()
+            .expect("the totals answer")
+            .present_artifacts,
+        entries() as u64
+    );
+    let context = CompileContext::new(jiff::Timestamp::now()).with_local_node("scale");
+    assert!(phase_enabled("HOARD_SCALE_CONCURRENT"));
+    let offset = u32::try_from(entries().saturating_sub(PAGE as usize) / 2)
+        .expect("the midpoint fits the query offset");
+    report(&concurrency_phase(&catalog, &context, offset));
+}
+
+#[test]
+#[ignore]
+fn mixed_size_hashing() {
+    use std::sync::atomic::Ordering;
+
+    use hoard_index::catalog::Stop;
+
+    let root = scale_dir().join("mixed-hashing");
+    if root.exists() {
+        fs::remove_dir_all(&root).expect("the previous hashing fixture is removable");
+    }
+    let tree = root.join("tree");
+    rewrite(&tree, 0..256, 0);
+    for index in 0..256 {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(tree.join(format!("d0/w{index}.safetensors")))
+            .expect("the hashing fixture is writable");
+        file.set_len(if index == 0 {
+            1024 * 1024 * 1024
+        } else {
+            128 * 1024
+        })
+        .expect("the hashing fixture can be extended");
+    }
+    let config = config(&root, &tree);
+    let catalog = Catalog::scan_sources(
+        &root.join("later"),
+        "scale",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )
+    .expect("the hashing fixture scans");
+    let stop = Stop::default();
+    let started = Instant::now();
+    let mut progress = Vec::with_capacity(256);
+    let interrupted = measure(|| {
+        catalog
+            .hash_pending_until(&config, &stop, |count| {
+                progress.push((count, started.elapsed()));
+                if count >= 64 {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            })
+            .expect("the interrupted hashing pass succeeds")
+    });
+    assert!(interrupted.value.interrupted);
+    let resumed = measure(|| {
+        catalog
+            .hash_pending(&config, |_| {})
+            .expect("hashing resumes")
+    });
+    assert_eq!(interrupted.value.hashed + resumed.value.hashed, 256);
+    assert_eq!(interrupted.value.unreadable + resumed.value.unreadable, 0);
+    let immediate = measure(|| {
+        Catalog::scan_sources(
+            &root.join("now"),
+            "scale",
+            &config,
+            HashPolicy::Now,
+            |_, _| {},
+        )
+        .expect("immediate hashing scans")
+    });
+    catalog
+        .rebuild_search(|_| {})
+        .expect("the resumed index builds");
+    immediate
+        .value
+        .rebuild_search(|_| {})
+        .expect("the immediate index builds");
+    let context = CompileContext::new(jiff::Timestamp::now()).with_local_node("scale");
+    for offset in [0, 100, 200] {
+        let query = |catalog: &Catalog| {
+            catalog
+                .query(QueryRequest {
+                    raw: "",
+                    sort: SortSpec::new(SortKey::Name, false),
+                    limit: PAGE,
+                    offset,
+                    context: &context,
+                })
+                .expect("the hashed page answers")
+        };
+        let resumed_page = query(&catalog);
+        let immediate_page = query(&immediate.value);
+        assert_eq!(resumed_page.total, 256);
+        assert_eq!(resumed_page.total, immediate_page.total);
+        assert_eq!(
+            resumed_page
+                .rows
+                .iter()
+                .map(|row| (&row.name, &row.blob_sha256))
+                .collect::<Vec<_>>(),
+            immediate_page
+                .rows
+                .iter()
+                .map(|row| (&row.name, &row.blob_sha256))
+                .collect::<Vec<_>>()
+        );
+    }
+    report(&[
+        (
+            "mixed hashing interrupted wall",
+            format!("{:?}", interrupted.wall),
+        ),
+        ("mixed hashing progress", format!("{progress:?}")),
+        ("mixed hashing resume wall", format!("{:?}", resumed.wall)),
+        (
+            "mixed hashing immediate scan wall",
+            format!("{:?}", immediate.wall),
+        ),
+        ("mixed hashing peak rss", interrupted.peak),
+    ]);
+}
+
+#[test]
+#[ignore]
+fn repository_log_retirement() {
+    assert!(phase_enabled("HOARD_SCALE_USAGE"));
+    let root = scale_dir().join("retirement");
+    fs::create_dir_all(&root).expect("the retirement root is creatable");
+    let tree = synthetic_tree(&root, FILES_PER_DIRECTORY);
+    let output = root.join("native");
+    if output.exists() {
+        fs::remove_dir_all(&output).expect("the previous retirement catalog is removable");
+    }
+    let mut config = config(&root, &tree);
+    let catalog = Catalog::scan_sources(&output, "scale", &config, HashPolicy::Never, |_, _| {})
+        .expect("the retirement fixture scans");
+    catalog
+        .rebuild_search(|_| {})
+        .expect("the retirement index builds");
+    let repository = catalog
+        .repositories(&RepositoryFilter::default(), None, 1)
+        .expect("the repository listing answers")
+        .rows[0]
+        .id;
+    report(&usage_phase(&catalog));
+    config.sources.clear();
+    let retired = measure(|| {
+        catalog
+            .rescan(
+                &config,
+                HashPolicy::Never,
+                RescanScope::Configured,
+                |_, _| {},
+            )
+            .expect("the source retires")
+    });
+    assert_eq!(retired.value.absent, FILES_PER_DIRECTORY as u64);
+    assert!(
+        catalog
+            .recent_pulls(repository, USAGE_PULL_LIMIT)
+            .expect("the retired log can be queried")
+            .is_empty()
+    );
+    let refreshed = measure(|| {
+        catalog
+            .refresh_search(|_| {})
+            .expect("deletion refresh succeeds")
+    });
+    let context = CompileContext::new(jiff::Timestamp::now()).with_local_node("scale");
+    assert_eq!(
+        catalog
+            .query(QueryRequest {
+                raw: "",
+                sort: SortSpec::new(SortKey::Name, false),
+                limit: PAGE,
+                offset: 0,
+                context: &context
+            })
+            .expect("the empty index answers")
+            .total,
+        0
+    );
+    report(&[
+        (
+            "repository log retirement wall",
+            format!("{:?}", retired.wall),
+        ),
+        ("repository log retirement peak rss", retired.peak),
+        (
+            "deletion-only refresh wall",
+            format!("{:?}", refreshed.wall),
+        ),
+    ]);
+}
+
+#[test]
+#[ignore]
 fn native_catalog_at_scale() {
     let count = entries();
+    assert!(count >= TOUCHED);
     let root = scale_dir();
     fs::create_dir_all(&root).expect("scale root is creatable");
     let tree = synthetic_tree(&root, count);
+    restore(&tree, TOUCHED);
     let output = root.join(format!("native-{count}"));
     if output.exists() {
         fs::remove_dir_all(&output).expect("old catalog is removable");
@@ -578,6 +841,7 @@ fn native_catalog_at_scale() {
 
     let mut sampled = 0_u64;
     let mut rebuild_peak = 0_u64;
+    let rss_before_rebuild = reset_peak_rss();
     let ((), rebuild_time) = timed(|| {
         catalog
             .rebuild_search(|indexed| {
@@ -607,6 +871,7 @@ fn native_catalog_at_scale() {
     let run = |raw: &str, offset: u32| run_sorted(raw, offset, SortSpec::new(SortKey::Name, false));
     let rss_at_first_query = current_rss_kb();
     let (first, first_time) = timed(|| run("", 0));
+    assert_eq!(first.total, count as u64);
     let deep_offset = u32::try_from(first.total.saturating_sub(u64::from(PAGE))).unwrap_or(0);
     let (_, deep_time) = timed(|| run("", deep_offset));
     let midpoint = deep_offset / 2;
@@ -625,7 +890,6 @@ fn native_catalog_at_scale() {
     let (_, collapse_middle_time) = timed(|| run("node:self", midpoint));
     let (_, collapse_deep_time) = timed(|| run("node:self", deep_offset));
     let resident_over_collapse = current_rss_kb();
-    let rss_after_collapse_pages = peak_rss_kb();
 
     let subject = first
         .rows
@@ -644,7 +908,30 @@ fn native_catalog_at_scale() {
     let disk_allocated = directory_size(&output, allocated);
     let (catalog, after_rebuild) = snapshot(&output, catalog, &format!("{count}-after-rebuild"));
 
+    let unchanged = measure(|| {
+        catalog
+            .rescan(
+                &config,
+                HashPolicy::Never,
+                RescanScope::Configured,
+                |_, _| {},
+            )
+            .expect("the unchanged rescan succeeds")
+    });
+    assert_eq!(unchanged.value.unchanged, count as u64);
+    assert_eq!(
+        unchanged.value.changed + unchanged.value.added + unchanged.value.absent,
+        0
+    );
+    assert!(!unchanged.value.interrupted);
+    assert_eq!(
+        catalog
+            .refresh_search(|_| {})
+            .expect("the unchanged refresh succeeds"),
+        0
+    );
     touch(&tree, TOUCHED);
+    let rss_before_rescan = reset_peak_rss();
     let (rescanned, rescan_time) = timed(|| {
         catalog
             .rescan(
@@ -707,7 +994,7 @@ fn native_catalog_at_scale() {
         ("rebuild wall", format!("{rebuild_time:?}")),
         (
             "peak rss growth during rebuild",
-            kb_between(rss_after_scan, rss_after_rebuild),
+            kb_between(rss_before_rebuild, rss_after_rebuild),
         ),
         ("on disk after scan, apparent", bytes(scanned_apparent)),
         ("on disk after scan, allocated", bytes(scanned_allocated)),
@@ -778,6 +1065,9 @@ fn native_catalog_at_scale() {
             kb_between(rss_at_collapse_pages, resident_over_collapse),
         ),
         ("rescan wall (1,000 changed)", format!("{rescan_time:?}")),
+        ("unchanged rescan wall", format!("{:?}", unchanged.wall)),
+        ("unchanged rescan peak rss growth", unchanged.peak),
+        ("unchanged rescan resident growth", unchanged.resident),
         ("rescan report", format!("{rescanned:?}")),
         ("refresh wall", format!("{refresh_time:?}")),
         ("changes refreshed", applied.to_string()),
@@ -788,7 +1078,7 @@ fn native_catalog_at_scale() {
         ),
         (
             "peak rss growth during rescan and refresh",
-            kb_between(rss_after_collapse_pages, rss_after_refresh),
+            kb_between(rss_before_rescan, rss_after_refresh),
         ),
         ("on disk after churn, apparent", bytes(churned_apparent)),
         ("on disk after churn, allocated", bytes(churned_allocated)),
@@ -830,18 +1120,24 @@ fn native_catalog_at_scale() {
 mod supplemental {
     use std::collections::BTreeMap;
     use std::fs;
+    use std::path::PathBuf;
 
     use hoard_core::{
         Artifact, ArtifactFormat, ArtifactId, Base, BlobId, CommitSha, Evidence, EvidenceSource,
         Precision, RepoId, RepoType, Role, Sha256, State, SubRole, TensorSample, TensorSummary,
     };
     use hoard_index::catalog::{
-        Catalog, SeedArtifact, SeedEntry, SeedRepository, SeedRevision, StorageReport,
+        Catalog, QueryRequest, RescanScope, SeedArtifact, SeedEntry, SeedRepository, SeedRevision,
+        StorageReport, UsageEvent,
     };
     use hoard_index::config::{HashPolicy, IndexConfig, SourceKind};
     use hoard_index::discover::RefKind;
+    use hoard_index::search::{CompileContext, SortKey, SortSpec};
 
-    use super::{allocated, apparent, bytes, directory_size, report, scale_dir, timed};
+    use super::{
+        allocated, apparent, bytes, directory_size, kb_between, measure, peak_rss_kb, report,
+        reset_peak_rss, scale_dir, timed,
+    };
 
     const REVISIONS: usize = 3;
     const FILES_PER_REVISION: usize = 50;
@@ -1060,6 +1356,204 @@ mod supplemental {
 
     fn payload_total(report: &StorageReport) -> u64 {
         report.tables.iter().map(|table| table.stored_bytes).sum()
+    }
+
+    fn wide_card_artifacts() -> Option<usize> {
+        std::env::var("HOARD_SCALE_WIDE_CARD_ARTIFACTS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+    }
+
+    fn wide_card_entries(index: usize) -> usize {
+        50 + index % 51
+    }
+
+    fn wide_card(name: &str) -> String {
+        let mut text = format!(
+            "---\nlicense: apache-2.0\ntags:\n- text-to-image\n- lora\nbase_model: sdxl-1.0\n---\n\n\
+             # {name}\n\n"
+        );
+        let paragraph = "This adapter was trained on a curated set of images at 1024 by 1024 \
+                          with a constant learning rate and a cosine schedule. Use the trigger \
+                          word to invoke the style, and keep the weight between 0.6 and 0.9 for \
+                          portraits.\n\n";
+        while text.len() < 4 * 1024 * 1024 {
+            text.push_str(paragraph);
+        }
+        text
+    }
+
+    fn wide_card_repositories(count: usize) -> Vec<SeedRepository> {
+        (0..count)
+            .map(|index| {
+                let artifact = SeedArtifact {
+                    identity: index as u128,
+                    artifact: artifact(index),
+                    name: format!("wide-{index:04}.safetensors"),
+                    org: Some(format!("org{:02}", index % 32)),
+                    tensors: Some(tensors(index)),
+                    evidence: evidence(),
+                    card: Some(wide_card(&format!("wide-{index:04}"))),
+                    group_bytes: None,
+                    shard_count: None,
+                };
+                let root_path = PathBuf::from(format!("/synthetic/wide/wide{index:04}"));
+                SeedRepository {
+                    repo: RepoId::new(
+                        RepoType::Models,
+                        Some(format!("org{:02}", index % 32)),
+                        format!("wide{index:04}"),
+                    ),
+                    source: "loose".to_owned(),
+                    kind: SourceKind::Loose,
+                    root_path: root_path.clone(),
+                    git_dir: None,
+                    revisions: vec![SeedRevision {
+                        name: "main".to_owned(),
+                        sha: Some(commit(index as u64)),
+                        refs: vec![("main".to_owned(), RefKind::Branch)],
+                        title: None,
+                        author: None,
+                        committed: Some(jiff::Timestamp::UNIX_EPOCH),
+                        entries: (0..wide_card_entries(index))
+                            .map(|shard| {
+                                let rel_path = format!("shard-{shard:03}.safetensors");
+                                SeedEntry {
+                                    abs_path: Some(
+                                        root_path.join(&rel_path).to_string_lossy().into_owned(),
+                                    ),
+                                    rel_path,
+                                    node: 1,
+                                    size: 1_073_741_824,
+                                    state: State::Local,
+                                    is_symlink: false,
+                                    sha256: Some(sha256(index as u64)),
+                                    git_sha1: Some(commit((index * 1_000 + shard) as u64)),
+                                    artifact: Some(artifact.clone()),
+                                }
+                            })
+                            .collect(),
+                    }],
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore]
+    fn wide_card_phase() {
+        let root = scale_dir();
+        let count = wide_card_artifacts().expect("HOARD_SCALE_WIDE_CARD_ARTIFACTS is required");
+        assert!(count > 0);
+        let wide_root = root.join("wide");
+        if wide_root.exists() {
+            fs::remove_dir_all(&wide_root).expect("old wide-card tree is removable");
+        }
+        fs::create_dir_all(&wide_root).expect("wide-card root is creatable");
+        let output = wide_root.join("native");
+        let config = IndexConfig {
+            data_dir: wide_root.clone(),
+            hash_policy: HashPolicy::Never,
+            sources: Vec::new(),
+            ..IndexConfig::default()
+        };
+        let catalog =
+            Catalog::scan_sources(&output, "scale", &config, HashPolicy::Never, |_, _| {})
+                .expect("an empty wide-card catalog is creatable");
+        let seeds = wide_card_repositories(count);
+        let (written, seed_time) = timed(|| catalog.seed(&seeds).expect("seeding succeeds"));
+
+        assert_eq!(written.len(), count);
+        drop(seeds);
+        let rss_before_rebuild = reset_peak_rss();
+        let mut indexed = 0;
+        let (commits, rebuild_time) = timed(|| {
+            catalog
+                .rebuild_search_commits(|count| indexed = count)
+                .expect("the wide-card rebuild succeeds")
+        });
+        let rss_after_rebuild = peak_rss_kb();
+        let entries: usize = (0..count).map(wide_card_entries).sum();
+        assert_eq!(indexed, entries as u64);
+        let context = CompileContext::new(jiff::Timestamp::now()).with_local_node("scale");
+        let query = || {
+            catalog
+                .query(QueryRequest {
+                    raw: "node:self",
+                    sort: SortSpec::new(SortKey::Name, false),
+                    limit: 100,
+                    offset: 0,
+                    context: &context,
+                })
+                .expect("the wide-card collapse query succeeds")
+        };
+        assert_eq!(query().total, count as u64);
+        let events: Vec<_> = written
+            .iter()
+            .map(|(_, id)| UsageEvent {
+                at: jiff::Timestamp::now(),
+                client: None,
+                repo: None,
+                artifact: Some(*id),
+                path: "synthetic.safetensors".to_owned(),
+                bytes: 1,
+                rate_bps: None,
+                status: 200,
+            })
+            .collect();
+        assert_eq!(
+            catalog
+                .log_usage_batch(&events)
+                .expect("the usage changes are logged"),
+            count as u64
+        );
+        let refreshed = measure(|| {
+            catalog
+                .refresh_search_reporting(|_| {})
+                .map(|report| (report.applied, report.commits))
+                .expect("the wide-card refresh succeeds")
+        });
+        assert_eq!(refreshed.value.0, count as u64);
+        assert_eq!(query().total, count as u64);
+        let retired = catalog
+            .rescan(
+                &config,
+                HashPolicy::Never,
+                RescanScope::Configured,
+                |_, _| {},
+            )
+            .expect("the synthetic source retires");
+        assert_eq!(retired.absent, entries as u64);
+        let deleted = measure(|| {
+            catalog
+                .refresh_search_reporting(|_| {})
+                .map(|report| (report.applied, report.commits))
+                .expect("the deletion-only refresh succeeds")
+        });
+        assert_eq!(query().total, 0);
+
+        report(&[
+            ("wide-card artifacts", count.to_string()),
+            ("wide-card artifacts written", written.len().to_string()),
+            ("wide-card seed wall", format!("{seed_time:?}")),
+            ("wide-card rebuild wall", format!("{rebuild_time:?}")),
+            ("wide-card rebuild commits", commits.to_string()),
+            ("wide-card refresh wall", format!("{:?}", refreshed.wall)),
+            ("wide-card refresh commits", refreshed.value.1.to_string()),
+            ("wide-card refresh peak rss growth", refreshed.peak),
+            (
+                "wide-card deletion-only refresh wall",
+                format!("{:?}", deleted.wall),
+            ),
+            (
+                "wide-card deletion-only refresh commits",
+                deleted.value.1.to_string(),
+            ),
+            (
+                "wide-card peak rss growth during rebuild",
+                kb_between(rss_before_rebuild, rss_after_rebuild),
+            ),
+        ]);
     }
 
     #[test]
