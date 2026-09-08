@@ -11544,3 +11544,60 @@ fn retirement_recounts_every_artifact_across_transaction_boundaries() -> Result<
     assert_eq!(catalog.retire_entries(&ids)?, 0);
     Ok(())
 }
+
+#[test]
+fn source_count_recovery_preserves_timestamps_and_non_scan_sources() -> Result<()> {
+    let (_directory, catalog, config) = csv_catalog_with_entries(2)?;
+    let transaction = catalog.database.rw_transaction()?;
+    let original: Source = transaction
+        .get()
+        .primary(config.sources[0].name.clone())?
+        .ok_or_else(|| IndexError::Catalog("the scanned source is missing".into()))?;
+    transaction.upsert(Source {
+        file_count: 99,
+        byte_count: 999,
+        ..original.clone()
+    })?;
+    let mut empty = original.clone();
+    empty.name = "empty-source".to_owned();
+    empty.config.name = empty.name.clone();
+    empty.file_count = 13;
+    empty.byte_count = 17;
+    empty.pending_hashes = 0;
+    transaction.upsert(empty.clone())?;
+    let mut protected = Vec::with_capacity(3);
+    for name in [
+        MIRROR_SOURCE.to_owned(),
+        super::PULL_SOURCE.to_owned(),
+        format!("{}test-peer", super::PEER_SOURCE),
+    ] {
+        let mut source = empty.clone();
+        source.name = name;
+        source.config.name = source.name.clone();
+        transaction.upsert(source.clone())?;
+        protected.push(source);
+    }
+    transaction.commit()?;
+    catalog.open_pass()?;
+    catalog.open_pass()?;
+    catalog.close_pass()?;
+
+    let read = catalog.database.r_transaction()?;
+    assert_eq!(
+        read.get().primary::<Source>(original.name.clone())?,
+        Some(original)
+    );
+    empty.file_count = 0;
+    empty.byte_count = 0;
+    assert_eq!(
+        read.get().primary::<Source>(empty.name.clone())?,
+        Some(empty)
+    );
+    for source in protected {
+        assert_eq!(
+            read.get().primary::<Source>(source.name.clone())?,
+            Some(source)
+        );
+    }
+    Ok(())
+}

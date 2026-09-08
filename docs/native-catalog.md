@@ -18,42 +18,34 @@ transactions and secondary indexes on redb, so Hoard does not have to own an ind
 maintenance layer. Tantivy replaced SQLite's FTS5 as a disposable search index that is
 rebuilt from the native records alone, without re-reading a single source file.
 
-## Follow-up: consume artifact cleanup work
+## Incremental memory follow-ups
 
-Artifact sweeping and retirement recounts now consume the existing touched-ID set directly
-in 1,024-item transactions. They no longer copy the entire set into an additional vector.
-Summary capture does not requeue the IDs being processed, and the set's allocation is
-released after cleanup. The initial touched-ID set still grows with the pass; this is not
-a strict bound on all scan memory. No public API or stored format changed.
+Artifact summary deltas commit with their records; the temporary snapshot map is drained
+per transaction and reuses its allocation. Sweeping and retirement consume touched-ID sets
+directly in 1,024-item transactions, without full-size vector copies or requeueing IDs.
 
-Focused tests cover deduplication, taking work once, independent summary capture, empty
-sweeps, and cleanup/retirement across transaction boundaries. The 895-test workspace suite,
-build, Clippy with warnings denied, and formatting pass. No new scale measurements
-or benchmark artifacts were added. Next slice: stream repository totals during scan-stat
-updates instead of collecting every repository into a vector.
+Source-stat updates and recovery now stream repository records into per-source totals.
+Aggregation retains one repository at a time plus one accumulator per source, instead of
+all repository records and their revisions. File totals, saturating byte sums, missing-source
+zeroes, recovery timestamps, and exclusion of mirror/pull/peer source updates are preserved.
+Repository-count settlement still uses one write transaction. Format and public APIs remain
+unchanged.
 
-## Follow-up: transaction summary folding
+Validation: 899 workspace tests, build, warning-free Clippy, and formatting. New source
+tests cover empty input, nonadjacent grouping, overflow behavior, read-error propagation,
+and recovery metadata. Earlier tests cover summary rollback, repeated touches, interrupted
+recovery, and cleanup across batches. These slices add no scale measurements or benchmark
+artifacts; the tables below describe `51418ad`. The pass-wide touched-ID set, retirement
+bookkeeping, usage changes, and oversized groups remain unresolved.
 
-Artifact summary deltas now commit in the transaction that changes the records. The
-temporary `Counters::before` map is drained after each fold and reuses its allocation;
-its size follows the largest write transaction rather than every artifact in the pass.
-Scan, hash, ingest, pull, retirement, and override writers use the same folding path.
-Repository-count settlement reads and writes under one write transaction, avoiding a
-stale summary overwrite. Catalog format and public APIs remain unchanged.
-
-Four additional tests cover repeated touches across transactions, clearing the snapshot
-map, rollback of artifact and summary changes together, and repository creation by a pull.
-Interrupted scan/hash tests also check committed totals before recovery. The workspace
-suite passes (892 tests). This slice uses correctness checks and the directly tested map
-lifetime; no new scale measurements or performance percentage claims are made. The tables
-below describe commit `51418ad`, before this follow-up. Grouped discovery, usage changes,
-the pass-wide touched-ID set, and oversized index groups remain outside this slice.
+Next slice: page entry IDs during dropped-source retirement instead of collecting every
+entry of a repository before deleting batches.
 
 ## Memory verification, 2026-09-08
 
-Delivered **continuous hashing and metered index commits**. Summary folding, grouped
-source discovery, and usage changes are excluded. The full memory redesign is not complete;
-these two improvements have fresh attributable evidence and pass the applicable gates.
+Commit `51418ad` delivered **continuous hashing and metered index commits**. Its measurements
+exclude the later follow-ups, grouped discovery, and usage changes. The full memory redesign
+is not complete; these two improvements have attributable evidence and pass the measured gates.
 
 The baseline is `bdf2964f954f2612c5a2a0ab4d33b9361aef8e00`. The selected production code
 recovers hashing and indexing from `fef969a`, with comment cleanup and constant relocation.

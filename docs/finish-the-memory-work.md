@@ -9,7 +9,8 @@ repeated-touch, snapshot-lifetime, and interrupted-recovery tests. It has no new
 measurements; the previous performance evidence belongs to `51418ad`.
 
 Cleanup now also consumes touched-ID sets directly, avoiding full-size vector copies and
-requeueing during summary capture. Next: stream repository totals during scan-stat updates.
+requeueing during summary capture. Source-stat updates stream repository totals into
+per-source accumulators. Next: page entry IDs during dropped-source retirement.
 
 This does not complete a strict memory bound for every workload. The remaining limits are
 source-wide retirement bookkeeping, pending usage batches, and oversized artifact groups.

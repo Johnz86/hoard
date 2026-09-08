@@ -420,20 +420,12 @@ impl Catalog {
             .is_some())
     }
 
-    /// Records what each walked source holds now that every unit of it is stored and the
-    /// paths the walk never reached have been retracted: the files still on this disk and
-    /// the bytes they occupy, summed from the repositories under it.
     fn record_scan_stats(&self, sources: &[&SourceConfig], counters: &mut Counters) -> Result<()> {
         let at = jiff::Timestamp::now().to_string();
         let transaction = self.database.rw_transaction()?;
         counters.derived.flush(&transaction)?;
         counters.settle_summary(&transaction)?;
-        let repositories: Vec<Repository> = transaction
-            .scan()
-            .primary()?
-            .all()?
-            .collect::<native_db::db_type::Result<_>>()?;
-        let held = held_by_source(&repositories);
+        let held = held_by_source(transaction.scan().primary::<Repository>()?.all()?)?;
         for source in sources {
             let Some(stored) = transaction.get().primary::<Source>(source.name.clone())? else {
                 continue;
@@ -451,18 +443,9 @@ impl Catalog {
         Ok(())
     }
 
-    /// Writes each scanned source's held files and bytes again, which the end of a walk does
-    /// and a walk that was killed did not reach. A source the mirror, the pull queue or a
-    /// peer owns keeps counts of its own and is left alone; `last_scan` is not written
-    /// either, because the scan it names did not finish.
     fn recount_source_counts(&self) -> Result<()> {
         let transaction = self.database.rw_transaction()?;
-        let repositories: Vec<Repository> = transaction
-            .scan()
-            .primary()?
-            .all()?
-            .collect::<native_db::db_type::Result<_>>()?;
-        let held = held_by_source(&repositories);
+        let held = held_by_source(transaction.scan().primary::<Repository>()?.all()?)?;
         let sources: Vec<Source> = transaction
             .scan()
             .primary()?
@@ -895,16 +878,17 @@ impl Catalog {
     }
 }
 
-/// What each source holds, summed from the repositories under it: the files still on this
-/// disk and the bytes they occupy.
-fn held_by_source(repositories: &[Repository]) -> HashMap<&str, (u64, u64)> {
-    let mut held: HashMap<&str, (u64, u64)> = HashMap::new();
+fn held_by_source(
+    repositories: impl IntoIterator<Item = native_db::db_type::Result<Repository>>,
+) -> Result<HashMap<String, (u64, u64)>> {
+    let mut held: HashMap<String, (u64, u64)> = HashMap::new();
     for repository in repositories {
-        let slot = held.entry(repository.source.as_str()).or_default();
+        let repository = repository?;
+        let slot = held.entry(repository.source).or_default();
         slot.0 += u64::from(repository.present_files);
         slot.1 = slot.1.saturating_add(repository.present_bytes);
     }
-    held
+    Ok(held)
 }
 
 /// Whether the sweep changed what the search index should hold for this artifact.
@@ -2745,6 +2729,64 @@ pub(super) fn settle_repositories(transaction: &RwTransaction<'_>) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn counted_repository(source: &str, files: u32, bytes: u64) -> Result<Repository> {
+        Ok(Repository {
+            id: 1,
+            key: source.to_owned(),
+            source: source.to_owned(),
+            repo: hoard_core::RepoId::parse_ref(hoard_core::RepoType::Models, "test/model")?,
+            root_path: String::new(),
+            git_dir: None,
+            default_ref: "main".to_owned(),
+            remote: None,
+            revisions: Vec::new(),
+            present_files: files,
+            present_bytes: bytes,
+        })
+    }
+
+    #[test]
+    fn source_totals_accept_an_empty_repository_stream() -> Result<()> {
+        assert!(held_by_source(std::iter::empty())?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn source_totals_group_nonadjacent_repositories_and_saturate_bytes() -> Result<()> {
+        let totals = held_by_source([
+            Ok(counted_repository("first", u32::MAX, u64::MAX)?),
+            Ok(counted_repository("second", 7, 19)?),
+            Ok(counted_repository("first", 2, 1)?),
+            Ok(counted_repository("empty", 0, 0)?),
+        ])?;
+        assert_eq!(totals.len(), 3);
+        assert_eq!(
+            totals.get("first"),
+            Some(&(u64::from(u32::MAX) + 2, u64::MAX))
+        );
+        assert_eq!(totals.get("second"), Some(&(7, 19)));
+        assert_eq!(totals.get("empty"), Some(&(0, 0)));
+        Ok(())
+    }
+
+    #[test]
+    fn source_totals_stop_at_a_repository_read_error() -> Result<()> {
+        let mut repositories = [
+            Ok(counted_repository("first", 1, 3)?),
+            Err(native_db::db_type::Error::Io(std::io::Error::other(
+                "synthetic repository read failure",
+            ))),
+            Ok(counted_repository("unread", 1, 5)?),
+        ]
+        .into_iter();
+        assert!(matches!(
+            held_by_source(&mut repositories),
+            Err(IndexError::Native(_))
+        ));
+        assert_eq!(repositories.len(), 1);
+        Ok(())
+    }
 
     #[test]
     fn an_absent_id_and_an_absent_shard_count_are_spelled_zero() {

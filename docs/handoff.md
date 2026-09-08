@@ -3,32 +3,21 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
-## Latest slice: consume artifact cleanup work
+## Latest slice: stream repository totals
 
-Sweeping and retirement recounts consume the existing touched-ID set in 1,024-item batches,
-removing both full-size ID-vector copies. Capturing summary deltas no longer requeues
-cleanup work. The initial pass-wide set remains; this slice does not claim bounded total
-scan memory. Tests cover deduplication, empty work, summary capture, and both cleanup paths
-across batch boundaries. No benchmarks, archives, worktrees, or persistent fixtures added.
-Validation: 895 workspace tests passed, along with the workspace build, warning-free
-Clippy, and formatting. The test adjusted for Clippy was rerun successfully.
+`record_scan_stats` and `recount_source_counts` now aggregate one repository at a time into
+per-source counters. Both full repository vectors are removed. Counts, byte saturation,
+recovery timestamps, and mirror/pull/peer source exclusions are preserved. Four new tests
+cover grouping, empty input, read failures, and recovery behavior.
 
-**Next slice:** stream repository totals in `record_scan_stats` and `recount_source_counts`,
-replacing their full repository vectors with per-source accumulators.
+Validation: 899 workspace tests, workspace build, warning-free Clippy, and formatting pass.
+No benchmarks, archives, worktrees, or persistent fixtures added. Previous follow-ups folded
+summary deltas per transaction and consumed cleanup sets without vector copies. No schema
+or public API changed. The measurements below belong to `51418ad`, not these follow-ups.
 
-## Previous slice: transaction summary folding
-
-Summary snapshots now last for one write transaction instead of the whole scan/hash pass.
-Artifact mutations and their summary deltas commit or roll back together. Ingest and pull
-writers share that path instead of maintaining separate artifact-counting implementations.
-Repository-count settlement uses one write transaction. No schema or public API changed.
-
-The full suite passes with 892 tests, including four new summary tests and stronger
-interrupted scan/hash assertions. Workspace build, Clippy with warnings denied, and
-formatting pass. This follow-up deliberately adds no scale benchmarks,
-archives, worktrees, or generated datasets. The measurements below belong to `51418ad`;
-they are not measurements of this slice. Grouped discovery, usage/schema work, pass-wide
-touched-ID bookkeeping, and oversized artifact groups remain unresolved.
+**Next slice:** page entry IDs in `retire_source` instead of collecting all entries of
+each repository before deleting batches. The pass-wide touched-ID set, other retirement
+bookkeeping, usage/schema work, and oversized groups remain unresolved.
 
 ## Memory delivery, 2026-09-08 (commit `51418ad`)
 
