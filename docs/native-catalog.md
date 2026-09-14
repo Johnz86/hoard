@@ -1462,6 +1462,53 @@ and met on the slowest A725 reading, 129.686 ms, by 370 ms. The 632.5 and 681.3 
 `0935fde` stand as history from a run this document cannot re-enter; every reading taken since,
 here and in the concurrent latency diagnosis above, is between 76 and 130 ms.
 
+### What a rescan alone holds, at 100k and at 1M
+
+The rescan rows above are differences of a high-water mark inside a process that has already
+scanned, rebuilt and queried, so they measure where the mark was left rather than what the
+rescan allocates: the same unchanged rescan reads 57 MiB in one run and 140 MiB in another.
+Two standalone vehicles answer it instead, each an ignored test in
+`crates/hoard-index/tests/scale.rs` that opens what an earlier `native_catalog_at_scale` left
+under `HOARD_SCALE_DIR` and does one thing: `rescan_only_catalog` rescans the seeded catalog,
+and `discovery_only_source` runs `discover::discover` over the seeded tree and holds the
+result. The figure each reports is the process's absolute `VmHWM`, not a growth.
+
+Measured at `e320a06`, release, nothing else running, pinned to the ten Cortex-X925 cores with
+`taskset -c 5-9,15-19`, each scale seeded once and every run against that seed:
+
+| vehicle | scale | run | wall | peak, absolute | resident after |
+| --- | --- | ---: | ---: | ---: | ---: |
+| rescan only | 100k | 1 | 461.6 ms | 143.52 MiB | 123.08 MiB |
+| rescan only | 100k | 2 | 355.5 ms | 140.48 MiB | 108.97 MiB |
+| rescan only | 1M | 1 | 4.285 s | 866.25 MiB | 514.30 MiB |
+| rescan only | 1M | 2 | 3.904 s | 870.54 MiB | 506.58 MiB |
+| discovery only | 1M | 1 | 1.115 s | 460.33 MiB | 354.69 MiB held |
+| discovery only | 1M | 2 | 1.159 s | 455.45 MiB | 349.65 MiB held |
+
+Each process starts at 4 to 8 MiB. The first rescan of each scale found the 1,000 headers the
+seeding run left rewritten and the second found nothing changed; the peak does not depend on
+it, because an unchanged rescan builds the discovered source and the known stamps in full.
+
+**The 1M peak is accounted for, within four per cent, by three things:**
+
+| component | why it is resident at the peak | MiB |
+| --- | --- | ---: |
+| redb read cache | `known_stamps` reads every `Entry` before the walk; the catalog caps the cache at 256 MiB, of which redb gives nine tenths to reads | up to 230 |
+| `walk.known` and `walk.seen` | a `HashMap<u128, Known>` of 64-byte pairs at 2^21 buckets, and a set of every entry id | about 147 |
+| discovery | the source's `DiscoveredEntry` rows, 144 bytes each with two heap paths, plus the walker's single `Vec<DiscoveredFile>` for the whole source, still allocated while the rows are built from it | about 452 |
+| baseline | the process before either | 8 |
+| **sum** | | **about 837** |
+
+against 866 to 871 MiB measured. Discovery's own peak is 105 MiB above what it holds when it
+returns, which is the walker's buffer; `known` is alive during discovery because
+`known_stamps` runs first, so the two add. The 6.1 ratio between the 1M and 100k peaks,
+rather than ten, is the cache: it is bounded, so at 100k it is a larger share.
+
+The prediction this was taken to test said roughly 390 to 470 MB and was wrong by about half.
+It had the ranking right and the total wrong: it left out the redb cache, it left out
+discovery's transient buffer, and it put the held discovered source at 254 MB where the
+scratchpad's long absolute paths make it 350 MiB.
+
 ### Thresholds
 
 At 1M entries, absolute: peak RSS growth during the scan under 2 GB, allocated disk under

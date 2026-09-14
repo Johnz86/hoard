@@ -41,56 +41,47 @@ Save compact evidence and remove scratch data and worktrees when finished.
 
 ## The open items, and what closes each
 
-Five items were opened here and four remain. Each closes by being fixed or by being measured
+Five items were opened here and one remains. Each closes by being fixed or by being measured
 and recorded as not worth fixing; none closes by being deferred again. They keep their
 original order, the closed one first with its result, then what blocks what.
 
 **Items 2, 3 and 4 were mis-sized when they were written.** They name structures bounded by a
-repository, a shard set and a revision, and each is worth single-digit megabytes at a
-pathological size. They sit beside two structures that a rescan holds unconditionally and that
-are an order of magnitude larger, neither of which was on this list. What a 1M rescan holds,
-by size, with the struct widths taken from the compiler rather than estimated:
+repository, a revision and a shard set, each worth single-digit megabytes at a pathological
+size. Measured at `e320a06`, a process that opens a 1M catalog and rescans peaks at an
+absolute 866 to 871 MiB, and three components account for all but four per cent of it; see
+"What a rescan alone holds" in [the native catalog report](native-catalog.md).
 
-| structure | where | bound | at 1M |
-| --- | --- | --- | ---: |
-| the discovered source | `discover::discover` in `catalog/scan/mod.rs:257` | one source, every entry, with `rel_path` and `abs_path` both on the heap | ~254 MB |
-| `walk.known` | `Catalog::known_stamps` | every entry of every scanned source | ~136 MB |
-| `retract_absent`'s `missing` | `catalog/scan/mod.rs:483` | every known entry not seen | up to 48 MB |
-| `walk.seen` + `counters.touched` | the pass | every entry, every artifact | ~36 MB |
-| item 2, `retire_source`'s ids | `catalog/scan/sweep.rs` | one repository's entries | 8 MB |
-| item 4, `counters.pending` | `log_revision_artifacts` | one revision's entries | 8 MB |
-| item 3, an unchunked shard set | `revision_units` | one artifact's shards | under 1 MB |
+| component | bound | MiB at 1M |
+| --- | --- | ---: |
+| discovery: the `DiscoveredEntry` rows plus the walker's single `Vec<DiscoveredFile>` | one source | about 452 at its peak, 350 held |
+| redb read cache, filled by `known_stamps` reading every `Entry` | `CACHE_BYTES`, nine tenths of 256 MiB | up to 230 |
+| `walk.known` and `walk.seen` | every entry of every scanned source | about 147 |
+| item 2, `retire_source`'s ids | one repository | 8 at a million-entry repository |
+| item 4, `counters.pending` | one revision | 8 at a million-entry revision |
+| item 3, an unchunked `Unit::Set` | one artifact's shards | under 1 |
 
-`DiscoveredEntry` is 144 bytes plus two heap strings; `revision_units` chunks standalone files
-by `CHUNK` and never chunks a `Unit::Set`. The measured scan peak of 866 MiB at 1M is
-consistent with the first two rows being most of it.
+**The one goal: a rescan holds one repository at a time, not one source.** The walk already
+loops sources, then repositories, then revisions; `walk.paths` already holds one repository's
+index at a time; and every lookup into `walk.known` is keyed by a hash seeded with the
+repository's id, so nothing reads across repositories. The only pass-wide consumer is
+`retract_absent`, which runs once at the end and not at all on an interrupt.
 
-**The one goal that follows: a rescan holds one repository at a time, not one source.** The
-walk is already structurally per repository - it loops sources, then repositories, then
-revisions - and `walk.paths` already demonstrates the pattern, carrying the comment "so no
-more than one repository's index is ever held". Extending that to the two large rows is the
-whole change, and `location_hash` already keys `known` by `repo_id`, so every lookup is
-already scoped to the repository being walked.
+It lands as three waves. The first is done; the other two are ordered by what they remove.
 
-It lands as three waves, each with a number before and after:
+1. **The vehicle, done at `e320a06`.** `rescan_only_catalog` and `discovery_only_source` in
+   the scale harness, and the attribution above.
+2. **Discovery per repository, expected to take the 1M peak from about 870 to about 420 MiB.**
+   The `discover` crate: split finding the repository roots, which is cheap, from reading one
+   repository's entries, which is not, so neither the walker's buffer nor the rows outlive the
+   repository being walked. `store_source` needs the roots up front to assign ordinals, and
+   the roots are what it gets. It goes first because it is three times the size of the next.
+3. **`known`, `seen` and retraction per repository, expected to take it to about 270 MiB.**
+   Catalog only: load a repository's stamps when the walk reaches it, retract what it did not
+   see before moving on, drop both. It changes one documented invariant, that an interrupted
+   walk retires nothing, into its per-repository form, and the plan must name the tests that
+   pin the old form. The floor after both is the redb cache plus one repository.
 
-1. **The vehicle.** No fixture can show any of this today: the harness runs the scan and the
-   rescan in one process, so the rescan's own peak is masked by pages the scan already made
-   resident, and "peak RSS growth" of a phase is not an allocation. A standalone rescan-only
-   test that opens a seeded catalog and reports the absolute peak of a process that does
-   nothing else, on the model of `concurrent_catalog_queries`. **Nothing else starts until
-   this prints a number.**
-2. **`known`, `seen` and retraction per repository.** Catalog only, one subsystem. Load a
-   repository's stamps as it is reached, retract what it did not see before moving on, drop
-   both. Expected to remove the second and third rows and most of the fourth.
-3. **Discovery per repository.** The `discover` crate, a separate subsystem and so a separate
-   wave: split `discover` into finding the repository roots, which is cheap, and reading one
-   repository's entries, which is not. `store_source` needs the roots up front to assign
-   ordinals, and the roots are what it should get.
-
-Items 2, 3 and 4 close against wave 1's number rather than against a wave of their own: an
-8 MB structure beside a 390 MB one is measured and recorded as not worth doing, unless wave 1
-says the sizes above are wrong. **That verdict is not licensed until the number exists.**
+Items 2, 3 and 4 close against this measurement below.
 
 1. **The concurrency gate: closed at `39bb637`, met, and it was never a lock.** Latency
    against thread count at 1, 2, 4 and 8 was taken at both 100k and 1M and is recorded in
@@ -108,30 +99,28 @@ says the sizes above are wrong. **That verdict is not licensed until the number 
    same page single-threaded. The gate line above binds exactly as written and is met by
    370 ms on the slowest reading taken, so it is left unchanged. No follow-on wave is owed.
 
-2. **Dropped-source retirement.** `retire_source` in `crates/hoard-index/src/catalog/scan/sweep.rs`
-   collects every entry id of a repository before it chunks the deletes. No harness phase drops
-   a configured source, so the cost has never been observed, and paging cannot remove the
-   dominant term because a native_db secondary scan materialises every matching primary key
-   before yielding. **Closes when** a phase that drops a source at 1M has run and the result is
-   either a fix with a before and an after, or a recorded verdict that the ids cost eight bytes
-   each and the item is not worth a wave.
+2. **Dropped-source retirement: closed at `e320a06`, measured and not worth a wave.**
+   `retire_source` in `crates/hoard-index/src/catalog/scan/sweep.rs` holds one repository's
+   entry ids at a time, eight bytes each: 8 KB for a fixture repository of 1,000 files and 8 MB
+   for a repository of a million, against a rescan peak of 866 MiB, under one per cent at the
+   pathological size. Paging it could not remove the larger term anyway, since a native_db
+   secondary scan materialises every matching key before it yields. **Reopens if** a single
+   repository approaches the size of a whole catalog, which the per-repository goal above
+   would then have to bound first.
 
-3. **Oversized artifact groups.** The one remaining limit with a fixture hook already in the
-   harness, `HOARD_SCALE_WIDE_CARD_ARTIFACTS`. **Closes when** it has been run at 1M and the
-   number decides, on the same terms as item 2.
+3. **Oversized artifact groups: closed at `e320a06`, measured and not worth a wave.**
+   `revision_units` chunks standalone files by `CHUNK` and never chunks a `Unit::Set`, so one
+   artifact's shards are prepared and stored together. A shard set is hundreds of files, not
+   millions: under 1 MiB of prepared entries against an 866 MiB peak. **Reopens if** a real
+   model is found whose shard count reaches the tens of thousands.
 
-4. **The pending change set, which is not bounded by `CHUNK`.** `counters.pending` drains
-   inside `log_changes` once per write transaction, which reads as a `CHUNK` bound and is not
-   one: a transaction can cover a whole revision. `log_revision_artifacts` in
-   `crates/hoard-index/src/catalog/scan/sweep.rs` scans every entry of a revision and pushes
-   one id per entry with no chunking and no `log_changes` inside the loop, and both callers -
-   `catalog/pulls.rs:140`, and the rescan at `catalog/scan/mod.rs:333` whenever a revision's
-   card changes - then drain it into one `SearchChange` insert per id in that same
-   transaction. For a revision of N entries that is N primary keys materialised by the
-   secondary scan, N whole `Entry` rows decoded to read one field, N times eight bytes held,
-   and N row inserts, all before one commit. **Closes when** a fixture with one large revision
-   has measured it and the result is either a fix with a before and an after, or a recorded
-   verdict that revisions do not get large enough to matter.
+4. **The pending change set: closed at `e320a06`, measured and not worth a wave.**
+   `log_revision_artifacts` pushes one id per entry of a revision into `counters.pending`
+   before a single `log_changes`, so the set is bounded by the largest revision rather than by
+   `CHUNK`, as recorded when this item was opened. At eight bytes an id that is 8 MB for a
+   million-entry revision against an 866 MiB peak; the row inserts it causes are write volume,
+   not memory, and are paid once per card change. **Reopens if** a card change on a very large
+   revision is measured to stall a rescan, which is a latency question this item never was.
 
 5. **Two files over the 1,500-line cap.** `crates/hoard-index/src/catalog/search.rs` at 4,062
    lines and `crates/hoard-index/src/catalog/tests.rs` at 11,603. **Closes when** both are

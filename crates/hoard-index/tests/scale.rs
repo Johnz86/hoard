@@ -10,6 +10,7 @@ use hoard_index::catalog::{
     Catalog, QueryRequest, RepositoryFilter, RescanScope, StorageReport, UsageEvent,
 };
 use hoard_index::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
+use hoard_index::discover::{self, NoiseFilter};
 use hoard_index::row::SearchRow;
 use hoard_index::search::{CompileContext, Facets, SortKey, SortSpec};
 
@@ -42,6 +43,10 @@ const USAGE_REPOSITORIES: u32 = 1000;
 /// How often the rebuild samples the output directory while it writes a new index, in
 /// documents. Sparse enough that the walk is not part of what is being measured.
 const REBUILD_SAMPLE: u64 = 51_200;
+/// What an operator who has not seeded this scale yet is told, because a rescan-only run
+/// needs both the catalog and the tree an earlier scan left and measures nothing without them.
+const SEED_FIRST: &str = "seed this scale first with HOARD_SCALE_ENTRIES and HOARD_SCALE_DIR: \
+cargo test --release -p hoard-index --test scale native_catalog_at_scale -- --ignored";
 const KEY_FAMILIES: [&str; 4] = [
     "model.layers.{n}.self_attn.q_proj.weight",
     "lora_unet_down_blocks_{n}_attn.lora_down.weight",
@@ -687,6 +692,111 @@ fn concurrent_catalog_queries() {
     let offset = u32::try_from(entries().saturating_sub(PAGE as usize) / 2)
         .expect("the midpoint fits the query offset");
     report(&concurrency_phase(&catalog, &context, offset));
+}
+
+#[test]
+#[ignore]
+fn rescan_only_catalog() {
+    let count = entries();
+    let root = scale_dir();
+    let tree = synthetic_tree(&root, count);
+    let config = config(&root, &tree);
+    let output = root.join(format!("native-{count}"));
+    let catalog = Catalog::open(&output).expect(SEED_FIRST);
+    assert_eq!(
+        catalog
+            .totals()
+            .expect("the totals answer")
+            .present_artifacts,
+        count as u64,
+        "{SEED_FIRST}"
+    );
+    let resident_before = current_rss_kb();
+    let peak_before = peak_rss_kb();
+    let (rescanned, rescan_wall) = timed(|| {
+        catalog
+            .rescan(
+                &config,
+                HashPolicy::Never,
+                RescanScope::Configured,
+                |_, _| {},
+            )
+            .expect("the rescan over a seeded catalog succeeds")
+    });
+    let resident_after = current_rss_kb();
+    let peak_after = peak_rss_kb();
+    assert!(!rescanned.interrupted);
+    assert_eq!(rescanned.added, 0, "{SEED_FIRST}");
+    assert_eq!(rescanned.absent, 0, "{SEED_FIRST}");
+    report(&[
+        ("entries", count.to_string()),
+        ("rescan wall", format!("{rescan_wall:?}")),
+        ("rescan report", format!("{rescanned:?}")),
+        (
+            "resident rss before the rescan",
+            bytes(resident_before * 1024),
+        ),
+        (
+            "resident rss after the rescan",
+            bytes(resident_after * 1024),
+        ),
+        (
+            "peak rss of the process before the rescan, absolute",
+            bytes(peak_before * 1024),
+        ),
+        (
+            "peak rss of the process after the rescan, absolute",
+            bytes(peak_after * 1024),
+        ),
+    ]);
+}
+
+#[test]
+#[ignore]
+fn discovery_only_source() {
+    let count = entries();
+    let root = scale_dir();
+    let tree = synthetic_tree(&root, count);
+    let config = config(&root, &tree);
+    let source = config
+        .sources
+        .first()
+        .expect("the scale configuration names one source");
+    let resident_before = current_rss_kb();
+    let peak_before = peak_rss_kb();
+    let (discovered, discovery_wall) = timed(|| {
+        discover::discover(source, &NoiseFilter::from_paths(Vec::new()))
+            .expect("the synthetic tree is discoverable")
+    });
+    let resident_held = current_rss_kb();
+    let peak_after = peak_rss_kb();
+    let found: usize = discovered
+        .repos()
+        .iter()
+        .flat_map(|repo| &repo.revisions)
+        .map(|revision| revision.entries.len())
+        .sum();
+    assert_eq!(found, count, "{SEED_FIRST}");
+    report(&[
+        ("entries", count.to_string()),
+        ("discovery wall", format!("{discovery_wall:?}")),
+        (
+            "resident rss before discovery",
+            bytes(resident_before * 1024),
+        ),
+        (
+            "resident rss holding the discovered source",
+            bytes(resident_held * 1024),
+        ),
+        (
+            "peak rss of the process before discovery, absolute",
+            bytes(peak_before * 1024),
+        ),
+        (
+            "peak rss of the process after discovery, absolute",
+            bytes(peak_after * 1024),
+        ),
+    ]);
 }
 
 #[test]
