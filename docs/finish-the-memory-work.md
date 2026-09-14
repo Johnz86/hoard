@@ -66,7 +66,7 @@ index at a time; and every lookup into `walk.known` is keyed by a hash seeded wi
 repository's id, so nothing reads across repositories. The only pass-wide consumer is
 `retract_absent`, which runs once at the end and not at all on an interrupt.
 
-It lands as three waves. The first is done; the other two are ordered by what they remove.
+It landed as three waves, ordered by what they remove.
 
 1. **The vehicle, done at `b10c30d`.** `rescan_only_catalog` and `discovery_only_source` in
    the scale harness, and the attribution above.
@@ -79,16 +79,21 @@ It lands as three waves. The first is done; the other two are ordered by what th
    files is held whole by design, because shard sets and the unchanged-revision test span a
    revision, so the one-repository tree stays at 866.50 MiB against 875.59. The numbers are in
    `docs/native-catalog.md` under "The rescan peak after windowed discovery, at 1M".
-3. **`known`, `seen` and retraction per repository, expected to take the per-folder peak from the
-   measured 478 MiB to about 330 MiB.** Catalog only: load a repository's stamps when the walk
-   reaches it, move the rows it did not see into a pass-wide list of missing rows, and drop the
-   rest. Retraction stays at the end of the pass and is still skipped when the walk is
-   interrupted, so "an interrupted walk retires nothing" holds exactly as written. The stored
-   repositories the walk never reached, which today are retracted only because every stamp was
-   loaded up front, are streamed and retracted at the end in `CHUNK` transactions;
-   `a_rescan_retracts_more_paths_than_one_transaction_holds` already fails if they are not. The
-   floor after it is the redb read cache plus one window of repositories. A single repository of
-   a million files stays held whole, as it does after wave 2.
+3. **`known`, `seen` and retraction per repository, done in the wave commit "Hold one
+   repository's stamps at a time".** A rescan loads a repository's stamps when the walk reaches
+   it and sets aside the rows it did not see when the walk leaves it. At the end of an
+   uninterrupted pass it retracts those, then streams and retracts the stored repositories the
+   walk never reached in `CHUNK` transactions. An interrupted walk still retires nothing, word
+   for word as `rescan_until` says. On the per-folder 1M tree the rescan-only peak went from
+   477.55 and 477.50 MiB at `9dd3eb8` to 271.84 and 272.33 MiB: **the gate is met**, a fall of
+   205 MiB against a required 100, with the rescan wall down from 4.19 to 3.50 s. The
+   one-repository tree went from 862.51 and 860.63 MiB to 846.48 and 848.27. As first implemented
+   it had risen by 78 MiB there, because a repository's stamps now load on top of its discovered
+   rows; sizing the stamp map from the stored file count and caching only the shard counts that
+   exist removed the rise before the wave landed. What the per-folder peak holds is up to 230 MiB
+   of redb read cache, the 8 MiB baseline, and about 34 MiB for one window of repositories and one
+   repository's stamps. The numbers are in `docs/native-catalog.md` under "The rescan peak after
+   per-repository stamps, at 1M".
 
 Items 2, 3 and 4 close against this measurement below.
 

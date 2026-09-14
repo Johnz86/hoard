@@ -201,7 +201,14 @@ pub(super) fn is_scanned_source(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use hoard_core::State;
+
     use super::*;
+    use crate::catalog::hashing::Stop;
+    use crate::catalog::scan::RescanScope;
+    use crate::config::HashPolicy;
 
     fn counted_repository(source: &str, files: u32, bytes: u64) -> Result<Repository> {
         Ok(Repository {
@@ -219,30 +226,179 @@ mod tests {
         })
     }
 
-    #[test]
-    fn a_source_discovered_across_many_windows_files_what_one_window_files() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let input = directory.path().join("models");
-        let folders = rayon::current_num_threads() * 2 + 1;
+    fn per_folder_root(input: &Path, folders: usize) -> Result<IndexConfig> {
         for folder in 0..folders {
             let path = input.join(format!("folder-{folder:03}"));
             std::fs::create_dir_all(&path)?;
             std::fs::write(path.join("a.bin"), format!("a{folder}"))?;
             std::fs::write(path.join("b.bin"), format!("b{folder}"))?;
         }
-        let source = SourceConfig {
-            name: "windows".to_owned(),
-            path: input,
-            kind: SourceKind::Loose,
-            include: Vec::new(),
-            exclude: Vec::new(),
-            follow_symlinks: false,
-            repo_per_folder: true,
-        };
-        let config = IndexConfig {
-            sources: vec![source.clone()],
+        Ok(IndexConfig {
+            sources: vec![SourceConfig {
+                name: "windows".to_owned(),
+                path: input.to_path_buf(),
+                kind: SourceKind::Loose,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                follow_symlinks: false,
+                repo_per_folder: true,
+            }],
             ..IndexConfig::default()
-        };
+        })
+    }
+
+    fn scanned_per_folder(folders: usize) -> Result<(tempfile::TempDir, Catalog, IndexConfig)> {
+        let directory = tempfile::tempdir()?;
+        let config = per_folder_root(&directory.path().join("models"), folders)?;
+        let catalog = Catalog::scan_sources(
+            &directory.path().join("native"),
+            "n",
+            &config,
+            HashPolicy::Never,
+            |_, _| {},
+        )?;
+        Ok((directory, catalog, config))
+    }
+
+    fn repository_of_folder(catalog: &Catalog, folder: &str) -> Result<Repository> {
+        catalog
+            .database
+            .r_transaction()?
+            .scan()
+            .primary::<Repository>()?
+            .all()?
+            .collect::<native_db::db_type::Result<Vec<Repository>>>()?
+            .into_iter()
+            .find(|repository| repository.key.ends_with(folder))
+            .ok_or_else(|| IndexError::Catalog(format!("no repository for {folder}")))
+    }
+
+    fn state_of(catalog: &Catalog, repo_id: i64, file: &str) -> Result<Option<State>> {
+        Ok(catalog
+            .database
+            .r_transaction()?
+            .scan()
+            .primary::<Entry>()?
+            .all()?
+            .collect::<native_db::db_type::Result<Vec<Entry>>>()?
+            .into_iter()
+            .find(|entry| entry.repo_id == repo_id && entry.rel_path.ends_with(file))
+            .map(|entry| entry.state))
+    }
+
+    #[test]
+    fn a_repository_folder_removed_beside_its_siblings_is_retracted_by_the_next_rescan()
+    -> Result<()> {
+        let (directory, catalog, config) = scanned_per_folder(3)?;
+        std::fs::remove_dir_all(directory.path().join("models/folder-001"))?;
+
+        let report = catalog.rescan(
+            &config,
+            HashPolicy::Never,
+            RescanScope::Configured,
+            |_, _| {},
+        )?;
+
+        assert_eq!(report.absent, 2);
+        assert!(!report.interrupted);
+        for folder in ["folder-000", "folder-002"] {
+            assert_eq!(repository_of_folder(&catalog, folder)?.present_files, 2);
+        }
+        assert_eq!(
+            repository_of_folder(&catalog, "folder-001")?.present_files,
+            0
+        );
+        assert_eq!(catalog.count_summary()?, catalog.totals()?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stop_raised_after_a_repository_is_walked_still_retires_nothing() -> Result<()> {
+        let (directory, catalog, config) = scanned_per_folder(3)?;
+        let input = directory.path().join("models");
+        std::fs::remove_file(input.join("folder-000/a.bin"))?;
+        std::fs::write(input.join("folder-000/c.bin"), "c0")?;
+        std::fs::write(input.join("folder-002/a.bin"), "rewritten")?;
+        let first = repository_of_folder(&catalog, "folder-000")?;
+
+        let stop = Stop::default();
+        let report = catalog.rescan_until(
+            &config,
+            HashPolicy::Never,
+            RescanScope::Configured,
+            &stop,
+            |name, entries| {
+                if name == "windows" && entries > 0 {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+        )?;
+
+        assert!(report.interrupted);
+        assert_eq!(report.absent, 0);
+        assert_eq!(report.added, 1);
+        assert_eq!(state_of(&catalog, first.id, "c.bin")?, Some(State::Triage));
+        assert_eq!(state_of(&catalog, first.id, "a.bin")?, Some(State::Triage));
+        assert_eq!(
+            repository_of_folder(&catalog, "folder-000")?.present_files,
+            3
+        );
+        assert!(catalog.manifest()?.pass_open);
+
+        let finished = catalog.rescan(
+            &config,
+            HashPolicy::Never,
+            RescanScope::Configured,
+            |_, _| {},
+        )?;
+        assert!(!finished.interrupted);
+        assert_eq!(finished.absent, 1);
+        assert_eq!(state_of(&catalog, first.id, "a.bin")?, Some(State::Remote));
+        assert_eq!(
+            repository_of_folder(&catalog, "folder-000")?.present_files,
+            2
+        );
+        assert!(!catalog.manifest()?.pass_open);
+        Ok(())
+    }
+
+    #[test]
+    fn a_rescan_holds_no_stamps_between_repositories() -> Result<()> {
+        let (directory, catalog, config) = scanned_per_folder(4)?;
+        let input = directory.path().join("models");
+        std::fs::write(input.join("folder-001/a.bin"), "rewritten")?;
+        std::fs::remove_file(input.join("folder-002/b.bin"))?;
+        std::fs::write(input.join("folder-002/c.bin"), "c2")?;
+        std::fs::remove_dir_all(input.join("folder-003"))?;
+
+        let report = catalog.rescan(
+            &config,
+            HashPolicy::Never,
+            RescanScope::Configured,
+            |_, _| {},
+        )?;
+
+        assert_eq!(
+            report,
+            super::super::RescanReport {
+                unchanged: 4,
+                changed: 1,
+                added: 1,
+                absent: 3,
+                interrupted: false,
+            }
+        );
+        assert!(!catalog.manifest()?.pass_open);
+        assert_eq!(catalog.count_summary()?, catalog.totals()?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_source_discovered_across_many_windows_files_what_one_window_files() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let folders = rayon::current_num_threads() * 2 + 1;
+        let config = per_folder_root(&directory.path().join("models"), folders)?;
+        let source = config.sources[0].clone();
         let noise = crate::discover::NoiseFilter::default();
         assert!(crate::discover::plan(&source, &noise)?.windows().count() > 1);
 

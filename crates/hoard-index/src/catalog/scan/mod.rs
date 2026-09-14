@@ -125,18 +125,7 @@ impl Catalog {
         self.open_pass()?;
         let restated = self.stored_triage()? != config.triage_confidence;
         let mut counters = Counters::load(&self.database, config.triage_confidence)?;
-        let KnownRows { known, sizes } = self.known_stamps(&sources)?;
-        let mut walk = Walk {
-            settings: ScanSettings::new(config, policy),
-            known,
-            paths: HashMap::new(),
-            paths_of: None,
-            sizes,
-            discovered: HashSet::new(),
-            seen: HashSet::new(),
-            moved: Vec::new(),
-            report: RescanReport::default(),
-        };
+        let mut walk = Walk::new(ScanSettings::new(config, policy));
         self.walk(&sources, &mut walk, &mut counters, stop, progress)?;
         match (scope, walk.report.interrupted) {
             (RescanScope::Configured, false) => {
@@ -196,17 +185,7 @@ impl Catalog {
     ) -> Result<()> {
         self.ensure_self_row(node)?;
         let mut counters = Counters::load(&self.database, settings.triage)?;
-        let mut walk = Walk {
-            settings,
-            known: HashMap::new(),
-            paths: HashMap::new(),
-            paths_of: None,
-            sizes: HashMap::new(),
-            discovered: HashSet::new(),
-            seen: HashSet::new(),
-            moved: Vec::new(),
-            report: RescanReport::default(),
-        };
+        let mut walk = Walk::new(settings);
         self.walk(
             sources,
             &mut walk,
@@ -264,6 +243,12 @@ impl Catalog {
                         .flat_map(|repo| repo.ordinals.iter().map(|ordinal| (repo.id, *ordinal))),
                 );
                 for (repo, walked) in repos.iter().zip(walked) {
+                    if walk.reached.insert(walked.id) {
+                        walk.set_aside_unseen();
+                        let KnownRows { known, sizes } = self.repository_stamps(walked.id)?;
+                        walk.known = known;
+                        walk.sizes = sizes;
+                    }
                     for (revision, ordinal) in repo.revisions.iter().zip(walked.ordinals) {
                         let found = RevisionEntries {
                             repo_id: walked.id,
@@ -353,7 +338,9 @@ impl Catalog {
         if walk.report.interrupted {
             return Ok(());
         }
+        walk.set_aside_unseen();
         self.retract_absent(walk, counters)?;
+        self.retract_unreached(sources, walk, counters)?;
         self.record_scan_stats(sources, counters)
     }
 
@@ -394,61 +381,52 @@ impl Catalog {
         self.retire_emptied_revisions(&emptied)
     }
 
-    /// Every path the catalog already holds for the selected sources, with the stamp that
-    /// proves it unchanged and the facts a decision needs before any file is opened, and how
-    /// many of them each stored revision holds.
+    /// Every path the catalog already holds for one repository, with the stamp that proves it
+    /// unchanged and the facts a decision needs before any file is opened, and how many of
+    /// them each stored revision holds.
     ///
     /// Keyed by [`location_hash`] rather than by the location itself: a million relative
     /// paths held as text is the largest thing a rescan keeps in memory, and nothing here
     /// reads a location back.
-    fn known_stamps(&self, sources: &[&SourceConfig]) -> Result<KnownRows> {
-        let names: HashSet<&str> = sources.iter().map(|source| source.name.as_str()).collect();
+    fn repository_stamps(&self, repo_id: i64) -> Result<KnownRows> {
         let read = self.database.r_transaction()?;
-        let repositories: Vec<Repository> = read
-            .scan()
-            .primary()?
-            .all()?
-            .collect::<native_db::db_type::Result<_>>()?;
-        let mut shards: HashMap<i64, Option<u32>> = HashMap::new();
-        let mut known: KnownPaths = HashMap::new();
+        let present = read
+            .get()
+            .primary::<Repository>(repo_id)?
+            .map_or(0, |repository| repository.present_files);
+        let mut shards: HashMap<i64, u32> = HashMap::new();
+        let mut known: KnownPaths =
+            HashMap::with_capacity(usize::try_from(present).unwrap_or_default());
         let mut sizes: RevisionSizes = HashMap::new();
-        for repository in repositories
-            .iter()
-            .filter(|repository| names.contains(repository.source.as_str()))
+        for entry in read
+            .scan()
+            .secondary::<Entry>(EntryKey::location)?
+            .start_with(LocationKey::repository(repo_id))?
         {
-            for entry in read
-                .scan()
-                .secondary::<Entry>(EntryKey::location)?
-                .start_with(LocationKey::repository(repository.id))?
-            {
-                let entry: Entry = entry?;
-                if entry.placed.is_absent() {
-                    continue;
-                }
-                let (Some(mtime), Some(inode)) = (entry.mtime, entry.inode) else {
-                    continue;
-                };
-                let shard_count = match entry.artifact_id {
-                    Some(id) => shard_count_of(&read, &mut shards, id)?,
-                    None => None,
-                };
-                let location = location_hash(repository.id, entry.revision, &entry.rel_path);
-                known.insert(
-                    location,
-                    Known {
-                        entry_id: entry.id,
-                        artifact_id: entry.artifact_id.unwrap_or_default(),
-                        stamp: FileStamp {
-                            inode,
-                            mtime,
-                            size: entry.size,
-                        },
-                        revision: entry.revision,
-                        shard_count: shard_count.unwrap_or_default(),
+            let entry: Entry = entry?;
+            let Some((mtime, inode)) = stamped(&entry) else {
+                continue;
+            };
+            let shard_count = match entry.artifact_id {
+                Some(id) => shard_count_of(&read, &mut shards, id)?,
+                None => None,
+            };
+            let location = location_hash(repo_id, entry.revision, &entry.rel_path);
+            known.insert(
+                location,
+                Known {
+                    entry_id: entry.id,
+                    artifact_id: entry.artifact_id.unwrap_or_default(),
+                    stamp: FileStamp {
+                        inode,
+                        mtime,
+                        size: entry.size,
                     },
-                );
-                *sizes.entry((repository.id, entry.revision)).or_default() += 1;
-            }
+                    revision: entry.revision,
+                    shard_count: shard_count.unwrap_or_default(),
+                },
+            );
+            *sizes.entry((repo_id, entry.revision)).or_default() += 1;
         }
         Ok(KnownRows { known, sizes })
     }
@@ -485,40 +463,84 @@ impl Catalog {
     /// because a source that was unmounted retracts every path it held and a transaction
     /// holds every row it writes until it commits.
     fn retract_absent(&self, walk: &mut Walk, counters: &mut Counters) -> Result<()> {
-        let missing: Vec<Known> = walk
-            .known
-            .values()
-            .filter(|known| !walk.seen.contains(&known.entry_id))
-            .copied()
-            .collect();
+        let missing = std::mem::take(&mut walk.missing);
         for batch in missing.chunks(CHUNK) {
-            let transaction = self.database.rw_transaction()?;
-            let mut taken = Vec::new();
-            for known in batch {
-                let Some(entry) = transaction.get().primary::<Entry>(known.entry_id)? else {
-                    continue;
-                };
-                counters.derived.removed(&entry);
-                transaction.upsert(Entry {
-                    state: State::Remote,
-                    preference: preference(State::Remote, false),
-                    mtime: None,
-                    inode: None,
-                    ..entry
-                })?;
-                if let Some(id) = known.artifact() {
-                    counters.touch(&transaction, id)?;
-                    counters.pending.push(id);
-                    taken.push(id);
-                }
-                walk.report.absent += 1;
-            }
-            sweep_taken(&transaction, taken, counters)?;
-            log_changes(&transaction, counters)?;
-            counters.derived.flush(&transaction)?;
-            counters.settle_summary(&transaction)?;
-            transaction.commit()?;
+            self.retract_rows(
+                batch.iter().map(|known| (known.entry_id, known.artifact())),
+                counters,
+                &mut walk.report,
+            )?;
         }
+        Ok(())
+    }
+
+    fn retract_unreached(
+        &self,
+        sources: &[&SourceConfig],
+        walk: &mut Walk,
+        counters: &mut Counters,
+    ) -> Result<()> {
+        let mut batch: Vec<(i64, Option<i64>)> = Vec::with_capacity(CHUNK);
+        for source in sources {
+            for repo_id in self.repositories_of_source(&source.name)? {
+                if walk.reached.contains(&repo_id) {
+                    continue;
+                }
+                let read = self.database.r_transaction()?;
+                for entry in read
+                    .scan()
+                    .secondary::<Entry>(EntryKey::location)?
+                    .start_with(LocationKey::repository(repo_id))?
+                {
+                    let entry: Entry = entry?;
+                    if stamped(&entry).is_none() {
+                        continue;
+                    }
+                    batch.push((entry.id, entry.artifact_id));
+                    if batch.len() == CHUNK {
+                        self.retract_rows(batch.drain(..), counters, &mut walk.report)?;
+                    }
+                }
+            }
+        }
+        match batch.is_empty() {
+            true => Ok(()),
+            false => self.retract_rows(batch.drain(..), counters, &mut walk.report),
+        }
+    }
+
+    fn retract_rows(
+        &self,
+        rows: impl Iterator<Item = (i64, Option<i64>)>,
+        counters: &mut Counters,
+        report: &mut RescanReport,
+    ) -> Result<()> {
+        let transaction = self.database.rw_transaction()?;
+        let mut taken = Vec::new();
+        for (entry_id, artifact) in rows {
+            let Some(entry) = transaction.get().primary::<Entry>(entry_id)? else {
+                continue;
+            };
+            counters.derived.removed(&entry);
+            transaction.upsert(Entry {
+                state: State::Remote,
+                preference: preference(State::Remote, false),
+                mtime: None,
+                inode: None,
+                ..entry
+            })?;
+            if let Some(id) = artifact {
+                counters.touch(&transaction, id)?;
+                counters.pending.push(id);
+                taken.push(id);
+            }
+            report.absent += 1;
+        }
+        sweep_taken(&transaction, taken, counters)?;
+        log_changes(&transaction, counters)?;
+        counters.derived.flush(&transaction)?;
+        counters.settle_summary(&transaction)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -623,6 +645,13 @@ impl Catalog {
         }
         Ok(summary)
     }
+}
+
+fn stamped(entry: &Entry) -> Option<(i64, u64)> {
+    entry
+        .mtime
+        .zip(entry.inode)
+        .filter(|_| !entry.placed.is_absent())
 }
 
 fn remove_partial(directory: &Path) {

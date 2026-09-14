@@ -28,10 +28,42 @@ pub(super) struct Walk {
     /// sitting on a revision the walk is about to reach is not refiled onto another.
     pub(super) discovered: HashSet<(i64, u32)>,
     pub(super) seen: HashSet<i64>,
+    pub(super) reached: HashSet<i64>,
+    pub(super) missing: Vec<Known>,
     /// Entries whose revision moved to another ordinal under them, with the ordinal it
     /// moved to. Written once at the end of the pass rather than once per unit.
     pub(super) moved: Vec<(i64, u32)>,
     pub(super) report: RescanReport,
+}
+
+impl Walk {
+    pub(super) fn new(settings: ScanSettings) -> Self {
+        Self {
+            settings,
+            known: HashMap::new(),
+            paths: HashMap::new(),
+            paths_of: None,
+            sizes: HashMap::new(),
+            discovered: HashSet::new(),
+            seen: HashSet::new(),
+            reached: HashSet::new(),
+            missing: Vec::new(),
+            moved: Vec::new(),
+            report: RescanReport::default(),
+        }
+    }
+
+    pub(super) fn set_aside_unseen(&mut self) {
+        let seen = &self.seen;
+        self.missing.extend(
+            self.known
+                .drain()
+                .map(|(_, known)| known)
+                .filter(|known| !seen.contains(&known.entry_id)),
+        );
+        self.sizes.clear();
+        self.seen.clear();
+    }
 }
 
 /// One repository of a walked source: the row it was filed under, and the ordinal each of
@@ -80,7 +112,8 @@ impl Known {
     }
 }
 
-/// Every path of the selected sources the catalog holds bytes for, by [`location_hash`].
+/// Every path of the repository being walked the catalog holds bytes for, by
+/// [`location_hash`].
 pub(super) type KnownPaths = HashMap<u128, Known>;
 
 /// Where a repository holds one relative path, by [`path_hash`]: the location of the one
@@ -92,7 +125,7 @@ pub(super) type PathIndex = HashMap<u128, Option<u128>>;
 /// How many of those paths each stored revision holds, by repository and ordinal.
 pub(super) type RevisionSizes = HashMap<(i64, u32), usize>;
 
-/// What the catalog already holds for the sources a rescan is about to walk.
+/// What the catalog already holds for the repository a walk is about to enter.
 pub(super) struct KnownRows {
     pub(super) known: KnownPaths,
     pub(super) sizes: RevisionSizes,

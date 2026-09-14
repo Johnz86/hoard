@@ -272,16 +272,18 @@ pub(in crate::catalog) fn present_paths(referencing: &[Entry], shard_count: Opti
 
 pub(super) fn shard_count_of(
     read: &native_db::transaction::RTransaction<'_>,
-    shards: &mut HashMap<i64, Option<u32>>,
+    shards: &mut HashMap<i64, u32>,
     id: i64,
 ) -> Result<Option<u32>> {
-    match shards.entry(id) {
-        std::collections::hash_map::Entry::Occupied(slot) => Ok(*slot.get()),
-        std::collections::hash_map::Entry::Vacant(slot) => {
-            let record: Option<ArtifactRecord> = read.get().primary(id)?;
-            Ok(*slot.insert(record.and_then(|record| record.shard_count)))
-        }
+    if let Some(count) = shards.get(&id) {
+        return Ok(Some(*count));
     }
+    let record: Option<ArtifactRecord> = read.get().primary(id)?;
+    let count = record.and_then(|record| record.shard_count);
+    if let Some(count) = count {
+        shards.insert(id, count);
+    }
+    Ok(count)
 }
 
 /// Recounts what each artifact a transaction took a path from still holds, in that same

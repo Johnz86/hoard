@@ -364,7 +364,7 @@ Every writer of an entry commits through `scan::Counters`:
   `Manifest.search_seq`.
 - `Counters::save(transaction)` flushes whatever shift is left and writes the allocator back.
 
-A rescan recognises a stored row by where it is filed. `known_stamps` keys the map it hands
+A rescan recognises a stored row by where it is filed. `repository_stamps` keys the map it hands
 the walk by a hash of the location - the repository id, the revision ordinal and the relative
 path - and not by the absolute path the row's bytes were last found at. The two are not the
 same identity: an hf-cache entry sits at a blob under `blobs/`, so a file rewritten in place
@@ -386,8 +386,11 @@ moved, which is what two hf-cache snapshots linking one blob look like.
 
 That index is built one repository at a time, as the walk reaches a revision the catalog
 holds no rows for, and not for every source before the walk starts: only a repository with a
-fresh slot pays for it and only one repository's worth is held. The map of stored rows
-itself is unavoidable and is 48 bytes a row.
+fresh slot pays for it and only one repository's worth is held. The map of stored rows is
+48 bytes a row and is loaded the same way, one repository at a time as the walk reaches it;
+the rows that repository did not see are set aside when the walk leaves it, and the stored
+repositories the walk never reached are streamed and retracted at the end of an uninterrupted
+pass.
 
 A pass that commits many times can also be asked to stop. `Catalog::rescan_until` checks a
 `Stop` before each source it discovers and between the units of the one it is inside, and
@@ -1565,6 +1568,88 @@ The seeding run, once per binary over the per-folder tree, with the same pinning
 A fresh scan reaches the same walk, so its peak growth halves with the rescan's, and its wall
 changes by a ratio of 0.96. That is one run a binary, so it is not a result beyond saying the
 scan did not get slower. The rebuild does not touch discovery, and its row is variance.
+
+### The rescan peak after per-repository stamps, at 1M
+
+A rescan now loads a repository's stamps, revision sizes and seen set when the walk reaches
+it. When the walk leaves that repository, the rows it did not see move to a pass-wide list.
+At the end of an uninterrupted pass that list is retracted, and so is every stored repository
+of the walked sources that the walk never reached, streamed from its prefix in `CHUNK`
+transactions. An interrupted rescan still retires nothing.
+
+Both binaries were built before the first timed run: release, nothing else running, pinned to
+the ten Cortex-X925 cores with `taskset -c 5-9,15-19`. The before binary is `9dd3eb8`. The
+after binary is the wave commit "Hold one repository's stamps at a time". Each seed opened with
+1,000,000 present artifacts, and every run below found nothing changed but the first after run
+on the one-repository tree, which found the 1,000 headers a reseed of the shared tree had
+rewritten; its peak is in line with the second. The two binaries were run back to back on each
+seed in the order shown.
+
+| tree | binary | run | rescan wall | peak, absolute |
+| --- | --- | ---: | ---: | ---: |
+| one repository | `9dd3eb8` | 1 | 3.899 s | 862.51 MiB |
+| one repository | `9dd3eb8` | 2 | 3.773 s | 860.63 MiB |
+| one repository | wave commit | 1 | 3.869 s | 846.48 MiB |
+| one repository | wave commit | 2 | 3.544 s | 848.27 MiB |
+| per folder | `9dd3eb8` | 1 | 4.179 s | 477.55 MiB |
+| per folder | `9dd3eb8` | 2 | 4.205 s | 477.50 MiB |
+| per folder | wave commit | 1 | 3.518 s | 271.84 MiB |
+| per folder | wave commit | 2 | 3.490 s | 272.33 MiB |
+
+**The gate is met: the per-folder rescan peak fell by 205 MiB, from 477.5 to 272.1 MiB, against
+a required fall of 100 MiB to 378 MiB or below.** Each binary's two runs agree to within
+0.5 MiB. The per-folder rescan wall fell from 4.19 s to 3.50 s, a ratio of 0.84, larger than
+either pair's spread.
+
+**The one-repository tree fell by 14 MiB, to 847.4 MiB**, where the plan expected it not to move.
+It did not get there first time. The wave as first implemented rose to 944.91 and 940.20 MiB on
+this tree against 861.83 and 866.07 at `9dd3eb8`, because a repository's stamps now load after its
+window is discovered: for a repository of a million files, the stamp map growing by doubling,
+with the half-size table alive through each resize, and the per-artifact `shards` cache sat on top
+of the discovered rows, where at `9dd3eb8` both were built and dropped before discovery began.
+Two changes removed it, each measured on the same seed. Sizing the stamp map from the
+repository's stored `present_files` before its scan brought the peak to 886.95 and 896.48 MiB.
+Caching in `shard_count_of` only the artifacts that have a shard count, which are the only ones
+a cache spares a repeated read of a shard set's members, brought it to the figures in the table:
+the cache no longer holds an entry per artifact of an unsharded repository. The design limit is
+unchanged: a repository is read and held whole.
+
+The per-folder fall is 58 MiB more than the 330 MiB estimate, which removed only the 147 MiB of
+`walk.known` and `walk.seen`. The pass-wide `shards` map `known_stamps` held, an entry for every
+artifact of every source, is gone as well; by arithmetic from its type sizes it came to about
+51 MiB with its resize table. That is arithmetic, not a separate measurement.
+
+What the per-folder peak holds now is up to 230 MiB of redb read cache, filled by a pass that
+reads every entry, the 8 MiB baseline, and about 34 MiB for one window of discovered
+repositories and one repository's stamps.
+
+The full harness, `native_catalog_at_scale` with `HOARD_SCALE_PER_FOLDER=1
+HOARD_SCALE_DELETE=1`, ran once per binary with the same pinning, `9dd3eb8` first, before the two
+changes above; neither changes a scan, a rebuild or a retraction, so its rows stand. Each run
+seeded the per-folder catalog again:
+
+| row | `9dd3eb8` | wave commit |
+| --- | ---: | ---: |
+| scan wall | 78.431 s | 78.568 s |
+| peak rss growth during scan | 325.11 MiB | 323.69 MiB |
+| rebuild wall | 9.110 s | 9.198 s |
+| rescan wall, 1,000 changed | 4.310 s | 3.703 s |
+| unchanged rescan wall | 4.226 s | 3.501 s |
+| unchanged rescan peak rss growth | 194.40 MiB | 0.81 MiB |
+| deletion rescan wall, 100,000 files removed | 16.506 s | 12.795 s |
+| peak rss growth during the deletion rescan | 194.56 MiB | 0.09 MiB |
+| deletion rescan report | 900,000 unchanged, 100,000 absent | 900,000 unchanged, 100,000 absent |
+
+A fresh scan now seeks each repository's empty stamp prefix. Its wall moved by a ratio of 1.00
+and its peak by 1.4 MiB, so that seek does not show. **The two rescan growth rows are not
+comparable as peaks.** Each is growth over the high-water mark the scan left in the same
+process. After this wave neither rescan exceeds that mark, so the rows read near zero, and the
+rescan-only runs above are the absolute measure.
+
+The deletion rescan is where the new pass-wide `missing` list grows: 100,000 rows at 48 bytes,
+about 4.6 MiB by arithmetic. It did not raise that process's high-water mark. Its wall fell by
+a ratio of 0.78, but that is one run per binary, so it only shows the list did not slow the
+retraction. The rebuild row is variance, since this wave does not touch it.
 
 ### Thresholds
 
