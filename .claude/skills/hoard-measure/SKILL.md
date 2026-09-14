@@ -29,6 +29,22 @@ State the commit for every column. A table without commits is not reproducible.
   cache voids the numbers. If you are reviewing while someone else measures, wait; if you are
   measuring, do every build before the first timed run.
 - Never set `RUSTFLAGS` and never `target-cpu=native`.
+- **This workstation is heterogeneous, and an unpinned latency reading carries a 1.68 factor
+  from core placement alone.** It has ten Cortex-X925 at 3.90 GHz on CPUs 5-9 and 15-19 and
+  ten Cortex-A725 at 2.81 GHz on CPUs 0-4 and 10-14. The scheduler places a run on either
+  class, so repeated unpinned readings of the same work are bimodal rather than noisy: at 1M
+  the same midpoint query measured 76.3 ms on the fast class and 127.9 ms on the slow one.
+  Two readings that differ by less than that factor are not a difference. **Pin a latency
+  comparison to one class** and say which:
+
+  ```sh
+  taskset -c 5-9,15-19 <the timed command>    # the ten Cortex-X925
+  taskset -c 0-4,10-14 <the timed command>    # the ten Cortex-A725
+  ```
+
+  This is what a concurrency reading of 632 ms at `0935fde` turned out to be: not a lock and
+  not bandwidth, but eight queries landing across both classes. The curve that settled it is
+  in `docs/native-catalog.md` under "Query latency against concurrent thread count".
 - Everything temporary - synthetic trees, scratch clones, the before and after files - goes
   under the scratchpad directory the harness names in your system prompt, never inside the
   repository. Delete a large tree when you are done with it. `git status` must be clean when
@@ -136,7 +152,7 @@ run, and derive the medians from them rather than from memory.
 
 ## The scale harness
 
-`crates/hoard-index/tests/scale.rs` is an ignored test driven by two environment variables.
+`crates/hoard-index/tests/scale.rs` is an ignored test driven by environment variables.
 Release, foreground, one at a time, and delete the tree afterwards:
 
 ```sh
@@ -149,6 +165,16 @@ HOARD_SCALE_ENTRIES=1000000 HOARD_SCALE_DIR=<scratch>/scale \
 It reports scan wall and peak RSS growth, rebuild wall and RSS, disk apparent and allocated,
 the query rows, the collapse query, and the rescan and refresh after 1,000 headers are
 rewritten. Record every row it prints, both scales, against the previous column.
+
+Four phases are off unless their variable is set, because each costs a run of its own:
+`HOARD_SCALE_DELETE` a mass deletion and the rescan after it, `HOARD_SCALE_USAGE` a log of
+half a million served rows, `HOARD_SCALE_CONCURRENT` a burst of simultaneous midpoint queries,
+and `HOARD_SCALE_BACKGROUND` a rebuild running inside that burst. With
+`HOARD_SCALE_CONCURRENT` set, `HOARD_SCALE_CONCURRENT_THREADS` takes a comma-separated list of
+thread counts and runs one burst per count against the same seeded catalog, which is how a
+latency-against-concurrency curve is taken without reseeding: `HOARD_SCALE_CONCURRENT_THREADS=1,2,4,8`.
+Unset, it runs the one burst of eight it always ran. The standalone `concurrent_catalog_queries`
+test opens a catalog an earlier run seeded, so seed once per scale and run the counts against it.
 
 Allocated disk is `du` over the output directory; apparent disk sums file lengths, and redb
 grows the file in regions, so the apparent number is quantised and the allocated one is what

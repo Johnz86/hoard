@@ -73,10 +73,18 @@ original order, the closed one first with its result, then what blocks what.
    harness, `HOARD_SCALE_WIDE_CARD_ARTIFACTS`. **Closes when** it has been run at 1M and the
    number decides, on the same terms as item 2.
 
-4. **Pending usage batches.** `counters.pending` drains inside `log_changes` once per write
-   transaction, so it appears already bounded by `CHUNK` rather than by the pass. **Closes
-   when** that is confirmed against the code and the item is struck from the limits above, or a
-   path that skips the drain is found and fixed.
+4. **The pending change set, which is not bounded by `CHUNK`.** `counters.pending` drains
+   inside `log_changes` once per write transaction, which reads as a `CHUNK` bound and is not
+   one: a transaction can cover a whole revision. `log_revision_artifacts` in
+   `crates/hoard-index/src/catalog/scan/sweep.rs` scans every entry of a revision and pushes
+   one id per entry with no chunking and no `log_changes` inside the loop, and both callers -
+   `catalog/pulls.rs:140`, and the rescan at `catalog/scan/mod.rs:333` whenever a revision's
+   card changes - then drain it into one `SearchChange` insert per id in that same
+   transaction. For a revision of N entries that is N primary keys materialised by the
+   secondary scan, N whole `Entry` rows decoded to read one field, N times eight bytes held,
+   and N row inserts, all before one commit. **Closes when** a fixture with one large revision
+   has measured it and the result is either a fix with a before and an after, or a recorded
+   verdict that revisions do not get large enough to matter.
 
 5. **Two files over the 1,500-line cap.** `crates/hoard-index/src/catalog/search.rs` at 4,062
    lines and `crates/hoard-index/src/catalog/tests.rs` at 11,603. **Closes when** both are
