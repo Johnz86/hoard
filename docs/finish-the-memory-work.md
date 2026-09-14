@@ -38,3 +38,44 @@ Keep the acceptance gates: at 1M entries, scan growth below 2 GB, allocated disk
 slowest of eight simultaneous midpoint requests. Run matched release binaries serially,
 without `RUSTFLAGS`, with asserted fixtures and independently seeded synthetic catalogs.
 Save compact evidence and remove scratch data and worktrees when finished.
+
+## The open items, and what closes each
+
+Five items are open. Each closes by being fixed or by being measured and recorded as not
+worth fixing; none closes by being deferred again. Ordered by whether something is currently
+failing, then by what blocks what.
+
+1. **The concurrency gate, the only one failing.** Eight simultaneous midpoint queries
+   measured 632 and 681 ms against 72 ms for one, on a twenty-core machine, crossing the
+   500 ms gate. No lock is held across the query path: `search_lane` is taken only by
+   `refresh_search` and `rebuild_search`, and `open_index` returns a read guard. The
+   discriminating measurement is latency against thread count at 1, 2, 4 and 8, taken at both
+   100k and 1M: a curve that rises linearly with the thread count at both scales is
+   serialization, and one that is flat at 100k and rises at 1M is memory bandwidth.
+   **Closes when** `docs/native-catalog.md` carries that curve and the gate line above either
+   reads as met or is restated with the reason it does not bind.
+
+2. **Dropped-source retirement.** `retire_source` in `crates/hoard-index/src/catalog/scan/sweep.rs`
+   collects every entry id of a repository before it chunks the deletes. No harness phase drops
+   a configured source, so the cost has never been observed, and paging cannot remove the
+   dominant term because a native_db secondary scan materialises every matching primary key
+   before yielding. **Closes when** a phase that drops a source at 1M has run and the result is
+   either a fix with a before and an after, or a recorded verdict that the ids cost eight bytes
+   each and the item is not worth a wave.
+
+3. **Oversized artifact groups.** The one remaining limit with a fixture hook already in the
+   harness, `HOARD_SCALE_WIDE_CARD_ARTIFACTS`. **Closes when** it has been run at 1M and the
+   number decides, on the same terms as item 2.
+
+4. **Pending usage batches.** `counters.pending` drains inside `log_changes` once per write
+   transaction, so it appears already bounded by `CHUNK` rather than by the pass. **Closes
+   when** that is confirmed against the code and the item is struck from the limits above, or a
+   path that skips the drain is found and fixed.
+
+5. **Two files over the 1,500-line cap.** `crates/hoard-index/src/catalog/search.rs` at 4,062
+   lines and `crates/hoard-index/src/catalog/tests.rs` at 11,603. **Closes when** both are
+   split the way `scan.rs` was, by responsibility, with no sibling import changed and no test
+   count moved.
+
+Items 2, 3 and 4 are all about the same question and share a harness run; do not seed three
+separate catalogs for them. Item 5 needs no measurement and blocks nothing, so it goes last.
