@@ -143,8 +143,14 @@ hoard/
                              ArtifactDetail, Entry, SearchText, RevisionText, SearchChange,
                              Manifest, Summary, Allocator, Node, Usage, RepoUsage and the
                              user-data rows
-          scan.rs            discovery -> sniff -> infer -> one transaction per unit;
-                             Counters, DerivedShift, log_changes, the artifact sweep
+          scan/mod.rs        discovery -> sniff -> infer -> one transaction per unit; CHUNK
+          scan/counters.rs   Counters, DerivedShift, log_changes, the summary parts, ids
+          scan/walk.rs       the walk state and the unchanged-or-changed decision
+          scan/plan.rs       discovery to units to prepared entries: shard sets, roles, sniffing
+          scan/store.rs      one entry, its artifact and its repository row
+          scan/sweep.rs      the artifact sweep and every retirement
+          scan/sources.rs    the source rows, their scanned counts, configuration validation
+          scan/revisions.rs  discovered revisions merged with the stored ones
           naming.rs          the config and card a revision carries, artifact names, file hashes
           search.rs          Tantivy schema, rebuild, per-entry documents collapsed per artifact
           query.rs           the grammar compiled against the Tantivy index

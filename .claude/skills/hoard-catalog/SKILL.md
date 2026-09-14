@@ -26,8 +26,14 @@ One line per file in `crates/hoard-index/src/catalog/`:
 - `models.rs` every `native_model` record: `Source`, `Repository`, `Revision`,
   `ArtifactRecord`, `ArtifactDetail`, `Entry`, `SearchText`, `RevisionText`, `SearchChange`,
   `Manifest`, `Summary`, `Allocator`, `Node`, `Usage`, `RepoUsage`, and the user-data rows.
-- `scan.rs` discovery to sniff to infer to one transaction per unit; `Counters`,
-  `DerivedShift`, `log_changes`, the artifact sweep, `CHUNK`.
+- `scan/mod.rs` the pass itself: `scan_sources`, `rescan`, the walk loop, the summary, `CHUNK`.
+- `scan/counters.rs` `Counters`, `DerivedShift`, the summary parts, `log_changes`, id allocation.
+- `scan/walk.rs` the walk state and the unchanged-or-changed decision for a revision and a unit.
+- `scan/plan.rs` discovery to units to prepared entries: shard sets, documents, roles, sniffing.
+- `scan/store.rs` one entry, its artifact and its repository row written in one transaction.
+- `scan/sweep.rs` the artifact sweep and every retirement of a revision, a source or a row.
+- `scan/sources.rs` the source rows, their scanned counts and the configuration validation.
+- `scan/revisions.rs` the revisions discovery found merged with the revisions the catalog holds.
 - `naming.rs` the config and card a revision carries, artifact names, per-file hashes.
 - `search.rs` the Tantivy schema, the rebuild, per-entry documents, the `primary` mark, the
   collectors, `refresh_search` and the published-directory swap.

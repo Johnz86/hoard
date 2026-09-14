@@ -29,7 +29,7 @@ pub(super) struct Source {
     pub(super) last_scan: Option<String>,
     /// The present files under this root that carry no sha256 yet. Moved by the same
     /// writers that move a repository's present counts, through
-    /// [`super::scan::DerivedShift`]; a writer added later must do the same.
+    /// [`super::scan::counters::DerivedShift`]; a writer added later must do the same.
     pub(super) pending_hashes: u64,
 }
 
@@ -54,7 +54,7 @@ pub(super) struct Repository {
     /// The entries of this repository whose bytes are on a node, and the bytes they hold.
     ///
     /// Every writer that changes an entry's presence, size or repository must move these
-    /// through [`super::scan::DerivedShift`]; a writer added later must do the same, or
+    /// through [`super::scan::counters::DerivedShift`]; a writer added later must do the same, or
     /// the repositories listing and the Hub face will report counts that never settle.
     pub(super) present_files: u32,
     pub(super) present_bytes: u64,
@@ -750,8 +750,8 @@ pub(super) struct Node {
     /// pass are what the peer stopped advertising.
     pub(super) pass: u64,
     /// The entries this catalog files against this node. Moved by the same writers that
-    /// move a repository's present counts, through [`super::scan::DerivedShift`]; a writer
-    /// added later must do the same.
+    /// move a repository's present counts, through
+    /// [`super::scan::counters::DerivedShift`]; a writer added later must do the same.
     pub(super) filed: u64,
 }
 
