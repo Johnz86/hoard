@@ -10,7 +10,14 @@ measurements; the previous performance evidence belongs to `51418ad`.
 
 Cleanup now also consumes touched-ID sets directly, avoiding full-size vector copies and
 requeueing during summary capture. Source-stat updates stream repository totals into
-per-source accumulators. Next: page entry IDs during dropped-source retirement.
+per-source accumulators. `scan.rs` is then split into `scan/`, eight modules by
+responsibility, none over 700 lines; retirement lives in `scan/sweep.rs`.
+
+Paging entry IDs during dropped-source retirement is the next candidate, and it needs a
+measurement before it needs a fix. `retire_source` collects ids, not decoded rows, at eight
+bytes each, and a native_db secondary scan materialises every matching primary key before
+yielding, so paging cannot remove the dominant term. No harness phase drops a configured
+source, so the cost has never been observed. Build that phase first and let its number decide.
 
 This does not complete a strict memory bound for every workload. The remaining limits are
 source-wide retirement bookkeeping, pending usage batches, and oversized artifact groups.
