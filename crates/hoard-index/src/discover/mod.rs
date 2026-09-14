@@ -9,7 +9,9 @@ pub mod hf_cache;
 pub mod loose;
 pub mod walker;
 
+use std::borrow::Cow;
 use std::fmt;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -206,23 +208,157 @@ impl Discovered {
     }
 }
 
-/// Reads one source, resolving `auto` against what the directory actually looks like.
-pub fn discover(source: &SourceConfig, noise: &NoiseFilter) -> Result<Discovered> {
+/// A source's repositories, listed but not yet read, in the order [`discover`] returns them.
+#[derive(Debug)]
+pub struct DiscoveryPlan {
+    root: PathBuf,
+    options: WalkOptions,
+    noise: NoiseFilter,
+    units: Units,
+}
+
+#[derive(Debug)]
+enum Units {
+    HfCache(Vec<hf_cache::CacheUnit>),
+    Git(Vec<git_clone::CloneUnit>),
+    Loose(loose::LoosePlan),
+}
+
+/// Resolves a source's layout and lists its repositories without reading what they hold. A
+/// loose source with a repository per folder is walked once to find its folders.
+pub fn plan(source: &SourceConfig, noise: &NoiseFilter) -> Result<DiscoveryPlan> {
     let options = WalkOptions::from_source(source)?;
     let root = source.path.as_path();
-    match resolve_kind(source.kind, root) {
-        SourceKind::HfCache => Ok(Discovered::HfCache(hf_cache::discover(
-            root, &options, noise,
-        )?)),
-        SourceKind::Git => Ok(Discovered::Git(git_clone::discover(root, &options, noise)?)),
-        SourceKind::Loose | SourceKind::Auto => Ok(Discovered::Loose(loose::discover(
+    let units = match resolve_kind(source.kind, root) {
+        SourceKind::HfCache => Units::HfCache(hf_cache::plan(root, noise)?),
+        SourceKind::Git => Units::Git(git_clone::plan(root, noise)?),
+        SourceKind::Loose | SourceKind::Auto => Units::Loose(loose::plan(
             root,
             &source.name,
             source.repo_per_folder,
             &options,
             noise,
-        )?)),
+        )?),
+    };
+    Ok(DiscoveryPlan {
+        root: root.to_path_buf(),
+        options,
+        noise: noise.clone(),
+        units,
+    })
+}
+
+impl DiscoveryPlan {
+    pub fn kind(&self) -> SourceKind {
+        match self.units {
+            Units::HfCache(_) => SourceKind::HfCache,
+            Units::Git(_) => SourceKind::Git,
+            Units::Loose(_) => SourceKind::Loose,
+        }
     }
+
+    pub fn len(&self) -> usize {
+        match &self.units {
+            Units::HfCache(units) => units.len(),
+            Units::Git(units) => units.len(),
+            Units::Loose(plan) => plan.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Consecutive ranges covering every unit once, each sized by the layout so that reading
+    /// one holds a bounded share of the source.
+    pub fn windows(&self) -> impl Iterator<Item = Range<usize>> + use<> {
+        let len = self.len();
+        let size = match &self.units {
+            Units::HfCache(_) | Units::Git(_) => rayon::current_num_threads(),
+            Units::Loose(plan) => plan.window_size(),
+        }
+        .max(1);
+        (0..len)
+            .step_by(size)
+            .map(move |start| start..len.min(start + size))
+    }
+
+    /// Reads the repositories of `units` in unit order; units past the end are not read. A
+    /// cache directory or clone that fails to read is logged and left out, while a loose walk
+    /// that fails is an error.
+    pub fn read(&self, units: Range<usize>) -> Result<Vec<DiscoveredRepo>> {
+        let end = units.end.min(self.len());
+        let units = units.start.min(end)..end;
+        match &self.units {
+            Units::HfCache(cache) => {
+                let options = match units.len() {
+                    0 | 1 => Cow::Borrowed(&self.options),
+                    _ => Cow::Owned(self.options.with_threads(1)),
+                };
+                Ok(hf_cache::read(&cache[units], &options, &self.noise))
+            }
+            Units::Git(clones) => Ok(git_clone::read(&self.root, &clones[units], &self.options)),
+            Units::Loose(plan) => plan.read(&self.root, units, &self.options, &self.noise),
+        }
+    }
+}
+
+fn read_all(
+    root: &Path,
+    options: WalkOptions,
+    noise: &NoiseFilter,
+    units: Units,
+) -> Result<Vec<DiscoveredRepo>> {
+    let plan = DiscoveryPlan {
+        root: root.to_path_buf(),
+        options,
+        noise: noise.clone(),
+        units,
+    };
+    plan.read(0..plan.len())
+}
+
+/// Reads one source, resolving `auto` against what the directory actually looks like.
+pub fn discover(source: &SourceConfig, noise: &NoiseFilter) -> Result<Discovered> {
+    let plan = plan(source, noise)?;
+    let repos = plan.read(0..plan.len())?;
+    Ok(match plan.units {
+        Units::HfCache(_) => Discovered::HfCache(repos),
+        Units::Git(_) => Discovered::Git(repos),
+        Units::Loose(_) => Discovered::Loose(repos),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn assert_windows_read_the_whole_plan(path: &Path, kind: SourceKind) {
+    let source = SourceConfig {
+        name: "windows".to_owned(),
+        path: path.to_path_buf(),
+        kind,
+        include: Vec::new(),
+        exclude: Vec::new(),
+        follow_symlinks: false,
+        repo_per_folder: true,
+    };
+    let noise = NoiseFilter::default();
+    let plan = plan(&source, &noise).expect("the source plans");
+    assert!(plan.len() > 1, "one unit proves nothing about windows");
+    let whole = plan.read(0..plan.len()).expect("the whole plan reads");
+    let singles: Vec<DiscoveredRepo> = (0..plan.len())
+        .flat_map(|unit| plan.read(unit..unit + 1).expect("one unit reads"))
+        .collect();
+    assert_eq!(singles, whole);
+    let windowed: Vec<DiscoveredRepo> = plan
+        .windows()
+        .flat_map(|window| plan.read(window).expect("a window reads"))
+        .collect();
+    assert_eq!(windowed, whole);
+    assert_eq!(
+        discover(&source, &noise)
+            .expect("the source discovers")
+            .into_repos(),
+        whole
+    );
 }
 
 /// Decides what a root is by looking at it: cache repo directories make it a cache, a git

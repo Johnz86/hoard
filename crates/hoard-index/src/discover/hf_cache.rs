@@ -51,33 +51,53 @@ pub fn discover(
     options: &WalkOptions,
     noise: &NoiseFilter,
 ) -> Result<Vec<DiscoveredRepo>> {
-    let options = &options.with_default_boundary(root);
-    let mut dirs: Vec<(PathBuf, RepoId)> = std::fs::read_dir(root)
+    super::read_all(
+        root,
+        options.with_default_boundary(root),
+        noise,
+        super::Units::HfCache(plan(root, noise)?),
+    )
+}
+
+#[derive(Debug)]
+pub(super) struct CacheUnit {
+    path: PathBuf,
+    repo: RepoId,
+}
+
+pub(super) fn plan(root: &Path, noise: &NoiseFilter) -> Result<Vec<CacheUnit>> {
+    let mut units: Vec<CacheUnit> = std::fs::read_dir(root)
         .map_err(|error| IndexError::io(root, error))?
         .flatten()
         .filter(|child| !noise.rejects(&child.path()))
         .filter_map(|child| {
             let path = child.path();
-            path.is_dir()
-                .then(|| repo_dir_name(&path).map(|repo| (path, repo)))
-                .flatten()
+            let repo = repo_dir_name(&path).filter(|_| path.is_dir())?;
+            Some(CacheUnit { path, repo })
         })
         .collect();
-    dirs.sort_by(|left, right| left.0.cmp(&right.0));
+    units.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    units.sort_by_cached_key(|unit| unit.repo.qualified());
+    Ok(units)
+}
 
-    let nested = options.with_threads(1);
-    let mut repos: Vec<DiscoveredRepo> = dirs
+pub(super) fn read(
+    units: &[CacheUnit],
+    options: &WalkOptions,
+    noise: &NoiseFilter,
+) -> Vec<DiscoveredRepo> {
+    units
         .par_iter()
-        .filter_map(|(path, repo)| match read_repo(path, repo, &nested, noise) {
-            Ok(repo) => Some(repo),
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "cache repository skipped");
-                None
-            }
-        })
-        .collect();
-    repos.sort_by_key(|found| found.repo.qualified());
-    Ok(repos)
+        .filter_map(
+            |unit| match read_repo(&unit.path, &unit.repo, options, noise) {
+                Ok(repo) => Some(repo),
+                Err(error) => {
+                    tracing::warn!(path = %unit.path.display(), %error, "cache repository skipped");
+                    None
+                }
+            },
+        )
+        .collect()
 }
 
 fn read_repo(
@@ -343,6 +363,38 @@ mod tests {
         assert_eq!(voice.rel_path, "voices/af.pt");
         assert_eq!(voice.git_sha1, Some(git_blob_sha1_bytes(b"voice")));
         assert_eq!(voice.sha256, None);
+    }
+
+    #[test]
+    fn every_window_of_a_plan_reads_what_the_whole_plan_reads() {
+        let dir = TempDir::new().expect("temp dir");
+        let weights = vec![7u8; 2048];
+        fixture::write_repo(
+            dir.path(),
+            "models--hexgrad--Kokoro-82M",
+            SNAPSHOT,
+            &[
+                ("model.safetensors", weights.as_slice()),
+                ("voices/af.pt", b"voice"),
+            ],
+        );
+        fixture::write_repo(
+            dir.path(),
+            "datasets--mlabonne--FineTome-100k",
+            SNAPSHOT,
+            &[("data/train.parquet", b"rows")],
+        );
+        fixture::write_repo(
+            dir.path(),
+            "models--gpt2",
+            SNAPSHOT,
+            &[("config.json", b"{}")],
+        );
+
+        crate::discover::assert_windows_read_the_whole_plan(
+            dir.path(),
+            crate::config::SourceKind::HfCache,
+        );
     }
 
     #[test]

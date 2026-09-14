@@ -252,94 +252,99 @@ impl Catalog {
                 break 'walking;
             }
             progress(&format!("discovering {}", source.name), counters.entries);
-            let discovered = discover::discover(source, &noise)?;
-            let kind = discovered.kind();
-            let walked = self.store_source(source, kind, discovered.repos(), counters)?;
-            walk.discovered.extend(
-                walked
-                    .iter()
-                    .flat_map(|repo| repo.ordinals.iter().map(|ordinal| (repo.id, *ordinal))),
-            );
-            for (repo, walked) in discovered.repos().iter().zip(walked) {
-                for (revision, ordinal) in repo.revisions.iter().zip(walked.ordinals) {
-                    let found = RevisionEntries {
-                        repo_id: walked.id,
-                        ordinal,
-                        entries: &revision.entries,
-                    };
-                    if unchanged_revision(walk, found) {
-                        mark_unchanged(walk, found, 0..revision.entries.len());
-                        continue;
-                    }
-                    if !walk.sizes.contains_key(&(walked.id, ordinal))
-                        && walk.paths_of != Some(walked.id)
-                    {
-                        walk.paths = self.repository_paths(walked.id)?;
-                        walk.paths_of = Some(walked.id);
-                    }
-                    let context = EntryContext {
-                        repo,
-                        repo_id: walked.id,
-                        revision,
-                        settings: walk.settings,
-                        kind,
-                        ordinal,
-                    };
-                    let documents = revision_documents(&revision.entries);
-                    let sets = shard_sets_by_name(&revision.entries, &documents);
-                    let units = revision_units(&revision.entries, sets);
-                    let plan = revision_plan(&context, documents, &units);
-                    let labels = set_labels(&plan.naming, &units);
-                    let mut card_written = false;
-                    for (unit, label) in units.iter().zip(labels) {
-                        if stop.load(Ordering::Relaxed) {
-                            walk.report.interrupted = true;
-                            break 'walking;
-                        }
-                        let prepare = match decide_unit(walk, found, unit) {
-                            UnitDecision::Skip => {
-                                mark_unchanged(walk, found, unit.positions().iter().copied());
-                                continue;
-                            }
-                            UnitDecision::Prepare { prepare, unchanged } => {
-                                mark_unchanged(walk, found, unchanged);
-                                prepare
-                            }
+            let discovery = discover::plan(source, &noise)?;
+            let kind = discovery.kind();
+            self.store_source(source, kind)?;
+            for window in discovery.windows() {
+                let repos = discovery.read(window)?;
+                let walked = self.store_repositories(source, &repos, counters)?;
+                walk.discovered.extend(
+                    walked
+                        .iter()
+                        .flat_map(|repo| repo.ordinals.iter().map(|ordinal| (repo.id, *ordinal))),
+                );
+                for (repo, walked) in repos.iter().zip(walked) {
+                    for (revision, ordinal) in repo.revisions.iter().zip(walked.ordinals) {
+                        let found = RevisionEntries {
+                            repo_id: walked.id,
+                            ordinal,
+                            entries: &revision.entries,
                         };
-                        let narrowed = match unit {
-                            Unit::Set(_) => None,
-                            Unit::Chunk(_) => Some(Unit::Chunk(prepare.clone())),
-                        };
-                        let prepared = prepare_unit(
-                            &context,
-                            &plan,
-                            narrowed.as_ref().unwrap_or(unit),
-                            label.as_deref(),
-                            stop,
-                        )?;
-                        if changed_while_prepared(&prepared) {
-                            mark_unchanged(walk, found, prepare.iter().copied());
+                        if unchanged_revision(walk, found) {
+                            mark_unchanged(walk, found, 0..revision.entries.len());
                             continue;
                         }
-                        let transaction = self.database.rw_transaction()?;
-                        if !std::mem::replace(&mut card_written, true)
-                            && store_revision_card(
-                                &transaction,
-                                walked.id,
-                                ordinal,
-                                plan.context.card().unwrap_or_default(),
-                            )?
+                        if !walk.sizes.contains_key(&(walked.id, ordinal))
+                            && walk.paths_of != Some(walked.id)
                         {
-                            log_revision_artifacts(&transaction, walked.id, ordinal, counters)?;
+                            walk.paths = self.repository_paths(walked.id)?;
+                            walk.paths_of = Some(walked.id);
                         }
-                        let taken = replace_known(&transaction, walk, counters, found, &prepare)?;
-                        store_unit(&transaction, &context, prepared, counters)?;
-                        sweep_taken(&transaction, taken, counters)?;
-                        log_changes(&transaction, counters)?;
-                        counters.derived.flush(&transaction)?;
-                        counters.settle_summary(&transaction)?;
-                        transaction.commit()?;
-                        progress(&source.name, counters.entries);
+                        let context = EntryContext {
+                            repo,
+                            repo_id: walked.id,
+                            revision,
+                            settings: walk.settings,
+                            kind,
+                            ordinal,
+                        };
+                        let documents = revision_documents(&revision.entries);
+                        let sets = shard_sets_by_name(&revision.entries, &documents);
+                        let units = revision_units(&revision.entries, sets);
+                        let plan = revision_plan(&context, documents, &units);
+                        let labels = set_labels(&plan.naming, &units);
+                        let mut card_written = false;
+                        for (unit, label) in units.iter().zip(labels) {
+                            if stop.load(Ordering::Relaxed) {
+                                walk.report.interrupted = true;
+                                break 'walking;
+                            }
+                            let prepare = match decide_unit(walk, found, unit) {
+                                UnitDecision::Skip => {
+                                    mark_unchanged(walk, found, unit.positions().iter().copied());
+                                    continue;
+                                }
+                                UnitDecision::Prepare { prepare, unchanged } => {
+                                    mark_unchanged(walk, found, unchanged);
+                                    prepare
+                                }
+                            };
+                            let narrowed = match unit {
+                                Unit::Set(_) => None,
+                                Unit::Chunk(_) => Some(Unit::Chunk(prepare.clone())),
+                            };
+                            let prepared = prepare_unit(
+                                &context,
+                                &plan,
+                                narrowed.as_ref().unwrap_or(unit),
+                                label.as_deref(),
+                                stop,
+                            )?;
+                            if changed_while_prepared(&prepared) {
+                                mark_unchanged(walk, found, prepare.iter().copied());
+                                continue;
+                            }
+                            let transaction = self.database.rw_transaction()?;
+                            if !std::mem::replace(&mut card_written, true)
+                                && store_revision_card(
+                                    &transaction,
+                                    walked.id,
+                                    ordinal,
+                                    plan.context.card().unwrap_or_default(),
+                                )?
+                            {
+                                log_revision_artifacts(&transaction, walked.id, ordinal, counters)?;
+                            }
+                            let taken =
+                                replace_known(&transaction, walk, counters, found, &prepare)?;
+                            store_unit(&transaction, &context, prepared, counters)?;
+                            sweep_taken(&transaction, taken, counters)?;
+                            log_changes(&transaction, counters)?;
+                            counters.derived.flush(&transaction)?;
+                            counters.settle_summary(&transaction)?;
+                            transaction.commit()?;
+                            progress(&source.name, counters.entries);
+                        }
                     }
                 }
             }

@@ -393,8 +393,9 @@ A pass that commits many times can also be asked to stop. `Catalog::rescan_until
 `Stop` before each source it discovers and between the units of the one it is inside, and
 `Catalog::hash_pending_until` checks it before the pass opens, before each batch and once per
 megabyte of every file it reads, so a shutdown costs a megabyte rather than an 80 GB
-checkpoint. What it cannot cut short is the discovery walk of the source it is already
-inside, so an exit costs a batch, a unit or one source's discovery, never a whole pass. Both
+checkpoint. What it cannot cut short is planning the source it is already inside or reading
+the window of repositories it has reached, so an exit costs a batch, a unit, or one source's
+plan and one window's discovery, never a whole pass. Both
 passes leave the pass mark set and retire nothing: an interrupted walk never looked for the
 paths it did not reach, so it must not retract them, and the next pass settles the counts and
 finishes the hashing. A hashing pass is not started behind an interrupted walk at all, since
@@ -1354,7 +1355,7 @@ close to serialized, and the slowest one is over the standing 500 ms query gate 
 single-request row is 427 ms inside it. That gate is written for a query, and nothing in this
 document says whether it is meant to bind on the slowest of eight at once; this wave measured
 the number and takes no view on the mechanism, which no measurement here establishes. The
-curve in the section below settles it at `39bb637`: the same burst on the same tree measures
+curve in the section below settles it at `df0b103`: the same burst on the same tree measures
 107.990 and 102.730 ms, it is flat against the thread count at both scales, and it is flat to
 within two per cent when the burst is pinned to one class of this machine's cores. The 632.5
 and 681.3 ms belong to that run, not to the catalog.
@@ -1396,7 +1397,7 @@ HOARD_SCALE_ENTRIES=1000000 HOARD_SCALE_DIR=<scratch>/scale \
   -- --nocapture --ignored
 ```
 
-Everything below was measured at `39bb637` on this workstation, one session, nothing else
+Everything below was measured at `df0b103` on this workstation, one session, nothing else
 running, no `RUSTFLAGS`, release. Each scale was seeded once by `native_catalog_at_scale` and
 every count ran against that same catalog, so no column pays for a different index. The page
 is 100 rows at the midpoint offset, name order, each answer asserted against a reference page
@@ -1473,7 +1474,7 @@ under `HOARD_SCALE_DIR` and does one thing: `rescan_only_catalog` rescans the se
 and `discovery_only_source` runs `discover::discover` over the seeded tree and holds the
 result. The figure each reports is the process's absolute `VmHWM`, not a growth.
 
-Measured at `e320a06`, release, nothing else running, pinned to the ten Cortex-X925 cores with
+Measured at `b10c30d`, release, nothing else running, pinned to the ten Cortex-X925 cores with
 `taskset -c 5-9,15-19`, each scale seeded once and every run against that seed:
 
 | vehicle | scale | run | wall | peak, absolute | resident after |
@@ -1508,6 +1509,62 @@ The prediction this was taken to test said roughly 390 to 470 MB and was wrong b
 It had the ranking right and the total wrong: it left out the redb cache, it left out
 discovery's transient buffer, and it put the held discovered source at 254 MB where the
 scratchpad's long absolute paths make it 350 MiB.
+
+### The rescan peak after windowed discovery, at 1M
+
+A scan or rescan now plans a source's repositories, then reads, stores and walks them one
+window at a time, so neither the walker's buffer nor the discovered rows outlive the window
+being walked. The harness's tree is one repository of a million files, which a window of
+repositories cannot bound, so the change is measured over the same tree filed one repository
+per folder: `HOARD_SCALE_PER_FOLDER=1` makes `config` in `crates/hoard-index/tests/scale.rs`
+set `repo_per_folder: true`, a thousand repositories of 1,000 files, seeded into
+`native-1000000-per-folder` beside the one-repository seed. Unset, `config` is what it was at
+`b10c30d`.
+
+Both binaries were built before the first timed run, release, nothing else running, pinned to
+the ten Cortex-X925 cores with `taskset -c 5-9,15-19`. The before binary is `b10c30d` with only
+the harness knob added; the after binary is the wave commit "Discover and store one repository window at a time", which
+carries the same knob. The per-folder tree was seeded once by the before binary
+and every rescan below ran against that seed:
+
+| tree | binary | run | rescan wall | peak, absolute | resident after |
+| --- | --- | ---: | ---: | ---: | ---: |
+| per folder | `b10c30d` | 1 | 4.291 s | 821.61 MiB | 613.82 MiB |
+| per folder | `b10c30d` | 2 | 4.220 s | 832.78 MiB | 470.38 MiB |
+| per folder | branch | 1 | 4.222 s | 477.62 MiB | 277.09 MiB |
+| per folder | branch | 2 | 4.256 s | 477.53 MiB | 280.83 MiB |
+| one repository | `b10c30d` | 1 | 4.257 s | 875.59 MiB | 523.51 MiB |
+| one repository | branch | 1 | 3.858 s | 866.50 MiB | 511.64 MiB |
+
+The first run of each tree found the 1,000 headers the seeding run left rewritten and every
+later run found nothing changed.
+
+**The per-folder rescan peak is met: 477.6 MiB against a threshold of 600, from 821.6 and
+832.8.** It is 57 MiB above the 420 the plan estimated, and this run does not attribute that
+difference. The rescan wall moved by less than the spread of its own runs: 4.239 s after
+against 4.256 s before on average, a ratio of 1.00, so the planning walk a loose per-folder
+source now pays before its windows are read does not show at this scale. What is resident
+after the rescan fell from 470 and 614 MiB before to 277 and 281 MiB after.
+
+**The one-repository tree does not move, and that is the design limit.** A window is made of
+repositories, and shard sets, a revision's documents and the unchanged-revision test all span a
+revision, so a repository of a million files is read and held whole. Its 866.5 MiB against
+875.6 MiB is within the spread of the earlier two runs at `b10c30d`, and its wall is not
+comparable because only the before run found changed headers.
+
+The seeding run, once per binary over the per-folder tree, with the same pinning:
+
+| row | `b10c30d` | branch |
+| --- | ---: | ---: |
+| scan wall | 80.503 s | 77.101 s |
+| peak rss growth during scan | 629.65 MiB | 324.71 MiB |
+| rebuild wall | 9.275 s | 9.122 s |
+| unchanged rescan wall | 4.088 s | 4.016 s |
+| unchanged rescan peak rss growth | 410.21 MiB | 194.56 MiB |
+
+A fresh scan reaches the same walk, so its peak growth halves with the rescan's, and its wall
+changes by a ratio of 0.96. That is one run a binary, so it is not a result beyond saying the
+scan did not get slower. The rebuild does not touch discovery, and its row is variance.
 
 ### Thresholds
 

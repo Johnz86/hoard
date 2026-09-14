@@ -16,7 +16,10 @@ the scratchpad and measures both runs back to back. Never compare a fresh run ag
 number already written in `docs/native-catalog.md`; quote that number as history and say
 which machine and commit it came from.
 
-State the commit for every column. A table without commits is not reproducible.
+State the commit for every column. A table without commits is not reproducible. **Cite a
+commit that is on `master`**: a wave's per-task checkpoints are squashed away when it lands, so
+a hash from the wave branch names nothing afterwards. The before column is the gate commit; the
+after column is the wave commit itself, named by its subject until it has a hash.
 
 ## Process hygiene while measuring
 

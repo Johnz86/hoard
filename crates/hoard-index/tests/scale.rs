@@ -111,9 +111,20 @@ fn config(data_dir: &Path, tree: &Path) -> IndexConfig {
             include: Vec::new(),
             exclude: Vec::new(),
             follow_symlinks: false,
-            repo_per_folder: false,
+            repo_per_folder: per_folder(),
         }],
         ..IndexConfig::default()
+    }
+}
+
+fn per_folder() -> bool {
+    std::env::var_os("HOARD_SCALE_PER_FOLDER").is_some_and(|value| !value.is_empty())
+}
+
+fn catalog_dir(root: &Path, count: usize) -> PathBuf {
+    match per_folder() {
+        true => root.join(format!("native-{count}-per-folder")),
+        false => root.join(format!("native-{count}")),
     }
 }
 
@@ -678,7 +689,7 @@ fn report<Name: AsRef<str>>(rows: &[(Name, String)]) {
 #[test]
 #[ignore]
 fn concurrent_catalog_queries() {
-    let output = scale_dir().join(format!("native-{}", entries()));
+    let output = catalog_dir(&scale_dir(), entries());
     let catalog = Catalog::open(&output).expect("the independently seeded catalog opens");
     assert_eq!(
         catalog
@@ -701,7 +712,7 @@ fn rescan_only_catalog() {
     let root = scale_dir();
     let tree = synthetic_tree(&root, count);
     let config = config(&root, &tree);
-    let output = root.join(format!("native-{count}"));
+    let output = catalog_dir(&root, count);
     let catalog = Catalog::open(&output).expect(SEED_FIRST);
     assert_eq!(
         catalog
@@ -998,7 +1009,7 @@ fn native_catalog_at_scale() {
     fs::create_dir_all(&root).expect("scale root is creatable");
     let tree = synthetic_tree(&root, count);
     restore(&tree, TOUCHED);
-    let output = root.join(format!("native-{count}"));
+    let output = catalog_dir(&root, count);
     if output.exists() {
         fs::remove_dir_all(&output).expect("old catalog is removable");
     }

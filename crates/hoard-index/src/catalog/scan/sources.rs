@@ -70,17 +70,7 @@ impl Catalog {
         Ok(())
     }
 
-    /// Writes the records a source needs before any of its files are read, and hands back
-    /// the identity and revision ordinals given to each repository in discovery order. A
-    /// repository the catalog already holds keeps its id and takes the freshly discovered
-    /// revisions and refs into the slots [`merged_revisions`] settled.
-    pub(super) fn store_source(
-        &self,
-        source: &SourceConfig,
-        kind: SourceKind,
-        repos: &[DiscoveredRepo],
-        counters: &mut Counters,
-    ) -> Result<Vec<WalkedRepo>> {
+    pub(super) fn store_source(&self, source: &SourceConfig, kind: SourceKind) -> Result<()> {
         let transaction = self.database.rw_transaction()?;
         let stored: Option<Source> = transaction.get().primary(source.name.clone())?;
         let carried = stored.unwrap_or_else(|| Source {
@@ -97,6 +87,21 @@ impl Catalog {
             resolved_kind: kind,
             ..carried
         })?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Writes the records a source needs before any of its files are read, and hands back
+    /// the identity and revision ordinals given to each repository in discovery order. A
+    /// repository the catalog already holds keeps its id and takes the freshly discovered
+    /// revisions and refs into the slots [`merged_revisions`] settled.
+    pub(super) fn store_repositories(
+        &self,
+        source: &SourceConfig,
+        repos: &[DiscoveredRepo],
+        counters: &mut Counters,
+    ) -> Result<Vec<WalkedRepo>> {
+        let transaction = self.database.rw_transaction()?;
         let mut walked = Vec::with_capacity(repos.len());
         for repo in repos {
             let key = repository_key(&source.name, &repo.repo);
@@ -212,6 +217,98 @@ mod tests {
             present_files: files,
             present_bytes: bytes,
         })
+    }
+
+    #[test]
+    fn a_source_discovered_across_many_windows_files_what_one_window_files() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let input = directory.path().join("models");
+        let folders = rayon::current_num_threads() * 2 + 1;
+        for folder in 0..folders {
+            let path = input.join(format!("folder-{folder:03}"));
+            std::fs::create_dir_all(&path)?;
+            std::fs::write(path.join("a.bin"), format!("a{folder}"))?;
+            std::fs::write(path.join("b.bin"), format!("b{folder}"))?;
+        }
+        let source = SourceConfig {
+            name: "windows".to_owned(),
+            path: input,
+            kind: SourceKind::Loose,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            follow_symlinks: false,
+            repo_per_folder: true,
+        };
+        let config = IndexConfig {
+            sources: vec![source.clone()],
+            ..IndexConfig::default()
+        };
+        let noise = crate::discover::NoiseFilter::default();
+        assert!(crate::discover::plan(&source, &noise)?.windows().count() > 1);
+
+        let scanned = Catalog::scan_sources(
+            &directory.path().join("scanned"),
+            "n",
+            &config,
+            crate::config::HashPolicy::Never,
+            |_, _| {},
+        )?;
+        let discovered = crate::discover::discover(&source, &noise)?;
+        let stored = Catalog::create(directory.path().join("stored"))?;
+        let mut counters = Counters::load(&stored.database, config.triage_confidence)?;
+        stored.store_source(&source, discovered.kind())?;
+        let walked = stored.store_repositories(&source, discovered.repos(), &mut counters)?;
+
+        let read = scanned.database.r_transaction()?;
+        let repositories: Vec<Repository> = read
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
+        let keys: HashMap<i64, String> = repositories
+            .iter()
+            .map(|repository| (repository.id, repository.key.clone()))
+            .collect();
+        let entries: Vec<Entry> = read
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
+        let mut filed: Vec<(String, String)> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    keys.get(&entry.repo_id).cloned().unwrap_or_default(),
+                    entry.rel_path.clone(),
+                )
+            })
+            .collect();
+        filed.sort();
+        let mut expected: Vec<(String, String)> = discovered
+            .repos()
+            .iter()
+            .flat_map(|repo| {
+                let key = repository_key(&source.name, &repo.repo);
+                repo.revisions
+                    .iter()
+                    .flat_map(|revision| &revision.entries)
+                    .map(move |entry| (key.clone(), entry.rel_path.clone()))
+            })
+            .collect();
+        expected.sort();
+
+        assert_eq!(walked.len(), folders);
+        assert_eq!(
+            read.len().primary::<Repository>()?,
+            stored
+                .database
+                .r_transaction()?
+                .len()
+                .primary::<Repository>()?
+        );
+        assert_eq!(entries.len(), discovered.file_count());
+        assert_eq!(filed, expected);
+        Ok(())
     }
 
     #[test]

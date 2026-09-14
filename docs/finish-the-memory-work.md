@@ -47,7 +47,7 @@ original order, the closed one first with its result, then what blocks what.
 
 **Items 2, 3 and 4 were mis-sized when they were written.** They name structures bounded by a
 repository, a revision and a shard set, each worth single-digit megabytes at a pathological
-size. Measured at `e320a06`, a process that opens a 1M catalog and rescans peaks at an
+size. Measured at `b10c30d`, a process that opens a 1M catalog and rescans peaks at an
 absolute 866 to 871 MiB, and three components account for all but four per cent of it; see
 "What a rescan alone holds" in [the native catalog report](native-catalog.md).
 
@@ -68,22 +68,31 @@ repository's id, so nothing reads across repositories. The only pass-wide consum
 
 It lands as three waves. The first is done; the other two are ordered by what they remove.
 
-1. **The vehicle, done at `e320a06`.** `rescan_only_catalog` and `discovery_only_source` in
+1. **The vehicle, done at `b10c30d`.** `rescan_only_catalog` and `discovery_only_source` in
    the scale harness, and the attribution above.
-2. **Discovery per repository, expected to take the 1M peak from about 870 to about 420 MiB.**
-   The `discover` crate: split finding the repository roots, which is cheap, from reading one
-   repository's entries, which is not, so neither the walker's buffer nor the rows outlive the
-   repository being walked. `store_source` needs the roots up front to assign ordinals, and
-   the roots are what it gets. It goes first because it is three times the size of the next.
-3. **`known`, `seen` and retraction per repository, expected to take it to about 270 MiB.**
-   Catalog only: load a repository's stamps when the walk reaches it, retract what it did not
-   see before moving on, drop both. It changes one documented invariant, that an interrupted
-   walk retires nothing, into its per-repository form, and the plan must name the tests that
-   pin the old form. The floor after both is the redb cache plus one repository.
+2. **Discovery per repository, done in the wave commit that follows `b10c30d`.** A scan or
+   rescan plans a source's repositories and reads, stores and walks them a window at a time.
+   On the 1M tree filed one repository per folder (`HOARD_SCALE_PER_FOLDER=1`), the rescan peak
+   went from 821.61 and 832.78 MiB at `b10c30d` to 477.62 and 477.53 MiB: met against 600, and
+   57 MiB above the 420 estimate. The rescan wall moved by less than its spread, 4.239 s against
+   4.256 s, and the scan wall went from 80.50 s to 77.10 s. A single repository of a million
+   files is held whole by design, because shard sets and the unchanged-revision test span a
+   revision, so the one-repository tree stays at 866.50 MiB against 875.59. The numbers are in
+   `docs/native-catalog.md` under "The rescan peak after windowed discovery, at 1M".
+3. **`known`, `seen` and retraction per repository, expected to take the per-folder peak from the
+   measured 478 MiB to about 330 MiB.** Catalog only: load a repository's stamps when the walk
+   reaches it, move the rows it did not see into a pass-wide list of missing rows, and drop the
+   rest. Retraction stays at the end of the pass and is still skipped when the walk is
+   interrupted, so "an interrupted walk retires nothing" holds exactly as written. The stored
+   repositories the walk never reached, which today are retracted only because every stamp was
+   loaded up front, are streamed and retracted at the end in `CHUNK` transactions;
+   `a_rescan_retracts_more_paths_than_one_transaction_holds` already fails if they are not. The
+   floor after it is the redb read cache plus one window of repositories. A single repository of
+   a million files stays held whole, as it does after wave 2.
 
 Items 2, 3 and 4 close against this measurement below.
 
-1. **The concurrency gate: closed at `39bb637`, met, and it was never a lock.** Latency
+1. **The concurrency gate: closed at `df0b103`, met, and it was never a lock.** Latency
    against thread count at 1, 2, 4 and 8 was taken at both 100k and 1M and is recorded in
    [the native catalog report](native-catalog.md) under "Query latency against concurrent
    thread count". The curve is flat at both scales. The slowest of eight simultaneous midpoint
@@ -99,7 +108,7 @@ Items 2, 3 and 4 close against this measurement below.
    same page single-threaded. The gate line above binds exactly as written and is met by
    370 ms on the slowest reading taken, so it is left unchanged. No follow-on wave is owed.
 
-2. **Dropped-source retirement: closed at `e320a06`, measured and not worth a wave.**
+2. **Dropped-source retirement: closed at `b10c30d`, measured and not worth a wave.**
    `retire_source` in `crates/hoard-index/src/catalog/scan/sweep.rs` holds one repository's
    entry ids at a time, eight bytes each: 8 KB for a fixture repository of 1,000 files and 8 MB
    for a repository of a million, against a rescan peak of 866 MiB, under one per cent at the
@@ -108,13 +117,13 @@ Items 2, 3 and 4 close against this measurement below.
    repository approaches the size of a whole catalog, which the per-repository goal above
    would then have to bound first.
 
-3. **Oversized artifact groups: closed at `e320a06`, measured and not worth a wave.**
+3. **Oversized artifact groups: closed at `b10c30d`, measured and not worth a wave.**
    `revision_units` chunks standalone files by `CHUNK` and never chunks a `Unit::Set`, so one
    artifact's shards are prepared and stored together. A shard set is hundreds of files, not
    millions: under 1 MiB of prepared entries against an 866 MiB peak. **Reopens if** a real
    model is found whose shard count reaches the tens of thousands.
 
-4. **The pending change set: closed at `e320a06`, measured and not worth a wave.**
+4. **The pending change set: closed at `b10c30d`, measured and not worth a wave.**
    `log_revision_artifacts` pushes one id per entry of a revision into `counters.pending`
    before a single `log_changes`, so the set is bounded by the largest revision rather than by
    `CHUNK`, as recorded when this item was opened. At eight bytes an id that is 8 MB for a

@@ -186,6 +186,31 @@ impl NoiseFilter {
     }
 }
 
+/// A file the walk accepted, with the one `stat` that accepted it.
+#[derive(Debug)]
+pub(crate) struct Accepted<'a> {
+    pub(crate) rel_path: String,
+    path: &'a Path,
+    metadata: Metadata,
+    is_symlink: bool,
+}
+
+impl Accepted<'_> {
+    pub(crate) fn into_file(self) -> DiscoveredFile {
+        DiscoveredFile {
+            abs_path: self.path.to_path_buf(),
+            symlink_target: self
+                .is_symlink
+                .then(|| std::fs::read_link(self.path).ok())
+                .flatten(),
+            rel_path: self.rel_path,
+            size: self.metadata.len(),
+            stamp: stamp_of(&self.metadata),
+            is_symlink: self.is_symlink,
+        }
+    }
+}
+
 /// Walks `root` in parallel and returns every regular file it holds, ordered by relative
 /// path so a rescan of an unchanged tree produces an identical list.
 pub fn walk(
@@ -193,13 +218,32 @@ pub fn walk(
     options: &WalkOptions,
     noise: &NoiseFilter,
 ) -> Result<Vec<DiscoveredFile>> {
+    let found = Mutex::new(Vec::new());
+    walk_with(
+        root,
+        options,
+        noise,
+        |_: &DirEntry| true,
+        |file: Accepted<'_>| found.lock().push(file.into_file()),
+    )?;
+    let mut files = found.into_inner();
+    files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+    Ok(files)
+}
+
+pub(crate) fn walk_with(
+    root: &Path,
+    options: &WalkOptions,
+    noise: &NoiseFilter,
+    admit: impl Fn(&DirEntry) -> bool + Send + Sync + 'static,
+    sink: impl Fn(Accepted<'_>) + Sync,
+) -> Result<()> {
     if !root.is_dir() {
         return Err(IndexError::Config(format!(
             "source root {} is not a directory",
             root.display()
         )));
     }
-    let found = Mutex::new(Vec::new());
     WalkBuilder::new(root)
         .threads(options.threads)
         .follow_links(options.follow_symlinks)
@@ -211,19 +255,18 @@ pub fn walk(
         .git_exclude(false)
         .require_git(false)
         .add_custom_ignore_filename(HOARD_IGNORE)
+        .filter_entry(admit)
         .build_parallel()
         .run(|| {
             Box::new(|entry| match entry {
-                Ok(entry) => visit(root, &entry, options, noise, &found),
+                Ok(entry) => visit(root, &entry, options, noise, &sink),
                 Err(error) => {
                     tracing::debug!(%error, "walk entry unreadable");
                     WalkState::Continue
                 }
             })
         });
-    let mut files = found.into_inner();
-    files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-    Ok(files)
+    Ok(())
 }
 
 fn visit(
@@ -231,7 +274,7 @@ fn visit(
     entry: &DirEntry,
     options: &WalkOptions,
     noise: &NoiseFilter,
-    found: &Mutex<Vec<DiscoveredFile>>,
+    sink: &impl Fn(Accepted<'_>),
 ) -> WalkState {
     let Some(file_type) = entry.file_type() else {
         return WalkState::Continue;
@@ -243,39 +286,46 @@ fn visit(
         }
         return WalkState::Continue;
     }
-    let Some(rel_path) = relative(root, path) else {
-        return WalkState::Continue;
-    };
+    if let Some(file) = accept(root, path, file_type.is_symlink(), options, noise) {
+        sink(file);
+    }
+    WalkState::Continue
+}
+
+fn accept<'a>(
+    root: &Path,
+    path: &'a Path,
+    is_symlink: bool,
+    options: &WalkOptions,
+    noise: &NoiseFilter,
+) -> Option<Accepted<'a>> {
+    let rel_path = relative(root, path)?;
     if skipped_file(&rel_path) || !options.accepts(&rel_path) || noise.rejects(path) {
-        return WalkState::Continue;
+        return None;
     }
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => {
             tracing::debug!(path = %path.display(), %error, "candidate is unreadable");
-            return WalkState::Continue;
+            return None;
         }
     };
     if !metadata.is_file() {
-        return WalkState::Continue;
+        return None;
     }
-    let is_symlink = file_type.is_symlink();
     if is_symlink && !options.permits_link(root, path) {
         tracing::debug!(
             path = %path.display(),
             "symlink leaves the source root; set follow_symlinks to index it"
         );
-        return WalkState::Continue;
+        return None;
     }
-    found.lock().push(DiscoveredFile {
-        abs_path: path.to_path_buf(),
+    Some(Accepted {
         rel_path,
-        size: metadata.len(),
-        stamp: stamp_of(&metadata),
+        path,
+        metadata,
         is_symlink,
-        symlink_target: is_symlink.then(|| std::fs::read_link(path).ok()).flatten(),
-    });
-    WalkState::Continue
+    })
 }
 
 /// Whether a symlink's target is inside the root that was nominated.

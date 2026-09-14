@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use gix::bstr::ByteSlice;
 use gix::objs::tree::EntryKind;
 use jiff::Timestamp;
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 use hoard_core::{CommitSha, RepoId, RepoType};
 
@@ -47,23 +47,60 @@ pub fn discover(
     options: &WalkOptions,
     noise: &NoiseFilter,
 ) -> Result<Vec<DiscoveredRepo>> {
-    let options = &options.with_default_boundary(root);
+    super::read_all(
+        root,
+        options.with_default_boundary(root),
+        noise,
+        super::Units::Git(plan(root, noise)?),
+    )
+}
+
+#[derive(Debug)]
+pub(super) struct CloneUnit {
+    path: PathBuf,
+    repo: RepoId,
+    remote: Option<String>,
+}
+
+pub(super) fn plan(root: &Path, noise: &NoiseFilter) -> Result<Vec<CloneUnit>> {
     let mut clones = Vec::new();
     collect_clones(root, CLONE_DEPTH, noise, &mut clones)?;
     clones.sort();
 
-    let mut repos: Vec<DiscoveredRepo> = clones
-        .par_iter()
-        .filter_map(|path| match read_clone(root, path, options) {
-            Ok(repo) => Some(repo),
+    let mut units: Vec<CloneUnit> = clones
+        .into_par_iter()
+        .filter_map(|path| match open(&path) {
+            Ok(repository) => {
+                let remote = remote_url(&repository);
+                let repo = repo_id(remote.as_deref(), root, &path);
+                Some(CloneUnit { path, repo, remote })
+            }
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "clone skipped");
                 None
             }
         })
         .collect();
-    repos.sort_by_key(|found| found.repo.qualified());
-    Ok(repos)
+    units.sort_by_cached_key(|unit| unit.repo.qualified());
+    Ok(units)
+}
+
+pub(super) fn read(root: &Path, units: &[CloneUnit], options: &WalkOptions) -> Vec<DiscoveredRepo> {
+    units
+        .par_iter()
+        .filter_map(|unit| match read_clone(root, unit, options) {
+            Ok(repo) => Some(repo),
+            Err(error) => {
+                tracing::warn!(path = %unit.path.display(), %error, "clone skipped");
+                None
+            }
+        })
+        .collect()
+}
+
+fn open(path: &Path) -> Result<gix::Repository> {
+    gix::open(path)
+        .map_err(|error| IndexError::Git(format!("{} does not open: {error}", path.display())))
 }
 
 fn collect_clones(
@@ -92,17 +129,14 @@ fn collect_clones(
     Ok(())
 }
 
-fn read_clone(root: &Path, path: &Path, options: &WalkOptions) -> Result<DiscoveredRepo> {
-    let repository = gix::open(path)
-        .map_err(|error| IndexError::Git(format!("{} does not open: {error}", path.display())))?;
+fn read_clone(root: &Path, unit: &CloneUnit, options: &WalkOptions) -> Result<DiscoveredRepo> {
+    let repository = open(&unit.path)?;
     let git_dir = repository.git_dir().to_path_buf();
     let work_dir = repository.workdir().map(Path::to_path_buf);
-    let remote = remote_url(&repository);
-    let id = repo_id(remote.as_deref(), root, path);
 
-    let mut discovered = DiscoveredRepo::new(id, path.to_path_buf());
+    let mut discovered = DiscoveredRepo::new(unit.repo.clone(), unit.path.clone());
     discovered.git_dir = Some(git_dir.clone());
-    discovered.remote = remote;
+    discovered.remote = unit.remote.clone();
 
     let mut shas: Vec<CommitSha> = Vec::new();
     for (name, kind, sha) in read_refs(&repository)? {
@@ -676,6 +710,52 @@ mod tests {
         assert!(!stays_below_the_work_tree("a/../../b"));
         assert!(!stays_below_the_work_tree("/etc/hostname"));
         assert!(!stays_below_the_work_tree(""));
+    }
+
+    #[test]
+    fn two_clones_of_one_remote_are_both_discovered_in_path_order() {
+        const REMOTE: &str = "https://huggingface.co/hexgrad/Kokoro-82M.git";
+        let dir = TempDir::new().expect("temp dir");
+        let clones: Vec<PathBuf> = ["second", "first"]
+            .iter()
+            .map(|name| {
+                let clone = dir.path().join(name);
+                fs::create_dir_all(&clone).expect("clone dir is creatable");
+                git(&clone, &["init", "--initial-branch=main", "--quiet"]);
+                git(&clone, &["remote", "add", "origin", REMOTE]);
+                fs::write(clone.join("config.json"), name.as_bytes()).expect("file is writable");
+                git(&clone, &["add", "."]);
+                git(&clone, &["commit", "-m", name, "--quiet"]);
+                clone
+            })
+            .collect();
+
+        let repos = discover(dir.path(), &WalkOptions::default(), &NoiseFilter::default())
+            .expect("clones are readable");
+        let qualified: Vec<String> = repos.iter().map(|repo| repo.repo.qualified()).collect();
+        assert_eq!(
+            qualified,
+            ["models/hexgrad/Kokoro-82M", "models/hexgrad/Kokoro-82M"]
+        );
+        let roots: Vec<&Path> = repos.iter().map(|repo| repo.root_path.as_path()).collect();
+        assert_eq!(roots, [clones[1].as_path(), clones[0].as_path()]);
+    }
+
+    #[test]
+    fn every_window_of_a_plan_reads_what_the_whole_plan_reads() {
+        let dir = TempDir::new().expect("temp dir");
+        build_clone(dir.path());
+        let other = dir.path().join("other");
+        fs::create_dir_all(&other).expect("clone dir is creatable");
+        git(&other, &["init", "--initial-branch=main", "--quiet"]);
+        fs::write(other.join("config.json"), b"{\"n\": 3}").expect("file is writable");
+        git(&other, &["add", "."]);
+        git(&other, &["commit", "-m", "other", "--quiet"]);
+
+        crate::discover::assert_windows_read_the_whole_plan(
+            dir.path(),
+            crate::config::SourceKind::Git,
+        );
     }
 
     #[test]
