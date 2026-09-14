@@ -1353,7 +1353,11 @@ the same page single-threaded in the same run. Eight times 72 ms is 576 ms, so t
 close to serialized, and the slowest one is over the standing 500 ms query gate while the
 single-request row is 427 ms inside it. That gate is written for a query, and nothing in this
 document says whether it is meant to bind on the slowest of eight at once; this wave measured
-the number and takes no view on the mechanism, which no measurement here establishes.
+the number and takes no view on the mechanism, which no measurement here establishes. The
+curve in the section below settles it at `39bb637`: the same burst on the same tree measures
+107.990 and 102.730 ms, it is flat against the thread count at both scales, and it is flat to
+within two per cent when the burst is pinned to one class of this machine's cores. The 632.5
+and 681.3 ms belong to that run, not to the catalog.
 
 **A usage log of 500,000 rows: no problem found against the gates.** All three reads the
 USAGE tab makes are under 500 ms, the widest of them, the 90 day chart that is counted from
@@ -1374,6 +1378,89 @@ same work without asking the kernel for more.
 Seeding grew the process by zero, which is not evidence that seeding allocates nothing: the
 peak mark is set after a scan and a rebuild have already run, and 500,000 rows written in
 1,954 transactions fit inside what those left behind.
+
+### Query latency against concurrent thread count, at 100k and at 1M
+
+The row above says the slowest of eight simultaneous midpoint queries took 632.5 and 681.3 ms
+at `0935fde`, which is the only gate this document has ever recorded as missed. That number is
+a single point: it cannot tell a lock from a bandwidth wall from a bad run. The harness now
+takes the whole curve. `HOARD_SCALE_CONCURRENT_THREADS` is a comma-separated list of thread
+counts, one burst per count against one already-seeded catalog, and `HOARD_SCALE_CONCURRENT`
+keeps its old meaning as the enable flag, so a run without the new variable prints exactly the
+rows it printed before.
+
+```sh
+HOARD_SCALE_ENTRIES=1000000 HOARD_SCALE_DIR=<scratch>/scale \
+  HOARD_SCALE_CONCURRENT=1 HOARD_SCALE_CONCURRENT_THREADS=1,2,4,8 \
+  cargo test --release -p hoard-index --test scale concurrent_catalog_queries \
+  -- --nocapture --ignored
+```
+
+Everything below was measured at `39bb637` on this workstation, one session, nothing else
+running, no `RUSTFLAGS`, release. Each scale was seeded once by `native_catalog_at_scale` and
+every count ran against that same catalog, so no column pays for a different index. The page
+is 100 rows at the midpoint offset, name order, each answer asserted against a reference page
+taken before the burst.
+
+| threads, 100k | slowest, ms | median, ms | burst wall, ms | peak RSS growth |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 14.296 / 14.232 | 14.296 / 14.232 | 15.697 / 14.409 | 438,272 B / 438,272 B |
+| 2 | 14.601 / 14.634 | 14.470 / 14.490 | 14.938 / 14.798 | 376,832 B / 376,832 B |
+| 4 | 14.761 / 14.744 | 14.514 / 14.464 | 15.055 / 15.027 | 753,664 B / 749,568 B |
+| 8 | 14.445 / 14.377 | 14.287 / 11.502 | 14.842 / 14.670 | 1,507,328 B / 1,527,808 B |
+
+| threads, 1M | slowest, ms | median, ms | burst wall, ms | peak RSS growth |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 91.415 / 90.025 | 91.415 / 90.025 | 92.446 / 91.131 | 856,064 B / 856,064 B |
+| 2 | 76.117 / 91.237 | 76.074 / 91.220 | 76.676 / 91.680 | 798,720 B / 798,720 B |
+| 4 | 90.873 / 89.317 | 76.024 / 77.121 | 91.401 / 89.946 | 1,581,056 B / 1,589,248 B |
+| 8 | 107.990 / 102.730 | 77.288 / 77.131 | 108.545 / 103.474 | 3,174,400 B / 3,170,304 B |
+
+Each cell gives run 1 / run 2. The 1M set was run twice because the 632 and 681 ms figures
+differed by 8 per cent and one run cannot tell a curve from noise.
+
+**The curve is flat at both scales, and the 632 ms figure did not reproduce in any vehicle.**
+The slowest query at eight threads over the slowest at one is 1.01 and 1.01 at 100k, and 1.18
+and 1.14 at 1M. Serialization would have put that ratio near eight; it is not near eight at
+either scale, and the 1M ratio is inside the spread of the one-thread row itself, which
+measured 76.011, 90.025 and 91.415 ms across three runs, a spread of 1.20. Aggregate memory is
+bounded as it was: eight queries at 1M grow the process by 3.03 MiB, about four times what one
+grows it by, and the median query at eight threads is *faster* than the single query in both
+1M runs.
+
+Three further runs rule out the readings that a flat curve can hide.
+
+- **Reversed order**, `HOARD_SCALE_CONCURRENT_THREADS=8,4,2,1` at 1M, to separate the curve
+  from warming: 98.124 ms at eight, 102.440 at four, 92.496 at two, 76.011 at one. Four threads
+  slower than eight is not a curve; it is the band the individual queries sit in.
+- **The vehicle the 632 ms came from**, `native_catalog_at_scale` at 1M with
+  `HOARD_SCALE_CONCURRENT=1` and no thread list, so the burst runs where it ran then, right
+  after the republished rebuild: the slowest of eight took 97.475 ms against 76.338 ms for the
+  same page single-threaded in the same run, a ratio of 1.28.
+- **Pinned to one core class.** This workstation is heterogeneous: ten Cortex-X925 at
+  3.90 GHz (CPUs 5-9 and 15-19) and ten Cortex-A725 at 2.81 GHz (CPUs 0-4 and 10-14). Every
+  unpinned burst above is bimodal, 76-78 ms or 89-108 ms at 1M and 8.4-9.1 ms or 14.2-14.9 ms
+  at 100k, and which mode a query lands in does not follow the thread count. Under `taskset`
+  the modes separate exactly and the curve goes dead flat:
+
+| pinned burst | 1 thread, ms | 8 threads, slowest, ms | 8 threads, median, ms | ratio |
+| --- | ---: | ---: | ---: | ---: |
+| 1M, ten X925 cores | 76.337 | 77.760 | 77.644 | 1.02 |
+| 1M, ten A725 cores | 127.891 | 129.686 | 128.947 | 1.01 |
+| 100k, ten X925 cores | 8.480 | 9.066 | 9.019 | 1.07 |
+| 100k, ten A725 cores | 14.288 | 14.874 | 14.839 | 1.04 |
+
+Eight simultaneous midpoint queries cost one query's time plus one to two per cent, on either
+core class, at either scale. The whole of the unpinned spread is the scheduler choosing a core
+class, and the 1.68 between the two classes at 1M is close to the 1.39 between their clocks
+with the rest in the wider core. Nothing in the query path serializes and nothing at 1M runs
+out of memory bandwidth at eight readers: the 3.03 MiB the burst adds is the working set of
+eight page selections, not eight copies of an index.
+
+The 500 ms gate is met at eight threads with a margin of 392 ms on the slowest reading above,
+and met on the slowest A725 reading, 129.686 ms, by 370 ms. The 632.5 and 681.3 ms of
+`0935fde` stand as history from a run this document cannot re-enter; every reading taken since,
+here and in the concurrent latency diagnosis above, is between 76 and 130 ms.
 
 ### Thresholds
 

@@ -41,19 +41,25 @@ Save compact evidence and remove scratch data and worktrees when finished.
 
 ## The open items, and what closes each
 
-Five items are open. Each closes by being fixed or by being measured and recorded as not
-worth fixing; none closes by being deferred again. Ordered by whether something is currently
-failing, then by what blocks what.
+Five items were opened here and four remain. Each closes by being fixed or by being measured
+and recorded as not worth fixing; none closes by being deferred again. They keep their
+original order, the closed one first with its result, then what blocks what.
 
-1. **The concurrency gate, the only one failing.** Eight simultaneous midpoint queries
-   measured 632 and 681 ms against 72 ms for one, on a twenty-core machine, crossing the
-   500 ms gate. No lock is held across the query path: `search_lane` is taken only by
-   `refresh_search` and `rebuild_search`, and `open_index` returns a read guard. The
-   discriminating measurement is latency against thread count at 1, 2, 4 and 8, taken at both
-   100k and 1M: a curve that rises linearly with the thread count at both scales is
-   serialization, and one that is flat at 100k and rises at 1M is memory bandwidth.
-   **Closes when** `docs/native-catalog.md` carries that curve and the gate line above either
-   reads as met or is restated with the reason it does not bind.
+1. **The concurrency gate: closed at `39bb637`, met, and it was never a lock.** Latency
+   against thread count at 1, 2, 4 and 8 was taken at both 100k and 1M and is recorded in
+   [the native catalog report](native-catalog.md) under "Query latency against concurrent
+   thread count". The curve is flat at both scales. The slowest of eight simultaneous midpoint
+   queries over the slowest of one is 1.01 and 1.01 at 100k and 1.18 and 1.14 at 1M over two
+   runs each, where serialization would have put it near eight; the 1M rise is inside the
+   spread of the one-thread row itself, which measured 76.0, 90.0 and 91.4 ms over three runs.
+   This workstation is heterogeneous, ten Cortex-X925 at 3.90 GHz and ten Cortex-A725 at
+   2.81 GHz, and every unpinned burst is bimodal for that reason alone; pinned to one class
+   the curve is flat to within two per cent, 76.337 ms at one thread against 77.760 ms for the
+   slowest of eight on the X925 cores and 127.891 against 129.686 ms on the A725 cores. The
+   632 and 681 ms did not reproduce in any vehicle, including the full harness run that
+   produced them, where the slowest of eight now measures 97.475 ms against 76.338 ms for the
+   same page single-threaded. The gate line above binds exactly as written and is met by
+   370 ms on the slowest reading taken, so it is left unchanged. No follow-on wave is owed.
 
 2. **Dropped-source retirement.** `retire_source` in `crates/hoard-index/src/catalog/scan/sweep.rs`
    collects every entry id of a repository before it chunks the deletes. No harness phase drops

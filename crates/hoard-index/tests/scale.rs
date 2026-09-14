@@ -21,6 +21,7 @@ const DELETED_DIRECTORY_SHARE: usize = 10;
 /// How many midpoint queries the concurrency phase runs at once, which is what a small
 /// office asks of one server between keystrokes.
 const CONCURRENT_QUERIES: usize = 8;
+const CONCURRENCY_ROWS: usize = 8;
 /// How many usage rows the usage phase seeds, and how many one `log_usage_batch` writes.
 const USAGE_ROWS: usize = 500_000;
 const USAGE_BATCH: usize = 256;
@@ -221,6 +222,41 @@ fn remove_directories(tree: &Path, count: usize, removed: usize) -> usize {
 /// existed.
 fn phase_enabled(variable: &str) -> bool {
     std::env::var_os(variable).is_some_and(|value| !value.is_empty())
+}
+
+fn concurrent_thread_counts() -> Vec<usize> {
+    thread_counts(
+        std::env::var("HOARD_SCALE_CONCURRENT_THREADS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The thread counts a concurrency run takes its bursts at, one burst per count, falling
+/// back to [`CONCURRENT_QUERIES`] alone when the setting names nothing usable so a run
+/// without the setting measures what it measured before the setting existed.
+fn thread_counts(setting: Option<&str>) -> Vec<usize> {
+    let counts: Vec<usize> = setting
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(|count| count.trim().parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .collect();
+    if counts.is_empty() {
+        vec![CONCURRENT_QUERIES]
+    } else {
+        counts
+    }
+}
+
+#[test]
+fn a_thread_count_list_falls_back_to_the_default_when_it_is_unusable() {
+    assert_eq!(thread_counts(None), vec![CONCURRENT_QUERIES]);
+    assert_eq!(thread_counts(Some("")), vec![CONCURRENT_QUERIES]);
+    assert_eq!(thread_counts(Some("0")), vec![CONCURRENT_QUERIES]);
+    assert_eq!(thread_counts(Some("x,y")), vec![CONCURRENT_QUERIES]);
+    assert_eq!(thread_counts(Some("1,2,4,8")), vec![1, 2, 4, 8]);
+    assert_eq!(thread_counts(Some(" 1 , 2 ,4, 8 ")), vec![1, 2, 4, 8]);
 }
 
 /// Moves the peak resident mark down to what is resident now and returns the mark to
@@ -453,19 +489,18 @@ fn usage_phase(catalog: &Catalog) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Runs [`CONCURRENT_QUERIES`] midpoint pages at once against one catalog and reports what
-/// the process holds across all of them, because a per-request figure says nothing about
-/// what a server answering eight of them at once needs.
+/// Runs each of [`concurrent_thread_counts`] midpoint pages at once against one catalog and
+/// reports what the process holds across all of them, because a per-request figure says
+/// nothing about what a server answering several of them at once needs.
 fn concurrency_phase(
     catalog: &Catalog,
     context: &CompileContext,
     offset: u32,
-) -> Vec<(&'static str, String)> {
+) -> Vec<(String, String)> {
     if !phase_enabled("HOARD_SCALE_CONCURRENT") {
         return Vec::new();
     }
     let background = phase_enabled("HOARD_SCALE_BACKGROUND");
-    let barrier = Barrier::new(CONCURRENT_QUERIES + usize::from(background));
     let expected = catalog
         .query(QueryRequest {
             raw: "",
@@ -475,70 +510,93 @@ fn concurrency_phase(
             context,
         })
         .expect("the reference concurrent page succeeds");
-    let mark = reset_peak_rss();
-    let resident_before = current_rss_kb();
-    let (walls, wall) = timed(|| {
-        std::thread::scope(|scope| {
-            if background {
-                scope.spawn(|| {
-                    barrier.wait();
-                    catalog
-                        .rebuild_search(|_| {})
-                        .expect("the background rebuild succeeds");
-                });
-            }
-            let queries: Vec<_> = (0..CONCURRENT_QUERIES)
-                .map(|_| {
+    let counts = concurrent_thread_counts();
+    let grouped = counts.len() > 1;
+    let mut rows = Vec::with_capacity(counts.len() * CONCURRENCY_ROWS);
+    for threads in counts {
+        let barrier = Barrier::new(threads + usize::from(background));
+        let mark = reset_peak_rss();
+        let resident_before = current_rss_kb();
+        let (walls, wall) = timed(|| {
+            std::thread::scope(|scope| {
+                if background {
                     scope.spawn(|| {
                         barrier.wait();
-                        let (page, elapsed) = timed(|| {
-                            catalog
-                                .query(QueryRequest {
-                                    raw: "",
-                                    sort: SortSpec::new(SortKey::Name, false),
-                                    limit: PAGE,
-                                    offset,
-                                    context,
-                                })
-                                .expect("a concurrent query succeeds")
-                        });
-                        assert_eq!(page.total, expected.total);
-                        assert_eq!(page.rows, expected.rows);
-                        assert_eq!(page.facets, expected.facets);
-                        elapsed
+                        catalog
+                            .rebuild_search(|_| {})
+                            .expect("the background rebuild succeeds");
+                    });
+                }
+                let queries: Vec<_> = (0..threads)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            let (page, elapsed) = timed(|| {
+                                catalog
+                                    .query(QueryRequest {
+                                        raw: "",
+                                        sort: SortSpec::new(SortKey::Name, false),
+                                        limit: PAGE,
+                                        offset,
+                                        context,
+                                    })
+                                    .expect("a concurrent query succeeds")
+                            });
+                            assert_eq!(page.total, expected.total);
+                            assert_eq!(page.rows, expected.rows);
+                            assert_eq!(page.facets, expected.facets);
+                            elapsed
+                        })
                     })
-                })
-                .collect();
-            queries
-                .into_iter()
-                .map(|query| query.join().expect("a query thread finishes"))
-                .collect::<Vec<Duration>>()
-        })
-    });
-    let peak = peak_rss_kb();
-    let resident_after = current_rss_kb();
-    vec![
-        (
-            "concurrent midpoint queries",
-            CONCURRENT_QUERIES.to_string(),
-        ),
-        ("concurrent midpoint queries, offset", offset.to_string()),
-        (
-            "peak rss growth over the concurrent queries",
-            kb_between(mark, peak),
-        ),
-        (
-            "resident rss over the concurrent queries",
-            kb_between(resident_before, resident_after),
-        ),
-        (
-            "slowest of the concurrent queries",
-            format!("{:?}", walls.iter().max().copied().unwrap_or_default()),
-        ),
-        ("concurrent workers, wall to join", format!("{wall:?}")),
-        ("concurrent background rebuild", background.to_string()),
-        ("concurrent queries, individual walls", format!("{walls:?}")),
-    ]
+                    .collect();
+                queries
+                    .into_iter()
+                    .map(|query| query.join().expect("a query thread finishes"))
+                    .collect::<Vec<Duration>>()
+            })
+        });
+        let peak = peak_rss_kb();
+        let resident_after = current_rss_kb();
+        let named = |measure: &str| {
+            if grouped {
+                format!("{threads} threads, {measure}")
+            } else {
+                measure.to_owned()
+            }
+        };
+        rows.extend([
+            (named("concurrent midpoint queries"), threads.to_string()),
+            (
+                named("concurrent midpoint queries, offset"),
+                offset.to_string(),
+            ),
+            (
+                named("peak rss growth over the concurrent queries"),
+                kb_between(mark, peak),
+            ),
+            (
+                named("resident rss over the concurrent queries"),
+                kb_between(resident_before, resident_after),
+            ),
+            (
+                named("slowest of the concurrent queries"),
+                format!("{:?}", walls.iter().max().copied().unwrap_or_default()),
+            ),
+            (
+                named("concurrent workers, wall to join"),
+                format!("{wall:?}"),
+            ),
+            (
+                named("concurrent background rebuild"),
+                background.to_string(),
+            ),
+            (
+                named("concurrent queries, individual walls"),
+                format!("{walls:?}"),
+            ),
+        ]);
+    }
+    rows
 }
 
 /// Deletes a tenth of the tree, rescans, and reports what the walk that finds a tenth of
@@ -597,12 +655,17 @@ fn deletion_phase(
     ]
 }
 
-fn report(rows: &[(&str, String)]) {
+fn owned_rows(rows: Vec<(&'static str, String)>) -> impl Iterator<Item = (String, String)> {
+    rows.into_iter()
+        .map(|(name, value)| (name.to_owned(), value))
+}
+
+fn report<Name: AsRef<str>>(rows: &[(Name, String)]) {
     eprintln!();
     eprintln!("| measure | value |");
     eprintln!("| --- | --- |");
     for (name, value) in rows {
-        eprintln!("| {name} | {value} |");
+        eprintln!("| {} | {value} |", name.as_ref());
     }
     eprintln!();
 }
@@ -977,8 +1040,8 @@ fn native_catalog_at_scale() {
     });
     let republished_allocated = directory_size(&output, allocated);
     let mut phases = concurrency_phase(&catalog, &context, midpoint);
-    phases.extend(usage_phase(&catalog));
-    phases.extend(deletion_phase(&catalog, &config, &tree, count));
+    phases.extend(owned_rows(usage_phase(&catalog)));
+    phases.extend(owned_rows(deletion_phase(&catalog, &config, &tree, count)));
     drop(catalog);
     restore(&tree, TOUCHED);
 
