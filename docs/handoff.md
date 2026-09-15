@@ -3,21 +3,43 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
-## Latest slice: stream repository totals
+## Latest work: the memory goal is closed
 
-`record_scan_stats` and `recount_source_counts` now aggregate one repository at a time into
-per-source counters. Both full repository vectors are removed. Counts, byte saturation,
-recovery timestamps, and mirror/pull/peer source exclusions are preserved. Four new tests
-cover grouping, empty input, read failures, and recovery behavior.
+The goal was that a rescan holds one repository at a time rather than the whole pass. It
+landed as `b10c30d` (a standalone vehicle to measure a rescan's absolute peak, not a
+high-water-mark difference), `9dd3eb8` (discovery reads and stores one repository window at a
+time instead of a source whole) and `5e06f56` (a rescan loads and retracts one repository's
+stamps, revision sizes and seen set at a time), followed by two module splits that touched no
+production code: the `search.rs` split at `4c32a46` and the `catalog/tests.rs` split at
+`568ec5f`.
 
-Validation: 899 workspace tests, workspace build, warning-free Clippy, and formatting pass.
-No benchmarks, archives, worktrees, or persistent fixtures added. Previous follow-ups folded
-summary deltas per transaction and consumed cleanup sets without vector copies. No schema
-or public API changed. The measurements below belong to `51418ad`, not these follow-ups.
+At 1M files, one repository per folder, the rescan peak is 272 MiB (it was about 870 before
+`9dd3eb8` and `5e06f56`). A single repository holding every file is still read and held whole
+by design, and its rescan peak is 847 MiB.
 
-**Next slice:** page entry IDs in `retire_source` instead of collecting all entries of
-each repository before deleting batches. The pass-wide touched-ID set, other retirement
-bookkeeping, usage/schema work, and oversized groups remain unresolved.
+Every open item in `docs/finish-the-memory-work.md` is closed; `568ec5f`'s commit message
+says so directly.
+
+**Next steps**, in this order:
+
+1. Two defects the run against this workstation's real caches found, recorded with their
+   evidence in `docs/native-catalog.md` under "A scan of this workstation's real caches":
+   `hoard scan` on an empty data directory builds the catalog through `Catalog::open_or_scan`
+   and then rescans it again in `src/cli/scan.rs::run`, reporting the second pass as
+   "unchanged"; and a source's byte total sums every filed path's size, so hf-cache snapshot
+   revisions that share a blob count it once per revision, 23.5 per cent over what the source
+   holds on disk here. Whether a source's bytes should mean disk held is the owner's call before
+   it is a fix.
+2. Two correctness gaps neither closed goal touched: `native_model::Model::native_model_decode`
+   panics on a stored row shorter than its 8-byte header instead of returning an error, and a
+   retirement killed between `retire_entries` and `recount_retired_paths` leaves `path_count`
+   stale in a way `hoard doctor` cannot see, because both the stored summary and a fresh count
+   read the same stale value.
+3. Splitting the files still over 1,500 lines: `crates/hoard-mirror/src/resolve.rs` (2,643),
+   `crates/hoard-server/src/api/tests.rs` (2,426), `crates/hoard-net/src/peer.rs` (2,413) and
+   `crates/hoard-index/tests/scale.rs` (1,837).
+4. Only if the real run says memory still matters, sizing the redb read cache, `CACHE_BYTES` in
+   `crates/hoard-index/src/catalog/mod.rs`, which is up to 230 MiB of the 272 MiB peak.
 
 ## Memory delivery, 2026-09-08 (commit `51418ad`)
 
@@ -58,7 +80,8 @@ the first interruption are excluded. Do not restart the restore-all-waves proces
   review of what each wave changed, the final numbers, what the closing reviews found and
   the recommendations for what comes next.
 - `docs/finish-the-memory-work.md` records the delivered scope and remaining acceptance
-  requirements. Only hashing and metered indexing were recovered; other waves stay deferred.
+  requirements as they stood when that document was written; the one-repository-at-a-time
+  rescan goal it left open has since landed and closed, as "Latest work" above says.
 - **The predictable-memory run of 2026-09-07 was reverted.** It set five waves and landed
   four, measured nothing, and was halted by the owner. Only the two components documented
   above have since been recovered. The original commits remain reachable at the tag
@@ -223,11 +246,12 @@ what wave 9 looked at and left.
   nothing. Found during wave 4 of the predictable-memory run and deliberately not fixed
   there: it is a different pass, and fixing it properly means giving retirement a durable
   record of what it still owes, which is a design rather than an edit.
-- **Discovery is not bounded, only the walk is.** Wave 4 groups a source's repositories in
-  sixty-fours for the stored-row map and the retraction, but `discover` still returns a
-  source whole with every entry materialised, so a fresh scan's peak is unchanged. Making
-  discovery itself yield groups is possible for an hf-cache and a git source and impossible
-  for a loose one, and means changing what `discover` returns.
+- **Discovery now reads a bounded window of repositories, and a single repository is still
+  read whole.** `9dd3eb8` made a scan or rescan plan a source's repositories and read, store
+  and walk them a window at a time rather than discovering the whole source into memory
+  first, which is what brought the per-folder rescan peak down from about 870 MiB to 272 MiB
+  at 1M files. A repository of a million files in one folder is still held whole by design,
+  and that tree's rescan peak stayed at 847 MiB.
 - The narrower items each carry their own paragraph in `docs/native-catalog.md` under
   "Remaining work": the tally's slot per term of a column, the sampled path's fallback
   recollecting, `sweep_artifact` decompressing a cold row to delete it, and

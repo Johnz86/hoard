@@ -1845,6 +1845,135 @@ number here is exact bytes with its MiB conversion beside it. The disk gate this
 tracks is stated in bytes: **1,500,000,000**. 1.5 GiB would be 1,610,612,736, so the two
 readings of the old threshold are 110 MB apart and the byte form is the one used.
 
+### A scan of this workstation's real caches
+
+Measured at `568ec5f` on the workstation this repository lives on: ten Cortex-X925 at
+3.90 GHz (cpus 5-9, 15-19) and ten Cortex-A725 at 2.81 GHz (cpus 0-4, 10-14). Every timed
+command below is pinned to the X925 set with `taskset -c 5-9,15-19` and read with
+`/usr/bin/time -v`. `cargo build --release` finished before the first timed command and
+nothing else ran beside one. The scratch config set `[mirror] offline = true` and
+`hash_policy = "never"`; nothing under the three sources or under `/home/johnz86/GIT/hoard`
+was written.
+
+**What the three sources hold.** `du -sb` over each root, apparent size, not the catalog's
+count:
+
+| source | path | `du -sb` | files (`find -type f`) |
+| --- | --- | ---: | ---: |
+| hf-cache | `~/.cache/huggingface/hub` | 345,344,151,695 bytes (321.6 GiB) | 1,085 |
+| comfy | `/home/johnz86/GIT/ComfyUI/models` | 893,979,929,241 bytes (832.6 GiB) | 344 |
+| lmstudio | `/home/johnz86/.lmstudio/models` | 405,827,252,128 bytes (378.0 GiB) | 28 |
+
+1.5 TB total, 1,457 files. This is the opposite shape from the synthetic tree: the synthetic
+tree is 100,000 to 1,000,000 files of one tensor each, and this real tree is a little over a
+thousand files, most of them tens of gigabytes each, filed under 103 repositories. Nothing
+below is comparable to the 100k or 1M rows elsewhere in this document, and it says so at each
+table rather than only here.
+
+**The scan**, `hoard --config <scratch>/hoard.toml scan --hash never` against an empty data
+directory, so this is `Catalog::open_or_scan`'s build followed by the CLI's own explicit
+rescan (see "Defects" below, item 1):
+
+| measure | value |
+| --- | --- |
+| wall | 3.35 s |
+| peak RSS (`/usr/bin/time -v`) | 337,828 KiB (329.9 MiB) |
+| exit status | 0 |
+| warnings or errors logged | none |
+| report | `unchanged=733 changed=0 added=0 absent=0` (see item 1: this is the CLI's second pass, not the build) |
+| sources / repositories / artifacts / entries (`hoard catalog status`) | 3 / 103 / 235 / 733 |
+| `du -sb` of the data directory right after the scan | 5,786,908 bytes (5.52 MiB) |
+
+**Two unchanged rescans**, each `hoard --config <scratch>/hoard.toml scan --hash never`
+against the now-populated catalog, nothing on disk touched between them:
+
+| run | wall | peak RSS | report |
+| --- | ---: | ---: | --- |
+| rescan 1 | 0.04 s | 16,308 KiB (15.93 MiB) | `unchanged=733 changed=0 added=0 absent=0` |
+| rescan 2 | 0.05 s | 15,664 KiB (15.30 MiB) | `unchanged=733 changed=0 added=0 absent=0` |
+
+Both rescans report zero changed, added and absent, which is correct for a source nothing
+touched.
+
+**`hoard doctor`** exits 0, every line `ok`: git, the data directory, catalog format 7, the
+node, 0 known peers, the summary (235 artifacts, 235 present, 103 repositories), the search
+index (built, 0 pending changes), the three sources (hf-cache 477 files, comfy 228 files,
+lmstudio 28 files), the mirror cache (not created yet, offline), and upstream (offline mode,
+the network is never touched).
+
+**The routes**, three runs each against real repositories read back from `GET
+/api/v1/repos`: `models/Qwen/Qwen3-Coder-Next` (6 files, 1.7 MB, hf-cache) for the model,
+detail, resolve and usage rows, and the term `qwen` for the added free-text search row. Server
+and requests ran as one `timeout`-wrapped foreground command; `pgrep -af 'target/release/hoard
+serve'` found nothing once it returned.
+
+| route | status | median |
+| --- | --- | ---: |
+| `GET /api/v1/repos?limit=1` | 200 | 0.617 ms |
+| `GET /api/v1/repos?limit=100` | 200 | 0.607 ms |
+| `GET /api/models?limit=1` | 200 | 0.454 ms |
+| `GET /api/models/Qwen/Qwen3-Coder-Next` | 200 | 0.549 ms |
+| `HEAD /Qwen/Qwen3-Coder-Next/resolve/main/config.json` | 200 | 0.522 ms |
+| `GET /api/v1/sources` | 200 | 0.358 ms |
+| `GET /api/v1/search?q=` | 200 | 1.307 ms |
+| `GET /api/v1/search?q=node:self` | 200 | 1.274 ms |
+| `GET /api/v1/search?q=role:lora` | 200 | 0.709 ms |
+| `GET /api/v1/triage?limit=20` | 200 | 0.654 ms |
+| `GET /api/v1/repos/models/Qwen/Qwen3-Coder-Next/usage` | 200 | 0.234 ms |
+| `GET /` | 200 | 0.205 ms |
+| `GET /api/v1/search?q=qwen` (added; a real free-text term) | 200 | 0.510 ms |
+
+Every route answered 200 on every run. All thirteen rows sit under 1.5 ms, which says nothing
+about the 1M gate of 500 ms: a 733-entry catalog exercises none of the paging, tallying or
+collapse cost that gate is for.
+
+**`hf download`** of one small file, `config.json` (1,178 bytes) from
+`Qwen/Qwen3-Coder-Next`, through `HF_ENDPOINT=http://127.0.0.1:7399` with `HF_HOME` under the
+scratch directory: exit 0, the downloaded blob is byte-identical to the source file in
+`~/.cache/huggingface/hub`.
+
+**Defects.**
+
+1. **`hoard scan` on an empty data directory scans twice, and reports the second pass as
+   "unchanged."** `src/cli/node.rs::open_catalog` calls `Catalog::open_or_scan`, which is the
+   real first build and is what logs the `"building the native catalog"` phase lines above.
+   `src/cli/scan.rs::run` then unconditionally calls `catalog.rescan(...)` again over the same
+   sources, and that second pass is what the `"scan complete"` line reports. On this run the
+   second pass cost 0.04 s against the 3.35 s of the command as a whole, because these
+   sources hold 733 files; the ratio would not stay negligible on a source the synthetic
+   harness's 1M-entry tree is sized like. The harness itself does not have this defect:
+   `native_catalog_at_scale` in `crates/hoard-index/tests/scale.rs` times
+   `Catalog::scan_sources` alone for its "scan wall" row and times `catalog.rescan` separately
+   for its rescan rows, so the "scan wall" figures elsewhere in this document are the build
+   alone, not what the CLI's `hoard scan` actually costs on an empty directory. A first-time
+   `hoard scan` is more expensive, and reports itself as "unchanged," which is the wrong word
+   for a catalog that a moment ago had nothing in it.
+2. **A source's reported byte total overcounts a repository that keeps more than one
+   revision.** `GET /api/v1/sources` and `hoard doctor`'s `source` line both read
+   `SourceRecord.byte_count`. A scan builds it by summing `entry.size` over every present
+   entry, one entry per filed path: `DerivedShift::shift` in
+   `crates/hoard-index/src/catalog/scan/counters.rs` adds each entry's size to its repository's
+   `present_bytes`, and `held_by_source` in `crates/hoard-index/src/catalog/scan/sources.rs`
+   adds those per source when `record_scan_stats` stores the source row. (`seed.rs` repeats the
+   same per-path sum for test fixtures only; it is compiled under `cfg(any(test, feature =
+   "fixtures"))` and is not what a real scan runs.) An hf-cache revision's
+   files are symlinks into `blobs/`, named by hash, so a file unchanged between two snapshots
+   of the same repository is one blob on disk and two entries in the catalog, each carrying
+   the blob's full size. On this workstation two hf-cache repositories keep two snapshot
+   revisions each
+   (`models--mistralai--Ministral-3-14B-Instruct-2512`,
+   `models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`), and the hf-cache source reports
+   414,409,479,660 bytes where the source's own `blobs/` directories sum to 335,552,746,441
+   bytes (`du -sb` over each repository's `blobs`) and the whole `hf-cache` directory to
+   345,344,151,695 bytes: the reported total is 78,856,733,219 bytes (73.4 GiB), 23.5 per
+   cent, above what is actually on disk. The Hub routes this total is not used by are correct
+   regardless - `resolve` and `hf download` above read the entry itself, not this aggregate -
+   but the number `doctor` and the sources panel show next to a source's path is not that
+   source's disk footprint whenever a repository's revisions share content.
+
+No other defect was observed: every command exited 0, every route answered 200, both rescans
+reported zero changed, and the downloaded file matched its source byte for byte.
+
 ## Remaining work
 
 - **A shallow window is never cut from the far end.** The pass that counts a shallow window
