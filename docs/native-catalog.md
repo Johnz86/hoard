@@ -266,8 +266,16 @@ the catalog at `<data_dir>/native`.
 - `scan/sources.rs` the source rows, their scanned counts and the configuration validation.
 - `scan/revisions.rs` the revisions discovery found merged with the revisions the catalog holds.
 - `naming.rs` the config and card a revision carries, artifact names, per-file hashes.
-- `search.rs` the Tantivy schema, the rebuild, per-entry documents, the `primary` mark, the
-  collectors, `refresh_search` and the published-directory swap.
+- `search/mod.rs` `QueryRequest`, `QueryPage`, `RefreshReport` and what the catalog imports.
+- `search/schema.rs` `Fields`, the keyword and column constants, the document one entry writes.
+- `search/build.rs` the rebuild, the metered writer, per-entry documents, the directory publish.
+- `search/refresh.rs` `refresh_search`, the change log and its cursor, the published directory.
+- `search/answer.rs` a query from request to page: the path, the facet rail, the rows.
+- `search/inspect.rs` the segment, delete and document counts the tests and diagnostics read.
+- `search/paging.rs` the page window, the heap or sampled selection and its boundaries.
+- `search/tally.rs` the facet tallies per segment and the base rail buckets.
+- `search/collapse.rs` the per-artifact collapse, the spelled terms and the column blocks.
+- `search/collectors.rs` the Tantivy collectors: primary, sampling, bucket, window, count.
 - `query.rs` the grammar compiled against the Tantivy index.
 - `read.rs` the inspector, the repository screens, the triage queue, the sources listing.
 - `verdict.rs` a user's override of what an artifact is, re-applied after a rescan.

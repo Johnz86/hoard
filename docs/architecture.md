@@ -152,7 +152,16 @@ hoard/
           scan/sources.rs    the source rows, their scanned counts, configuration validation
           scan/revisions.rs  discovered revisions merged with the stored ones
           naming.rs          the config and card a revision carries, artifact names, file hashes
-          search.rs          Tantivy schema, rebuild, per-entry documents collapsed per artifact
+          search/mod.rs      QueryRequest, QueryPage, RefreshReport, the re-exports
+          search/schema.rs   Fields, the keyword and column constants, the entry document
+          search/build.rs    the rebuild, the metered writer, per-entry documents, publish
+          search/refresh.rs  refresh_search, the change log and its cursor, the directory
+          search/answer.rs   a query from request to page: path, facet rail, rows
+          search/inspect.rs  segment, delete and document counts
+          search/paging.rs   the page window, heap or sampled selection, boundaries
+          search/tally.rs    per-segment facet tallies and the base rail buckets
+          search/collapse.rs the per-artifact collapse, spelled terms, column blocks
+          search/collectors.rs the Tantivy collectors: primary, sampling, bucket, window, count
           query.rs           the grammar compiled against the Tantivy index
           read.rs            inspector, repository screens, triage queue, sources
           verdict.rs         a user's override of what an artifact is
