@@ -88,6 +88,13 @@ pub const DIFFUSION_KEYS: &[KeyMatch] = &[
     KeyMatch::Fragment("diffusion_model."),
 ];
 
+/// The latent diffusion layout: an autoencoder group beside a denoiser group, which is what
+/// a single-file SD checkpoint has always looked like.
+pub const LATENT_DIFFUSION_KEYS: &[KeyMatch] = &[
+    KeyMatch::Segment("first_stage_model"),
+    KeyMatch::AnyOf(&[KeyMatch::Segment("model"), KeyMatch::Segment("model_ema")]),
+];
+
 pub const DIT_STREAM_KEYS: &[KeyMatch] = &[
     KeyMatch::Fragment("double_blocks."),
     KeyMatch::Fragment("single_blocks."),
@@ -221,6 +228,11 @@ pub const WAN_BLOCK_KEYS: &[KeyMatch] = &[KeyMatch::AllOf(&[
     KeyMatch::Fragment("cross_attn.k."),
     KeyMatch::Fragment("ffn."),
 ])];
+
+/// The `require` list of the one `Role::Ckpt` rule whose match is not a diffusion backbone,
+/// held as a constant so the rule table and the pairing verdict name the same list rather
+/// than two copies of it.
+pub const TEXT_ENCODER_BODY_RULE: &[KeyMatch] = &[KeyMatch::AnyOf(TEXT_ENCODER_BODY_KEYS)];
 
 /// Text encoder bodies that stand alone as a file: CLIP and the T5 family.
 pub const TEXT_ENCODER_BODY_KEYS: &[KeyMatch] = &[
@@ -409,10 +421,7 @@ pub const ROLE_RULES: &[RoleRule] = &[
     RoleRule {
         role: Role::Ckpt,
         sub_role: None,
-        require: &[
-            KeyMatch::Segment("first_stage_model"),
-            KeyMatch::AnyOf(&[KeyMatch::Segment("model"), KeyMatch::Segment("model_ema")]),
-        ],
+        require: LATENT_DIFFUSION_KEYS,
         forbid: NOT_LORA,
         max_tensors: None,
         confidence: TENSOR_PATTERN,
@@ -452,7 +461,7 @@ pub const ROLE_RULES: &[RoleRule] = &[
     RoleRule {
         role: Role::Ckpt,
         sub_role: None,
-        require: &[KeyMatch::AnyOf(TEXT_ENCODER_BODY_KEYS)],
+        require: TEXT_ENCODER_BODY_RULE,
         forbid: NOT_ADAPTER_OR_DIFFUSION,
         max_tensors: None,
         confidence: TENSOR_PATTERN,
@@ -720,6 +729,25 @@ pub const FOLDER_ROLE_HINTS: &[(&str, Role, Option<SubRole>)] = &[
     ("datasets", Role::Ds, None),
 ];
 
+/// Component nouns a file name can carry, matched as whole tokens of the stem. A file name
+/// never decides a role on its own either; it guesses, and agrees or disagrees with the
+/// folder. Generic words that name no single component are deliberately absent.
+pub const FILENAME_ROLE_HINTS: &[(&str, Role, Option<SubRole>)] = &[
+    ("vae", Role::Vae, None),
+    ("autoencoder", Role::Vae, None),
+    ("lora", Role::Lora, None),
+    ("lycoris", Role::Lora, None),
+    ("locon", Role::Lora, None),
+    ("loha", Role::Lora, None),
+    ("ipadapter", Role::Lora, Some(SubRole::Ipa)),
+    ("controlnet", Role::Ctrl, None),
+    ("upscale", Role::Upsc, None),
+    ("upscaler", Role::Upsc, None),
+    ("esrgan", Role::Upsc, None),
+    ("swinir", Role::Upsc, None),
+    ("unet", Role::Ckpt, None),
+];
+
 /// File names that are tokenizers whatever the folder says.
 pub const TOKENIZER_FILES: &[&str] = &[
     "tokenizer.json",
@@ -745,9 +773,12 @@ pub const CLASS_NAME_ROLES: &[(&str, Role)] = &[
     ("transformer3dmodel", Role::Ckpt),
 ];
 
-/// Architecture tokens carried by diffusion GGUF files, which are checkpoints, not
-/// language models.
-pub const DIFFUSION_ARCHITECTURES: &[&str] = &["flux", "sd1", "sd3", "sdxl", "wan", "ltxv"];
+/// Architecture tokens carried by diffusion files in their metadata, which are checkpoints,
+/// not language models however much of a language model they fuse in. Matched as a prefix of
+/// the `Base` normalization of the raw spelling, so every entry is written normalized and a
+/// family is only listed once a file on disk is known to name it.
+pub const DIFFUSION_ARCHITECTURES: &[&str] =
+    &["flux", "sd1", "sd3", "sdxl", "wan", "ltxv", "hidream"];
 
 /// Raw base spellings, normalized to alphanumerics, mapped to the family token. Longest
 /// and most specific patterns come first.

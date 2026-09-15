@@ -88,7 +88,7 @@ phase, and the follow-ups under `### Phase 11` carry their own acceptance criter
 | Repo | `type/org/name`: a git clone, a Hub cache repo, or a bare directory adopted as one | `RepoId` |
 | Revision | A commit, branch or tag; loose repos get one synthetic sha from their content | `CommitSha` |
 | Entry | A path inside a revision pointing at a blob, on a node | (revision, path, node) |
-| Role | ckpt, lora, ctrl, upsc, vae, emb, llm, ds, unk; sub-roles ipa, tok, mot | inferred, reviewable |
+| Role | ckpt, lora, ctrl, upsc, vae, emb, llm, ds, unk; sub-roles ipa, tok, mot, cmp, bb | inferred, reviewable |
 | State | served, local, pulling, stale, remote, triage | derived per entry and node |
 | Shelf | A named query | query string |
 | Loadout | Pinned entries with weights | TOML document |

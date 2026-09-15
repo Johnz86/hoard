@@ -488,6 +488,27 @@ mod tests {
     }
 
     #[test]
+    fn a_pairing_alias_narrows_the_checkpoint_role() {
+        for (raw, sub) in [
+            ("role:complete", "cmp"),
+            ("role:all-in-one", "cmp"),
+            ("role:backbone", "bb"),
+            ("role:needs-pairing", "bb"),
+        ] {
+            let rendered = compiled(raw);
+            assert!(
+                rendered.contains("ckpt") && rendered.contains(sub),
+                "{raw} compiled to {rendered}"
+            );
+        }
+        let plain = compiled("role:ckpt");
+        assert!(
+            !plain.contains("cmp") && !plain.contains("bb"),
+            "a bare role keeps both pairing states: {plain}"
+        );
+    }
+
+    #[test]
     fn compat_without_a_target_is_an_error() {
         let (_, fields) = Fields::build();
         let context = CompileContext::new("2026-09-04T00:00:00Z".parse().expect("clock"));

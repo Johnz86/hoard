@@ -93,7 +93,20 @@ impl Role {
     /// Every accepted spelling of every role, in the order the grammar table lists them.
     pub fn aliases(self) -> &'static [&'static str] {
         match self {
-            Role::Ckpt => &["ckpt", "checkpoint", "base", "model", "unet", "diffusion"],
+            Role::Ckpt => &[
+                "ckpt",
+                "checkpoint",
+                "base",
+                "model",
+                "unet",
+                "diffusion",
+                "cmp",
+                "complete",
+                "all-in-one",
+                "bb",
+                "backbone",
+                "needs-pairing",
+            ],
             Role::Lora => &[
                 "lora",
                 "lycoris",
@@ -169,6 +182,8 @@ pub enum SubRole {
     Ipa,
     Tok,
     Mot,
+    Cmp,
+    Bb,
 }
 
 impl SubRole {
@@ -177,6 +192,8 @@ impl SubRole {
             SubRole::Ipa => "ipa",
             SubRole::Tok => "tok",
             SubRole::Mot => "mot",
+            SubRole::Cmp => "cmp",
+            SubRole::Bb => "bb",
         }
     }
 
@@ -185,6 +202,8 @@ impl SubRole {
             SubRole::Ipa => Role::Lora,
             SubRole::Tok => Role::Emb,
             SubRole::Mot => Role::Ctrl,
+            SubRole::Cmp => Role::Ckpt,
+            SubRole::Bb => Role::Ckpt,
         }
     }
 
@@ -193,6 +212,8 @@ impl SubRole {
             SubRole::Ipa => "IP-ADAPTER",
             SubRole::Tok => "TOKENIZER",
             SubRole::Mot => "MOTION MODULE",
+            SubRole::Cmp => "COMPLETE",
+            SubRole::Bb => "NEEDS PAIRING",
         }
     }
 
@@ -201,6 +222,8 @@ impl SubRole {
             SubRole::Ipa => &["ipa", "ip-adapter", "ipadapter"],
             SubRole::Tok => &["tok", "tokenizer"],
             SubRole::Mot => &["mot", "motion", "motion-module"],
+            SubRole::Cmp => &["cmp", "complete", "all-in-one"],
+            SubRole::Bb => &["bb", "backbone", "needs-pairing"],
         }
     }
 
@@ -342,6 +365,31 @@ mod tests {
         assert_eq!(SubRole::Ipa.role(), Role::Lora);
         assert_eq!(SubRole::Mot.role(), Role::Ctrl);
         assert_eq!(SubRole::Tok.role(), Role::Emb);
+        assert_eq!(Role::sub_role_from_alias("complete"), Some(SubRole::Cmp));
+        assert_eq!(Role::sub_role_from_alias("all-in-one"), Some(SubRole::Cmp));
+        assert_eq!(Role::sub_role_from_alias("backbone"), Some(SubRole::Bb));
+        assert_eq!(
+            Role::sub_role_from_alias("needs-pairing"),
+            Some(SubRole::Bb)
+        );
+        assert_eq!(SubRole::Cmp.role(), Role::Ckpt);
+        assert_eq!(SubRole::Bb.role(), Role::Ckpt);
+        assert_eq!(SubRole::Cmp.label(), "COMPLETE");
+        assert_eq!(SubRole::Bb.label(), "NEEDS PAIRING");
+        for sub in SubRole::iter() {
+            assert_eq!(
+                SubRole::from_alias(sub.as_str()),
+                Some(sub),
+                "{} resolves from its own spelling",
+                sub.as_str()
+            );
+            assert_eq!(
+                Role::from_alias(sub.as_str()),
+                Some(sub.role()),
+                "{} reaches its role through the grammar",
+                sub.as_str()
+            );
+        }
     }
 
     #[test]

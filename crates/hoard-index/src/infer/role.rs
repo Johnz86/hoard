@@ -1,13 +1,24 @@
-use hoard_core::{Evidence, EvidenceSource, Role, SubRole, TensorSummary};
+use hoard_core::{Base, Evidence, EvidenceSource, Role, SubRole, TensorSummary};
 
 use super::rules::{
-    self, CLASS_NAME_ROLES, CROSS_ATTENTION_DIMS, DIFFUSION_ARCHITECTURES, FOLDER_ROLE_HINTS,
-    ROLE_RULES, TOKENIZER_FILES,
+    self, CLASS_NAME_ROLES, CROSS_ATTENTION_DIMS, DIFFUSION_ARCHITECTURES, DIFFUSION_KEYS,
+    FILENAME_ROLE_HINTS, FOLDER_ROLE_HINTS, KeyMatch, LATENT_DIFFUSION_KEYS, ROLE_RULES,
+    TEXT_ENCODER_BODY_RULE, TEXT_ENCODER_KEYS, TOKENIZER_FILES,
 };
 use super::{Accumulator, InferInput, ROLE_FLOOR};
 
 const EMBEDDING_MAX_TENSORS: u32 = 4;
 const EMBEDDING_MAX_SIZE: u64 = 16 * 1024 * 1024;
+
+/// A checkpoint that loads alone: a denoiser with the text encoder it is conditioned on, or
+/// the latent diffusion layout that carries both beside its autoencoder.
+const COMPLETE_CHECKPOINT_KEYS: &[KeyMatch] = &[
+    KeyMatch::AllOf(&[
+        KeyMatch::AnyOf(DIFFUSION_KEYS),
+        KeyMatch::AnyOf(TEXT_ENCODER_KEYS),
+    ]),
+    KeyMatch::AllOf(LATENT_DIFFUSION_KEYS),
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RoleVerdict {
@@ -40,6 +51,11 @@ pub(crate) fn infer_role(input: &InferInput<'_>) -> RoleVerdict {
         .best()
         .map(|(sub, _)| sub)
         .filter(|sub| sub.role() == role);
+    let sub_role = if role == Role::Ckpt {
+        input.tensors.and_then(pairing_sub_role)
+    } else {
+        sub_role
+    };
 
     let mut evidence = roles.into_evidence();
     evidence.extend(sub_roles.into_evidence());
@@ -112,18 +128,31 @@ fn embedding_shape_rule(
 }
 
 fn architecture_rule(tensors: &TensorSummary, roles: &mut Accumulator<Role>) {
-    let Some(architecture) = tensors.metadata.get("general.architecture") else {
-        return;
-    };
-    let normalized = architecture.to_ascii_lowercase();
-    let role = if DIFFUSION_ARCHITECTURES
+    if let Some(architecture) = tensors.metadata.get("general.architecture") {
+        let normalized = architecture.to_ascii_lowercase();
+        let role = if names_a_diffusion_architecture(&normalized) {
+            Role::Ckpt
+        } else {
+            Role::Llm
+        };
+        push_architecture(roles, role, "general.architecture", &normalized);
+    }
+    if let Some(model_type) = tensors.metadata.get("model_type") {
+        let normalized = model_type.to_ascii_lowercase();
+        if names_a_diffusion_architecture(&normalized) {
+            push_architecture(roles, Role::Ckpt, "model_type", &normalized);
+        }
+    }
+}
+
+fn names_a_diffusion_architecture(raw: &str) -> bool {
+    let normalized = Base::new(raw);
+    DIFFUSION_ARCHITECTURES
         .iter()
-        .any(|known| normalized.starts_with(known))
-    {
-        Role::Ckpt
-    } else {
-        Role::Llm
-    };
+        .any(|known| normalized.as_str().starts_with(known))
+}
+
+fn push_architecture(roles: &mut Accumulator<Role>, role: Role, key: &str, normalized: &str) {
     roles.push(
         role,
         Evidence::new(
@@ -132,7 +161,7 @@ fn architecture_rule(tensors: &TensorSummary, roles: &mut Accumulator<Role>) {
             EvidenceSource::Metadata,
             rules::METADATA_STRONG,
         )
-        .with_detail(format!("general.architecture {normalized}")),
+        .with_detail(format!("{key} {normalized}")),
     );
 }
 
@@ -248,6 +277,67 @@ fn name_rules(
             .with_detail(format!("{file_name} is a tokenizer file")),
         );
     }
+    name_hints(&file_name, roles, sub_roles);
+}
+
+fn name_hints(
+    file_name: &str,
+    roles: &mut Accumulator<Role>,
+    sub_roles: &mut Accumulator<SubRole>,
+) {
+    let stem = file_name
+        .rsplit_once('.')
+        .map_or(file_name, |(head, _)| head);
+    let mut claimed: Vec<Role> = Vec::new();
+    for token in stem.split(|character: char| !character.is_ascii_alphanumeric()) {
+        let Some((name, role, sub_role)) = FILENAME_ROLE_HINTS
+            .iter()
+            .find(|(name, _, _)| *name == token)
+        else {
+            continue;
+        };
+        if claimed.contains(role) {
+            continue;
+        }
+        claimed.push(*role);
+        let detail = format!("{name} in {file_name} names a component");
+        roles.push(
+            *role,
+            Evidence::new(
+                "role",
+                role.as_str(),
+                EvidenceSource::Filename,
+                rules::FILENAME_HINT,
+            )
+            .with_detail(detail.clone()),
+        );
+        if let Some(sub) = sub_role {
+            sub_roles.push(
+                *sub,
+                Evidence::new(
+                    "sub_role",
+                    sub.as_str(),
+                    EvidenceSource::Filename,
+                    rules::FILENAME_HINT,
+                )
+                .with_detail(detail),
+            );
+        }
+    }
+}
+
+fn pairing_sub_role(tensors: &TensorSummary) -> Option<SubRole> {
+    if KeyMatch::AnyOf(COMPLETE_CHECKPOINT_KEYS).matches(tensors) {
+        return Some(SubRole::Cmp);
+    }
+    ROLE_RULES
+        .iter()
+        .any(|rule| {
+            rule.role == Role::Ckpt
+                && rule.require != TEXT_ENCODER_BODY_RULE
+                && rule.matches(tensors)
+        })
+        .then_some(SubRole::Bb)
 }
 
 fn folder_hints(
@@ -345,6 +435,86 @@ mod tests {
         );
     }
 
+    fn bespoke_blocks() -> TensorSummary {
+        tensors(&[
+            ("shape_dec.blocks.0.weight", &[512, 512]),
+            ("struct_dec.blocks.0.weight", &[512, 512]),
+        ])
+    }
+
+    #[test]
+    fn a_file_name_and_a_folder_that_agree_clear_the_role_floor() {
+        let summary = bespoke_blocks();
+        let path = Path::new("/models/vae/trellis_2_shape_vae_bf16.safetensors");
+        let verdict =
+            infer_role(&input(path, "trellis_2_shape_vae_bf16.safetensors").with_tensors(&summary));
+        assert_eq!(verdict.role, Role::Vae);
+        assert!(verdict.confidence >= ROLE_FLOOR);
+        assert_eq!(
+            verdict
+                .evidence
+                .iter()
+                .filter(|item| item.source == EvidenceSource::FolderHint)
+                .count(),
+            1
+        );
+        assert_eq!(
+            verdict
+                .evidence
+                .iter()
+                .filter(|item| item.source == EvidenceSource::Filename)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_file_name_hint_alone_stays_unclassified() {
+        let summary = bespoke_blocks();
+        let path = Path::new("/data/weights/trellis_2_shape_vae_bf16.safetensors");
+        let verdict =
+            infer_role(&input(path, "trellis_2_shape_vae_bf16.safetensors").with_tensors(&summary));
+        assert_eq!(verdict.role, Role::Unk);
+        assert!(verdict.confidence < ROLE_FLOOR);
+    }
+
+    #[test]
+    fn a_file_name_that_disagrees_with_its_folder_classifies_nothing() {
+        let summary = bespoke_blocks();
+        let path = Path::new("/models/checkpoints/vae_prompt_helper.safetensors");
+        let verdict =
+            infer_role(&input(path, "vae_prompt_helper.safetensors").with_tensors(&summary));
+        assert_eq!(verdict.role, Role::Unk);
+    }
+
+    #[test]
+    fn a_rescued_role_still_needs_triage() {
+        let summary = bespoke_blocks();
+        let path = Path::new("/models/vae/trellis_2_shape_vae_bf16.safetensors");
+        let verdict =
+            infer_role(&input(path, "trellis_2_shape_vae_bf16.safetensors").with_tensors(&summary));
+        assert!(verdict.confidence < 0.85);
+    }
+
+    #[test]
+    fn a_novel_architecture_without_a_component_noun_stays_unclassified() {
+        let summary = bespoke_blocks();
+        let cases = [
+            (
+                "/models/checkpoints/anima/animaOfficial_preview2.safetensors",
+                "animaOfficial_preview2.safetensors",
+            ),
+            (
+                "/models/checkpoints/hunyuan_3d_v2.1.safetensors",
+                "hunyuan_3d_v2.1.safetensors",
+            ),
+        ];
+        for (raw, name) in cases {
+            let verdict = infer_role(&input(Path::new(raw), name).with_tensors(&summary));
+            assert_eq!(verdict.role, Role::Unk, "{raw}");
+        }
+    }
+
     #[test]
     fn tokenizer_files_narrow_to_an_embedding() {
         let path = Path::new("/models/llm/tokenizer.json");
@@ -372,6 +542,114 @@ mod tests {
     }
 
     #[test]
+    fn a_checkpoint_with_a_text_encoder_is_complete() {
+        let summary = tensors(&[
+            (
+                "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn2.to_k.weight",
+                &[640, 2048],
+            ),
+            (
+                "cond_stage_model.transformer.text_model.encoder.layers.0.mlp.fc1.weight",
+                &[5120, 1280],
+            ),
+        ]);
+        let path = Path::new("/models/checkpoints/juggernautXL_v9.safetensors");
+        let verdict =
+            infer_role(&input(path, "juggernautXL_v9.safetensors").with_tensors(&summary));
+        assert_eq!(verdict.role, Role::Ckpt);
+        assert_eq!(verdict.sub_role, Some(SubRole::Cmp));
+    }
+
+    #[test]
+    fn a_backbone_checkpoint_needs_pairing() {
+        let summary = tensors(&[
+            ("double_blocks.0.img_attn.qkv.weight", &[9216, 3072]),
+            ("single_blocks.0.linear1.weight", &[21504, 3072]),
+        ]);
+        let path = Path::new("/models/diffusion_models/flux1-dev.safetensors");
+        let verdict = infer_role(&input(path, "flux1-dev.safetensors").with_tensors(&summary));
+        assert_eq!(verdict.role, Role::Ckpt);
+        assert_eq!(verdict.sub_role, Some(SubRole::Bb));
+    }
+
+    #[test]
+    fn a_wan_or_krea_backbone_needs_pairing() {
+        let video = tensors(&[
+            ("blocks.0.self_attn.q.weight", &[5120, 5120]),
+            ("blocks.0.cross_attn.k_img.weight", &[5120, 1280]),
+            ("patch_embedding.weight", &[5120, 16, 1, 2, 2]),
+            ("time_projection.1.weight", &[5120, 5120]),
+        ]);
+        let gated = tensors(&[
+            ("layers.0.attn.wq.weight", &[3072, 3072]),
+            ("layers.0.attn.gate.weight", &[3072, 3072]),
+            ("layers.0.mlp.gate.weight", &[8192, 3072]),
+            ("txtfusion.0.weight", &[3072, 4096]),
+        ]);
+        let cases = [
+            (
+                video,
+                "/models/diffusion_models/wan2.2-i2v-a14b.safetensors",
+                "wan2.2-i2v-a14b.safetensors",
+            ),
+            (
+                gated,
+                "/models/diffusion_models/krea2_bf16.safetensors",
+                "krea2_bf16.safetensors",
+            ),
+        ];
+        for (summary, raw, name) in cases {
+            let verdict = infer_role(&input(Path::new(raw), name).with_tensors(&summary));
+            assert_eq!(verdict.role, Role::Ckpt, "{raw}");
+            assert_eq!(verdict.sub_role, Some(SubRole::Bb), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_complete_checkpoint_is_not_downgraded_by_its_backbone_rules() {
+        let summary = tensors(&[
+            (
+                "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn2.to_k.weight",
+                &[640, 2048],
+            ),
+            ("model.diffusion_model.time_embed.0.weight", &[1280, 320]),
+            (
+                "model.diffusion_model.output_blocks.0.0.adaLN_modulation.1.weight",
+                &[1920, 320],
+            ),
+            (
+                "cond_stage_model.transformer.text_model.encoder.layers.0.mlp.fc1.weight",
+                &[5120, 1280],
+            ),
+        ]);
+        let path = Path::new("/models/checkpoints/merged_everything.safetensors");
+        let verdict =
+            infer_role(&input(path, "merged_everything.safetensors").with_tensors(&summary));
+        assert_eq!(verdict.role, Role::Ckpt);
+        assert!(
+            ROLE_RULES
+                .iter()
+                .filter(|rule| rule.role == Role::Ckpt && rule.matches(&summary))
+                .count()
+                >= 3,
+            "the fixture must fire the complete rule and the backbone shaped ones at once"
+        );
+        assert_eq!(verdict.sub_role, Some(SubRole::Cmp));
+    }
+
+    #[test]
+    fn a_standalone_text_encoder_carries_no_pairing_tag() {
+        let summary = tensors(&[
+            ("text_model.encoder.layers.0.mlp.fc1.weight", &[5120, 1280]),
+            ("text_model.encoder.layers.1.mlp.fc1.weight", &[5120, 1280]),
+        ]);
+        let path = Path::new("/models/text_encoders/clip_h.safetensors");
+        let verdict = infer_role(&input(path, "clip_h.safetensors").with_tensors(&summary));
+        assert_eq!(verdict.role, Role::Ckpt);
+        assert_eq!(verdict.sub_role, None);
+    }
+
+    #[test]
     fn a_gguf_diffusion_architecture_is_a_checkpoint_not_a_language_model() {
         let summary = with_metadata(
             tensors(&[("double_blocks.0.img_attn.qkv.weight", &[9216, 3072])]),
@@ -380,6 +658,86 @@ mod tests {
         let path = Path::new("/models/unet/flux.gguf");
         let verdict = infer_role(&input(path, "flux.gguf").with_tensors(&summary));
         assert_eq!(verdict.role, Role::Ckpt);
+    }
+
+    fn fused_image_model() -> TensorSummary {
+        tensors(&[
+            (
+                "language_model.model.layers.0.self_attn.q_proj.weight",
+                &[4096, 4096],
+            ),
+            ("lm_head.weight", &[128256, 4096]),
+        ])
+    }
+
+    #[test]
+    fn a_fused_image_model_is_a_checkpoint_not_a_language_model() {
+        for spelling in ["hidream_o1_image", "HiDream-O1-Image", "hidream.o1 image"] {
+            let summary = with_metadata(fused_image_model(), &[("model_type", spelling)]);
+            let path = Path::new("/models/diffusion_models/hidream_o1_full.safetensors");
+            let verdict = infer_role(
+                &InferInput::new(
+                    ArtifactFormat::Safetensors,
+                    path,
+                    "hidream_o1_full.safetensors",
+                    17_179_869_184,
+                )
+                .with_tensors(&summary),
+            );
+            assert_eq!(verdict.role, Role::Ckpt, "{spelling}");
+            assert!(
+                verdict.evidence.iter().any(|item| {
+                    item.source == EvidenceSource::Metadata && item.value == Role::Ckpt.as_str()
+                }),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hunyuan_language_model_gguf_stays_a_language_model() {
+        for architecture in ["hunyuan-moe", "hunyuan-dense"] {
+            let summary = with_metadata(
+                tensors(&[
+                    ("blk.0.attn_q.weight", &[4096, 4096]),
+                    ("token_embd.weight", &[128256, 4096]),
+                ]),
+                &[("general.architecture", architecture)],
+            );
+            let path = Path::new("/models/checkpoints/hunyuan-a13b-instruct.Q4_K_M.gguf");
+            let verdict = infer_role(
+                &InferInput::new(
+                    ArtifactFormat::Gguf,
+                    path,
+                    "hunyuan-a13b-instruct.Q4_K_M.gguf",
+                    8_589_934_592,
+                )
+                .with_tensors(&summary),
+            );
+            assert_eq!(verdict.role, Role::Llm, "{architecture}");
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_metadata_model_type_names_no_role() {
+        let summary = with_metadata(fused_image_model(), &[("model_type", "someones_merge")]);
+        let path = Path::new("/models/diffusion_models/someones_merge.safetensors");
+        let verdict = infer_role(
+            &InferInput::new(
+                ArtifactFormat::Safetensors,
+                path,
+                "someones_merge.safetensors",
+                17_179_869_184,
+            )
+            .with_tensors(&summary),
+        );
+        assert_eq!(verdict.role, Role::Llm);
+        assert!(
+            verdict
+                .evidence
+                .iter()
+                .all(|item| item.source != EvidenceSource::Metadata || item.field != "role")
+        );
     }
 
     #[test]

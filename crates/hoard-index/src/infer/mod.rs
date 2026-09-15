@@ -722,7 +722,7 @@ mod acceptance {
                 file_name: "v1-5-pruned.safetensors",
                 size: 4_265_000_000,
                 role: Role::Ckpt,
-                sub_role: None,
+                sub_role: Some(SubRole::Cmp),
                 base: "sd15",
             },
             Case {
@@ -732,7 +732,7 @@ mod acceptance {
                 file_name: "sd_xl_base_1.0.safetensors",
                 size: 6_900_000_000,
                 role: Role::Ckpt,
-                sub_role: None,
+                sub_role: Some(SubRole::Cmp),
                 base: "sdxl",
             },
             Case {
@@ -742,7 +742,7 @@ mod acceptance {
                 file_name: "flux1-dev.safetensors",
                 size: 23_800_000_000,
                 role: Role::Ckpt,
-                sub_role: None,
+                sub_role: Some(SubRole::Bb),
                 base: "flux",
             },
             Case {
@@ -752,7 +752,7 @@ mod acceptance {
                 file_name: "wan2.1-t2v-14b.safetensors",
                 size: 28_600_000_000,
                 role: Role::Ckpt,
-                sub_role: None,
+                sub_role: Some(SubRole::Bb),
                 base: "wan",
             },
             Case {
@@ -852,7 +852,7 @@ mod acceptance {
                 file_name: "z_image_turbo_bf16.safetensors",
                 size: 12_800_000_000,
                 role: Role::Ckpt,
-                sub_role: None,
+                sub_role: Some(SubRole::Bb),
                 base: "zimage",
             },
             Case {

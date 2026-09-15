@@ -63,7 +63,8 @@ Role colors (8 plus unknown). `roleColorMode: Monochrome` maps all to `--role-un
 | `unk` | `?`, triage | `oklch(0.6 0.012 75)` |
 
 Sub-roles shown as chips in the taxonomy: IPA (ip-adapter, lora color), TOK (tokenizer, emb
-color), MOT (motion module, ctrl color).
+color), MOT (motion module, ctrl color), CMP (COMPLETE, a checkpoint that loads alone, ckpt
+color), BB (NEEDS PAIRING, a checkpoint wanting a separate CLIP and VAE, ckpt color).
 
 State colors:
 
@@ -248,7 +249,7 @@ Leading `~` forces fuzzy matching over everything indexed. Comma inside a value 
 
 | Key | Semantics |
 | --- | --- |
-| `role:` | alias table: checkpoint/ckpt/base/model, lora/lycoris/locon/adapter/ip-adapter/ipa, controlnet/ctrl/control/motion, upscaler/upsc/upscale/esrgan, vae, embedding/emb/textualinversion, llm/language model/text, dataset/ds/data, ?/unknown/unclassified/triage |
+| `role:` | alias table: checkpoint/ckpt/base/model/complete/cmp/backbone/bb, lora/lycoris/locon/adapter/ip-adapter/ipa, controlnet/ctrl/control/motion, upscaler/upsc/upscale/esrgan, vae, embedding/emb/textualinversion, llm/language model/text, dataset/ds/data, ?/unknown/unclassified/triage |
 | `base:` | architecture family, compared with spaces and dots stripped (`sdxl`, `sd15`, `flux`, `wan`, `llama`, `qwen`) |
 | `fmt:` / `format:` | container: safetensors, gguf, diffusers, pth, pt, parquet, jsonl.gz |
 | `prec:` / `precision:` | fp16, bf16, fp32, q4_k_m, q8_0, ... |

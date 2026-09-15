@@ -623,6 +623,11 @@ fn overwrite_rows(path: &Path, table: &str, model: u32) -> Result<usize> {
 }
 
 #[test]
+fn format_version_is_nine() {
+    assert_eq!(FORMAT_VERSION, 9);
+}
+
+#[test]
 fn a_catalog_of_another_format_is_rebuilt_before_a_changed_record_is_decoded() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (_input, mut config) = loose_fixture(directory.path())?;

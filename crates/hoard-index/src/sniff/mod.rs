@@ -370,6 +370,23 @@ pub(crate) fn prefix_histogram(tensors: &[TensorSample]) -> Vec<(String, u32)> {
     prefixes
 }
 
+fn first_keyword_matches(tensors: &[TensorSample]) -> [Option<usize>; SAMPLE_KEYWORDS.len()] {
+    let mut first = [None; SAMPLE_KEYWORDS.len()];
+    let mut unmatched = SAMPLE_KEYWORDS.len();
+    for (index, tensor) in tensors.iter().enumerate() {
+        if unmatched == 0 {
+            break;
+        }
+        for (slot, keyword) in first.iter_mut().zip(SAMPLE_KEYWORDS) {
+            if slot.is_none() && tensor.name.contains(keyword) {
+                *slot = Some(index);
+                unmatched -= 1;
+            }
+        }
+    }
+    first
+}
+
 fn select_samples(tensors: &[TensorSample]) -> BTreeSet<usize> {
     let mut selected = BTreeSet::new();
     if tensors.is_empty() {
@@ -381,6 +398,12 @@ fn select_samples(tensors: &[TensorSample]) -> BTreeSet<usize> {
         .enumerate()
         .max_by_key(|(_, tensor)| tensor.element_count())
     {
+        selected.insert(index);
+    }
+    for index in first_keyword_matches(tensors).into_iter().flatten() {
+        if selected.len() >= KEYWORD_BUDGET {
+            break;
+        }
         selected.insert(index);
     }
     for (index, tensor) in tensors.iter().enumerate() {
@@ -409,9 +432,11 @@ pub(crate) mod tests {
     use std::io::Write;
     use std::path::PathBuf;
 
+    use hoard_core::{Base, Role};
     use tempfile::TempDir;
 
     use super::*;
+    use crate::infer::{InferInput, infer};
 
     #[test]
     fn keyword_matches_cannot_starve_the_structural_spread() {
@@ -436,6 +461,49 @@ pub(crate) mod tests {
             selected.len() > KEYWORD_BUDGET,
             "the reserved slots must actually be filled by the spread"
         );
+    }
+
+    #[test]
+    fn every_sample_keyword_keeps_a_slot_of_its_own() {
+        let mut tensors: Vec<TensorSample> = (0..600)
+            .map(|index| {
+                sample(
+                    &format!("first_stage_model.blocks.{index}.weight"),
+                    "F16",
+                    &[8, 8],
+                )
+            })
+            .collect();
+        tensors.push(sample(
+            "first_stage_model.decoder.conv_out.weight",
+            "F16",
+            &[4096, 4096],
+        ));
+        tensors.push(sample(
+            "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn2.to_k.weight",
+            "F16",
+            &[640, 2048],
+        ));
+
+        let selected = select_samples(&tensors);
+        assert!(
+            selected.contains(&(tensors.len() - 1)),
+            "the cross-attention projection must keep a slot of its own, got {selected:?}"
+        );
+
+        let summary = summarize_tensors(tensors);
+        let path = Path::new("/models/checkpoints/pony/cyberrealisticPony_v160.safetensors");
+        let inferred = infer(
+            &InferInput::new(
+                ArtifactFormat::Safetensors,
+                path,
+                "cyberrealisticPony_v160.safetensors",
+                6_938_040_129,
+            )
+            .with_tensors(&summary),
+        );
+        assert_eq!(inferred.role, Role::Ckpt);
+        assert_eq!(inferred.base, Base::new("sdxl"));
     }
 
     #[test]

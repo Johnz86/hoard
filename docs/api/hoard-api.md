@@ -7,7 +7,7 @@ matching status. Mutating routes require `Authorization: Bearer <HOARD_NODE_TOKE
 that variable is set; read routes are open on the LAN.
 
 Field vocabularies are the grammar spellings: `role` in `ckpt lora ctrl upsc vae emb llm
-ds unk`, `sub_role` in `ipa tok mot` or null, `state` in `served local pulling stale
+ds unk`, `sub_role` in `ipa tok mot cmp bb` or null, `state` in `served local pulling stale
 remote triage`, `format` in `safetensors gguf diffusers transformers pth pt bin onnx
 parquet arrow jsonl csv readme config unknown`.
 
