@@ -191,6 +191,7 @@ nothing here restates it.
 
 `<data_dir>/native/` holds:
 
+- `FORMAT`, the catalog format as a decimal number and a newline, read before redb is opened.
 - `catalog.redb`, the one file every record lives in.
 - one published `search-v1-<nanos>/` directory holding the Tantivy index. A rebuild writes a
   new directory and publishes its name in a redb transaction only after Tantivy commits; an
@@ -204,8 +205,7 @@ process may open a catalog at a time; `hoard doctor` reports it when a second on
 
 native_model writes an eight byte header naming the record and its version, then a body in
 whichever codec `#[native_model(with = ...)]` names. `catalog/codec.rs` holds two, and the
-records that do not name one keep native_model's own bincode default, which is what
-`Manifest` bootstraps from before any changed record is read.
+records that do not name one keep native_model's own bincode default.
 
 - `Compact` is bincode 1.3 with variable length integers, little endian, trailing bytes
   refused. It is on every record but `Manifest` and the three cold ones. native_model's
@@ -218,8 +218,9 @@ records that do not name one keep native_model's own bincode default, which is w
   a rebuild reads one per artifact and one per revision. Each row is compressed on its own,
   so a read is still one primary lookup and one bounded decode, and a length claiming more
   than the 256 MiB maximum is refused before anything is allocated for it.
-- `Manifest` alone keeps native_model's default, because `open_checked` reads it to compare
-  `format_version` before any record in either of the other two codecs is decoded.
+- `Manifest` alone keeps native_model's default. It does not carry the format:
+  `open_checked` reads the `FORMAT` stamp before redb is opened, so no record of a catalog
+  written in another format, the manifest included, is ever decoded.
 
 Hashes and row ids serialize as bytes and integers to a binary format and as hex and
 prefixed strings to a human-readable one, so the catalog is compact and the JSON the API

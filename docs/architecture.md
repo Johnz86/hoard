@@ -324,8 +324,9 @@ mDNS _hoard._tcp -> node records -> periodic GET /api/v1/peers/digest?since=curs
 
 ## Storage
 
-- Index: `<data-dir>/native/`, recreatable from disk plus peers. It holds `catalog.redb`,
-  the one file every record lives in, plus one `search-v1-<nanos>/` directory holding the
+- Index: `<data-dir>/native/`, recreatable from disk plus peers. It holds `FORMAT`, the
+  format stamp read before redb is opened, `catalog.redb`, the one file every record lives
+  in, and one `search-v1-<nanos>/` directory holding the
   published Tantivy index; a rebuild writes a new directory and the old ones are removed
   once the manifest names the new one. Beside the scanned sources, repositories, artifacts,
   entries and search text the redb file holds the user data those screens read: shelves (the

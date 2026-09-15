@@ -53,9 +53,11 @@ pub use self::usage::{ArtifactUsage, PullRow, UsageDay, UsageEvent, UsageReport}
 pub use self::userdata::{NewProjection, NoiseRecord, ProjectionRecord, ShelfRecord};
 pub use self::verdict::OverrideRecord;
 
-/// The one shape this build reads and writes. A catalog whose manifest names another is
-/// rebuilt from disk rather than converted.
-pub const FORMAT_VERSION: u32 = 7;
+/// The one shape this build reads and writes. A catalog whose `FORMAT` stamp names another,
+/// or that carries no stamp, is rebuilt from disk rather than converted.
+pub const FORMAT_VERSION: u32 = 8;
+
+const FORMAT_FILE: &str = "FORMAT";
 
 /// One redb table's share of the catalog file: the rows it holds, the payload bytes those
 /// rows spend, the btree pages holding them, and the space inside those pages that holds
@@ -169,6 +171,16 @@ impl Catalog {
     }
 
     fn open_checked(directory: &Path) -> Result<(Self, Manifest)> {
+        match stamped_format(directory)? {
+            Some(FORMAT_VERSION) => {}
+            found => {
+                return Err(IndexError::CatalogFormat {
+                    directory: directory.to_path_buf(),
+                    found,
+                    expected: FORMAT_VERSION,
+                });
+            }
+        }
         let database = builder().open(models()?, directory.join("catalog.redb"))?;
         let catalog = Self {
             database,
@@ -177,13 +189,6 @@ impl Catalog {
             search_lane: parking_lot::Mutex::new(()),
         };
         let manifest = catalog.manifest()?;
-        if manifest.format_version != FORMAT_VERSION {
-            return Err(IndexError::CatalogFormat {
-                directory: directory.to_path_buf(),
-                found: manifest.format_version,
-                expected: FORMAT_VERSION,
-            });
-        }
         Ok((catalog, manifest))
     }
 
@@ -243,7 +248,13 @@ impl Catalog {
         let manifest = self.manifest()?;
         let pending_changes = self.pending_changes()?;
         Ok(CatalogStatus {
-            format_version: manifest.format_version,
+            format_version: stamped_format(&self.directory)?.ok_or_else(|| {
+                IndexError::CatalogFormat {
+                    directory: self.directory.clone(),
+                    found: None,
+                    expected: FORMAT_VERSION,
+                }
+            })?,
             generation: manifest.generation,
             scanned_at: manifest.scanned_at,
             node: manifest.node,
@@ -336,6 +347,21 @@ impl Catalog {
                 directory: self.directory.clone(),
             })
     }
+}
+
+fn stamped_format(directory: &Path) -> Result<Option<u32>> {
+    let path = directory.join(FORMAT_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(IndexError::io(path, error)),
+    };
+    text.trim_end().parse().map(Some).map_err(|_| {
+        IndexError::Catalog(format!(
+            "{} holds {text:?}, which is not a format version",
+            path.display()
+        ))
+    })
 }
 
 fn totals_of(summary: &Summary) -> Totals {

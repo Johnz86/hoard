@@ -44,10 +44,10 @@ use super::search::{Cost, INDEX_FLUSH_BYTES, Paging, QueryPath};
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::usage::{HISTORY_DAYS, Window};
 use super::{
-    Catalog, Dedupe, DigestApplied, EntryDetail, FORMAT_VERSION, HashReport, JobProgress, JobState,
-    MIRROR_SOURCE, NewProjection, PullMark, PullSlot, PulledFile, QueryPage, QueryRequest,
-    RefreshReport, RemoteEntry, RepositoryDetail, RepositoryFilter, RescanReport, RescanScope,
-    ServedFile, Stop, Totals, TriageItem, UsageEvent, builder, models, query,
+    Catalog, Dedupe, DigestApplied, EntryDetail, FORMAT_FILE, FORMAT_VERSION, HashReport,
+    JobProgress, JobState, MIRROR_SOURCE, NewProjection, PullMark, PullSlot, PulledFile, QueryPage,
+    QueryRequest, RefreshReport, RemoteEntry, RepositoryDetail, RepositoryFilter, RescanReport,
+    RescanScope, ServedFile, Stop, Totals, TriageItem, UsageEvent, models, query,
 };
 
 fn source(path: &Path, name: &str) -> SourceConfig {

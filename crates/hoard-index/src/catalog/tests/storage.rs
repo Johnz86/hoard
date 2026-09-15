@@ -633,19 +633,7 @@ fn a_catalog_of_another_format_is_rebuilt_before_a_changed_record_is_decoded() -
     assert!(built > 0, "the fixture produced artifacts");
     drop(catalog);
 
-    {
-        let database = builder().open(models()?, native.join("catalog.redb"))?;
-        let transaction = database.rw_transaction()?;
-        let manifest: Manifest = transaction
-            .get()
-            .primary(0_u8)?
-            .ok_or_else(|| IndexError::Catalog("a manifest".into()))?;
-        transaction.upsert(Manifest {
-            format_version: FORMAT_VERSION - 1,
-            ..manifest
-        })?;
-        transaction.commit()?;
-    }
+    stamp_format(&native, FORMAT_VERSION - 1)?;
     let rewritten = overwrite_rows(&native.join("catalog.redb"), "7_1_id", 7)?;
     assert!(rewritten > 0, "the entry rows were made undecodable");
 
@@ -673,6 +661,49 @@ fn a_catalog_of_another_format_is_rebuilt_before_a_changed_record_is_decoded() -
     assert!(
         native.join("catalog.redb").exists(),
         "nothing removed the catalog it could not read"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_catalog_whose_manifest_no_longer_decodes_and_carries_no_stamp_is_rebuilt() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (_input, mut config) = loose_fixture(directory.path())?;
+    config.data_dir = directory.path().join("data");
+    let native = config.native_path();
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let totals = catalog.totals()?;
+    let built = search(&catalog, "")?.total;
+    drop(catalog);
+    fs::remove_file(native.join(FORMAT_FILE))?;
+    let broken = overwrite_rows(&native.join("catalog.redb"), "6_1_id", 6)?;
+    assert_eq!(broken, 1, "the manifest row was made undecodable");
+
+    let rebuilt = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+
+    let status = rebuilt.status()?;
+    assert_eq!(status.generation, 1, "the rebuild is a fresh scan");
+    assert_eq!(status.format_version, FORMAT_VERSION);
+    assert_eq!(rebuilt.totals()?, totals);
+    assert_eq!(search(&rebuilt, "")?.total, built);
+    Ok(())
+}
+
+#[test]
+fn a_garbled_format_stamp_is_an_error_not_a_rebuild() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (_input, mut config) = loose_fixture(directory.path())?;
+    config.data_dir = directory.path().join("data");
+    let native = config.native_path();
+    drop(Catalog::open_or_scan(&config, "workstation", |_, _| {})?);
+    fs::write(native.join(FORMAT_FILE), "not a version\n")?;
+
+    let refused = Catalog::open_or_scan(&config, "workstation", |_, _| {});
+
+    assert!(refused.is_err(), "no build writes such a stamp");
+    assert!(
+        native.join("catalog.redb").exists(),
+        "nothing removed the catalog behind the garbled stamp"
     );
     Ok(())
 }
@@ -745,7 +776,7 @@ fn open_refuses_another_format() -> Result<()> {
             expected,
         }) => {
             assert_eq!(named, native);
-            assert_eq!(found, crate::catalog::FORMAT_VERSION + 1);
+            assert_eq!(found, Some(crate::catalog::FORMAT_VERSION + 1));
             assert_eq!(expected, crate::catalog::FORMAT_VERSION);
         }
         other => panic!("a catalog of another format is refused: {other:?}"),
@@ -754,16 +785,6 @@ fn open_refuses_another_format() -> Result<()> {
 }
 
 fn stamp_format(directory: &Path, format_version: u32) -> Result<()> {
-    let database = builder().open(models()?, directory.join("catalog.redb"))?;
-    let transaction = database.rw_transaction()?;
-    let manifest: Manifest = transaction
-        .get()
-        .primary(0_u8)?
-        .ok_or_else(|| IndexError::Catalog("the manifest".into()))?;
-    transaction.upsert(Manifest {
-        format_version,
-        ..manifest
-    })?;
-    transaction.commit()?;
+    fs::write(directory.join(FORMAT_FILE), format!("{format_version}\n"))?;
     Ok(())
 }

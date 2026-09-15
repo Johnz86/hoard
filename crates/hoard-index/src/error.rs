@@ -33,12 +33,13 @@ pub enum IndexError {
     CatalogBusy,
 
     #[error(
-        "catalog at {directory} has format {found}, this build writes {expected}: \
-         delete the directory and scan again"
+        "catalog at {directory} {}, this build writes {expected}: \
+         delete the directory and scan again",
+        described_stamp(.found)
     )]
     CatalogFormat {
         directory: PathBuf,
-        found: u32,
+        found: Option<u32>,
         expected: u32,
     },
 
@@ -87,6 +88,13 @@ impl IndexError {
             kind,
             id: id.into(),
         }
+    }
+}
+
+fn described_stamp(found: &Option<u32>) -> String {
+    match found {
+        Some(version) => format!("has format {version}"),
+        None => "predates format stamps".to_owned(),
     }
 }
 

@@ -325,13 +325,9 @@ fn incomplete_or_unknown_catalogs_are_refused() -> Result<()> {
     drop(database);
     assert!(Catalog::open(directory.path()).is_err());
     let (_directory, catalog) = fixture()?;
-    let mut manifest = catalog.manifest()?;
-    manifest.format_version = 999;
-    let transaction = catalog.database.rw_transaction()?;
-    transaction.upsert(manifest)?;
-    transaction.commit()?;
     let path = catalog.directory.clone();
     drop(catalog);
+    fs::write(path.join(FORMAT_FILE), "999\n")?;
     assert!(Catalog::open(&path).is_err());
     Ok(())
 }

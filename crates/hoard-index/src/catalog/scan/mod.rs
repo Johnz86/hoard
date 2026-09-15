@@ -158,7 +158,13 @@ impl Catalog {
     /// Claims a fresh directory, leaving nothing behind if the database cannot be created.
     fn create(directory: PathBuf) -> Result<Self> {
         std::fs::create_dir(&directory)?;
-        match builder().create(models()?, directory.join("catalog.redb")) {
+        let created = std::fs::write(
+            directory.join(super::FORMAT_FILE),
+            format!("{}\n", super::FORMAT_VERSION),
+        )
+        .map_err(IndexError::from)
+        .and_then(|()| Ok(builder().create(models()?, directory.join("catalog.redb"))?));
+        match created {
             Ok(database) => {
                 let catalog = Self {
                     database,
@@ -171,7 +177,7 @@ impl Catalog {
             }
             Err(error) => {
                 remove_partial(&directory);
-                Err(error.into())
+                Err(error)
             }
         }
     }
@@ -198,7 +204,6 @@ impl Catalog {
         counters.save(&transaction)?;
         transaction.insert(Manifest {
             id: 0,
-            format_version: super::FORMAT_VERSION,
             generation: 1,
             scanned_at: jiff::Timestamp::now().to_string(),
             node: node.to_owned(),

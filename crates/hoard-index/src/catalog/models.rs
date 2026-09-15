@@ -476,7 +476,6 @@ pub(super) fn remove_revision_cards(
 pub(super) struct Manifest {
     #[primary_key]
     pub(super) id: u8,
-    pub(super) format_version: u32,
     pub(super) generation: u64,
     pub(super) scanned_at: String,
     pub(super) node: String,

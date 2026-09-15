@@ -34,7 +34,11 @@ says so directly.
    panics on a stored row shorter than its 8-byte header instead of returning an error, and a
    retirement killed between `retire_entries` and `recount_retired_paths` leaves `path_count`
    stale in a way `hoard doctor` cannot see, because both the stored summary and a fresh count
-   read the same stale value.
+   read the same stale value. Two more found while fixing the format rebuild: a run killed
+   after `Catalog::create` makes the catalog directory but before `catalog.redb` exists leaves a
+   directory that `open_or_scan` cannot recreate, so the next start fails on `create_dir`; and
+   `hoard_mirror`'s `batch::tests::what_is_left_is_written_by_a_flush_and_by_a_shutdown` hung
+   once while a release build and a rescan shared the CPU, and passed on a quiet rerun.
 3. Splitting the files still over 1,500 lines: `crates/hoard-mirror/src/resolve.rs` (2,643),
    `crates/hoard-server/src/api/tests.rs` (2,426), `crates/hoard-net/src/peer.rs` (2,413) and
    `crates/hoard-index/tests/scale.rs` (1,837).

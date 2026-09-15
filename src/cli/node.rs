@@ -22,7 +22,7 @@ pub enum Finding {
     Missing(PathBuf),
     Format {
         directory: PathBuf,
-        found: u32,
+        found: Option<u32>,
         expected: u32,
     },
     Locked(String),
@@ -39,11 +39,21 @@ impl std::fmt::Display for Finding {
             ),
             Finding::Format {
                 directory,
-                found,
+                found: Some(found),
                 expected,
             } => write!(
                 formatter,
                 "catalog at {} is format {found}, this build reads {expected}; \
+                 `hoard scan` rebuilds it",
+                directory.display()
+            ),
+            Finding::Format {
+                directory,
+                found: None,
+                expected,
+            } => write!(
+                formatter,
+                "catalog at {} predates format stamps, this build reads {expected}; \
                  `hoard scan` rebuilds it",
                 directory.display()
             ),
