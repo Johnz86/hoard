@@ -175,6 +175,9 @@ hoard/
           nodes.rs           this machine and every peer it knows
           digest.rs          the rows this node offers and the rows a peer advertises
           pulls.rs           a pull in flight and the file it lands
+          tests/             shared fixtures in mod.rs; scan, revisions, storage, codec, reads,
+                             mirror, counts, rescan, index, paging, collapse, usage, hashing,
+                             recovery
         row.rs               SearchRow, FacetBucket, DiskPressure: what a search answers with
         time.rs              reading and writing the instants the catalog stores
         search/

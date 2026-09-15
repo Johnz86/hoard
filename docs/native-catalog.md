@@ -514,7 +514,7 @@ recovery; and `retire_entries` and `retract_digest` settle the totals at the end
 multi-transaction passes without the mark, so a kill inside one of those leaves the totals to
 `hoard doctor`.
 
-The `recovery` module of `catalog/tests.rs` holds the proof. It interrupts a stage from the
+`catalog/tests/recovery.rs` holds the proof. It interrupts a stage from the
 progress callback the stage already takes - counting the calls, panicking on a chosen one and
 catching the unwind - and compares what the next run completes to against a clean run of the
 same fixture, through one fingerprint of the totals, the counts, every source, repository,

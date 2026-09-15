@@ -41,9 +41,9 @@ Save compact evidence and remove scratch data and worktrees when finished.
 
 ## The open items, and what closes each
 
-Five items were opened here and one remains. Each closes by being fixed or by being measured
+Five items were opened here and none remains. Each closes by being fixed or by being measured
 and recorded as not worth fixing; none closes by being deferred again. They keep their
-original order, the closed one first with its result, then what blocks what.
+original order, each with the result it closed on.
 
 **Items 2, 3 and 4 were mis-sized when they were written.** They name structures bounded by a
 repository, a revision and a shard set, each worth single-digit megabytes at a pathological
@@ -136,10 +136,12 @@ Items 2, 3 and 4 close against this measurement below.
    not memory, and are paid once per card change. **Reopens if** a card change on a very large
    revision is measured to stall a rescan, which is a latency question this item never was.
 
-5. **Two files over the 1,500-line cap.** `crates/hoard-index/src/catalog/search.rs` at 4,062
-   lines and `crates/hoard-index/src/catalog/tests.rs` at 11,603. **Closes when** both are
-   split the way `scan.rs` was, by responsibility, with no sibling import changed and no test
-   count moved.
+5. **Two files over the 1,500-line cap: closed in the wave commit "Split the catalog tests into
+   one module per subject".** `crates/hoard-index/src/catalog/search.rs`, 4,062 lines, split at
+   `4c32a46` into ten modules, the largest 869 lines. `crates/hoard-index/src/catalog/tests.rs`,
+   11,603 lines and 172 tests, split into `catalog/tests/`: a shared `mod.rs` and fourteen
+   subject files, the largest `scan.rs` at 1,413 lines, with no production file changed and no
+   test count moved.
 
 Items 2, 3 and 4 are all about the same question and share a harness run; do not seed three
 separate catalogs for them. Item 5 needs no measurement and blocks nothing, so it goes last.

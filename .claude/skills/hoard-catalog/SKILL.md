@@ -58,7 +58,9 @@ One line per file in `crates/hoard-index/src/catalog/`:
 - `nodes.rs` this machine and every peer it knows.
 - `digest.rs` the rows this node offers and the rows a peer advertises.
 - `pulls.rs` a pull in flight and the file it lands.
-- `tests.rs` the catalog's own tests.
+- `tests/` the catalog's own tests: shared fixtures in `mod.rs`, then `scan`, `revisions`,
+  `storage`, `codec`, `reads`, `mirror`, `counts`, `rescan`, `index`, `paging`, `collapse`,
+  `usage`, `hashing` and `recovery`.
 
 ## The write path
 
