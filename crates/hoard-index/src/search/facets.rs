@@ -6,8 +6,9 @@ use crate::search::grammar::scan;
 use crate::search::token::{ParsedQuery, Token, TokenKind};
 
 /// The facet rail, in the order it renders: the query key and the header the UI shows.
-pub const FACET_DIMENSIONS: [(&str, &str); 5] = [
+pub const FACET_DIMENSIONS: [(&str, &str); 6] = [
     ("role", "ROLE"),
+    ("layout", "SOURCE LAYOUT"),
     ("base", "BASE ARCHITECTURE"),
     ("format", "FORMAT"),
     ("precision", "PRECISION"),
@@ -18,6 +19,7 @@ pub const FACET_DIMENSIONS: [(&str, &str); 5] = [
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Facets {
     pub role: Vec<FacetBucket>,
+    pub layout: Vec<FacetBucket>,
     pub base: Vec<FacetBucket>,
     pub format: Vec<FacetBucket>,
     pub precision: Vec<FacetBucket>,
@@ -32,10 +34,11 @@ impl Facets {
         }
     }
 
-    /// The five dimensions in the order [`FACET_DIMENSIONS`] names them.
-    pub fn dimensions(&self) -> [&[FacetBucket]; 5] {
+    /// The six dimensions in the order [`FACET_DIMENSIONS`] names them.
+    pub fn dimensions(&self) -> [&[FacetBucket]; FACET_DIMENSIONS.len()] {
         [
             &self.role,
+            &self.layout,
             &self.base,
             &self.format,
             &self.precision,
@@ -43,9 +46,10 @@ impl Facets {
         ]
     }
 
-    fn dimensions_mut(&mut self) -> [&mut Vec<FacetBucket>; 5] {
+    fn dimensions_mut(&mut self) -> [&mut Vec<FacetBucket>; FACET_DIMENSIONS.len()] {
         [
             &mut self.role,
+            &mut self.layout,
             &mut self.base,
             &mut self.format,
             &mut self.precision,
@@ -130,9 +134,12 @@ mod tests {
     }
 
     #[test]
-    fn the_rail_names_five_dimensions_in_order() {
+    fn the_rail_names_six_dimensions_in_order() {
         let keys: Vec<&str> = FACET_DIMENSIONS.iter().map(|(key, _)| *key).collect();
-        assert_eq!(keys, vec!["role", "base", "format", "precision", "node"]);
+        assert_eq!(
+            keys,
+            vec!["role", "layout", "base", "format", "precision", "node"]
+        );
     }
 
     #[test]
@@ -172,6 +179,7 @@ mod tests {
     fn facets_mark_every_dimension_at_once() {
         let mut facets = Facets {
             role: vec![bucket("lora")],
+            layout: vec![bucket("loras")],
             base: vec![bucket("sdxl10")],
             format: vec![bucket("gguf")],
             precision: vec![bucket("fp16")],
@@ -179,9 +187,10 @@ mod tests {
             disk_pressure: DiskPressure::default(),
         };
         facets.mark_query(&parse(
-            "role:lora base:sdxl fmt:gguf prec:fp16 node:workstation",
+            "role:lora layout:loras base:sdxl fmt:gguf prec:fp16 node:workstation",
         ));
         assert!(facets.role[0].active);
+        assert!(facets.layout[0].active);
         assert!(facets.base[0].active);
         assert!(facets.format[0].active);
         assert!(facets.precision[0].active);

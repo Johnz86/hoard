@@ -39,11 +39,12 @@ pub struct FacetBucketView {
     pub query: String,
 }
 
-/// The facet rail: five dimensions, each counted with its own key removed, plus the DISK
+/// The facet rail: six dimensions, each counted with its own key removed, plus the DISK
 /// PRESSURE summary underneath.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct FacetsView {
     pub role: Vec<FacetBucketView>,
+    pub layout: Vec<FacetBucketView>,
     pub base: Vec<FacetBucketView>,
     pub format: Vec<FacetBucketView>,
     pub precision: Vec<FacetBucketView>,
@@ -188,9 +189,10 @@ fn facets(counted: &Facets, query: &ParsedQuery) -> FacetsView {
 }
 
 impl FacetsView {
-    fn dimensions_mut(&mut self) -> [&mut Vec<FacetBucketView>; 5] {
+    fn dimensions_mut(&mut self) -> [&mut Vec<FacetBucketView>; FACET_DIMENSIONS.len()] {
         [
             &mut self.role,
+            &mut self.layout,
             &mut self.base,
             &mut self.format,
             &mut self.precision,

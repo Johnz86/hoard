@@ -571,7 +571,7 @@ async fn search_answers_the_documented_shape() {
     let pressure = &body["facets"]["disk_pressure"];
     assert_eq!(pressure["duplicate_blobs"], 1);
     assert_eq!(pressure["reclaimable_bytes"], LORA_SIZE);
-    for dimension in ["role", "base", "format", "precision", "node"] {
+    for dimension in ["role", "layout", "base", "format", "precision", "node"] {
         assert!(
             body["facets"][dimension].is_array(),
             "{dimension} is a list"
@@ -692,7 +692,7 @@ async fn every_facet_count_is_the_number_of_rows_its_own_query_returns() {
             &format!("/api/v1/search?q={}", encoded(query)),
         )
         .await;
-        for dimension in ["role", "base", "format", "precision", "node"] {
+        for dimension in ["role", "layout", "base", "format", "precision", "node"] {
             for bucket in body["facets"][dimension]
                 .as_array()
                 .expect("a facet dimension is a list")
@@ -819,13 +819,18 @@ async fn the_inspector_reads_facts_in_the_order_the_design_lists_them() {
             "format",
             "size",
             "node",
+            "layout",
             "blob",
             "rank / alpha"
         ]
     );
     assert_eq!(body["facts"][2]["value"], "safetensors \u{b7} fp16");
     assert_eq!(body["facts"][3]["value"], "239.1 MB");
-    assert_eq!(body["facts"][6]["value"], "32 / 16");
+    assert_eq!(
+        body["facts"][5]["value"], "hub repo",
+        "an hf-cache entry reads a fixed layout, not the folder its own path names"
+    );
+    assert_eq!(body["facts"][7]["value"], "32 / 16");
 
     let ckpt = get(&world.state, &format!("/api/v1/artifacts/{}", world.ckpt)).await;
     let ckpt_keys: Vec<&str> = ckpt["facts"]
@@ -842,6 +847,7 @@ async fn the_inspector_reads_facts_in_the_order_the_design_lists_them() {
             "format",
             "size",
             "node",
+            "layout",
             "blob",
             "resolution"
         ]
@@ -849,7 +855,7 @@ async fn the_inspector_reads_facts_in_the_order_the_design_lists_them() {
 
     let llm = get(&world.state, &format!("/api/v1/artifacts/{}", world.llm)).await;
     assert_eq!(
-        llm["facts"][6],
+        llm["facts"][7],
         json!({ "key": "context", "value": "8192" })
     );
 }
@@ -1143,6 +1149,7 @@ async fn a_repository_detail_carries_the_header_refs_and_pull_box() {
             "format",
             "size",
             "node",
+            "layout",
             "blob",
             "resolution",
             "first seen",

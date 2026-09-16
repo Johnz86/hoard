@@ -2,6 +2,7 @@ import { el, fmtBytes } from "./dom.js";
 
 const SECTIONS = [
     { title: "ROLE", groups: [["role", "role"]] },
+    { title: "SOURCE LAYOUT", groups: [["layout", "layout"]] },
     { title: "BASE ARCHITECTURE", groups: [["base", "base"]] },
     { title: "FORMAT · PRECISION", groups: [["format", "fmt"], ["precision", "prec"]] },
     { title: "NODE", groups: [["node", "node"]] }

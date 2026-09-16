@@ -1,8 +1,10 @@
 use super::*;
 
-/// Where the node rail sits in the five the facets carry, which is the one dimension a
+use crate::search::FACET_DIMENSIONS;
+
+/// Where the node rail sits in the six the facets carry, which is the one dimension a
 /// query in these cases names its own key in.
-const NODE_RAIL: usize = 4;
+const NODE_RAIL: usize = 5;
 
 #[test]
 fn the_primary_path_answers_exactly_what_the_collapse_path_answers() -> Result<()> {
@@ -235,18 +237,20 @@ struct CollapseCase {
     own_rail: Option<usize>,
 }
 
-/// The five facet rails the preferred entries spell, as the counts the rail would show.
+/// The six facet rails the preferred entries spell, as the counts the rail would show.
 fn expected_facets(
     catalog: &Catalog,
     preferred: &[(ArtifactId, EntryDetail)],
-) -> Result<[BTreeMap<String, u64>; 5]> {
-    let mut counted: [BTreeMap<String, u64>; 5] = std::array::from_fn(|_| BTreeMap::new());
+) -> Result<[BTreeMap<String, u64>; FACET_DIMENSIONS.len()]> {
+    let mut counted: [BTreeMap<String, u64>; FACET_DIMENSIONS.len()] =
+        std::array::from_fn(|_| BTreeMap::new());
     for (artifact_id, entry) in preferred {
         let row = catalog.artifact_row(*artifact_id)?.ok_or_else(|| {
             IndexError::Catalog(format!("the fixture lost artifact {artifact_id:?}"))
         })?;
         let values = [
             row.role.as_str().to_owned(),
+            row.layout.clone(),
             row.base.as_str().to_owned(),
             row.format.as_str().to_owned(),
             row.precision
@@ -342,6 +346,7 @@ fn the_collapse_path_answers_the_same_page_facets_and_totals_as_before() -> Resu
                 assert_eq!(page.nodes, nodes.len() as u64, "{where_}");
                 let shown = [
                     counted_rail(&page.facets.role),
+                    counted_rail(&page.facets.layout),
                     counted_rail(&page.facets.base),
                     counted_rail(&page.facets.format),
                     counted_rail(&page.facets.precision),
@@ -550,5 +555,15 @@ fn entry_level_tokens_and_sorts_take_the_collapse_path() -> Result<()> {
             "{key:?}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn a_layout_token_filters_on_an_entry() -> Result<()> {
+    let context = CompileContext::new(jiff::Timestamp::now());
+    assert!(
+        query::needs_collapse(&parse("layout:loras").tokens, &context, SortKey::Role)?,
+        "a layout is an entry-level fact, so the primary document alone under-reports it"
+    );
     Ok(())
 }

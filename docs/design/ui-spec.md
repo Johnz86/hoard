@@ -112,9 +112,12 @@ Token strip (shown when the query is non-empty): `PARSED` label, one chip per to
 
 Index view grid: `214px minmax(0,1fr) 288px` (rail collapses to `0px` when hidden).
 
-Facet rail (`--panel`, right rule): sections ROLE, BASE ARCHITECTURE, FORMAT · PRECISION,
-NODE, each a 10px 0.16em label with a rule below, then rows of 8px square mark + label +
-count (mono 12px, 3.5px 4px padding). Active facet: amber mark filled, `--panel2` row.
+Facet rail (`--panel`, right rule): sections ROLE, SOURCE LAYOUT, BASE ARCHITECTURE,
+FORMAT · PRECISION, NODE, each a 10px 0.16em label with a rule below, then rows of 8px
+square mark + label + count (mono 12px, 3.5px 4px padding). SOURCE LAYOUT sits second, between
+ROLE and BASE ARCHITECTURE: it names the folder discovery filed the entry's repository under,
+the placement decision the tree already carries, so a file filed correctly but recognized by
+no tensor rule still says where it came from. Active facet: amber mark filled, `--panel2` row.
 Count `—` when zero. Below, SAVED SHELVES list (mono 11.5px, `--muted`, amber on hover,
 `›` at right). The proposal also shows a DISK PRESSURE mini bar chart with
 `311 GB reclaimable — 47 duplicate blobs`.
@@ -155,8 +158,8 @@ Footer key hints (`--panel`, mono 11px): `J/K move`, `↵ open`, `SPC select`,
 
 Inspector rail (288px, `--panel`, left rule, 16px padding, 20px gaps): INSPECTOR label,
 role bar + role code, name 18px, path in `--dim` 11.5px; facts list (dashed rows, key in
-`--dim`, value right-aligned in `--text`): role, base, format · prec, size, node, blob
-sha256, plus rank / alpha for lora, context for llm, resolution for ckpt; buttons
+`--dim`, value right-aligned in `--text`): role, base, format · prec, size, node, layout,
+blob sha256, plus rank / alpha for lora, context for llm, resolution for ckpt; buttons
 `OPEN REPO ↵` (amber primary), `ADD TO LOADOUT`, `YANK PULL COMMAND` (outline); PLUGS INTO
 list of up to four compatible artifacts (`role · name`, amber on hover, click opens).
 
@@ -254,6 +257,7 @@ Leading `~` forces fuzzy matching over everything indexed. Comma inside a value 
 | `fmt:` / `format:` | container: safetensors, gguf, diffusers, pth, pt, parquet, jsonl.gz |
 | `prec:` / `precision:` | fp16, bf16, fp32, q4_k_m, q8_0, ... |
 | `node:` | which machine holds the bytes |
+| `layout:` | the ComfyUI or A1111 folder the entry's repository was filed under (`checkpoints`, `diffusion_models`, `text_encoders`, `loras`, `controlnet`, `vae`, `upscale_models`, ...), or `hub repo`, `git clone`, `(unplaced)`; folds a folder spelling onto its canonical layout the way `role:` folds its aliases |
 | `state:` | served, local, pulling, stale, remote, triage |
 | `rev:` / `tag:` | revision, branch or tag name |
 | `dupe:true` | blobs with more than one path |

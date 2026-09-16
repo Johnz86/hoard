@@ -314,7 +314,7 @@ impl Fact {
 }
 
 /// The inspector facts in the order the design lists them: role, base, format, size, node,
-/// blob, then the role specific lines.
+/// layout, blob, then the role specific lines.
 pub fn facts(row: &SearchRow) -> Vec<Fact> {
     let mut facts = vec![
         Fact::new("role", role_value(row.role, row.sub_role)),
@@ -325,6 +325,7 @@ pub fn facts(row: &SearchRow) -> Vec<Fact> {
         Fact::new("format", format_value(row.format, row.precision.as_ref())),
         Fact::new("size", format_size(row.size)),
         Fact::new("node", row.node.clone()),
+        Fact::new("layout", row.layout.clone()),
         Fact::new("blob", blob_value(row.blob_sha256.as_ref())),
     ];
     if row.shard_count > 1 {

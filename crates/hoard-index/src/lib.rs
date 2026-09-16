@@ -11,6 +11,7 @@ pub mod discover;
 pub mod error;
 pub mod hash;
 pub mod infer;
+pub(crate) mod layout;
 pub mod row;
 pub mod search;
 pub mod shard;

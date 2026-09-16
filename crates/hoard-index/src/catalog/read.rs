@@ -24,7 +24,7 @@ use super::models::{
 };
 use super::nodes::NodeNames;
 use super::scan::preferred_entry;
-use super::search::{EntryFacts, assemble_row, revision_of};
+use super::search::{EntryFacts, assemble_row, revision_of, source_kind_of};
 use super::usage::last_used_in;
 use super::{Catalog, QueryRequest};
 
@@ -722,6 +722,7 @@ pub(super) struct Reader<'a, 'db> {
     snapshot: &'a RTransaction<'db>,
     names: &'a NodeNames,
     repositories: HashMap<i64, Repository>,
+    source_kinds: HashMap<String, Option<SourceKind>>,
 }
 
 impl<'a, 'db> Reader<'a, 'db> {
@@ -730,6 +731,7 @@ impl<'a, 'db> Reader<'a, 'db> {
             snapshot,
             names,
             repositories: HashMap::new(),
+            source_kinds: HashMap::new(),
         }
     }
 
@@ -782,15 +784,39 @@ impl<'a, 'db> Reader<'a, 'db> {
     }
 
     fn repository(&mut self, id: i64) -> Result<&Repository> {
+        self.load_repository(id)?;
+        self.repositories
+            .get(&id)
+            .ok_or_else(|| IndexError::Catalog("resolution cache went empty".into()))
+    }
+
+    fn load_repository(&mut self, id: i64) -> Result<()> {
         if !self.repositories.contains_key(&id) {
             let stored: Repository = self.snapshot.get().primary(id)?.ok_or_else(|| {
                 IndexError::Catalog(format!("an entry references missing repository {id}"))
             })?;
             self.repositories.insert(id, stored);
         }
-        self.repositories
+        Ok(())
+    }
+
+    /// The repository one entry sits in beside the kind of the source it belongs to, which
+    /// is keyed by that repository's own source name and so is resolved with it.
+    fn placement(&mut self, id: i64) -> Result<(&Repository, Option<SourceKind>)> {
+        self.load_repository(id)?;
+        let repository = self
+            .repositories
             .get(&id)
-            .ok_or_else(|| IndexError::Catalog("resolution cache went empty".into()))
+            .ok_or_else(|| IndexError::Catalog("resolution cache went empty".into()))?;
+        let kind = match self.source_kinds.get(&repository.source) {
+            Some(kind) => *kind,
+            None => {
+                let kind = source_kind_of(self.snapshot, &repository.source)?;
+                self.source_kinds.insert(repository.source.clone(), kind);
+                kind
+            }
+        };
+        Ok((repository, kind))
     }
 
     fn row(&mut self, record: &ArtifactRecord) -> Result<Option<SearchRow>> {
@@ -809,7 +835,7 @@ impl<'a, 'db> Reader<'a, 'db> {
     ) -> Result<SearchRow> {
         let names = self.names;
         let node = names.of(entry.node);
-        let repository = self.repository(entry.repo_id)?;
+        let (repository, kind) = self.placement(entry.repo_id)?;
         let revision = revision_of(repository, entry)?;
         Ok(assemble_row(&EntryFacts {
             entry,
@@ -819,6 +845,7 @@ impl<'a, 'db> Reader<'a, 'db> {
             node,
             primary: true,
             last_used,
+            layout: crate::layout::classify(kind, repository.repo.name()),
         }))
     }
 

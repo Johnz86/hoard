@@ -83,6 +83,7 @@ impl Catalog {
                 names: &names,
                 repository: None,
                 card: None,
+                source_kind: None,
             };
             for id in ids {
                 let mut operations = vec![UserOperation::Delete(Term::from_field_i64(

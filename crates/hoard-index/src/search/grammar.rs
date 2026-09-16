@@ -319,6 +319,10 @@ fn normalize(kind: TokenKind, value: &str) -> (String, Option<String>) {
             Some(days) => (days.to_string(), None),
             None => (lowered, unknown(kind, trimmed)),
         },
+        TokenKind::Layout => match crate::layout::resolve(&lowered) {
+            Some(layout) => (layout.to_owned(), None),
+            None => (lowered, unknown(kind, trimmed)),
+        },
         TokenKind::Hash => (lowered, None),
         TokenKind::Node
         | TokenKind::Revision
@@ -472,6 +476,20 @@ mod tests {
         assert_eq!(one("source:vault").normalized, "vault");
         assert_eq!(one("hash:9F2C41AB").normalized, "9f2c41ab");
         assert_eq!(one("shelf:\"flux workhorse\"").normalized, "flux workhorse");
+        assert_eq!(one("layout:Loras").kind, TokenKind::Layout);
+        assert_eq!(
+            one("layout:Loras").normalized,
+            "loras",
+            "a layout is a machine-generated lowercase vocabulary, so a typed one is lowered \
+             to reach the term the index holds"
+        );
+        assert_eq!(one("layout:\"hub repo\"").normalized, "hub repo");
+        assert_eq!(
+            one("layout:unet").normalized,
+            "diffusion_models",
+            "a folder spelling reaches the layout it was folded into, the way a role alias \
+             reaches its role"
+        );
     }
 
     #[test]
@@ -560,6 +578,15 @@ mod tests {
         assert!(token.warning.is_some());
         assert!(one("size:huge").warning.is_some());
         assert!(one("state:cold").warning.is_some());
+        let typo = one("layout:lorass");
+        assert_eq!(typo.kind, TokenKind::Layout);
+        assert_eq!(typo.normalized, "lorass");
+        assert!(
+            typo.warning.is_some(),
+            "a layout is a closed vocabulary, so a value no folder spells warns rather than \
+             answering nothing in silence"
+        );
+        assert!(one("layout:loras").warning.is_none());
     }
 
     #[test]

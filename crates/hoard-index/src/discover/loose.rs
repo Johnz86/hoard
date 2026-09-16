@@ -23,6 +23,7 @@ use crate::discover::{
 };
 use crate::error::Result;
 use crate::hash::sha256_bytes;
+use crate::layout::{Tool, marks_tool};
 
 /// A tool's models directory, recognized by the folders it keeps beside each other. A
 /// recognized layout always yields one repository per category folder.
@@ -45,23 +46,7 @@ impl ToolLayout {
     }
 }
 
-const COMFYUI_DIRS: [&str; 12] = [
-    "loras",
-    "checkpoints",
-    "controlnet",
-    "vae",
-    "upscale_models",
-    "embeddings",
-    "unet",
-    "clip",
-    "text_encoders",
-    "diffusion_models",
-    "clip_vision",
-    "style_models",
-];
-
-const A1111_DIRS: [&str; 5] = ["stable-diffusion", "lora", "esrgan", "vae", "embeddings"];
-
+/// Kohya's training folders, which name no model category and so are not layout folders.
 const KOHYA_DIRS: [&str; 4] = ["img", "model", "log", "reg"];
 
 const LAYOUT_QUORUM: usize = 2;
@@ -84,18 +69,18 @@ pub fn layout(root: &Path) -> Option<ToolLayout> {
             gguf = gguf || name.ends_with(".gguf");
         }
     }
-    let hits = |markers: &[&str]| {
-        dirs.iter()
-            .filter(|dir| markers.contains(&dir.as_str()))
-            .count()
-    };
-    if hits(&COMFYUI_DIRS) >= LAYOUT_QUORUM {
+    let marked = |tool: Tool| dirs.iter().filter(|dir| marks_tool(dir, tool)).count();
+    if marked(Tool::ComfyUi) >= LAYOUT_QUORUM {
         return Some(ToolLayout::ComfyUi);
     }
-    if hits(&A1111_DIRS) >= LAYOUT_QUORUM {
+    if marked(Tool::A1111) >= LAYOUT_QUORUM {
         return Some(ToolLayout::A1111);
     }
-    if hits(&KOHYA_DIRS) >= LAYOUT_QUORUM {
+    let kohya = dirs
+        .iter()
+        .filter(|dir| KOHYA_DIRS.contains(&dir.as_str()))
+        .count();
+    if kohya >= LAYOUT_QUORUM {
         return Some(ToolLayout::Kohya);
     }
     gguf.then_some(ToolLayout::LlamaCpp)

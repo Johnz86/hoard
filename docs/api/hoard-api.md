@@ -25,7 +25,7 @@ parquet arrow jsonl csv readme config unknown`.
   "facets": {
     "role": [ { "value": "lora", "label": "LoRA", "count": 412, "active": true,
                 "token": "role:lora", "query": "role:lora" } ],
-    "base": [], "format": [], "precision": [], "node": [],
+    "layout": [], "base": [], "format": [], "precision": [], "node": [],
     "disk_pressure": { "reclaimable_bytes": 333000000000, "duplicate_blobs": 47,
                         "label": "310.0 GB reclaimable — 47 duplicate blobs" } },
   "rows": [ {
@@ -33,12 +33,22 @@ parquet arrow jsonl csv readme config unknown`.
     "role_confidence": 0.98, "org": "kohya", "name": "film-grain-35mm", "base": "sdxl 1.0",
     "format": "safetensors", "precision": "fp16", "size": 239075328, "rank": 32, "alpha": 16,
     "params": null, "context": null, "quant": null, "revision": "main", "revision_sha": "462c3cb...",
-    "node": "workstation", "state": "served", "pull_progress": null,
+    "node": "workstation", "layout": "loras", "state": "served", "pull_progress": null,
     "trigger": "film grain, 35mm, halation", "path": "/mnt/vault/loras/film-grain-35mm.safetensors",
     "path_count": 2, "shard_count": 1, "last_used": "2026-09-04T09:10:00Z" } ],
   "next_cursor": "...", "total": 212, "nodes": 3, "summary": "212 ARTIFACTS · 3 NODES"
 }
 ```
+
+`facets.layout` is the folder discovery filed the entry's repository under, which is the
+placement decision the tree already carries rather than anything inference concluded: a
+ComfyUI or A1111 folder folded onto its canonical spelling (`unet/` reads `diffusion_models`,
+`clip/` reads `text_encoders`, `t2i_adapter/` reads `controlnet`, `vae_approx/` reads `vae`,
+`esrgan/` reads `upscale_models`), or `hub repo` for an hf-cache entry, `git clone` for a git
+one, and `(unplaced)` for a folder no tool registers. `layout:` filters on it, folding a
+folder spelling onto its canonical layout the way `role:` folds its aliases (`layout:unet`
+matches `diffusion_models`), and warns on a value naming neither a canonical layout nor a
+folder spelling.
 
 `facets.base` carries at most 32 buckets. A bucket's `count` is the prefix-rule count,
 which is how many artifacts the query the bucket opens answers, so a family bucket counts

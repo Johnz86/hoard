@@ -121,6 +121,7 @@ hoard/
       src/
         config.rs            IndexConfig: sources, globs, hashing policy, layouts
         coordinate.rs        the one lane every scan under serve runs on
+        layout.rs            the ComfyUI or A1111 folder an entry's repository was filed under
         discover/
           walker.rs          ignore-based parallel walk
           hf_cache.rs        ~/.cache/huggingface/hub layout
@@ -298,7 +299,7 @@ Index screen search:
 
 ```
 GET /api/v1/search?q=... -> Catalog::list_shelves -> Catalog::compile_context
-  -> Catalog::query on a blocking thread -> page, totals, five facet dimensions
+  -> Catalog::query on a blocking thread -> page, totals, six facet dimensions
 ```
 
 `GET /api/v1/stats` and `hoard ls` read the same catalog, and so do the artifact inspector,

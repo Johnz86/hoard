@@ -633,17 +633,16 @@ mod tests {
 
     #[test]
     fn an_absent_column_reads_as_no_term_in_a_block() {
+        let precision = FACET_COLUMNS
+            .iter()
+            .position(|name| *name == "precision")
+            .expect("precision is a facet dimension");
         let rows: Vec<Indexed> = sample_rows()
             .into_iter()
-            .map(|row| Indexed {
-                facets: [
-                    row.facets[0],
-                    row.facets[1],
-                    row.facets[2],
-                    "",
-                    row.facets[4],
-                ],
-                ..row
+            .map(|row| {
+                let mut facets = row.facets;
+                facets[precision] = "";
+                Indexed { facets, ..row }
             })
             .collect();
         let index = one_segment(&rows);
@@ -651,10 +650,6 @@ mod tests {
         let segment = searcher.segment_reader(0);
         let columns =
             HitColumns::open(0, segment, SortKey::Size).expect("the segment opens its columns");
-        let precision = FACET_COLUMNS
-            .iter()
-            .position(|name| *name == "precision")
-            .expect("precision is a facet dimension");
         let docs: Vec<DocId> = (0..rows.len() as DocId).collect();
         let mut block = Block::default();
         columns.read_block(&docs, &mut block);

@@ -338,19 +338,13 @@ fn payload_total(report: &StorageReport) -> u64 {
     report.tables.iter().map(|table| table.stored_bytes).sum()
 }
 
-/// How many buckets each of the five dimensions came back with, in the rail's order, so a
+/// How many buckets each of the six dimensions came back with, in the rail's order, so a
 /// zero anywhere is visible beside the time the query took.
 fn facet_summary(facets: &Facets) -> String {
-    let counts = [
-        facets.role.len(),
-        facets.base.len(),
-        facets.format.len(),
-        facets.precision.len(),
-        facets.node.len(),
-    ];
-    counts
+    facets
+        .dimensions()
         .iter()
-        .map(usize::to_string)
+        .map(|buckets| buckets.len().to_string())
         .collect::<Vec<String>>()
         .join(" / ")
 }

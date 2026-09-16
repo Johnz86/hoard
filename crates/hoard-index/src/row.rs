@@ -36,6 +36,9 @@ pub struct SearchRow {
     pub revision: String,
     pub revision_sha: Option<CommitSha>,
     pub node: String,
+    /// The folder discovery filed the entry's repository under: a ComfyUI or A1111 layout
+    /// folder, or `hub repo`, `git clone` or `(unplaced)`.
+    pub layout: String,
     pub state: State,
     pub pull_progress: Option<f32>,
     pub trigger: Option<String>,

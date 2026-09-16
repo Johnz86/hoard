@@ -13,9 +13,9 @@ use crate::search::context::{HOURS_PER_DAY, MAX_SHELF_DEPTH};
 use crate::search::{CompareOp, CompileContext, SortKey, Token, TokenKind, parse};
 
 use super::search::{
-    BASE_FIELD, FORMAT_FIELD, Fields, HASH_FIELD, NODE_FIELD, ORG_FIELD, PRECISION_FIELD,
-    REPO_FIELD, REVISION_FIELD, ROLE_FIELD, SOURCE_FIELD, STATE_FIELD, SUB_ROLE_FIELD,
-    TRIGGER_FIELD,
+    BASE_FIELD, FORMAT_FIELD, Fields, HASH_FIELD, LAYOUT_FIELD, NODE_FIELD, ORG_FIELD,
+    PRECISION_FIELD, REPO_FIELD, REVISION_FIELD, ROLE_FIELD, SOURCE_FIELD, STATE_FIELD,
+    SUB_ROLE_FIELD, TRIGGER_FIELD,
 };
 
 const ANY_BASE: &str = "any";
@@ -60,6 +60,7 @@ fn filters_on_an_entry(tokens: &[Token], context: &CompileContext, depth: usize)
     for token in tokens {
         let entry_level = match token.kind {
             TokenKind::Node
+            | TokenKind::Layout
             | TokenKind::State
             | TokenKind::Source
             | TokenKind::Repo
@@ -154,6 +155,7 @@ fn clause(token: &Token, fields: &QueryFields<'_>, depth: usize) -> Result<Box<d
         TokenKind::Base => Ok(each_value(token, |value| base_filter(schema, value))),
         TokenKind::Format => Ok(equality(token, schema.keyword(FORMAT_FIELD))),
         TokenKind::Precision => Ok(equality(token, schema.keyword(PRECISION_FIELD))),
+        TokenKind::Layout => Ok(equality(token, schema.keyword(LAYOUT_FIELD))),
         TokenKind::State => Ok(equality(token, schema.keyword(STATE_FIELD))),
         TokenKind::Source => Ok(equality(token, schema.keyword(SOURCE_FIELD))),
         TokenKind::Repo => Ok(equality(token, schema.keyword(REPO_FIELD))),

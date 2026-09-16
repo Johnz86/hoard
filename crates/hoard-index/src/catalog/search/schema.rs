@@ -23,10 +23,12 @@ pub(in crate::catalog) const REVISION_FIELD: usize = 9;
 pub(in crate::catalog) const ORG_FIELD: usize = 10;
 pub(in crate::catalog) const HASH_FIELD: usize = 11;
 pub(in crate::catalog) const TRIGGER_FIELD: usize = 12;
-/// The keyword fields something reads as a column: the five facet dimensions, plus the two
+pub(in crate::catalog) const LAYOUT_FIELD: usize = 13;
+/// The keyword fields something reads as a column: the six facet dimensions, plus the two
 /// the sort keys `revision` and `state` order by. Every other keyword is a filter term.
-const COLUMN_KEYWORDS: [usize; 7] = [
+const COLUMN_KEYWORDS: [usize; 8] = [
     ROLE_FIELD,
+    LAYOUT_FIELD,
     BASE_FIELD,
     FORMAT_FIELD,
     PRECISION_FIELD,
@@ -34,7 +36,7 @@ const COLUMN_KEYWORDS: [usize; 7] = [
     STATE_FIELD,
     REVISION_FIELD,
 ];
-const KEYWORD_FIELDS: [&str; 13] = [
+const KEYWORD_FIELDS: [&str; 14] = [
     "role",
     "sub_role",
     "base",
@@ -48,6 +50,7 @@ const KEYWORD_FIELDS: [&str; 13] = [
     "org",
     "hash",
     "trigger",
+    "layout",
 ];
 
 pub(in crate::catalog) struct Fields {
@@ -135,6 +138,7 @@ impl Fields {
             node,
             primary,
             last_used,
+            layout,
         } = facts;
         let inferred = &artifact.artifact;
         let repo = repository.repo.qualified();
@@ -161,6 +165,7 @@ impl Fields {
             artifact.org.as_deref().unwrap_or_default(),
             hash.as_deref().unwrap_or_default(),
             inferred.trigger.as_deref().unwrap_or_default(),
+            layout,
         ];
         for (field, value) in self.keywords.iter().zip(values) {
             if !value.is_empty() {
@@ -232,6 +237,7 @@ mod tests {
             (ORG_FIELD, "org"),
             (HASH_FIELD, "hash"),
             (TRIGGER_FIELD, "trigger"),
+            (LAYOUT_FIELD, "layout"),
         ];
         assert_eq!(KEYWORD_FIELDS.len(), positions.len());
         for (index, name) in positions {

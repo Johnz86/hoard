@@ -818,6 +818,145 @@ fn the_base_rail_holds_at_most_the_capped_buckets_and_counts_them_by_prefix() ->
     Ok(())
 }
 
+/// The layout facet over a real ComfyUI-shaped tree, discovered and scanned rather than
+/// seeded, because a seeded repository row can carry a shape discovery never writes: a
+/// loose source gives every synthetic repository the source's own root and names the
+/// category folder in the repository's identity instead.
+#[test]
+fn the_layout_facet_counts_the_folder_discovery_filed_an_entry_under() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let models = directory.path().join("models");
+    for (path, header) in [
+        ("checkpoints/anima.safetensors", plain_header_named("anima")),
+        ("loras/film-grain.safetensors", lora_header_named("grain")),
+        ("loras/halation.safetensors", lora_header_named("halation")),
+        ("vae/sdxl-vae.safetensors", plain_header_named("decoder")),
+        ("unet/flux-dev.safetensors", plain_header_named("flux")),
+    ] {
+        let file = models.join(path);
+        if let Some(parent) = file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(file, header)?;
+    }
+    let config = IndexConfig {
+        sources: vec![SourceConfig {
+            repo_per_folder: true,
+            ..source(&models, "comfy")
+        }],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "workstation",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    catalog.rebuild_search(|_| {})?;
+
+    let snapshot = catalog.database.r_transaction()?;
+    let repositories: Vec<Repository> = snapshot
+        .scan()
+        .primary::<Repository>()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    drop(snapshot);
+    let mut filed: Vec<(&str, &str)> = repositories
+        .iter()
+        .map(|repository| (repository.repo.name(), repository.root_path.as_str()))
+        .collect();
+    filed.sort_unstable();
+    let root = models.to_str().unwrap_or_default();
+    assert_eq!(
+        filed,
+        vec![
+            ("checkpoints", root),
+            ("loras", root),
+            ("unet", root),
+            ("vae", root),
+        ],
+        "discovery names the category folder in the repository and leaves every root at the \
+         source's own, which is why a layout read from the root path reads nothing"
+    );
+
+    let page = search(&catalog, "")?;
+    assert_eq!(page.total, 5, "every file is indexed");
+    let mut counted: Vec<(&str, u64)> = page
+        .facets
+        .layout
+        .iter()
+        .map(|bucket| (bucket.value.as_str(), bucket.count))
+        .collect();
+    counted.sort_unstable();
+    assert_eq!(
+        counted,
+        vec![
+            ("checkpoints", 1),
+            ("diffusion_models", 1),
+            ("loras", 2),
+            ("vae", 1),
+        ],
+        "each entry is counted under the folder it was filed in, with unet folded into \
+         diffusion_models"
+    );
+    let mut placed: Vec<(&str, &str)> = page
+        .rows
+        .iter()
+        .map(|row| (row.path.as_str(), row.layout.as_str()))
+        .collect();
+    placed.sort_unstable();
+    assert_eq!(
+        placed,
+        vec![
+            ("anima.safetensors", "checkpoints"),
+            ("film-grain.safetensors", "loras"),
+            ("flux-dev.safetensors", "diffusion_models"),
+            ("halation.safetensors", "loras"),
+            ("sdxl-vae.safetensors", "vae"),
+        ],
+        "every row reads the folder its own file sits in"
+    );
+    assert_eq!(
+        search(&catalog, "layout:loras")?.total,
+        2,
+        "the bucket counts the query it opens"
+    );
+    assert_eq!(
+        search(&catalog, "layout:LORAS")?.total,
+        2,
+        "a hand-typed layout reaches the same term the rail's own click does"
+    );
+    assert_eq!(
+        search(&catalog, "layout:unet")?.total,
+        1,
+        "a folder spelling reaches the layout it was folded into"
+    );
+    Ok(())
+}
+
+/// [`source_kind_of`] answers with no kind for a source name the catalog does not hold.
+///
+/// Nothing reaches this through the catalog's own writers: each creates a source row before
+/// the repositories that name it, and `retire_source` removes it after them. This covers the
+/// defensive branch itself, not a state a run can be in.
+#[test]
+fn a_source_name_the_catalog_does_not_hold_resolves_to_no_kind() -> Result<()> {
+    let (_directory, catalog) = fixture()?;
+    let snapshot = catalog.database.r_transaction()?;
+    assert!(
+        source_kind_of(&snapshot, "datasets")?.is_some(),
+        "the source the fixture scanned resolves to a kind"
+    );
+    assert_eq!(source_kind_of(&snapshot, "no-such-source")?, None);
+    assert_eq!(
+        crate::layout::classify(None, "loras"),
+        "(unplaced)",
+        "and a kind that could not be resolved reads unplaced rather than the folder"
+    );
+    Ok(())
+}
+
 #[test]
 fn inspect_opens_without_seeding_shelves_or_a_self_row() -> Result<()> {
     let directory = tempfile::tempdir()?;

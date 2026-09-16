@@ -4,6 +4,7 @@ use tantivy::indexer::UserOperation;
 use tantivy::schema::{TantivyDocument, Value};
 use tantivy::{Index, IndexWriter};
 
+use crate::config::SourceKind;
 use crate::error::{IndexError, Result};
 
 use crate::catalog::Catalog;
@@ -14,7 +15,7 @@ use crate::catalog::nodes::NodeNames;
 use crate::catalog::scan::collapse_key;
 use crate::catalog::usage::last_used_in;
 
-use super::answer::{EntryFacts, revision_of};
+use super::answer::{EntryFacts, revision_of, source_kind_of};
 use super::schema::Fields;
 
 pub(super) const WRITER_BUDGET: usize = 32 * 1024 * 1024;
@@ -82,6 +83,7 @@ impl Catalog {
             names: &names,
             repository: None,
             card: None,
+            source_kind: None,
         };
         let mut indexed = 0_u64;
         let mut reported = 0_u64;
@@ -215,18 +217,42 @@ pub(super) struct Indexing<'a, 'db> {
     pub(super) names: &'a NodeNames,
     pub(super) repository: Option<(i64, Repository)>,
     pub(super) card: Option<((i64, u32), String)>,
+    pub(super) source_kind: Option<(String, Option<SourceKind>)>,
 }
 
 impl Indexing<'_, '_> {
-    /// The repository one entry sits in and the card of the revision it sits at.
-    fn resolve(&mut self, entry: &Entry) -> Result<(&Repository, &str)> {
+    /// The repository one entry sits in, the card of the revision it sits at, and the kind
+    /// of the source that repository belongs to.
+    fn resolve(&mut self, entry: &Entry) -> Result<(&Repository, &str, Option<SourceKind>)> {
         self.load_repository(entry.repo_id)?;
         self.load_card(entry.repo_id, entry.revision)?;
+        self.load_source_kind()?;
+        let kind = self
+            .source_kind
+            .as_ref()
+            .map(|(_, kind)| *kind)
+            .ok_or_else(|| IndexError::Catalog("resolution cache went empty".into()))?;
         let repository = self.repository.as_ref().map(|(_, repository)| repository);
         let card = self.card.as_ref().map(|(_, card)| card.as_str());
         repository
             .zip(card)
+            .map(|(repository, card)| (repository, card, kind))
             .ok_or_else(|| IndexError::Catalog("resolution cache went empty".into()))
+    }
+
+    fn load_source_kind(&mut self) -> Result<()> {
+        let Some((_, repository)) = self.repository.as_ref() else {
+            return Err(IndexError::Catalog("resolution cache went empty".into()));
+        };
+        if self
+            .source_kind
+            .as_ref()
+            .is_none_or(|(name, _)| name != &repository.source)
+        {
+            let kind = source_kind_of(self.snapshot, &repository.source)?;
+            self.source_kind = Some((repository.source.clone(), kind));
+        }
+        Ok(())
     }
 
     fn load_repository(&mut self, repo_id: i64) -> Result<()> {
@@ -320,7 +346,7 @@ fn documents_from(
         .map(|entry| entry.id);
     let mut documents = Vec::with_capacity(entries.len());
     for entry in &entries {
-        let (repository, card) = indexing.resolve(entry)?;
+        let (repository, card, kind) = indexing.resolve(entry)?;
         let facts = EntryFacts {
             revision: revision_of(repository, entry)?,
             entry,
@@ -329,6 +355,7 @@ fn documents_from(
             node: names.of(entry.node),
             primary: preferred == Some(entry.id),
             last_used,
+            layout: crate::layout::classify(kind, repository.repo.name()),
         };
         documents.push(fields.document(&facts, text.as_ref(), card));
     }

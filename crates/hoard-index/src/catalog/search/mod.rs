@@ -18,15 +18,15 @@ use super::Catalog;
 
 #[cfg(test)]
 pub(super) use self::answer::QueryPath;
-pub(super) use self::answer::{EntryFacts, assemble_row, revision_of};
+pub(super) use self::answer::{EntryFacts, assemble_row, revision_of, source_kind_of};
 #[cfg(test)]
 pub(super) use self::build::INDEX_FLUSH_BYTES;
 #[cfg(test)]
 pub(super) use self::paging::{Cost, Paging};
 pub(super) use self::schema::{
-    BASE_FIELD, FORMAT_FIELD, Fields, HASH_FIELD, NODE_FIELD, ORG_FIELD, PRECISION_FIELD,
-    REPO_FIELD, REVISION_FIELD, ROLE_FIELD, SOURCE_FIELD, STATE_FIELD, SUB_ROLE_FIELD,
-    TRIGGER_FIELD,
+    BASE_FIELD, FORMAT_FIELD, Fields, HASH_FIELD, LAYOUT_FIELD, NODE_FIELD, ORG_FIELD,
+    PRECISION_FIELD, REPO_FIELD, REVISION_FIELD, ROLE_FIELD, SOURCE_FIELD, STATE_FIELD,
+    SUB_ROLE_FIELD, TRIGGER_FIELD,
 };
 
 /// One query of Hoard's own grammar, the one the search bar, `hoard ls` and shelves speak.
@@ -79,11 +79,11 @@ mod test_support {
 
     use super::build::WRITER_BUDGET;
     use super::schema::{
-        BASE_FIELD, FORMAT_FIELD, Fields, NODE_FIELD, PRECISION_FIELD, ROLE_FIELD,
+        BASE_FIELD, FORMAT_FIELD, Fields, LAYOUT_FIELD, NODE_FIELD, PRECISION_FIELD, ROLE_FIELD,
     };
     use super::tally::FACET_COLUMNS;
 
-    /// One indexed document as the columns a tallying collector reads: the five facet terms
+    /// One indexed document as the columns a tallying collector reads: the six facet terms
     /// in the order [`FACET_COLUMNS`] names them, the base label, and the size the sort
     /// orders by. An empty term is one the document does not carry.
     pub(super) struct Indexed {
@@ -107,6 +107,7 @@ mod test_support {
             document.add_u64(fields.size, row.size);
             let keywords = [
                 ROLE_FIELD,
+                LAYOUT_FIELD,
                 BASE_FIELD,
                 FORMAT_FIELD,
                 PRECISION_FIELD,
@@ -131,18 +132,45 @@ mod test_support {
     pub(super) fn sample_rows() -> Vec<Indexed> {
         [
             (
-                ["lora", "sdxl", "safetensors", "fp16", "workstation"],
+                [
+                    "lora",
+                    "loras",
+                    "sdxl",
+                    "safetensors",
+                    "fp16",
+                    "workstation",
+                ],
                 "SDXL",
             ),
             (
-                ["ckpt", "sdxl", "safetensors", "fp16", "workstation"],
+                [
+                    "ckpt",
+                    "checkpoints",
+                    "sdxl",
+                    "safetensors",
+                    "fp16",
+                    "workstation",
+                ],
                 "SDXL",
             ),
-            (["lora", "flux", "safetensors", "", "laptop"], "Flux"),
-            (["lora", "sdxl", "gguf", "q4", "laptop"], ""),
-            (["vae", "", "safetensors", "fp16", "workstation"], ""),
-            (["lora", "flux", "gguf", "", "workstation"], "Flux"),
-            (["ckpt", "flux", "safetensors", "fp8", "laptop"], "Flux"),
+            (
+                ["lora", "loras", "flux", "safetensors", "", "laptop"],
+                "Flux",
+            ),
+            (["lora", "loras", "sdxl", "gguf", "q4", "laptop"], ""),
+            (["vae", "vae", "", "safetensors", "fp16", "workstation"], ""),
+            (["lora", "loras", "flux", "gguf", "", "workstation"], "Flux"),
+            (
+                [
+                    "ckpt",
+                    "checkpoints",
+                    "flux",
+                    "safetensors",
+                    "fp8",
+                    "laptop",
+                ],
+                "Flux",
+            ),
         ]
         .into_iter()
         .enumerate()

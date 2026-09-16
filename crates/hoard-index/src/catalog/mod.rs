@@ -55,7 +55,7 @@ pub use self::verdict::OverrideRecord;
 
 /// The one shape this build reads and writes. A catalog whose `FORMAT` stamp names another,
 /// or that carries no stamp, is rebuilt from disk rather than converted.
-pub const FORMAT_VERSION: u32 = 9;
+pub const FORMAT_VERSION: u32 = 10;
 
 const FORMAT_FILE: &str = "FORMAT";
 

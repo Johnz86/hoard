@@ -15,9 +15,10 @@ use crate::search::{
 };
 
 use crate::catalog::Catalog;
-use crate::catalog::models::{ArtifactRecord, Entry, Repository, Revision};
+use crate::catalog::models::{ArtifactRecord, Entry, Repository, Revision, Source};
 use crate::catalog::query::{self, QueryFields};
 use crate::catalog::usage::last_used_in;
+use crate::config::SourceKind;
 
 use super::collapse::{Retained, SegmentStrings};
 use super::collectors::{CollapsedCount, PrimaryCollector};
@@ -226,9 +227,10 @@ impl Catalog {
             }
             dimensions[index] = buckets;
         }
-        let [role, base, format, precision, node] = dimensions;
+        let [role, layout, base, format, precision, node] = dimensions;
         let mut facets = Facets {
             role,
+            layout,
             base,
             format,
             precision,
@@ -254,6 +256,7 @@ impl Catalog {
         let snapshot = self.database.r_transaction()?;
         let names = self.node_names(&snapshot)?;
         let mut repositories: HashMap<i64, Repository> = HashMap::new();
+        let mut source_kinds: HashMap<String, Option<SourceKind>> = HashMap::new();
         let mut rows = Vec::with_capacity(page.len());
         let mut skipped = 0_u64;
         for candidate in page {
@@ -275,6 +278,14 @@ impl Catalog {
                     slot.insert(repository)
                 }
             };
+            let kind = match source_kinds.get(&repository.source) {
+                Some(kind) => *kind,
+                None => {
+                    let kind = source_kind_of(&snapshot, &repository.source)?;
+                    source_kinds.insert(repository.source.clone(), kind);
+                    kind
+                }
+            };
             rows.push(assemble_row(&EntryFacts {
                 revision: revision_of(repository, &entry)?,
                 entry: &entry,
@@ -283,6 +294,7 @@ impl Catalog {
                 node: names.of(entry.node),
                 primary: true,
                 last_used: last_used_in(&snapshot, artifact.id)?,
+                layout: crate::layout::classify(kind, repository.repo.name()),
             }));
         }
         Ok((rows, skipped))
@@ -299,6 +311,20 @@ pub(in crate::catalog) struct EntryFacts<'a> {
     pub(in crate::catalog) node: &'a str,
     pub(in crate::catalog) primary: bool,
     pub(in crate::catalog) last_used: Option<jiff::Timestamp>,
+    pub(in crate::catalog) layout: &'static str,
+}
+
+/// The kind a source resolved to at scan time, which is what decides whether an entry's
+/// layout is read from its folder at all. Every writer creates a source row before the
+/// repositories that name it and retires it after them, so a repository naming a source the
+/// catalog does not hold is not a state a run reaches; one met anyway answers with no kind,
+/// which reads as unplaced rather than failing a query or a rebuild over a label.
+pub(in crate::catalog) fn source_kind_of(
+    snapshot: &native_db::transaction::RTransaction<'_>,
+    name: &str,
+) -> Result<Option<SourceKind>> {
+    let stored: Option<Source> = snapshot.get().primary(name.to_owned())?;
+    Ok(stored.map(|source| source.resolved_kind))
 }
 
 /// A candidate the page had to walk past, at the level its cause deserves. A rescan whose
@@ -363,6 +389,7 @@ pub(in crate::catalog) fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
         artifact,
         node,
         last_used,
+        layout,
         ..
     } = facts;
     let inferred = &artifact.artifact;
@@ -389,6 +416,7 @@ pub(in crate::catalog) fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
         revision: revision.name.clone(),
         revision_sha: revision.sha,
         node: (*node).to_owned(),
+        layout: (*layout).to_owned(),
         state: entry.state,
         pull_progress: entry.pull_progress,
         trigger: inferred.trigger.clone(),
