@@ -1,5 +1,9 @@
 use super::*;
 
+/// The sha256 and git blob sha1 the catalog holds for each entry, by the path it was read
+/// from.
+type StoredDigests = BTreeMap<String, (Option<Sha256>, Option<CommitSha>)>;
+
 #[test]
 fn hashing_gives_every_file_a_sha256_and_merges_two_copies_into_one_artifact() -> Result<()> {
     let directory = tempfile::tempdir()?;
@@ -735,6 +739,265 @@ fn a_hashing_pass_counts_triage_against_the_threshold_the_catalog_stored() -> Re
         catalog.count_summary()?,
         catalog.totals()?,
         "the pass counted against the threshold the scan stored, not the one it was handed"
+    );
+    Ok(())
+}
+
+fn hashes_by_path(catalog: &Catalog) -> Result<StoredDigests> {
+    let read = catalog.database.r_transaction()?;
+    let entries: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| (entry.rel_path, (entry.sha256, entry.git_sha1)))
+        .collect())
+}
+
+#[test]
+fn a_rebuilt_catalog_recalls_digests_the_memo_already_knows() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(&input)?;
+    let sizes = [512 * 1024_usize, 768 * 1024, 1024 * 1024];
+    let mut total = 0_u64;
+    for (index, size) in sizes.iter().enumerate() {
+        let body: Vec<u8> = (0..*size).map(|offset| (offset + index) as u8).collect();
+        fs::write(input.join(format!("weights{index}.bin")), &body)?;
+        total += body.len() as u64;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let native = directory.path().join("native");
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
+    assert_eq!(catalog.pending_hashes()?, sizes.len() as u64);
+
+    let mut first = Vec::new();
+    let read = catalog.hash_pending(&config, |update| first.push(update))?;
+
+    assert_eq!(read.hashed, sizes.len() as u64);
+    assert_eq!(
+        first.last().map(|update| update.bytes_done),
+        Some(total),
+        "the first pass reads every byte of the fixture: {first:?}"
+    );
+    let found = hashes_by_path(&catalog)?;
+    assert_eq!(found.len(), sizes.len());
+    assert!(
+        found
+            .values()
+            .all(|(sha256, git_sha1)| sha256.is_some() && git_sha1.is_some()),
+        "the first pass stored both digests for every file"
+    );
+    drop(catalog);
+
+    fs::remove_dir_all(&native)?;
+    assert!(
+        directory.path().join("digests.redb").is_file(),
+        "the sidecar sits beside the catalog directory, not inside it"
+    );
+    let rebuilt = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
+    assert_eq!(
+        rebuilt.pending_hashes()?,
+        sizes.len() as u64,
+        "a catalog scanned again owes every hash from the start"
+    );
+
+    let mut second = Vec::new();
+    let recalled = rebuilt.hash_pending(&config, |update| second.push(update))?;
+
+    assert!(
+        second.iter().all(|update| update.bytes_done == 0),
+        "the second pass reads no file's bytes at all: {second:?}"
+    );
+    assert_eq!(
+        recalled.hashed,
+        sizes.len() as u64,
+        "every file is still counted as hashed"
+    );
+    assert_eq!(recalled.unreadable, 0);
+    assert!(!recalled.interrupted);
+    assert_eq!(rebuilt.pending_hashes()?, 0, "nothing is left owing");
+    assert_eq!(
+        hashes_by_path(&rebuilt)?,
+        found,
+        "every recalled digest is byte-identical to what the first pass read"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_changed_file_is_rehashed_despite_a_stale_memo_entry() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(&input)?;
+    let path = input.join("weights.bin");
+    let before = vec![1_u8; 256 * 1024];
+    let after = vec![2_u8; 320 * 1024];
+    fs::write(&path, &before)?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let mut first = Vec::new();
+    catalog.hash_pending(&config, |update| first.push(update))?;
+    assert_eq!(
+        first.last().map(|update| update.bytes_done),
+        Some(before.len() as u64),
+        "the first pass read the file it was given: {first:?}"
+    );
+    assert_eq!(
+        hashes_by_path(&catalog)?
+            .into_values()
+            .map(|(sha256, _)| sha256)
+            .collect::<Vec<_>>(),
+        vec![Some(crate::hash::sha256_bytes(&before))]
+    );
+
+    fs::write(&path, &after)?;
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    fs::File::options()
+        .write(true)
+        .open(&path)?
+        .set_modified(later)?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    assert_eq!(
+        catalog.pending_hashes()?,
+        1,
+        "the changed file owes a hash again"
+    );
+
+    let mut second = Vec::new();
+    let report = catalog.hash_pending(&config, |update| second.push(update))?;
+
+    assert_eq!(report.hashed, 1);
+    assert_eq!(
+        second.last().map(|update| update.bytes_done),
+        Some(after.len() as u64),
+        "a file whose stamp moved is read for real, not recalled: {second:?}"
+    );
+    assert_eq!(
+        hashes_by_path(&catalog)?
+            .into_values()
+            .map(|(sha256, _)| sha256)
+            .collect::<Vec<_>>(),
+        vec![Some(crate::hash::sha256_bytes(&after))],
+        "the digest is of what the file holds now, not what the memo remembered"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_threshold_change_rereads_a_file_whose_git_sha1_answer_moved() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(&input)?;
+    let body = vec![3_u8; 4096];
+    fs::write(input.join("weights.bin"), &body)?;
+    let over_the_threshold = IndexConfig {
+        sources: vec![source(&input, "files")],
+        lfs_threshold: 1024,
+        ..IndexConfig::default()
+    };
+    let under_the_threshold = IndexConfig {
+        lfs_threshold: 10 * 1024 * 1024,
+        ..over_the_threshold.clone()
+    };
+    let native = directory.path().join("native");
+    let catalog = Catalog::scan_sources(
+        &native,
+        "n",
+        &over_the_threshold,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+
+    let mut first = Vec::new();
+    catalog.hash_pending(&over_the_threshold, |update| first.push(update))?;
+
+    assert_eq!(
+        first.last().map(|update| update.bytes_done),
+        Some(body.len() as u64)
+    );
+    assert_eq!(
+        hashes_by_path(&catalog)?.into_values().collect::<Vec<_>>(),
+        vec![(Some(crate::hash::sha256_bytes(&body)), None)],
+        "a file over the threshold owes no git blob sha1"
+    );
+    drop(catalog);
+
+    fs::remove_dir_all(&native)?;
+    let rebuilt = Catalog::scan_sources(
+        &native,
+        "n",
+        &under_the_threshold,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let mut second = Vec::new();
+    let report = rebuilt.hash_pending(&under_the_threshold, |update| second.push(update))?;
+
+    assert_eq!(report.hashed, 1);
+    assert_eq!(
+        second.last().map(|update| update.bytes_done),
+        Some(body.len() as u64),
+        "a lowered threshold is a question the memo's row does not answer, so the file is \
+         read again: {second:?}"
+    );
+    let found = hashes_by_path(&rebuilt)?;
+    let (sha256, git_sha1) = found
+        .into_values()
+        .next()
+        .ok_or_else(|| IndexError::Catalog("the entry vanished".into()))?;
+    assert_eq!(sha256, Some(crate::hash::sha256_bytes(&body)));
+    assert!(
+        git_sha1.is_some(),
+        "the pass that now wants a git blob sha1 gets one"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_pass_with_nothing_pending_opens_no_memo() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(&input)?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    assert_eq!(catalog.pending_hashes()?, 0);
+
+    let report = catalog.hash_pending(&config, |_| {})?;
+
+    assert_eq!(report.hashed, 0);
+    assert!(!report.interrupted);
+    assert!(
+        !directory.path().join("digests.redb").exists(),
+        "a pass owed nothing writes no sidecar at all"
     );
     Ok(())
 }

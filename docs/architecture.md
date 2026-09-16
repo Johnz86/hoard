@@ -172,6 +172,7 @@ hoard/
           loadouts.rs        loadout documents and pin resolution
           jobs.rs            scan, apply and pull job rows
           hashing.rs         sha256 and git blob sha1 per file, content identities, merges
+          hash_memo.rs       <data_dir>/digests.redb: a digest against the stamp that earned it
           ingest.rs          a file the mirror fetched, filed as a served entry
           nodes.rs           this machine and every peer it knows
           digest.rs          the rows this node offers and the rows a peer advertises

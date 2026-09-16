@@ -1,5 +1,6 @@
 mod codec;
 mod digest;
+mod hash_memo;
 mod hashing;
 mod ingest;
 mod jobs;

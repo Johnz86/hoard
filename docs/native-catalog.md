@@ -201,6 +201,48 @@ nothing here restates it.
 The whole thing is recreatable from disk plus peers. redb takes an exclusive lock, so one
 process may open a catalog at a time; `hoard doctor` reports it when a second one tries.
 
+`<data_dir>/` holds two more files beside `native/`, and they are beside it rather than inside
+it on purpose: `open_or_scan` answers a format mismatch with `remove_dir_all` of
+`<data_dir>/native` alone, so what sits next to that directory survives a rebuild.
+
+- `digests.redb`, the hashing pass's memo: one row per file it has read, keyed by a `u128`
+  xxh3 of the inode, mtime and size that earned the digest and holding those three fields
+  again so a hash collision degrades to a miss rather than a wrong answer, valued by the
+  sha256 and, when it was computed, the git blob sha1. `Catalog::hash_pending_until` opens it
+  for the length of one pass and closes it again, and does not open it at all when the pass is
+  owed nothing; nothing holds it open. Before a candidate is queued to a worker the pass stats
+  it and asks the memo, and a hit goes straight to the digest writer without the file being
+  read. A row is a hit only when all three stamp fields match **and** it answers the same
+  question about the git blob sha1 that this pass is asking: `[index] lfs_threshold` decides
+  whether a git blob sha1 is computed at all, so an operator who moves that threshold gets the
+  files re-read rather than the previous threshold's answer served back. The digests a batch
+  read are written to the memo in one transaction after that batch's own catalog transaction
+  commits, on the writer thread, because redb has no durability knob and fsyncs every commit;
+  a recalled digest is not written back, since the memo is where it came from. Nothing else
+  builds the memo: an ordinary pass fills it.
+- `digests.version`, that memo's own format as a decimal number and a newline, versioned apart
+  from `FORMAT`: a content digest and an inference rule are unrelated facts and a change to
+  one has no business throwing away the other. A memo whose stamp is absent, unparsable or
+  from another version, and a memo whose redb file is corrupt, is deleted and started again
+  empty; neither is ever converted and neither fails the pass. A memo another handle already
+  holds redb's lock on is neither, and is reported as `CatalogBusy` rather than unlinked from
+  under its holder.
+
+The memo grows monotonically: one row per distinct `(inode, mtime, size)` ever seen, with no
+eviction, and it is not counted by `Catalog::storage` or `hoard doctor`, which report the
+catalog directory alone. Deleting `digests.redb` by hand at any time is safe and costs only
+the re-reads a later pass then pays.
+
+On the fixture of `a_rebuilt_catalog_recalls_digests_the_memo_already_knows`, three files of
+2,359,296 bytes in all: the first pass reports `HashProgress.bytes_done` of 2,359,296, and a
+pass over a catalog scanned again from scratch into the same path reports 0 with
+`HashReport.hashed` still 3 and every recalled digest byte-identical to the first pass's. A
+file whose content and mtime changed between two passes is read for real again and gets the
+digest of what it holds now, which is what
+`a_changed_file_is_rehashed_despite_a_stale_memo_entry` pins, and a file whose
+`lfs_threshold` answer moved is read again too, which is what
+`a_threshold_change_rereads_a_file_whose_git_sha1_answer_moved` pins.
+
 ## How a record is encoded
 
 native_model writes an eight byte header naming the record and its version, then a body in
@@ -286,6 +328,8 @@ the catalog at `<data_dir>/native`.
 - `loadouts.rs` loadout documents and pin resolution.
 - `jobs.rs` scan, apply and pull job rows.
 - `hashing.rs` sha256 and git blob sha1 per file, content identities, merges.
+- `hash_memo.rs` the `<data_dir>/digests.redb` sidecar: a digest against the inode, mtime and
+  size that earned it, and its own version stamp.
 - `ingest.rs` a file the mirror fetched, filed as a served entry.
 - `nodes.rs` this machine and every peer it knows.
 - `digest.rs` the rows this node offers and the rows a peer advertises.

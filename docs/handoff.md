@@ -3,6 +3,16 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest wave: a format bump no longer costs a rehash
+
+A hashing pass now recalls a file's sha256 and git blob sha1 from `<data_dir>/digests.redb`,
+a sidecar keyed by the inode, mtime and size that earned them, and reads a file's bytes only
+when that stamp actually moved. The sidecar sits beside `native/` rather than inside it, so a
+`FORMAT_VERSION` bump - which deletes `<data_dir>/native` and scans it again, throwing away
+every stored `sha256` - now costs a walk and a stat per file rather than a re-read of every
+byte the cache holds. `docs/native-catalog.md` under "Layout" has the file, its own version
+stamp and the measured before and after.
+
 ## Latest work: the memory goal is closed
 
 The goal was that a rescan holds one repository at a time rather than the whole pass. It

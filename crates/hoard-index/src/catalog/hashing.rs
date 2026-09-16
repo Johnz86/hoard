@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -11,8 +11,10 @@ use hoard_core::{GitSha1, Sha256, State};
 
 use crate::config::IndexConfig;
 use crate::error::{IndexError, Result};
+use crate::hash::FileStamp;
 
 use super::Catalog;
+use super::hash_memo::{HashMemo, Remembered};
 use super::models::{
     ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, Override, Repository,
     SearchText, Source,
@@ -132,11 +134,26 @@ impl Catalog {
         self.open_pass()?;
         let mut counters = Counters::load(&self.database, self.stored_triage()?)?;
         let mut report = HashReport::default();
+        let files_total = self.pending_hashes()?;
+        let opened = match files_total {
+            0 => None,
+            _ => Some(HashMemo::open(self.memo_directory())?),
+        };
+        let memo = opened.as_ref();
         let (sender, receiver) = mpsc::sync_channel::<Digest>(DIGEST_QUEUE);
         let recording = &mut counters;
         let merged = std::thread::scope(|scope| -> Result<u64> {
-            let writing = scope.spawn(move || self.record_digests(receiver, recording));
-            let read = self.read_digests(config, stop, &sender, &mut progress);
+            let writing = scope.spawn(move || self.record_digests(receiver, recording, memo));
+            let read = self.read_digests(
+                config,
+                &Pass {
+                    stop,
+                    sender: &sender,
+                    memo,
+                    files_total,
+                },
+                &mut progress,
+            );
             drop(sender);
             let merged = writing
                 .join()
@@ -155,14 +172,14 @@ impl Catalog {
     fn read_digests(
         &self,
         config: &IndexConfig,
-        stop: &Stop,
-        sender: &mpsc::SyncSender<Digest>,
+        pass: &Pass<'_>,
         progress: &mut (impl FnMut(HashProgress) + Send),
     ) -> Result<HashReport> {
         let workers = config.hash_workers();
         let threshold = config.lfs_threshold;
-        let files_total = self.pending_hashes()?;
-        let (work_tx, work_rx) = mpsc::sync_channel::<(Entry, PathBuf)>(workers);
+        let stop = pass.stop;
+        let files_total = pass.files_total;
+        let (work_tx, work_rx) = mpsc::sync_channel::<Pending>(workers);
         let work_rx = Arc::new(Mutex::new(work_rx));
         let hashed = AtomicU64::new(0);
         let unreadable = AtomicU64::new(0);
@@ -195,7 +212,7 @@ impl Catalog {
             let mut crew = Vec::with_capacity(workers);
             for _ in 0..workers {
                 let receiver = Arc::clone(&work_rx);
-                let worker_sender = sender.clone();
+                let worker_sender = pass.sender.clone();
                 let hashed = &hashed;
                 let unreadable = &unreadable;
                 let bytes = &bytes;
@@ -206,7 +223,7 @@ impl Catalog {
                             Ok(guard) => guard.recv(),
                             Err(poisoned) => poisoned.into_inner().recv(),
                         };
-                        let Ok((entry, path)) = next else {
+                        let Ok((entry, path, stamp)) = next else {
                             break;
                         };
                         if stop.load(Ordering::Relaxed) {
@@ -219,6 +236,7 @@ impl Catalog {
                                     entry_id: entry.id,
                                     sha256,
                                     git_sha1,
+                                    stamp,
                                 };
                                 match worker_sender.send(digest) {
                                     Ok(()) => {
@@ -280,7 +298,16 @@ impl Catalog {
                 ended: &ended,
             };
 
-            let walked = self.page_pending(stop, &work_tx, &interrupted, nudge_progress);
+            let pager = Pager {
+                stop,
+                work_tx: &work_tx,
+                sender: pass.sender,
+                memo: pass.memo,
+                threshold,
+                hashed: &hashed,
+                interrupted: &interrupted,
+            };
+            let walked = self.page_pending(&pager, nudge_progress);
             drop(work_tx);
             let lost = crew
                 .into_iter()
@@ -302,17 +329,11 @@ impl Catalog {
         })
     }
 
-    fn page_pending(
-        &self,
-        stop: &Stop,
-        work_tx: &mpsc::SyncSender<(Entry, PathBuf)>,
-        interrupted: &AtomicBool,
-        report: impl Fn(),
-    ) -> Result<()> {
+    fn page_pending(&self, pager: &Pager<'_>, report: impl Fn()) -> Result<()> {
         let mut after = 0;
         'paging: loop {
-            if stop.load(Ordering::Relaxed) {
-                interrupted.store(true, Ordering::Relaxed);
+            if pager.stop.load(Ordering::Relaxed) {
+                pager.interrupted.store(true, Ordering::Relaxed);
                 break 'paging;
             }
             let batch = self.pending_batch(after)?;
@@ -320,13 +341,15 @@ impl Catalog {
                 break 'paging;
             };
             after = last.id;
-            for pair in batch {
-                if stop.load(Ordering::Relaxed) {
-                    interrupted.store(true, Ordering::Relaxed);
+            for (entry, path) in batch {
+                if pager.stop.load(Ordering::Relaxed) {
+                    pager.interrupted.store(true, Ordering::Relaxed);
                     break 'paging;
                 }
-                if work_tx.send(pair).is_err() {
-                    interrupted.store(true, Ordering::Relaxed);
+                let stamp = crate::hash::stamp(&path).ok();
+                let listening = pager.queue(entry, path, stamp);
+                if !listening {
+                    pager.interrupted.store(true, Ordering::Relaxed);
                     break 'paging;
                 }
                 report();
@@ -335,12 +358,17 @@ impl Catalog {
         Ok(())
     }
 
+    fn memo_directory(&self) -> &Path {
+        self.directory.parent().unwrap_or(&self.directory)
+    }
+
     /// Commits digests as they arrive, in batches of at most [`HASH_BATCH`], and returns
     /// how many artifacts two copies of one file collapsed into.
     fn record_digests(
         &self,
         receiver: mpsc::Receiver<Digest>,
         counters: &mut Counters,
+        memo: Option<&HashMemo>,
     ) -> Result<u64> {
         let mut merged = 0;
         let mut batch: Vec<Digest> = Vec::with_capacity(HASH_BATCH);
@@ -353,6 +381,7 @@ impl Catalog {
                 }
             }
             merged += self.record_batch(&batch, counters)?;
+            remember_digests(memo, &batch);
             batch.clear();
         }
         Ok(merged)
@@ -469,11 +498,99 @@ impl Catalog {
     }
 }
 
-/// One file's content hashes, against the entry they were read for.
+/// One file's content hashes, against the entry they were read for. `stamp` is what the
+/// digests should be remembered against, and is absent both for a file that could not be
+/// stat'd and for a digest the memo was the source of, which has nothing to learn.
 struct Digest {
     entry_id: i64,
     sha256: Sha256,
     git_sha1: Option<GitSha1>,
+    stamp: Option<FileStamp>,
+}
+
+/// A file handed to a worker: the entry owing the hash, the path to read it from, and the
+/// stamp the digest it produces is remembered against, absent when the file could not be
+/// stat'd.
+type Pending = (Entry, PathBuf, Option<FileStamp>);
+
+/// What every stage of one pass shares: where a finished digest goes, the memo it is
+/// recalled from and remembered in, and what the pass was owed when it started.
+struct Pass<'a> {
+    stop: &'a Stop,
+    sender: &'a mpsc::SyncSender<Digest>,
+    memo: Option<&'a HashMemo>,
+    files_total: u64,
+}
+
+/// What a pass's pager hands each candidate to: the queue the workers read, the channel a
+/// digest the memo already knows skips straight to, and the count both of them raise.
+struct Pager<'a> {
+    stop: &'a Stop,
+    work_tx: &'a mpsc::SyncSender<Pending>,
+    sender: &'a mpsc::SyncSender<Digest>,
+    memo: Option<&'a HashMemo>,
+    threshold: u64,
+    hashed: &'a AtomicU64,
+    interrupted: &'a AtomicBool,
+}
+
+impl Pager<'_> {
+    fn queue(&self, entry: Entry, path: PathBuf, stamp: Option<FileStamp>) -> bool {
+        let Some((sha256, git_sha1)) = self.recalled(&entry, &path, stamp) else {
+            return self.work_tx.send((entry, path, stamp)).is_ok();
+        };
+        let sent = self
+            .sender
+            .send(Digest {
+                entry_id: entry.id,
+                sha256,
+                git_sha1,
+                stamp: None,
+            })
+            .is_ok();
+        if sent {
+            self.hashed.fetch_add(1, Ordering::Relaxed);
+        }
+        sent
+    }
+
+    fn recalled(
+        &self,
+        entry: &Entry,
+        path: &Path,
+        stamp: Option<FileStamp>,
+    ) -> Option<(Sha256, Option<GitSha1>)> {
+        match self.memo?.recall(stamp?, entry.size < self.threshold) {
+            Ok(recalled) => recalled,
+            Err(error) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    %error,
+                    "the digest memo could not be read"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Remembers what a batch read, in one transaction, after the catalog committed it. A memo
+/// that cannot be written does not fail the pass: the files it forgot are read again.
+fn remember_digests(memo: Option<&HashMemo>, batch: &[Digest]) {
+    let Some(memo) = memo else {
+        return;
+    };
+    let rows: Vec<Remembered> = batch
+        .iter()
+        .filter_map(|digest| {
+            digest
+                .stamp
+                .map(|stamp| (stamp, digest.sha256, digest.git_sha1))
+        })
+        .collect();
+    if let Err(error) = memo.remember_batch(&rows) {
+        tracing::debug!(rows = rows.len(), %error, "the digest memo could not be written");
+    }
 }
 
 /// Which artifact the hashed entry belongs to now, and whether reaching it collapsed two
