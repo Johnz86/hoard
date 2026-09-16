@@ -40,7 +40,7 @@ pub struct FacetBucketView {
 }
 
 /// The facet rail: six dimensions, each counted with its own key removed, plus the DISK
-/// PRESSURE summary underneath.
+/// PRESSURE summary underneath and how many bases the base rail was cut from.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct FacetsView {
     pub role: Vec<FacetBucketView>,
@@ -50,6 +50,7 @@ pub struct FacetsView {
     pub precision: Vec<FacetBucketView>,
     pub node: Vec<FacetBucketView>,
     pub disk_pressure: DiskPressureView,
+    pub base_total: u64,
 }
 
 /// The DISK PRESSURE summary and the line the rail prints under the bar.
@@ -166,6 +167,7 @@ pub async fn parse_query(Query(params): Query<SearchParams>) -> Json<ParseRespon
 fn facets(counted: &Facets, query: &ParsedQuery) -> FacetsView {
     let mut view = FacetsView {
         disk_pressure: counted.disk_pressure.into(),
+        base_total: counted.base_total,
         ..FacetsView::default()
     };
     for (((key, _), buckets), rendered) in FACET_DIMENSIONS

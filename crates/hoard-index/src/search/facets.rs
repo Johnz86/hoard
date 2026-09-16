@@ -25,6 +25,9 @@ pub struct Facets {
     pub precision: Vec<FacetBucket>,
     pub node: Vec<FacetBucket>,
     pub disk_pressure: DiskPressure,
+    /// How many distinct bases the result set holds, before the rail was cut to the
+    /// largest of them, so the rail can say what it is not showing.
+    pub base_total: u64,
 }
 
 impl Facets {
@@ -185,6 +188,7 @@ mod tests {
             precision: vec![bucket("fp16")],
             node: vec![bucket("workstation")],
             disk_pressure: DiskPressure::default(),
+            base_total: 1,
         };
         facets.mark_query(&parse(
             "role:lora layout:loras base:sdxl fmt:gguf prec:fp16 node:workstation",

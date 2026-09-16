@@ -486,13 +486,18 @@ impl<'a> Selecting<'a> {
     /// How many rows the match holds, counted the way the path the query took counts them:
     /// a primary document stands for its artifact, and a collapsed match counts the runs of
     /// one artifact rather than the entries in them. It reads nothing else, so it costs a
-    /// fraction of the pass that would have counted it on the way past.
-    fn counted(&self) -> Result<usize> {
-        let counted = match self.path {
+    /// fraction of the pass that would have counted it on the way past, which is what a
+    /// caller wanting the total alone pays instead of answering a page.
+    pub(super) fn total(&self) -> Result<u64> {
+        Ok(match self.path {
             QueryPath::Primary => self.searcher.search(self.restricted, &Count)? as u64,
             QueryPath::Collapse => self.searcher.search(self.restricted, &CollapsedCount)?,
-        };
-        Ok(usize::try_from(counted).unwrap_or(usize::MAX))
+        })
+    }
+
+    /// The same count, as the size of the set a selection walks.
+    fn counted(&self) -> Result<usize> {
+        Ok(usize::try_from(self.total()?).unwrap_or(usize::MAX))
     }
 
     /// One pass, keeping a heap of everything that can reach the window.

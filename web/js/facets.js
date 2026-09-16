@@ -10,6 +10,9 @@ const SECTIONS = [
 
 const DISK_BARS = 6;
 const AMBER_SHARE = 0.7;
+const BASE_SECTION = "BASE ARCHITECTURE";
+const FILTER_ROWS = 15;
+const LABEL_FITS = 22;
 
 export function facetToken(item, key) {
     if (item.token) return item.token;
@@ -25,6 +28,13 @@ function selectFacet(app, item, key) {
     app.toggleToken(facetToken(item, key));
 }
 
+function facetTitle(item) {
+    const value = String(item.value ?? "");
+    const label = String(item.label || value);
+    if (label !== value) return `${label} (${value})`;
+    return label.length > LABEL_FITS ? label : null;
+}
+
 function facetRow(app, item, key) {
     const count = Number(item.count) || 0;
     return el(
@@ -34,7 +44,11 @@ function facetRow(app, item, key) {
             onClick: () => selectFacet(app, item, key)
         },
         el("span", { class: "facet-mark" }),
-        el("span", { class: `facet-label${count ? "" : " is-empty"}`, text: item.label || item.value }),
+        el("span", {
+            class: `facet-label${count ? "" : " is-empty"}`,
+            text: item.label || item.value,
+            title: facetTitle(item)
+        }),
         el("span", { class: "facet-count", text: count ? String(count) : "—" })
     );
 }
@@ -70,6 +84,29 @@ function diskPressure(pressure, nodeFacet) {
     );
 }
 
+function baseCapNote(facets, shown) {
+    const total = Number(facets.base_total) || 0;
+    if (total <= shown) return null;
+    return el("div", {
+        class: "rail-note",
+        text: `${shown} of ${total} — showing the most common`
+    });
+}
+
+function railFilter(rows) {
+    const input = el("input", {
+        class: "field rail-filter",
+        type: "text",
+        placeholder: "filter",
+        spellcheck: "false",
+        onInput: () => {
+            const needle = input.value.trim().toLowerCase();
+            for (const row of rows) row.node.hidden = !!needle && !row.label.includes(needle);
+        }
+    });
+    return input;
+}
+
 export function renderFacets(app) {
     const facets = app.state.facets || {};
     const blocks = SECTIONS.map((section) => {
@@ -77,11 +114,17 @@ export function renderFacets(app) {
             (facets[field] || []).map((item) => ({ item, key }))
         );
         if (!items.length) return null;
+        const rows = items.map(({ item, key }) => ({
+            node: facetRow(app, item, key),
+            label: String(item.label || item.value || "").toLowerCase()
+        }));
         return el(
             "div",
             { class: "rail-block" },
             el("div", { class: "rail-title", text: section.title }),
-            items.map(({ item, key }) => facetRow(app, item, key))
+            rows.length > FILTER_ROWS ? railFilter(rows) : null,
+            rows.map((row) => row.node),
+            section.title === BASE_SECTION ? baseCapNote(facets, items.length) : null
         );
     }).filter(Boolean);
     if (!blocks.length) {

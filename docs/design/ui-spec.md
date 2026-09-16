@@ -118,9 +118,19 @@ square mark + label + count (mono 12px, 3.5px 4px padding). SOURCE LAYOUT sits s
 ROLE and BASE ARCHITECTURE: it names the folder discovery filed the entry's repository under,
 the placement decision the tree already carries, so a file filed correctly but recognized by
 no tensor rule still says where it came from. Active facet: amber mark filled, `--panel2` row.
-Count `—` when zero. Below, SAVED SHELVES list (mono 11.5px, `--muted`, amber on hover,
-`›` at right). The proposal also shows a DISK PRESSURE mini bar chart with
-`311 GB reclaimable — 47 duplicate blobs`.
+Count `—` when zero. A row whose label the rail cannot show whole recovers it on hover: as
+`label (value)` whenever the two differ, and as the label alone when it is longer than the
+22 characters the column fits. A short label that is its own value carries no tooltip,
+because repeating it says nothing. BASE ARCHITECTURE prints `27 of 213 — showing the most
+common` (mono 11px, `--dim`) under its rows whenever the rail holds fewer bases than the
+result set does; a section of more than fifteen rows carries a filter field above them
+(mono 11.5px, full width) that shows and hides the rows already drawn and asks the server
+for nothing. Below, SAVED SHELVES list (mono 11.5px, `--muted`, amber on hover,
+count in `--dim` then `›` at right). The triage queue sorts first among the shelves and the
+SAVED SHELVES title carries its count, `SAVED SHELVES (25)`, so the number of artifacts
+waiting to be classified is on screen without opening anything; the title drops the count
+when no shelf named `triage queue` was counted. The proposal also shows a DISK PRESSURE
+mini bar chart with `311 GB reclaimable — 47 duplicate blobs`.
 
 Results header (`--panel`): `N ARTIFACTS · M NODES · SORT KEY ↑` at left, view tabs
 TABLE / CARDS (TREE and DISK are listed in the proposal, not built) at right.
@@ -268,10 +278,16 @@ Leading `~` forces fuzzy matching over everything indexed. Comma inside a value 
 | free text | substring over org, name, base, trigger words, role, node; `~` for fuzzy |
 
 Facets compute their counts with their own key removed from the query so a click never
-produces zero. Shelves in the prototype: `sdxl · lora · small` = `role:lora base:sdxl
-size:<400mb`, `flux workhorse` = `base:flux`, `quantised llm` = `role:llm fmt:gguf`,
-`cold + duplicate` = `dupe:true`, `triage queue` = `role:?`, `everything on laptop` =
-`node:laptop`.
+produces zero. Shelves in the prototype: `triage queue` = `role:?`, `sdxl · lora · small` =
+`role:lora base:sdxl size:<400mb`, `flux workhorse` = `base:flux`, `quantised llm` =
+`role:llm fmt:gguf`, `cold + duplicate` = `dupe:true`, `everything on laptop` =
+`node:laptop`, in that order.
+
+The SHELVES tab lists them in the same order, one row per shelf over the grid
+`220px minmax(0,1fr) 70px 90px 40px`, headed NAME, QUERY, COUNT, KIND and an unlabelled
+column for the delete glyph. COUNT is the shelf's own count, right-aligned and mono, `—`
+when the shelf was not counted; KIND reads `builtin` or `saved`, and only a saved shelf
+carries the `×`.
 
 ## Compatibility rule as prototyped
 

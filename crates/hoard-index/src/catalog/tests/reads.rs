@@ -701,8 +701,9 @@ fn an_any_base_answers_only_its_own_bucket() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn the_base_rail_holds_at_most_the_capped_buckets_and_counts_them_by_prefix() -> Result<()> {
+/// A catalog of 46 distinct bases: two families whose roots the rail has to add, and forty
+/// siblings no root joins, which together are more bases than the rail can hold.
+fn base_rail_fixture() -> Result<(TempDir, Catalog, usize)> {
     let directory = tempfile::tempdir()?;
     let config = IndexConfig {
         data_dir: directory.path().join("data"),
@@ -749,7 +750,12 @@ fn the_base_rail_holds_at_most_the_capped_buckets_and_counts_them_by_prefix() ->
         entries,
     )])?;
     catalog.rebuild_search(|_| {})?;
+    Ok((directory, catalog, seeded))
+}
 
+#[test]
+fn the_base_rail_holds_at_most_the_capped_buckets_and_counts_them_by_prefix() -> Result<()> {
+    let (_directory, catalog, seeded) = base_rail_fixture()?;
     let page = search(&catalog, "")?;
     assert_eq!(
         page.total, seeded as u64,
@@ -814,6 +820,80 @@ fn the_base_rail_holds_at_most_the_capped_buckets_and_counts_them_by_prefix() ->
         search(&catalog, "base:base35")?.total,
         1,
         "a base the rail does not show still answers its own query"
+    );
+    Ok(())
+}
+
+/// One query counted both ways: the full path, which tallies the rail and cuts a page, and
+/// the total on its own.
+fn totals_agree(catalog: &Catalog, raw: &str) -> Result<u64> {
+    let context = catalog.compile_context(raw, jiff::Timestamp::now(), Vec::new())?;
+    let page = catalog.query(QueryRequest {
+        raw,
+        sort: SortSpec::default(),
+        limit: 50,
+        offset: 0,
+        context: &context,
+    })?;
+    let counted = catalog.total(QueryRequest {
+        raw,
+        sort: SortSpec::default(),
+        limit: 0,
+        offset: 0,
+        context: &context,
+    })?;
+    assert_eq!(
+        counted, page.total,
+        "{raw:?} counts the same with the facet rail and without it"
+    );
+    Ok(counted)
+}
+
+#[test]
+fn a_total_counts_what_the_page_path_counts_without_answering_a_page() -> Result<()> {
+    let (_directory, catalog, seeded) = base_rail_fixture()?;
+    assert_eq!(
+        totals_agree(&catalog, "")?,
+        seeded as u64,
+        "the empty query counts every artifact, over more bases than the rail can show"
+    );
+    for raw in ["base:sd", "base:base35", "role:lora", "role:ds", "size:>1"] {
+        totals_agree(&catalog, raw)?;
+    }
+    let (_mirrored, collapsing) = paging_fixture(40)?;
+    assert_eq!(
+        totals_agree(&collapsing, "")?,
+        40,
+        "the collapsed path counts artifacts, not the entries mirrored onto a second node"
+    );
+    for raw in ["node:self", "node:attic", "state:local"] {
+        totals_agree(&collapsing, raw)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn the_base_rail_reports_how_many_bases_it_could_not_show() -> Result<()> {
+    let (_directory, catalog, _seeded) = base_rail_fixture()?;
+    let page = search(&catalog, "")?;
+    assert_eq!(page.facets.base.len(), 32, "the rail is capped");
+    assert_eq!(
+        page.facets.base_total, 46,
+        "every distinct base is counted before the cap"
+    );
+    assert!(
+        page.facets.base_total > page.facets.base.len() as u64,
+        "the rail knows it is hiding the rest"
+    );
+    assert_eq!(
+        search(&catalog, "base:sd")?.facets.base_total,
+        46,
+        "the total is counted over the set the base key does not narrow, like the buckets"
+    );
+    assert_eq!(
+        search(&catalog, "role:ds")?.facets.base_total,
+        0,
+        "a result set holding no base hides none"
     );
     Ok(())
 }
@@ -1076,6 +1156,134 @@ fn shelves_settings_and_noise_live_in_the_catalog_and_noise_reaches_the_scan() -
     );
     assert!(catalog.remove_noise(id)?);
     assert!(!catalog.is_noise(&gone)?);
+    Ok(())
+}
+
+#[test]
+fn the_triage_queue_leads_the_seeded_shelves() -> Result<()> {
+    let (_directory, catalog) = fixture()?;
+    let shelves = catalog.list_shelves()?;
+    let triage = shelves
+        .iter()
+        .find(|shelf| shelf.name == "triage queue")
+        .ok_or_else(|| IndexError::Catalog("the triage queue is seeded".into()))?;
+    assert_eq!(triage.position, 0);
+    assert_eq!(
+        shelves.first().map(|shelf| shelf.name.as_str()),
+        Some("triage queue"),
+        "the rail and the SHELVES tab both draw it first"
+    );
+    catalog.seed_builtin_shelves()?;
+    assert_eq!(
+        catalog
+            .list_shelves()?
+            .first()
+            .map(|shelf| shelf.name.as_str()),
+        Some("triage queue"),
+        "re-seeding keeps it there"
+    );
+    Ok(())
+}
+
+/// A catalog holding three artifacts no rule classified and two flux LoRAs, which is what
+/// two of the seeded shelves answer with and every other one answers nothing with.
+fn shelf_count_fixture() -> Result<(TempDir, Catalog)> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let mut repositories = Vec::with_capacity(5);
+    for index in 0..3_u128 {
+        let artifact = seeded_artifact(
+            0x7100 + index,
+            &format!("mystery-{index}"),
+            None,
+            Artifact {
+                role: Role::Unk,
+                role_confidence: 0.2,
+                ..seeded_facts()
+            },
+        );
+        repositories.push(seeded_revision(
+            seeded_repo(&format!("misc/mystery-{index}"), RepoType::Models),
+            0x71 + index as u8,
+            vec![seeded_entry(
+                &format!("mystery-{index}.bin"),
+                1_024,
+                Some(artifact),
+            )],
+        ));
+    }
+    for index in 0..2_u128 {
+        let artifact = seeded_artifact(
+            0x7200 + index,
+            &format!("flux-lora-{index}"),
+            Some("kohya"),
+            Artifact {
+                role: Role::Lora,
+                base: Base::new("flux"),
+                base_label: Some("flux".to_owned()),
+                ..seeded_facts()
+            },
+        );
+        repositories.push(seeded_revision(
+            seeded_repo(&format!("kohya/flux-lora-{index}"), RepoType::Models),
+            0x81 + index as u8,
+            vec![seeded_entry(
+                &format!("flux-lora-{index}.safetensors"),
+                2_048,
+                Some(artifact),
+            )],
+        ));
+    }
+    catalog.seed(&repositories)?;
+    catalog.rebuild_search(|_| {})?;
+    Ok((directory, catalog))
+}
+
+#[test]
+fn a_shelf_reports_how_many_artifacts_its_query_answers() -> Result<()> {
+    let (_directory, catalog) = shelf_count_fixture()?;
+    let counted = catalog.shelves_with_counts(jiff::Timestamp::now())?;
+    let count_of = |counted: &[(ShelfRecord, Option<u64>)], name: &str| {
+        counted
+            .iter()
+            .find(|(shelf, _)| shelf.name == name)
+            .map(|(_, count)| *count)
+    };
+    assert_eq!(counted.len(), 6, "every shelf is counted");
+    assert_eq!(
+        count_of(&counted, "triage queue"),
+        Some(Some(3)),
+        "the triage queue answers the three unclassified artifacts"
+    );
+    assert_eq!(count_of(&counted, "flux workhorse"), Some(Some(2)));
+    assert_eq!(
+        count_of(&counted, "everything on laptop"),
+        Some(Some(0)),
+        "a shelf naming a node this catalog does not hold counts nothing"
+    );
+
+    let flux = counted
+        .iter()
+        .find(|(shelf, _)| shelf.name == "flux workhorse")
+        .map(|(shelf, _)| shelf.id)
+        .ok_or_else(|| IndexError::Catalog("the flux shelf is seeded".into()))?;
+    catalog.update_shelf(flux, "flux workhorse", "shelf:nowhere", 1)?;
+    let recounted = catalog.shelves_with_counts(jiff::Timestamp::now())?;
+    assert_eq!(
+        count_of(&recounted, "flux workhorse"),
+        Some(None),
+        "a shelf whose query does not compile reports no count"
+    );
+    assert_eq!(
+        count_of(&recounted, "triage queue"),
+        Some(Some(3)),
+        "and its siblings still report numbers"
+    );
     Ok(())
 }
 

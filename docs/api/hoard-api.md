@@ -27,7 +27,8 @@ parquet arrow jsonl csv readme config unknown`.
                 "token": "role:lora", "query": "role:lora" } ],
     "layout": [], "base": [], "format": [], "precision": [], "node": [],
     "disk_pressure": { "reclaimable_bytes": 333000000000, "duplicate_blobs": 47,
-                        "label": "310.0 GB reclaimable — 47 duplicate blobs" } },
+                        "label": "310.0 GB reclaimable — 47 duplicate blobs" },
+    "base_total": 213 },
   "rows": [ {
     "artifact_id": "a_01H...", "blob_sha256": "9f2c...41ab", "role": "lora", "sub_role": null,
     "role_confidence": 0.98, "org": "kohya", "name": "film-grain-35mm", "base": "sdxl 1.0",
@@ -56,6 +57,11 @@ the versions under it. The 32 are the largest by that count among the most popul
 exact term together with the family roots those bases extend, so a root that few artifacts
 carry exactly but many extend is on the rail. A base outside the 32 is not shown and is not
 marked active, and a query naming it still answers.
+
+`facets.base_total` is how many distinct bases the result set holds by exact term, counted
+before the rail added any family root and before it was cut to 32, so a rail showing fewer
+buckets than `base_total` is hiding the rest and can say so. It answers only for `base`;
+no other dimension is capped.
 
 `shard_count` is how many files the model spans: a checkpoint split into
 `model-00001-of-00040.safetensors` and its siblings is one row whose `size` is the whole
@@ -137,6 +143,14 @@ short. The server logs the window at `debug`; nothing in the response names it.
 `GET /api/v1/shelves`, `POST { "name", "query" }`, `PUT /{id}`, `DELETE /{id}`. Seeded
 shelves carry `"builtin": true`; `name` may not be empty (400), and deleting a builtin
 shelf is 409, not 404 or 400.
+
+A listed shelf carries `count`, how many artifacts its query answers: the same number
+`GET /api/v1/search` reports as `total` for that query, counted without the facet rail and
+without a page. `0` means the query answers nothing. `null` means it was not counted, for
+any reason - the query does not compile, the search index is not built yet, the catalog
+refused it - or because the shelf came back from a write, which answers with the row it
+wrote rather than re-running its query. One shelf that cannot be counted never stops the
+rest being counted.
 
 ## Loadouts
 

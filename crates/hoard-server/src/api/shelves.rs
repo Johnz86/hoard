@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use hoard_core::ShelfId;
@@ -13,7 +14,10 @@ use crate::api::common::{authorize, blocking};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
-/// A shelf as the rail and the SHELVES tab show it.
+/// A shelf as the rail and the SHELVES tab show it. `count` is how many artifacts the
+/// shelf's query answers, and null when it was not counted, whatever the reason: the
+/// listing counts every shelf it can, and a write answers with the row it wrote rather than
+/// re-running its query.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ShelfView {
     pub id: ShelfId,
@@ -21,17 +25,24 @@ pub struct ShelfView {
     pub query: String,
     pub builtin: bool,
     pub position: i64,
+    pub count: Option<u64>,
 }
 
-impl From<ShelfRecord> for ShelfView {
-    fn from(row: ShelfRecord) -> Self {
+impl ShelfView {
+    fn counted(row: ShelfRecord, count: Option<u64>) -> Self {
         Self {
             id: row.id,
             name: row.name,
             query: row.query,
             builtin: row.builtin,
             position: row.position,
+            count,
         }
+    }
+
+    /// A shelf a write returned, which carries no count because nothing counted it.
+    fn written(row: ShelfRecord) -> Self {
+        Self::counted(row, None)
     }
 }
 
@@ -63,9 +74,9 @@ pub async fn list(State(state): State<AppState>) -> ApiResult<Json<Vec<ShelfView
     let catalog = Arc::clone(state.catalog());
     let rows = blocking(move || {
         Ok(catalog
-            .list_shelves()?
+            .shelves_with_counts(Timestamp::now())?
             .into_iter()
-            .map(ShelfView::from)
+            .map(|(row, count)| ShelfView::counted(row, count))
             .collect::<Vec<ShelfView>>())
     })
     .await?;
@@ -86,7 +97,7 @@ pub async fn create(
             Some(position) => position,
             None => catalog.list_shelves()?.len() as i64,
         };
-        Ok(ShelfView::from(
+        Ok(ShelfView::written(
             catalog.create_shelf(&name, &query, position)?,
         ))
     })
@@ -108,7 +119,7 @@ pub async fn update(
     let view = blocking(move || {
         let existing = require_shelf(&catalog, id)?;
         let position = body.position.unwrap_or(existing.position);
-        Ok(ShelfView::from(
+        Ok(ShelfView::written(
             catalog.update_shelf(id, &name, &query, position)?,
         ))
     })

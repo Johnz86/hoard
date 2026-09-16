@@ -13,8 +13,10 @@ use crate::error::{IndexError, Result};
 use super::Catalog;
 use super::models::{Node, Noise, NoiseKey, Projection, ProjectionKey, Setting, Shelf, ShelfKey};
 
-/// The shelves hoard ships with, in the order the rail lists them.
+/// The shelves hoard ships with, in the order the rail lists them. The triage queue leads,
+/// because what a node has not classified is the one shelf whose emptiness is the goal.
 const BUILTIN_SHELVES: [(&str, &str); 6] = [
+    ("triage queue", "role:?"),
     (
         "sdxl \u{b7} lora \u{b7} small",
         "role:lora base:sdxl size:<400mb",
@@ -22,7 +24,6 @@ const BUILTIN_SHELVES: [(&str, &str); 6] = [
     ("flux workhorse", "base:flux"),
     ("quantised llm", "role:llm fmt:gguf"),
     ("cold + duplicate", "dupe:true"),
-    ("triage queue", "role:?"),
     ("everything on laptop", "node:laptop"),
 ];
 

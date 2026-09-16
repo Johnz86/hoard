@@ -1,6 +1,9 @@
 import * as api from "./api.js";
 import { el, errorPanel, loadingPanel, toast } from "./dom.js";
 
+const TRIAGE_SHELF = "triage queue";
+const SHELF_RAIL_TITLE = "SAVED SHELVES";
+
 export async function loadShelves(app) {
     try {
         const list = await api.shelves();
@@ -12,18 +15,29 @@ export async function loadShelves(app) {
     app.render();
 }
 
+function shelfCount(shelf) {
+    return typeof shelf.count === "number" ? String(shelf.count) : "—";
+}
+
+function shelfRailTitle(shelves) {
+    const triage = shelves.find((shelf) => shelf.name === TRIAGE_SHELF);
+    if (!triage || typeof triage.count !== "number") return SHELF_RAIL_TITLE;
+    return `${SHELF_RAIL_TITLE} (${triage.count})`;
+}
+
 export function renderShelfRail(app) {
     const shelves = app.state.shelves || [];
     return el(
         "div",
         { class: "rail-block rail-shelves" },
-        el("div", { class: "rail-title", text: "SAVED SHELVES" }),
+        el("div", { class: "rail-title", text: shelfRailTitle(shelves) }),
         shelves.length
             ? shelves.map((shelf) =>
                   el(
                       "div",
                       { class: "shelf-row", onClick: () => app.commitQuery(shelf.query, { echo: true }) },
                       el("span", { class: "shelf-name", text: shelf.name }),
+                      el("span", { class: "shelf-count", text: shelfCount(shelf) }),
                       el("span", { class: "shelf-chevron", text: "›" })
                   )
               )
@@ -49,6 +63,7 @@ export function renderShelvesView(app) {
             { class: "panel-head shelf-grid" },
             el("span", { text: "NAME" }),
             el("span", { text: "QUERY" }),
+            el("span", { class: "align-right", text: "COUNT" }),
             el("span", { text: "KIND" }),
             el("span", { class: "align-right", text: "" })
         ),
@@ -62,6 +77,7 @@ export function renderShelvesView(app) {
                     onClick: () => app.commitQuery(shelf.query, { echo: true, goIndex: true })
                 }),
                 el("span", { class: "mono-dim", text: shelf.query }),
+                el("span", { class: "mono-dim align-right", text: shelfCount(shelf) }),
                 el("span", { class: "mono-dim", text: shelf.builtin ? "builtin" : "saved" }),
                 el(
                     "span",

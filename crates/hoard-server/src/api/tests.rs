@@ -577,6 +577,14 @@ async fn search_answers_the_documented_shape() {
             "{dimension} is a list"
         );
     }
+    let base_total = body["facets"]["base_total"]
+        .as_u64()
+        .expect("the rail says how many bases it counted");
+    assert_eq!(
+        base_total,
+        body["facets"]["base"].as_array().expect("base").len() as u64,
+        "this world holds fewer bases than the rail caps at, so it hides none"
+    );
 }
 
 /// A safetensors header with one tensor, which is enough for a scan to make an artifact of
@@ -1349,6 +1357,14 @@ async fn shelves_are_seeded_created_updated_and_deleted() {
     let rows = seeded_shelves.as_array().expect("shelves");
     assert!(!rows.is_empty());
     assert!(rows.iter().all(|shelf| shelf["builtin"] == json!(true)));
+    assert!(
+        rows.iter().all(|shelf| shelf["count"].is_u64()),
+        "every listed shelf reports how many artifacts its query answers: {rows:?}"
+    );
+    assert_eq!(
+        rows[0]["name"], "triage queue",
+        "the triage queue leads the listing"
+    );
 
     let created = post(
         &world.state,

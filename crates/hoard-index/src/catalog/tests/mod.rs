@@ -47,7 +47,7 @@ use super::{
     Catalog, Dedupe, DigestApplied, EntryDetail, FORMAT_FILE, FORMAT_VERSION, HashReport,
     JobProgress, JobState, MIRROR_SOURCE, NewProjection, PullMark, PullSlot, PulledFile, QueryPage,
     QueryRequest, RefreshReport, RemoteEntry, RepositoryDetail, RepositoryFilter, RescanReport,
-    RescanScope, ServedFile, Stop, Totals, TriageItem, UsageEvent, models, query,
+    RescanScope, ServedFile, ShelfRecord, Stop, Totals, TriageItem, UsageEvent, models, query,
 };
 
 fn source(path: &Path, name: &str) -> SourceConfig {

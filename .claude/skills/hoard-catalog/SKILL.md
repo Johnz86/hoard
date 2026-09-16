@@ -39,7 +39,8 @@ One line per file in `crates/hoard-index/src/catalog/`:
 - `search/schema.rs` `Fields`, the keyword and column constants, the document one entry writes.
 - `search/build.rs` the rebuild, the metered writer, per-entry documents, the directory publish.
 - `search/refresh.rs` `refresh_search`, the change log and its cursor, the published directory.
-- `search/answer.rs` a query from request to page: the path, the facet rail, the rows.
+- `search/answer.rs` a query from request to page: the path, the facet rail, the rows, a
+  count-only path with no rail (`Catalog::total`), and the shelf listing's counts.
 - `search/inspect.rs` the segment, delete and document counts the tests and diagnostics read.
 - `search/paging.rs` the page window, the heap or sampled selection and its boundaries.
 - `search/tally.rs` the facet tallies per segment and the base rail buckets.

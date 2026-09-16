@@ -1,4 +1,6 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::RwLockReadGuard;
 
 use tantivy::Searcher;
 use tantivy::collector::Count;
@@ -14,10 +16,10 @@ use crate::search::{
     TokenKind, parse,
 };
 
-use crate::catalog::Catalog;
-use crate::catalog::models::{ArtifactRecord, Entry, Repository, Revision, Source};
+use crate::catalog::models::{ArtifactRecord, Entry, Manifest, Repository, Revision, Source};
 use crate::catalog::query::{self, QueryFields};
 use crate::catalog::usage::last_used_in;
+use crate::catalog::{Catalog, OpenIndex, ShelfRecord};
 use crate::config::SourceKind;
 
 use super::collapse::{Retained, SegmentStrings};
@@ -46,21 +48,28 @@ impl Catalog {
         now: jiff::Timestamp,
         shelves: Vec<(String, String)>,
     ) -> Result<CompileContext> {
-        let mut context = CompileContext::new(now)
+        let context = CompileContext::new(now)
             .with_local_node(self.manifest()?.node)
             .with_shelves(shelves);
+        Ok(match self.compat_of(raw, now)? {
+            Some(target) => context.with_compat(target),
+            None => context,
+        })
+    }
+
+    /// The `compat:` target one query names, if it names one at all. It is the only part of
+    /// a compile context that depends on the query text, which is what lets several queries
+    /// share one context.
+    fn compat_of(&self, raw: &str, now: jiff::Timestamp) -> Result<Option<CompatTarget>> {
         let parsed = parse(raw);
         let Some(token) = parsed
             .tokens
             .iter()
             .find(|token| token.kind == TokenKind::Compat)
         else {
-            return Ok(context);
+            return Ok(None);
         };
-        if let Some(target) = self.compat_target(&token.normalized, now)? {
-            context = context.with_compat(target);
-        }
-        Ok(context)
+        self.compat_target(&token.normalized, now)
     }
 
     /// What a `compat:` value names, because the rule reads a role and a base rather than a
@@ -98,6 +107,87 @@ impl Catalog {
             false => QueryPath::Primary,
         };
         Ok(self.answer(request, parsed, path, Paging::DEFAULT)?.0)
+    }
+
+    /// How many artifacts one query answers, and nothing else: the same number
+    /// [`Catalog::query`] reports as `total`, found without the facet rail, the page or a
+    /// single row assembled, because a count needs none of them.
+    pub fn total(&self, request: QueryRequest<'_>) -> Result<u64> {
+        let parsed = parse(request.raw);
+        let path = match query::needs_collapse(&parsed.tokens, request.context, request.sort.key)? {
+            true => QueryPath::Collapse,
+            false => QueryPath::Primary,
+        };
+        let (guard, _) = self.published()?;
+        let open = opened(&guard)?;
+        let (_, fields) = Fields::build();
+        let bound = QueryFields {
+            fields: &fields,
+            context: request.context,
+        };
+        let searcher = open.reader.searcher();
+        let compiled = query::compile(&parsed.tokens, None, &bound)?;
+        let restricted = path.restrict(&fields, compiled);
+        Selecting::of(
+            &searcher,
+            restricted.as_ref(),
+            path,
+            &request,
+            Paging::DEFAULT,
+        )
+        .total()
+    }
+
+    /// Every shelf beside how many artifacts its query answers, counted the way
+    /// [`Catalog::total`] counts one. A shelf whose query this catalog cannot answer reports
+    /// `None` rather than failing the whole list.
+    pub fn shelves_with_counts(
+        &self,
+        now: jiff::Timestamp,
+    ) -> Result<Vec<(ShelfRecord, Option<u64>)>> {
+        let shelves = self.list_shelves()?;
+        let shared = CompileContext::new(now)
+            .with_local_node(self.manifest()?.node)
+            .with_shelves(
+                shelves
+                    .iter()
+                    .map(|shelf| (shelf.name.clone(), shelf.query.clone()))
+                    .collect(),
+            );
+        Ok(shelves
+            .into_iter()
+            .map(|shelf| {
+                let counted = match self.shelf_total(&shelf.query, now, &shared) {
+                    Ok(total) => Some(total),
+                    Err(error) => {
+                        tracing::debug!(
+                            shelf = shelf.name,
+                            %error,
+                            "a shelf's query does not answer; it reports no count"
+                        );
+                        None
+                    }
+                };
+                (shelf, counted)
+            })
+            .collect())
+    }
+
+    /// One shelf's total against the context every shelf shares. The local node and the
+    /// shelf list are the same for all of them, so they are built once; only a `compat:`
+    /// token, which resolves by querying this catalog, needs a context of its own.
+    fn shelf_total(&self, raw: &str, now: jiff::Timestamp, shared: &CompileContext) -> Result<u64> {
+        let context = match self.compat_of(raw, now)? {
+            Some(target) => Cow::Owned(shared.clone().with_compat(target)),
+            None => Cow::Borrowed(shared),
+        };
+        self.total(QueryRequest {
+            raw,
+            sort: SortSpec::default(),
+            limit: 0,
+            offset: 0,
+            context: &context,
+        })
     }
 
     /// The same answer forced onto one path, so the two can be compared on a query either
@@ -142,21 +232,9 @@ impl Catalog {
                 "page limit must be at most {PAGE_LIMIT}"
             )));
         }
-        let manifest = self.manifest()?;
-        let directory = manifest
-            .search_directory
-            .as_deref()
-            .ok_or_else(|| IndexError::Catalog("search index needs rebuilding".into()))?;
+        let (guard, manifest) = self.published()?;
         let stale = self.first_change_after(manifest.search_seq)?;
-        if !directory.starts_with("search-v1-") || directory.contains(['/', '\\']) {
-            return Err(IndexError::Catalog(
-                "invalid search directory in manifest".into(),
-            ));
-        }
-        let guard = self.open_index(directory)?;
-        let open = guard
-            .as_ref()
-            .ok_or_else(|| IndexError::Catalog("search index was closed".into()))?;
+        let open = opened(&guard)?;
         let (_, fields) = Fields::build();
         let bound = QueryFields {
             fields: &fields,
@@ -197,6 +275,24 @@ impl Catalog {
         ))
     }
 
+    /// The index this catalog answers from, beside the manifest that named it. A catalog
+    /// with no published directory, or one whose manifest names something that is not a
+    /// published directory, is refused here rather than by whatever reads it.
+    fn published(&self) -> Result<(RwLockReadGuard<'_, Option<OpenIndex>>, Manifest)> {
+        let manifest = self.manifest()?;
+        let directory = manifest
+            .search_directory
+            .as_deref()
+            .ok_or_else(|| IndexError::Catalog("search index needs rebuilding".into()))?;
+        if !directory.starts_with("search-v1-") || directory.contains(['/', '\\']) {
+            return Err(IndexError::Catalog(
+                "invalid search directory in manifest".into(),
+            ));
+        }
+        let guard = self.open_index(directory)?;
+        Ok((guard, manifest))
+    }
+
     /// Each dimension counted over the set its own key does not narrow, which is what keeps
     /// a facet click from reducing the rail it was clicked in to one bucket.
     ///
@@ -206,6 +302,7 @@ impl Catalog {
     fn facets(&self, pass: &FacetPass<'_>) -> Result<Facets> {
         let mut dimensions: [Vec<FacetBucket>; FACET_DIMENSIONS.len()] =
             std::array::from_fn(|_| Vec::new());
+        let mut base_total = 0_u64;
         for (index, (key, _)) in FACET_DIMENSIONS.iter().enumerate() {
             let excluded = query::compile(&pass.parsed.tokens, Some(key), pass.bound)?;
             let narrowed = match pass.parsed.tokens_with_key(key).next() {
@@ -214,6 +311,7 @@ impl Catalog {
             };
             let mut buckets = count_buckets(narrowed.as_ref().unwrap_or(pass.summary), index)?;
             if index == BASE_DIMENSION {
+                base_total = buckets.len() as u64;
                 buckets = base_candidates(buckets);
                 for bucket in &mut buckets {
                     let scoped = BooleanQuery::intersection(vec![
@@ -236,6 +334,7 @@ impl Catalog {
             precision,
             node,
             disk_pressure: self.disk_pressure()?,
+            base_total,
         };
         facets.mark_query(pass.parsed);
         Ok(facets)
@@ -299,6 +398,13 @@ impl Catalog {
         }
         Ok((rows, skipped))
     }
+}
+
+/// The index a guard holds open, or the refusal a guard closed under it earns.
+fn opened<'a>(guard: &'a RwLockReadGuard<'_, Option<OpenIndex>>) -> Result<&'a OpenIndex> {
+    guard
+        .as_ref()
+        .ok_or_else(|| IndexError::Catalog("search index was closed".into()))
 }
 
 /// Everything one indexed or returned row needs, with the records an `Entry` only points at
