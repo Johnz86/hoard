@@ -843,9 +843,9 @@ fn mixed_size_hashing() {
     let mut progress = Vec::with_capacity(256);
     let interrupted = measure(|| {
         catalog
-            .hash_pending_until(&config, &stop, |count| {
-                progress.push((count, started.elapsed()));
-                if count >= 64 {
+            .hash_pending_until(&config, &stop, |update| {
+                progress.push((update.files_done, started.elapsed()));
+                if update.files_done >= 64 {
                     stop.store(true, Ordering::Relaxed);
                 }
             })

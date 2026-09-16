@@ -12,7 +12,9 @@ use crate::error::IndexError;
 pub enum HashPolicy {
     /// Hash every candidate during the scan, before it is reported as indexed.
     Now,
-    /// Hash in a background rayon pool at the lowest priority.
+    /// Leave every digest the scan owes and fill them in afterwards, in a pass sized by
+    /// [`IndexConfig::hash_workers`]. The scan reports what it found before any file is read
+    /// whole; the hashing that follows runs at ordinary priority, exactly as `Now` does.
     #[default]
     Background,
     /// Never hash; `resolve` of a loose file stays 404 because clients verify ETags.
@@ -106,7 +108,8 @@ pub struct IndexConfig {
     /// reconciliation off and leaves the watcher driven by events alone.
     #[serde(default = "default_reconcile_interval")]
     pub reconcile_interval_secs: u64,
-    /// How many files a hashing pass reads at once. Zero means the rayon pool's size.
+    /// How many files a hashing pass reads at once. Zero means the count
+    /// [`IndexConfig::hash_workers`] derives from the rayon pool's size.
     #[serde(default)]
     pub hash_threads: usize,
     #[serde(default, rename = "sources")]
@@ -172,15 +175,23 @@ impl IndexConfig {
         }
     }
 
-    /// The worker count a hashing pass runs with: `hash_threads`, or the rayon pool's size
-    /// when it is zero, clamped to between 1 and 256 either way.
+    /// The worker count a hashing pass runs with: `hash_threads`, or a quarter of the rayon
+    /// pool's size held between 2 and 8 and never above the pool itself when it is zero,
+    /// clamped to between 1 and 256 either way. The default reads a disk fast without
+    /// turning a disk-bound pass into a CPU-bound one; an operator who wants every core
+    /// sets `hash_threads` explicitly.
     pub fn hash_workers(&self) -> usize {
         match self.hash_threads {
-            0 => rayon::current_num_threads(),
+            0 => automatic_workers(rayon::current_num_threads()),
             threads => threads,
         }
         .clamp(1, 256)
     }
+}
+
+fn automatic_workers(pool: usize) -> usize {
+    let pool = pool.max(1);
+    (pool / 4).clamp(2, 8).min(pool)
 }
 
 /// The source a path belongs to, longest root first so nested roots resolve to the inner
@@ -222,11 +233,33 @@ mod tests {
     }
 
     #[test]
-    fn hash_threads_of_zero_is_the_rayon_pools_size_and_any_other_value_is_itself() {
+    fn hash_threads_of_zero_is_capped_to_a_quarter_of_the_pool_between_two_and_eight() {
+        let pool = rayon::current_num_threads();
         assert_eq!(
             IndexConfig::default().hash_workers(),
-            rayon::current_num_threads().clamp(1, 256)
+            automatic_workers(pool)
         );
+        assert_eq!(automatic_workers(1), 1, "one core keeps one worker");
+        assert_eq!(automatic_workers(2), 2);
+        assert_eq!(automatic_workers(4), 2, "the floor is two, not a quarter");
+        assert_eq!(automatic_workers(20), 5);
+        assert_eq!(automatic_workers(64), 8, "the ceiling is eight");
+        assert_eq!(
+            automatic_workers(0),
+            1,
+            "a pool that reports nothing is one"
+        );
+
+        let parsed: IndexConfig =
+            toml::from_str("hash_policy = \"never\"\n").expect("an [index] section parses");
+        assert_eq!(
+            parsed.hash_threads, 0,
+            "a config that names no hash_threads gets the serde default"
+        );
+    }
+
+    #[test]
+    fn hash_threads_set_explicitly_is_itself_up_to_the_cap() {
         let pinned = IndexConfig {
             hash_threads: 3,
             ..IndexConfig::default()
@@ -247,13 +280,6 @@ mod tests {
             huge.hash_workers(),
             256,
             "the worker count is capped at 256"
-        );
-
-        let parsed: IndexConfig =
-            toml::from_str("hash_policy = \"never\"\n").expect("an [index] section parses");
-        assert_eq!(
-            parsed.hash_threads, 0,
-            "a config that names no hash_threads gets the serde default"
         );
     }
 

@@ -8,6 +8,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -15,7 +16,7 @@ use tokio::task::JoinHandle;
 
 use hoard_core::JobId;
 
-use crate::catalog::{Catalog, JobProgress, RescanReport, RescanScope, Stop};
+use crate::catalog::{Catalog, HashProgress, JobProgress, RescanReport, RescanScope, Stop};
 use crate::config::{HashPolicy, IndexConfig};
 use crate::error::{IndexError, Result};
 
@@ -27,6 +28,13 @@ const INTERRUPTED: &str = "interrupted by shutdown; resumes on the next scan";
 
 /// What a job that never started carries when the closing lane drops it.
 const DROPPED: &str = "dropped when the lane closed; resumes on the next scan";
+
+/// The phase a job carries while its files are read for their content hashes.
+const HASHING: &str = "hashing";
+
+/// How often the hashing phase is allowed to write its job row. Every write is a committed
+/// transaction, and the pass reports each file it hands to a worker.
+const JOB_UPDATE_EVERY: Duration = Duration::from_millis(250);
 
 /// Who asked for a scan, which decides how it is reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,9 +337,19 @@ fn run_scan(
     let report = catalog.rescan_until(config, item.hash, scope, stop, |_, _| {})?;
     let hashing = match (item.hash, report.interrupted) {
         (HashPolicy::Now | HashPolicy::Background, false) => {
-            phase(catalog, item.job, "hashing")?;
+            phase(catalog, item.job, HASHING)?;
+            let mut written = Instant::now();
+            let mut finished = false;
             catalog
-                .hash_pending_until(config, stop, |_| {})?
+                .hash_pending_until(config, stop, |update| {
+                    let due = written.elapsed() >= JOB_UPDATE_EVERY
+                        || (!finished && update.files_done >= update.files_total);
+                    if due {
+                        written = Instant::now();
+                        finished = update.files_done >= update.files_total;
+                        hashing_progress(catalog, item.job, update);
+                    }
+                })?
                 .interrupted
         }
         (HashPolicy::Now | HashPolicy::Background, true) | (HashPolicy::Never, _) => false,
@@ -362,6 +380,22 @@ fn phase(catalog: &Catalog, job: JobId, phase: &str) -> Result<()> {
             ..JobProgress::default()
         },
     )
+}
+
+fn hashing_progress(catalog: &Catalog, job: JobId, update: HashProgress) {
+    let written = catalog.update_job(
+        job,
+        &JobProgress {
+            phase: Some(HASHING.to_owned()),
+            progress: (update.files_done as f32 / update.files_total.max(1) as f32).min(1.0),
+            bytes: update.bytes_done,
+            total: None,
+            rate_bps: update.rate_bps,
+        },
+    );
+    if let Err(error) = written {
+        tracing::error!(%job, %error, "the hashing job row could not be updated");
+    }
 }
 
 fn narrowed(config: &IndexConfig, sources: Option<&BTreeSet<String>>) -> IndexConfig {
@@ -537,6 +571,65 @@ mod tests {
         catalog
             .job(job)?
             .ok_or_else(|| IndexError::Catalog(format!("job {job} was not written")))
+    }
+
+    #[test]
+    fn a_hashing_update_leaves_the_job_row_naming_its_phase_and_fraction() -> Result<()> {
+        let (_directory, catalog, _config) = world()?;
+        let job = catalog.create_job(SCAN_KIND, None)?;
+
+        hashing_progress(
+            &catalog,
+            job,
+            HashProgress {
+                files_done: 3,
+                files_total: 4,
+                bytes_done: 4096,
+                rate_bps: Some(512),
+            },
+        );
+
+        let record = settled(&catalog, job)?;
+        assert_eq!(record.phase.as_deref(), Some(HASHING));
+        assert_eq!(record.progress, 0.75);
+        assert_eq!(record.bytes, 4096);
+        assert_eq!(record.rate_bps, Some(512));
+        assert_eq!(record.total, None, "no byte total is known this wave");
+        assert_eq!(record.state, JobState::Running);
+
+        hashing_progress(
+            &catalog,
+            job,
+            HashProgress {
+                files_done: 9,
+                files_total: 4,
+                bytes_done: 8192,
+                rate_bps: None,
+            },
+        );
+
+        let over = settled(&catalog, job)?;
+        assert_eq!(
+            over.progress, 1.0,
+            "a pass that finds more files than it was owed still reports a full fraction"
+        );
+        assert_eq!(
+            over.rate_bps, None,
+            "a tick with no rate clears the last one"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_hashing_update_of_nothing_owed_reports_no_fraction_rather_than_dividing_by_zero()
+    -> Result<()> {
+        let (_directory, catalog, _config) = world()?;
+        let job = catalog.create_job(SCAN_KIND, None)?;
+
+        hashing_progress(&catalog, job, HashProgress::default());
+
+        assert_eq!(settled(&catalog, job)?.progress, 0.0);
+        Ok(())
     }
 
     #[test]

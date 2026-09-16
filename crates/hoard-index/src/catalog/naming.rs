@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use hoard_core::{GitSha1, RepoId, Sha256};
 
@@ -182,13 +182,15 @@ pub(super) fn inference_path(root_path: &Path, rel_path: &str, abs_path: Option<
 }
 
 /// The hashes one file owes, or nothing when `stop` was raised while it was being read.
+/// `bytes` is raised by what each buffer of the file held as it is read.
 pub(super) fn content_hashes(
     path: &Path,
     size: u64,
     threshold: u64,
     stop: &AtomicBool,
+    bytes: &AtomicU64,
 ) -> Result<Option<(Sha256, Option<GitSha1>)>> {
-    hash::content_digests(path, size < threshold, stop)
+    hash::content_digests(path, size < threshold, stop, bytes)
 }
 
 #[cfg(test)]

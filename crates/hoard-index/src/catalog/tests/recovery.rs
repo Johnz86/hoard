@@ -91,7 +91,7 @@ fn interrupt<T>(
     catalog_dir: &Path,
     snapshot: &Path,
     at: usize,
-    stage: impl FnOnce(&mut dyn FnMut()) -> Result<T>,
+    stage: impl FnOnce(&mut (dyn FnMut() + Send)) -> Result<T>,
 ) -> String {
     let mut calls = 0_usize;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {

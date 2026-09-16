@@ -285,6 +285,124 @@ fn a_file_that_blocks_holds_no_other_file_back() -> Result<()> {
 }
 
 #[test]
+fn hash_pending_until_reports_progress_before_a_large_file_finishes() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let empty = directory.path().join("empty");
+    fs::create_dir_all(&empty)?;
+    let config = IndexConfig {
+        sources: vec![source(&empty, "files")],
+        hash_threads: 1,
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+
+    let storage = directory.path().join("files");
+    fs::create_dir_all(&storage)?;
+    let fifo = storage.join("streamed.bin");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .map_err(|error| IndexError::Catalog(format!("mkfifo is unavailable: {error}")))?;
+    assert!(status.success(), "mkfifo did not create the fifo");
+
+    let chunk = vec![7u8; 3 * 1024 * 1024];
+    catalog.seed(&[SeedRepository {
+        repo: RepoId::parse_ref(RepoType::Models, "acme/streamed").expect("a valid reference"),
+        source: "files".to_owned(),
+        kind: SourceKind::Loose,
+        root_path: storage.clone(),
+        git_dir: None,
+        revisions: vec![SeedRevision {
+            name: "main".to_owned(),
+            sha: None,
+            refs: Vec::new(),
+            title: None,
+            author: None,
+            committed: None,
+            entries: vec![SeedEntry {
+                node: LOCAL_NODE,
+                abs_path: Some(fifo.to_string_lossy().into_owned()),
+                rel_path: "streamed.bin".to_owned(),
+                size: 2 * chunk.len() as u64,
+                state: State::Local,
+                is_symlink: false,
+                sha256: None,
+                git_sha1: None,
+                artifact: None,
+            }],
+        }],
+    }])?;
+    assert_eq!(catalog.pending_hashes()?, 1);
+
+    let mut writer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)?;
+    let seen = std::sync::Mutex::new(Vec::new());
+    let report = std::thread::scope(|scope| -> Result<HashReport> {
+        let handle = scope.spawn(|| {
+            catalog.hash_pending(&config, |update| match seen.lock() {
+                Ok(mut recorded) => recorded.push(update),
+                Err(poisoned) => poisoned.into_inner().push(update),
+            })
+        });
+        std::io::Write::write_all(&mut writer, &chunk)?;
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        std::io::Write::write_all(&mut writer, &chunk)?;
+        drop(writer);
+        handle
+            .join()
+            .map_err(|_| IndexError::Catalog("the hashing pass panicked".into()))?
+    })?;
+
+    assert_eq!(report.hashed, 1);
+    let updates = match seen.into_inner() {
+        Ok(recorded) => recorded,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    assert!(
+        updates.len() > 1,
+        "a pass reading one file still reports while it reads: {updates:?}"
+    );
+    assert!(
+        updates
+            .windows(2)
+            .all(|pair| pair[0].bytes_done <= pair[1].bytes_done),
+        "the bytes read never go backwards: {updates:?}"
+    );
+    assert!(
+        updates.iter().all(|update| update.files_total == 1),
+        "every update names what the pass was owed: {updates:?}"
+    );
+    assert!(
+        updates
+            .iter()
+            .any(|update| update.files_done == 0 && update.bytes_done > 0),
+        "bytes are reported before the file they belong to is finished: {updates:?}"
+    );
+    assert!(
+        updates.iter().any(|update| update.rate_bps.is_some()),
+        "a tick that timed a read reports the rate it read at: {updates:?}"
+    );
+    let last = updates
+        .last()
+        .ok_or_else(|| IndexError::Catalog("the pass reported nothing".into()))?;
+    assert_eq!(last.files_done, 1, "the last update counts the file");
+    assert_eq!(
+        last.bytes_done,
+        2 * chunk.len() as u64,
+        "the last update counts every byte of it"
+    );
+    Ok(())
+}
+
+#[test]
 fn hash_threads_of_one_hashes_in_primary_key_order() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("files");
@@ -310,7 +428,7 @@ fn hash_threads_of_one_hashes_in_primary_key_order() -> Result<()> {
     assert_eq!(catalog.pending_hashes()?, 130);
 
     let mut counts = Vec::new();
-    let report = catalog.hash_pending(&config, |hashed| counts.push(hashed))?;
+    let report = catalog.hash_pending(&config, |update| counts.push(update.files_done))?;
 
     assert_eq!(report.hashed, 130);
     assert!(
@@ -360,8 +478,8 @@ fn a_raised_stop_ends_a_hashing_pass_within_a_queue_of_files_and_the_next_pass_f
     assert_eq!(catalog.pending_hashes()?, total);
 
     let stop = Stop::default();
-    let report = catalog.hash_pending_until(&config, &stop, |hashed| {
-        if hashed >= batch {
+    let report = catalog.hash_pending_until(&config, &stop, |update| {
+        if update.files_done >= batch {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     })?;

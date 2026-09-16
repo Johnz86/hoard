@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use native_db::transaction::RwTransaction;
 use serde::Serialize;
@@ -30,6 +31,12 @@ pub type Stop = Arc<AtomicBool>;
 
 const DIGEST_QUEUE: usize = 256;
 
+const PROGRESS_TICK: Duration = Duration::from_millis(500);
+
+const RATE_SAMPLE_FLOOR: Duration = Duration::from_millis(250);
+
+const RATE_UNKNOWN: u64 = u64::MAX;
+
 /// What one hashing run did: the files it read, the artifacts two copies of one file
 /// collapsed into, and the files it could not read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
@@ -41,22 +48,63 @@ pub struct HashReport {
     pub interrupted: bool,
 }
 
+/// Where a hashing pass has got to while it is still running: the files it has finished
+/// against the files it was owed when it started, the bytes it has read through them, and
+/// what it read them at over the last half second. `rate_bps` is absent until the first
+/// timed sample of the pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HashProgress {
+    pub files_done: u64,
+    pub files_total: u64,
+    pub bytes_done: u64,
+    pub rate_bps: Option<u64>,
+}
+
 /// The content identity a sha256 makes, the same text an artifact identity is hashed from.
 /// Two copies of one file share a record because they hash to this same key.
 pub fn content_key(sha: &Sha256) -> u128 {
     xxhash_rust::xxh3::xxh3_128(format!("sha256:{sha}").as_bytes())
 }
 
+#[derive(Debug)]
+struct TickerStop<'a> {
+    ending: &'a Mutex<bool>,
+    ended: &'a Condvar,
+}
+
+impl Drop for TickerStop<'_> {
+    fn drop(&mut self) {
+        *held(self.ending) = true;
+        self.ended.notify_all();
+    }
+}
+
+fn held<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn per_second(moved: u64, elapsed: Duration) -> u64 {
+    let seconds = elapsed.as_secs_f64();
+    match seconds > 0.0 {
+        true => (moved as f64 / seconds) as u64,
+        false => 0,
+    }
+}
+
 impl Catalog {
     /// Hashes every present entry that has no sha256 yet and records what it read.
     ///
-    /// Uses `[index] hash_threads` workers; zero uses the Rayon pool size, capped at 256.
+    /// Uses `[index] hash_threads` workers, or the count `IndexConfig::hash_workers` derives
+    /// when it is zero.
     /// Completed digests are committed while other files are still being read. Matching
     /// content identities merge into one artifact.
     pub fn hash_pending(
         &self,
         config: &IndexConfig,
-        progress: impl FnMut(u64),
+        progress: impl FnMut(HashProgress) + Send,
     ) -> Result<HashReport> {
         self.hash_pending_until(config, &Stop::default(), progress)
     }
@@ -66,11 +114,14 @@ impl Catalog {
     /// Checks cancellation before opening a pass, between files, and once per megabyte
     /// read by each worker. Queued digests and artifact bookkeeping finish before returning.
     /// An interrupted pass preserves committed work and can be resumed.
+    ///
+    /// `progress` is called as each file is handed to a worker and on a half-second tick
+    /// while they read, so a pass moving one enormous file still reports what it is doing.
     pub fn hash_pending_until(
         &self,
         config: &IndexConfig,
         stop: &Stop,
-        mut progress: impl FnMut(u64),
+        mut progress: impl FnMut(HashProgress) + Send,
     ) -> Result<HashReport> {
         if stop.load(Ordering::Relaxed) {
             return Ok(HashReport {
@@ -106,24 +157,50 @@ impl Catalog {
         config: &IndexConfig,
         stop: &Stop,
         sender: &mpsc::SyncSender<Digest>,
-        progress: &mut impl FnMut(u64),
+        progress: &mut (impl FnMut(HashProgress) + Send),
     ) -> Result<HashReport> {
         let workers = config.hash_workers();
         let threshold = config.lfs_threshold;
+        let files_total = self.pending_hashes()?;
         let (work_tx, work_rx) = mpsc::sync_channel::<(Entry, PathBuf)>(workers);
         let work_rx = Arc::new(Mutex::new(work_rx));
         let hashed = AtomicU64::new(0);
         let unreadable = AtomicU64::new(0);
+        let bytes = AtomicU64::new(0);
+        let rate = AtomicU64::new(RATE_UNKNOWN);
         let interrupted = AtomicBool::new(false);
+        let reporting = Mutex::new(progress);
+        let ending = Mutex::new(false);
+        let ended = Condvar::new();
+        let snapshot = || HashProgress {
+            files_done: hashed.load(Ordering::Relaxed),
+            files_total,
+            bytes_done: bytes.load(Ordering::Relaxed),
+            rate_bps: match rate.load(Ordering::Relaxed) {
+                RATE_UNKNOWN => None,
+                measured => Some(measured),
+            },
+        };
+        let report_progress = || {
+            let mut sink = held(&reporting);
+            (*sink)(snapshot());
+        };
+        let nudge_progress = || {
+            if let Ok(mut sink) = reporting.try_lock() {
+                (*sink)(snapshot());
+            }
+        };
 
         let paging = std::thread::scope(|scope| -> Result<()> {
+            let mut crew = Vec::with_capacity(workers);
             for _ in 0..workers {
                 let receiver = Arc::clone(&work_rx);
                 let worker_sender = sender.clone();
                 let hashed = &hashed;
                 let unreadable = &unreadable;
+                let bytes = &bytes;
                 let interrupted = &interrupted;
-                scope.spawn(move || {
+                crew.push(scope.spawn(move || {
                     loop {
                         let next = match receiver.lock() {
                             Ok(guard) => guard.recv(),
@@ -136,7 +213,7 @@ impl Catalog {
                             interrupted.store(true, Ordering::Relaxed);
                             break;
                         }
-                        match content_hashes(&path, entry.size, threshold, stop) {
+                        match content_hashes(&path, entry.size, threshold, stop, bytes) {
                             Ok(Some((sha256, git_sha1))) => {
                                 let digest = Digest {
                                     entry_id: entry.id,
@@ -164,38 +241,58 @@ impl Catalog {
                             }
                         }
                     }
-                });
+                }));
             }
             drop(work_rx);
+            scope.spawn(|| {
+                let mut sampled = Instant::now();
+                let mut seen = 0_u64;
+                loop {
+                    let finished = {
+                        let waiting = held(&ending);
+                        let waited =
+                            match ended
+                                .wait_timeout_while(waiting, PROGRESS_TICK, |ending| !*ending)
+                            {
+                                Ok((waited, _)) => waited,
+                                Err(poisoned) => poisoned.into_inner().0,
+                            };
+                        *waited
+                    };
+                    let read = bytes.load(Ordering::Relaxed);
+                    let elapsed = sampled.elapsed();
+                    if elapsed >= RATE_SAMPLE_FLOOR {
+                        rate.store(
+                            per_second(read.saturating_sub(seen), elapsed),
+                            Ordering::Relaxed,
+                        );
+                        sampled = Instant::now();
+                        seen = read;
+                    }
+                    report_progress();
+                    if finished {
+                        break;
+                    }
+                }
+            });
+            let _stopping = TickerStop {
+                ending: &ending,
+                ended: &ended,
+            };
 
-            let mut after = 0;
-            'paging: loop {
-                if stop.load(Ordering::Relaxed) {
-                    interrupted.store(true, Ordering::Relaxed);
-                    break 'paging;
-                }
-                let batch = self.pending_batch(after)?;
-                let Some((last, _)) = batch.last() else {
-                    break 'paging;
-                };
-                after = last.id;
-                for pair in batch {
-                    if stop.load(Ordering::Relaxed) {
-                        interrupted.store(true, Ordering::Relaxed);
-                        break 'paging;
-                    }
-                    if work_tx.send(pair).is_err() {
-                        interrupted.store(true, Ordering::Relaxed);
-                        break 'paging;
-                    }
-                    progress(hashed.load(Ordering::Relaxed));
-                }
-            }
+            let walked = self.page_pending(stop, &work_tx, &interrupted, nudge_progress);
             drop(work_tx);
-            Ok(())
+            let lost = crew
+                .into_iter()
+                .fold(false, |lost, worker| lost | worker.join().is_err());
+            walked?;
+            match lost {
+                true => Err(IndexError::Catalog("a hashing worker panicked".into())),
+                false => Ok(()),
+            }
         });
         paging?;
-        progress(hashed.load(Ordering::Relaxed));
+        report_progress();
 
         Ok(HashReport {
             hashed: hashed.load(Ordering::Relaxed),
@@ -203,6 +300,39 @@ impl Catalog {
             unreadable: unreadable.load(Ordering::Relaxed),
             interrupted: interrupted.load(Ordering::Relaxed),
         })
+    }
+
+    fn page_pending(
+        &self,
+        stop: &Stop,
+        work_tx: &mpsc::SyncSender<(Entry, PathBuf)>,
+        interrupted: &AtomicBool,
+        report: impl Fn(),
+    ) -> Result<()> {
+        let mut after = 0;
+        'paging: loop {
+            if stop.load(Ordering::Relaxed) {
+                interrupted.store(true, Ordering::Relaxed);
+                break 'paging;
+            }
+            let batch = self.pending_batch(after)?;
+            let Some((last, _)) = batch.last() else {
+                break 'paging;
+            };
+            after = last.id;
+            for pair in batch {
+                if stop.load(Ordering::Relaxed) {
+                    interrupted.store(true, Ordering::Relaxed);
+                    break 'paging;
+                }
+                if work_tx.send(pair).is_err() {
+                    interrupted.store(true, Ordering::Relaxed);
+                    break 'paging;
+                }
+                report();
+            }
+        }
+        Ok(())
     }
 
     /// Commits digests as they arrive, in batches of at most [`HASH_BATCH`], and returns

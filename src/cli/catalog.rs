@@ -11,7 +11,7 @@ use hoard_index::config::HashPolicy;
 use hoard_index::search::{SortKey, SortSpec};
 
 use super::HashWhen;
-use super::scan::progress_bar;
+use super::scan::{hashing_message, progress_bar};
 
 #[derive(Debug, Subcommand)]
 pub enum CatalogCommand {
@@ -153,8 +153,8 @@ fn run_blocking(config_path: Option<&Path>, command: CatalogCommand) -> Result<(
             let hashing = match policy {
                 HashPolicy::Now | HashPolicy::Background => Some(
                     catalog
-                        .hash_pending(&config.index, |hashed| {
-                            progress.set_message(format!("Hashing: {hashed} files"));
+                        .hash_pending(&config.index, |update| {
+                            progress.set_message(hashing_message(update));
                         })
                         .context("hashing the native catalog")?,
                 ),

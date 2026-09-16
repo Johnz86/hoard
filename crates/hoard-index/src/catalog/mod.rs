@@ -34,7 +34,7 @@ use crate::row::DiskPressure;
 use self::models::{Manifest, Summary, define_models};
 
 pub use self::digest::{DigestApplied, DigestEntry, DigestPage, RemoteEntry};
-pub use self::hashing::{HashReport, Stop, content_key};
+pub use self::hashing::{HashProgress, HashReport, Stop, content_key};
 pub use self::ingest::{IngestRecord, MIRROR_SOURCE, ServedFile};
 pub use self::jobs::{JobProgress, JobRecord, JobState};
 pub use self::loadouts::LoadoutRecord;
@@ -195,8 +195,10 @@ impl Catalog {
     /// Opens the catalog at `config.native_path()`, scanning the configured sources into a
     /// new one when there is none, and always returns one a query can use: an index is built
     /// when there is none and refreshed when a rescan left changes behind. A catalog written
-    /// in another format is removed and scanned again rather than converted. A configuration
-    /// naming no walkable source yields an empty catalog rather than an error.
+    /// in another format is removed and scanned again rather than converted, and `progress`
+    /// is told why before that scan starts: it is the only channel a start-up has, since a
+    /// server opens its catalog before it binds. A configuration naming no walkable source
+    /// yields an empty catalog rather than an error.
     pub fn open_or_scan(
         config: &IndexConfig,
         node: &str,
@@ -217,6 +219,7 @@ impl Catalog {
                     %error,
                     "the catalog on disk cannot be opened; scanning a fresh one"
                 );
+                progress(&rebuild_reason(&error), 0);
                 std::fs::remove_dir_all(&directory)?;
                 Self::scan_fresh(&directory, node, config, &mut progress)?
             }
@@ -362,6 +365,30 @@ fn stamped_format(directory: &Path) -> Result<Option<u32>> {
             path.display()
         ))
     })
+}
+
+fn rebuild_reason(error: &IndexError) -> String {
+    match error {
+        IndexError::CatalogFormat {
+            found: Some(found),
+            expected,
+            ..
+        } => format!(
+            "rebuilding after a catalog format change (found {found}, this build writes \
+             {expected})"
+        ),
+        IndexError::CatalogFormat {
+            found: None,
+            expected,
+            ..
+        } => format!(
+            "rebuilding a catalog that carries no format stamp (this build writes {expected})"
+        ),
+        IndexError::CatalogIncomplete { .. } => {
+            "rebuilding a catalog whose scan never finished".to_owned()
+        }
+        opened => format!("rebuilding a catalog that cannot be opened ({opened})"),
+    }
 }
 
 fn totals_of(summary: &Summary) -> Totals {

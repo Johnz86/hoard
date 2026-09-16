@@ -146,3 +146,12 @@ workspace = true
 lto = "fat"
 codegen-units = 1
 strip = true
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.sha1]
+opt-level = 3
+
+[profile.dev.package.xxhash-rust]
+opt-level = 3

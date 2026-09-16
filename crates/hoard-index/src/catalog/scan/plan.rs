@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
@@ -382,6 +383,7 @@ pub(super) fn prepare_unit<'a>(
 /// Reads the content hashes of every file of one unit that does not already carry them, so
 /// the identity the unit's artifacts take is a content identity from this scan onwards.
 fn hash_presences(presences: &mut [Presence], threshold: u64, stop: &Stop) {
+    let bytes_this_phase_does_not_report = AtomicU64::new(0);
     let digests: Vec<Option<(Sha256, Option<GitSha1>)>> = presences
         .par_iter()
         .map(|presence| {
@@ -389,7 +391,13 @@ fn hash_presences(presences: &mut [Presence], threshold: u64, stop: &Stop) {
                 .abs_path
                 .as_deref()
                 .filter(|_| presence.sha256.is_none())?;
-            match content_hashes(path, presence.size, threshold, stop) {
+            match content_hashes(
+                path,
+                presence.size,
+                threshold,
+                stop,
+                &bytes_this_phase_does_not_report,
+            ) {
                 Ok(hashes) => hashes,
                 Err(error) => {
                     tracing::debug!(path = %path.display(), %error, "file is unhashable");

@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use hoard_core::{CommitSha, Sha256};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
@@ -88,11 +88,14 @@ pub fn sha256_bytes(bytes: &[u8]) -> Sha256 {
 /// given, because no safe wrapper for one is in this workspace's dependency graph.
 ///
 /// `stop` is read once per buffer, so a shutdown that arrives while an 80 GB checkpoint is
-/// being read waits for a megabyte rather than for the file.
+/// being read waits for a megabyte rather than for the file. `bytes` is raised by what each
+/// buffer held at the same cadence, so a pass reading one enormous file still reports that it
+/// is moving.
 pub fn content_digests(
     path: &Path,
     want_git_sha1: bool,
     stop: &AtomicBool,
+    bytes: &AtomicU64,
 ) -> Result<Option<(Sha256, Option<CommitSha>)>> {
     let mut file = File::open(path).map_err(|error| IndexError::io(path, error))?;
     let size = file
@@ -120,6 +123,7 @@ pub fn content_digests(
         if let Some(blob) = &mut blob {
             blob.update(&buffer[..read]);
         }
+        bytes.fetch_add(read as u64, Ordering::Relaxed);
     }
     Ok(Some((
         Sha256::from_bytes(finish::<32>(sha256.finalize().as_slice())),
@@ -268,18 +272,20 @@ mod tests {
             ),
         ] {
             let path = write(&dir, name, &payload);
-            let (sha256, git_sha1) = content_digests(&path, true, &AtomicBool::new(false))
-                .expect("both digests")
-                .expect("an unstopped read finishes");
+            let (sha256, git_sha1) =
+                content_digests(&path, true, &AtomicBool::new(false), &AtomicU64::new(0))
+                    .expect("both digests")
+                    .expect("an unstopped read finishes");
             assert_eq!(sha256, sha256_file(&path).expect("sha256"), "{name}");
             assert_eq!(
                 git_sha1,
                 Some(git_blob_sha1(&path).expect("git blob sha1")),
                 "{name}"
             );
-            let (only_sha256, none) = content_digests(&path, false, &AtomicBool::new(false))
-                .expect("one digest")
-                .expect("an unstopped read finishes");
+            let (only_sha256, none) =
+                content_digests(&path, false, &AtomicBool::new(false), &AtomicU64::new(0))
+                    .expect("one digest")
+                    .expect("an unstopped read finishes");
             assert_eq!(only_sha256, sha256, "{name}");
             assert_eq!(none, None, "{name}");
         }
@@ -291,15 +297,57 @@ mod tests {
         let payload = vec![3u8; STREAM_BUFFER * 3 + 17];
         let path = write(&dir, "checkpoint.bin", &payload);
         assert_eq!(
-            content_digests(&path, true, &AtomicBool::new(true)).expect("the read answers"),
+            content_digests(&path, true, &AtomicBool::new(true), &AtomicU64::new(0))
+                .expect("the read answers"),
             None,
             "a stop already raised reads no megabyte of the file"
         );
         assert!(
-            content_digests(&path, true, &AtomicBool::new(false))
+            content_digests(&path, true, &AtomicBool::new(false), &AtomicU64::new(0))
                 .expect("the read answers")
                 .is_some(),
             "and a pass nobody stopped reads it to the end"
+        );
+    }
+
+    #[test]
+    fn content_digests_reports_every_buffer_it_reads() {
+        let dir = TempDir::new().expect("temp dir");
+        let payload: Vec<u8> = (0..251u8).cycle().take(STREAM_BUFFER * 3 + 11).collect();
+        let path = write(&dir, "checkpoint.bin", &payload);
+        let read = AtomicU64::new(0);
+        content_digests(&path, true, &AtomicBool::new(false), &read)
+            .expect("the read answers")
+            .expect("an unstopped read finishes");
+        assert_eq!(
+            read.load(Ordering::Relaxed),
+            payload.len() as u64,
+            "every byte of the file is counted exactly once"
+        );
+
+        let stopped = AtomicU64::new(0);
+        assert_eq!(
+            content_digests(&path, true, &AtomicBool::new(true), &stopped)
+                .expect("the read answers"),
+            None
+        );
+        assert_eq!(
+            stopped.load(Ordering::Relaxed),
+            0,
+            "a read stopped before its first buffer counts nothing"
+        );
+
+        let shared = AtomicU64::new(0);
+        for name in ["one.bin", "two.bin"] {
+            let path = write(&dir, name, &payload);
+            content_digests(&path, false, &AtomicBool::new(false), &shared)
+                .expect("the read answers")
+                .expect("an unstopped read finishes");
+        }
+        assert_eq!(
+            shared.load(Ordering::Relaxed),
+            2 * payload.len() as u64,
+            "one counter accumulates what several files read"
         );
     }
 

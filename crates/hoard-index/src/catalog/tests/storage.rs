@@ -684,13 +684,24 @@ fn a_catalog_whose_manifest_no_longer_decodes_and_carries_no_stamp_is_rebuilt() 
     let broken = overwrite_rows(&native.join("catalog.redb"), "6_1_id", 6)?;
     assert_eq!(broken, 1, "the manifest row was made undecodable");
 
-    let rebuilt = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let mut phases = Vec::new();
+    let rebuilt = Catalog::open_or_scan(&config, "workstation", |phase, _| {
+        phases.push(phase.to_owned())
+    })?;
 
     let status = rebuilt.status()?;
     assert_eq!(status.generation, 1, "the rebuild is a fresh scan");
     assert_eq!(status.format_version, FORMAT_VERSION);
     assert_eq!(rebuilt.totals()?, totals);
     assert_eq!(search(&rebuilt, "")?.total, built);
+    assert_eq!(
+        phases.first().map(String::as_str),
+        Some(
+            format!("rebuilding a catalog that carries no format stamp (this build writes {FORMAT_VERSION})")
+                .as_str()
+        ),
+        "a catalog with no stamp is not reported as a format change"
+    );
     Ok(())
 }
 
@@ -758,14 +769,50 @@ fn a_catalog_of_another_format_is_rebuilt_on_open() -> Result<()> {
     let native = config.native_path();
     stamp_format(&native, crate::catalog::FORMAT_VERSION + 1)?;
 
-    let rebuilt = Catalog::open_or_scan(&config, "n", |_, _| {})?;
+    let mut phases = Vec::new();
+    let rebuilt = Catalog::open_or_scan(&config, "n", |phase, _| phases.push(phase.to_owned()))?;
 
     let status = rebuilt.status()?;
     assert_eq!(status.format_version, crate::catalog::FORMAT_VERSION);
     assert_eq!(status.generation, 1, "the rebuild is a fresh scan");
     assert_eq!(rebuilt.totals()?, expected);
     assert_eq!(search(&rebuilt, "")?.total, 2);
+    let named = phases
+        .first()
+        .ok_or_else(|| IndexError::Catalog("the rebuild reported nothing".into()))?;
+    assert!(
+        named.contains(&format!("found {}", crate::catalog::FORMAT_VERSION + 1))
+            && named.contains(&format!("writes {}", crate::catalog::FORMAT_VERSION)),
+        "the first thing a rebuild reports names both formats: {named:?}"
+    );
     Ok(())
+}
+
+#[test]
+fn a_rebuild_names_why_it_is_rebuilding() {
+    let directory = PathBuf::from("/tmp/native");
+    let changed = crate::catalog::rebuild_reason(&IndexError::CatalogFormat {
+        directory: directory.clone(),
+        found: Some(9),
+        expected: 10,
+    });
+    assert_eq!(
+        changed,
+        "rebuilding after a catalog format change (found 9, this build writes 10)"
+    );
+
+    let unstamped = crate::catalog::rebuild_reason(&IndexError::CatalogFormat {
+        directory: directory.clone(),
+        found: None,
+        expected: 10,
+    });
+    assert_eq!(
+        unstamped,
+        "rebuilding a catalog that carries no format stamp (this build writes 10)"
+    );
+
+    let unfinished = crate::catalog::rebuild_reason(&IndexError::CatalogIncomplete { directory });
+    assert_eq!(unfinished, "rebuilding a catalog whose scan never finished");
 }
 
 #[test]

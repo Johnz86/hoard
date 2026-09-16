@@ -105,6 +105,12 @@ the first interruption are excluded. Do not restart the restore-all-waves proces
   `docs/superpowers/research/2026-09-05-native-db-tantivy.md` are the decision and the
   dependency research; they stay. The wave plan files under `docs/superpowers/plans/` are
   deleted - git keeps them, and a stale plan in the tree is a trap for the next agent.
+- A run against the real configured sources, as opposed to a synthetic fixture in a test, uses
+  `cargo run --release -- serve`. A debug build hashes at a fraction of a release build's
+  throughput, so a first scan of a large cache appears to hang; the
+  `[profile.dev.package.{sha2,sha1,xxhash-rust}]` stanzas in the root `Cargo.toml` close most
+  of that gap by giving the three hashing crates full codegen in a dev profile, but not all of
+  it, because the code around them is still unoptimized.
 - Phases 0 to 11 are done. `docs/feature-plan.md` holds the table. The TREE and DISK views
   are not an unfinished phase: they wait on a design decision and are recorded under that
   document's "Risks and open decisions".
