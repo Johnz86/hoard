@@ -31,6 +31,10 @@ pub(super) struct Source {
     /// writers that move a repository's present counts, through
     /// [`super::scan::counters::DerivedShift`]; a writer added later must do the same.
     pub(super) pending_hashes: u64,
+    /// The bytes those files hold, so a hashing pass can report what it still owes rather
+    /// than how many files are left. Moved by the same writers, through
+    /// [`super::scan::counters::DerivedShift`].
+    pub(super) pending_bytes: u64,
 }
 
 /// A repository as a scan found it, with the clone directory the git face serves from and

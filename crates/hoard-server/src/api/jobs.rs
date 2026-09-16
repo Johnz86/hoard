@@ -38,6 +38,9 @@ pub struct SourceView {
     pub bytes_human: String,
     pub last_scan: Option<Timestamp>,
     pub pending_hashes: u64,
+    /// The bytes those files hold, so a sources table says what a hashing pass owes and not
+    /// only how many files it owes.
+    pub pending_bytes: u64,
     /// Whether `POST /api/v1/scan` will accept this source: it is named in the
     /// configuration.
     pub can_scan: bool,
@@ -118,6 +121,7 @@ fn source_view(
         bytes_human: format_size(record.byte_count),
         last_scan: record.last_scan,
         pending_hashes: record.pending_hashes,
+        pending_bytes: record.pending_bytes,
         can_scan,
         managed_by,
     }

@@ -350,6 +350,7 @@ impl Applying<'_, '_> {
             byte_count: 0,
             last_scan: None,
             pending_hashes: 0,
+            pending_bytes: 0,
         })?;
         Ok(())
     }

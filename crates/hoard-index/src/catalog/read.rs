@@ -136,6 +136,7 @@ pub struct SourceRecord {
     pub byte_count: u64,
     pub last_scan: Option<jiff::Timestamp>,
     pub pending_hashes: u64,
+    pub pending_bytes: u64,
 }
 
 impl SourceRecord {
@@ -148,6 +149,7 @@ impl SourceRecord {
             byte_count: stored.byte_count,
             last_scan: parse_opt_timestamp(stored.last_scan)?,
             pending_hashes: stored.pending_hashes,
+            pending_bytes: stored.pending_bytes,
         })
     }
 }

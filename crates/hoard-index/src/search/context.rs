@@ -204,7 +204,14 @@ mod tests {
         let allowed = target.allowed_roles();
         assert_eq!(
             allowed,
-            vec![Role::Lora, Role::Ctrl, Role::Upsc, Role::Vae, Role::Emb]
+            vec![
+                Role::Lora,
+                Role::Ctrl,
+                Role::Upsc,
+                Role::Vae,
+                Role::Emb,
+                Role::Proj
+            ]
         );
         assert!(allowed.iter().all(|role| role.is_adapter()));
     }

@@ -2,7 +2,8 @@ use hoard_core::{Base, Evidence, EvidenceSource, Role, TensorSample, TensorSumma
 
 use super::rules::{
     self, BASE_ALIASES, BASE_RULES, CROSS_ATTENTION_DIMS, CROSS_ATTENTION_KEYS, KeyMatch,
-    PROJECTION_KEYS, UNET_BODY_KEYS,
+    PROJECTION_KEYS, PROJECTOR_ARCHITECTURE, PROJECTOR_DESCRIPTORS, PROJECTOR_SHAPES,
+    UNET_BODY_KEYS,
 };
 use super::{Accumulator, InferInput};
 
@@ -28,6 +29,20 @@ pub(crate) fn alias_base(raw: &str) -> Option<Base> {
 /// alias table has never seen it, such as a transformers `model_type`.
 pub(crate) fn canonical_base(raw: &str) -> Base {
     alias_base(raw).unwrap_or_else(|| Base::new(raw))
+}
+
+/// The family a `clip.projector_type` names; `None` when the value names a topology
+/// instead.
+pub(crate) fn projector_base(raw: &str) -> Option<Base> {
+    let normalized = canonical_base(raw);
+    let trimmed = PROJECTOR_DESCRIPTORS
+        .iter()
+        .find_map(|descriptor| normalized.as_str().strip_suffix(descriptor))
+        .unwrap_or_else(|| normalized.as_str());
+    if trimmed.is_empty() || PROJECTOR_SHAPES.contains(&trimmed) {
+        return None;
+    }
+    Some(Base::new(trimmed))
 }
 
 #[derive(Debug)]
@@ -167,7 +182,11 @@ fn metadata_rules(
             },
         );
     }
-    if let Some(raw) = tensors.metadata.get("general.architecture") {
+    if let Some(raw) = tensors
+        .metadata
+        .get("general.architecture")
+        .filter(|raw| !raw.trim().eq_ignore_ascii_case(PROJECTOR_ARCHITECTURE))
+    {
         record(
             bases,
             labels,
@@ -175,6 +194,23 @@ fn metadata_rules(
                 base: canonical_base(raw),
                 raw,
                 key: "general.architecture",
+                source: EvidenceSource::Metadata,
+                confidence: rules::METADATA_STRONG,
+            },
+        );
+    }
+    if let Some((base, raw)) = tensors
+        .metadata
+        .get("clip.projector_type")
+        .and_then(|raw| projector_base(raw).map(|base| (base, raw)))
+    {
+        record(
+            bases,
+            labels,
+            BaseClaim {
+                base,
+                raw,
+                key: "clip.projector_type",
                 source: EvidenceSource::Metadata,
                 confidence: rules::METADATA_STRONG,
             },
@@ -458,6 +494,68 @@ mod tests {
         );
         assert_eq!(verdict.base, Base::new("nemotronh"));
         assert_eq!(verdict.label.as_deref(), Some("nemotron_h"));
+    }
+
+    #[test]
+    fn a_projector_types_family_replaces_the_clip_architecture() {
+        let claims = [
+            ("gemma3", "gemma3"),
+            ("qwen3vl_merger", "qwen3vl"),
+            ("pixtral", "pixtral"),
+        ];
+        for (projector_type, family) in claims {
+            let summary = with_metadata(
+                tensors(&[
+                    ("v.blk.0.attn_q.weight", &[1152, 1152]),
+                    ("mm.0.weight", &[2560, 1152]),
+                ]),
+                &[
+                    ("general.architecture", "clip"),
+                    ("clip.has_vision_encoder", "true"),
+                    ("clip.projector_type", projector_type),
+                ],
+            );
+            let path = Path::new("/models/lmstudio/mmproj-model-f16.gguf");
+            let verdict = infer_base(
+                &input(path, "mmproj-model-f16.gguf").with_tensors(&summary),
+                Role::Proj,
+            );
+            assert_eq!(verdict.base, Base::new(family), "{projector_type}");
+            assert_eq!(verdict.label.as_deref(), Some(projector_type));
+            assert!(
+                verdict
+                    .evidence
+                    .iter()
+                    .all(|item| item.value != PROJECTOR_ARCHITECTURE),
+                "clip never reaches the base rail: {:?}",
+                verdict.evidence
+            );
+        }
+    }
+
+    #[test]
+    fn a_projectors_generic_shape_name_records_no_base() {
+        for shape in ["mlp", "MLP", "mlp-norm", "ldpv2", "resampler"] {
+            assert_eq!(projector_base(shape), None, "{shape}");
+        }
+        let summary = with_metadata(
+            tensors(&[
+                ("v.blk.0.attn_q.weight", &[1152, 1152]),
+                ("mm.0.weight", &[2560, 1152]),
+            ]),
+            &[
+                ("general.architecture", "clip"),
+                ("clip.has_vision_encoder", "true"),
+                ("clip.projector_type", "mlp"),
+            ],
+        );
+        let path = Path::new("/models/lmstudio/mmproj-model-f16.gguf");
+        let verdict = infer_base(
+            &input(path, "mmproj-model-f16.gguf").with_tensors(&summary),
+            Role::Proj,
+        );
+        assert!(verdict.base.is_empty());
+        assert_eq!(verdict.label, None);
     }
 
     #[test]

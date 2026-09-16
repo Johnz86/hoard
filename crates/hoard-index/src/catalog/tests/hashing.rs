@@ -343,6 +343,8 @@ fn hash_pending_until_reports_progress_before_a_large_file_finishes() -> Result<
         }],
     }])?;
     assert_eq!(catalog.pending_hashes()?, 1);
+    let owed_bytes = 2 * chunk.len() as u64;
+    assert_eq!(catalog.pending_hash_bytes()?, owed_bytes);
 
     let mut writer = std::fs::OpenOptions::new()
         .read(true)
@@ -383,6 +385,12 @@ fn hash_pending_until_reports_progress_before_a_large_file_finishes() -> Result<
     assert!(
         updates.iter().all(|update| update.files_total == 1),
         "every update names what the pass was owed: {updates:?}"
+    );
+    assert!(
+        updates
+            .iter()
+            .all(|update| update.bytes_total == owed_bytes),
+        "every update names the bytes the pass was owed: {updates:?}"
     );
     assert!(
         updates
@@ -811,8 +819,21 @@ fn a_rebuilt_catalog_recalls_digests_the_memo_already_knows() -> Result<()> {
     let recalled = rebuilt.hash_pending(&config, |update| second.push(update))?;
 
     assert!(
-        second.iter().all(|update| update.bytes_done == 0),
-        "the second pass reads no file's bytes at all: {second:?}"
+        second
+            .iter()
+            .all(|update| update.rate_bps.unwrap_or(0) == 0),
+        "the second pass reads no file's bytes at all, so it reports no read rate: {second:?}"
+    );
+    assert_eq!(
+        second.last().map(|update| update.bytes_done),
+        Some(total),
+        "and settles every byte it was owed by recall rather than by reading: {second:?}"
+    );
+    assert!(
+        second
+            .iter()
+            .all(|update| update.bytes_total == total && update.bytes_done <= total),
+        "a recalled pass reaches what it was owed and never overshoots it: {second:?}"
     );
     assert_eq!(
         recalled.hashed,
@@ -827,6 +848,71 @@ fn a_rebuilt_catalog_recalls_digests_the_memo_already_knows() -> Result<()> {
         found,
         "every recalled digest is byte-identical to what the first pass read"
     );
+    Ok(())
+}
+
+#[test]
+fn a_pass_that_recalls_some_files_and_reads_others_still_settles_every_byte() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(&input)?;
+    let sizes = [512 * 1024_usize, 768 * 1024];
+    for (index, size) in sizes.iter().enumerate() {
+        let body: Vec<u8> = (0..*size).map(|offset| (offset + index) as u8).collect();
+        fs::write(input.join(format!("weights{index}.bin")), &body)?;
+    }
+    let changed = input.join("changed.bin");
+    fs::write(&changed, vec![9_u8; 256 * 1024])?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let native = directory.path().join("native");
+    let catalog = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
+    catalog.hash_pending(&config, |_| {})?;
+    assert_eq!(catalog.pending_hashes()?, 0);
+    drop(catalog);
+
+    let grown = vec![8_u8; 1024 * 1024];
+    fs::write(&changed, &grown)?;
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    fs::File::options()
+        .write(true)
+        .open(&changed)?
+        .set_modified(later)?;
+    fs::remove_dir_all(&native)?;
+    let rebuilt = Catalog::scan_sources(&native, "n", &config, HashPolicy::Never, |_, _| {})?;
+    let owed = rebuilt.pending_hash_bytes()?;
+    assert_eq!(
+        owed,
+        (sizes.iter().sum::<usize>() + grown.len()) as u64,
+        "the rebuilt catalog owes every file at its current size"
+    );
+
+    let mut updates = Vec::new();
+    let report = rebuilt.hash_pending(&config, |update| updates.push(update))?;
+
+    assert_eq!(report.hashed, 3);
+    assert_eq!(report.unreadable, 0);
+    assert_eq!(
+        updates.last().map(|update| update.bytes_done),
+        Some(owed),
+        "two files recalled and one read together settle the whole debt: {updates:?}"
+    );
+    assert!(
+        updates
+            .iter()
+            .all(|update| update.bytes_total == owed && update.bytes_done <= owed),
+        "no update overshoots what the pass was owed: {updates:?}"
+    );
+    assert_eq!(
+        hashes_by_path(&rebuilt)?
+            .get("changed.bin")
+            .and_then(|(sha256, _)| *sha256),
+        Some(crate::hash::sha256_bytes(&grown)),
+        "the file whose stamp moved was read for real, not recalled"
+    );
+    assert_eq!(rebuilt.pending_hashes()?, 0);
     Ok(())
 }
 

@@ -7,8 +7,8 @@ matching status. Mutating routes require `Authorization: Bearer <HOARD_NODE_TOKE
 that variable is set; read routes are open on the LAN.
 
 Field vocabularies are the grammar spellings: `role` in `ckpt lora ctrl upsc vae emb llm
-ds unk`, `sub_role` in `ipa tok mot cmp bb` or null, `state` in `served local pulling stale
-remote triage`, `format` in `safetensors gguf diffusers transformers pth pt bin onnx
+ds proj unk`, `sub_role` in `ipa tok mot cmp bb` or null, `state` in `served local pulling
+stale remote triage`, `format` in `safetensors gguf diffusers transformers pth pt bin onnx
 parquet arrow jsonl csv readme config unknown`.
 
 ## Search
@@ -195,7 +195,8 @@ no `dir` at all and always uses the configured root.
 
 ## Sources, scans, jobs
 
-- `GET /api/v1/sources`: kind, files, bytes, last scan, pending hashes; `blobs` is kept for
+- `GET /api/v1/sources`: kind, files, bytes, last scan, `pending_hashes` and the
+  `pending_bytes` those files hold; `blobs` is kept for
   the shape and always reads zero, the catalog counts content by artifact rather than by
   blob. The list holds every source the catalog knows, including the ones this node does not
   scan: the mirror's downloads, the puller's landings and a peer's namespace. `can_scan` says
@@ -216,7 +217,8 @@ no `dir` at all and always uses the configured root.
   over `"later"` over `"never"`. A node shutting down runs what the lane still holds before
   it exits.
 - `GET /api/v1/jobs?state=`: scans, hash runs, pulls, applies with `phase`, `progress`
-  (0..1), `bytes`, `rate_bps`, `started`, `finished`, `error`. `GET /api/v1/jobs/{id}`,
+  (0..1), `bytes`, `total`, `rate_bps`, `started`, `finished`, `error`. A scan's hashing
+  phase reports `total` as the bytes it was owed when the pass opened. `GET /api/v1/jobs/{id}`,
   `POST /api/v1/jobs/{id}/cancel`.
 
 ## Nodes and peers

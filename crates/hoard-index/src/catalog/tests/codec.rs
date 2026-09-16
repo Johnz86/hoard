@@ -490,6 +490,7 @@ fn every_record_round_trips_through_the_compact_codec() -> Result<()> {
         byte_count: u64::MAX,
         last_scan: Some("2026-09-07T08:00:00Z".to_owned()),
         pending_hashes: 300,
+        pending_bytes: 1 << 50,
     };
     let repository = Repository {
         id: 4242,

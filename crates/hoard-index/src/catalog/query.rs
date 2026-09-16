@@ -275,9 +275,19 @@ fn role_filter(token: &Token, schema: &Fields) -> Box<dyn Query> {
                 let narrowed = typed
                     .get(index)
                     .and_then(|alias| Role::sub_role_from_alias(alias))
-                    .filter(|sub| sub.role().as_str() == value);
+                    .filter(|sub| sub.roles().iter().any(|narrow| narrow.as_str() == value));
                 match narrowed {
-                    Some(sub) => all_of(vec![term(role, value), term(sub_role, sub.as_str())]),
+                    Some(sub) => any_of(
+                        sub.roles()
+                            .iter()
+                            .map(|narrow| {
+                                all_of(vec![
+                                    term(role, narrow.as_str()),
+                                    term(sub_role, sub.as_str()),
+                                ])
+                            })
+                            .collect(),
+                    ),
                     None => term(role, value),
                 }
             })
@@ -507,6 +517,22 @@ mod tests {
         assert!(
             !plain.contains("cmp") && !plain.contains("bb"),
             "a bare role keeps both pairing states: {plain}"
+        );
+    }
+
+    #[test]
+    fn a_pairing_alias_reaches_every_role_the_sub_role_sits_under() {
+        for raw in ["role:backbone", "role:needs-pairing"] {
+            let rendered = compiled(raw);
+            assert!(
+                rendered.contains("ckpt") && rendered.contains("proj"),
+                "{raw} compiled to {rendered}"
+            );
+        }
+        let single = compiled("role:complete");
+        assert!(
+            !single.contains("proj"),
+            "a sub-role under one role unions nothing: {single}"
         );
     }
 

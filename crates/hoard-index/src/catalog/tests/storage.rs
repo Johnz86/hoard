@@ -623,8 +623,8 @@ fn overwrite_rows(path: &Path, table: &str, model: u32) -> Result<usize> {
 }
 
 #[test]
-fn format_version_is_ten() {
-    assert_eq!(FORMAT_VERSION, 10);
+fn format_version_is_eleven() {
+    assert_eq!(FORMAT_VERSION, 11);
 }
 
 #[test]

@@ -48,7 +48,7 @@ Paper surface, used by the proposal deck and the light theme:
 | `--amb-deep` | `oklch(0.5 0.14 50)` |
 | `--red` | `oklch(0.58 0.17 22)` |
 
-Role colors (8 plus unknown). `roleColorMode: Monochrome` maps all to `--role-unk`.
+Role colors (9 plus unknown). `roleColorMode: Monochrome` maps all to `--role-unk`.
 
 | Role key | Label | Color |
 | --- | --- | --- |
@@ -60,11 +60,13 @@ Role colors (8 plus unknown). `roleColorMode: Monochrome` maps all to `--role-un
 | `emb` | EMB, embedding / tokenizer | `oklch(0.74 0.15 100)` |
 | `ds` | DS, dataset | `oklch(0.7 0.15 22)` |
 | `llm` | LLM, language model | `oklch(0.8 0.02 80)` |
+| `proj` | PROJ, vision projector | `oklch(0.72 0.15 285)` |
 | `unk` | `?`, triage | `oklch(0.6 0.012 75)` |
 
 Sub-roles shown as chips in the taxonomy: IPA (ip-adapter, lora color), TOK (tokenizer, emb
 color), MOT (motion module, ctrl color), CMP (COMPLETE, a checkpoint that loads alone, ckpt
-color), BB (NEEDS PAIRING, a checkpoint wanting a separate CLIP and VAE, ckpt color).
+color), BB (NEEDS PAIRING, a checkpoint wanting a separate CLIP and VAE, or a vision
+projector wanting its host, in the color of the role it sits under).
 
 State colors:
 
@@ -270,7 +272,7 @@ Leading `~` forces fuzzy matching over everything indexed. Comma inside a value 
 
 | Key | Semantics |
 | --- | --- |
-| `role:` | alias table: checkpoint/ckpt/base/model/complete/cmp/backbone/bb, lora/lycoris/locon/adapter/ip-adapter/ipa, controlnet/ctrl/control/motion, upscaler/upsc/upscale/esrgan, vae, embedding/emb/textualinversion, llm/language model/text, dataset/ds/data, ?/unknown/unclassified/triage |
+| `role:` | alias table: checkpoint/ckpt/base/model/complete/cmp/backbone/bb, lora/lycoris/locon/adapter/ip-adapter/ipa, controlnet/ctrl/control/motion, upscaler/upsc/upscale/esrgan, vae, embedding/emb/textualinversion, llm/language model/text, dataset/ds/data, proj/projector/mmproj/vision-projector, ?/unknown/unclassified/triage |
 | `base:` | architecture family, compared with spaces and dots stripped (`sdxl`, `sd15`, `flux`, `wan`, `llama`, `qwen`) |
 | `fmt:` / `format:` | container: safetensors, gguf, diffusers, pth, pt, parquet, jsonl.gz |
 | `prec:` / `precision:` | fp16, bf16, fp32, q4_k_m, q8_0, ... |

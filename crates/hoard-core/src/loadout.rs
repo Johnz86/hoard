@@ -107,7 +107,7 @@ impl LoadoutSlot {
             Role::Vae => Some(LoadoutSlot::Vae),
             Role::Upsc => Some(LoadoutSlot::Upscaler),
             Role::Emb => Some(LoadoutSlot::Embedding),
-            Role::Ds | Role::Unk => None,
+            Role::Ds | Role::Proj | Role::Unk => None,
         }
     }
 }

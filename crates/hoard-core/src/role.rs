@@ -21,12 +21,20 @@ pub enum Role {
     Emb,
     Llm,
     Ds,
+    Proj,
     Unk,
 }
 
 impl Role {
     /// Roles that resolve against a host, never against each other.
-    pub const ADAPTERS: [Role; 5] = [Role::Lora, Role::Ctrl, Role::Vae, Role::Emb, Role::Upsc];
+    pub const ADAPTERS: [Role; 6] = [
+        Role::Lora,
+        Role::Ctrl,
+        Role::Vae,
+        Role::Emb,
+        Role::Upsc,
+        Role::Proj,
+    ];
     /// Roles an adapter can plug into.
     pub const HOSTS: [Role; 2] = [Role::Ckpt, Role::Llm];
 
@@ -41,6 +49,7 @@ impl Role {
             Role::Emb => "emb",
             Role::Llm => "llm",
             Role::Ds => "ds",
+            Role::Proj => "proj",
             Role::Unk => "unk",
         }
     }
@@ -63,6 +72,7 @@ impl Role {
             Role::Emb => "EMB",
             Role::Llm => "LLM",
             Role::Ds => "DS",
+            Role::Proj => "PROJ",
             Role::Unk => "UNK",
         }
     }
@@ -78,6 +88,7 @@ impl Role {
             Role::Emb => "EMBEDDING",
             Role::Llm => "LANGUAGE MODEL",
             Role::Ds => "DATASET",
+            Role::Proj => "PROJECTOR",
             Role::Unk => "UNCLASSIFIED",
         }
     }
@@ -143,6 +154,7 @@ impl Role {
                 "gguf-llm",
             ],
             Role::Ds => &["ds", "dataset", "data"],
+            Role::Proj => &["proj", "projector", "mmproj", "vision-projector"],
             Role::Unk => &["?", "unk", "unknown", "unclassified", "triage"],
         }
     }
@@ -197,14 +209,27 @@ impl SubRole {
         }
     }
 
-    pub const fn role(self) -> Role {
+    /// Every role this sub-role can sit under, never empty. `Bb` means "needs pairing", which
+    /// a diffusion backbone and a vision projector both are, so it names two.
+    pub const fn roles(self) -> &'static [Role] {
         match self {
-            SubRole::Ipa => Role::Lora,
-            SubRole::Tok => Role::Emb,
-            SubRole::Mot => Role::Ctrl,
-            SubRole::Cmp => Role::Ckpt,
-            SubRole::Bb => Role::Ckpt,
+            SubRole::Ipa => &[Role::Lora],
+            SubRole::Tok => &[Role::Emb],
+            SubRole::Mot => &[Role::Ctrl],
+            SubRole::Cmp => &[Role::Ckpt],
+            SubRole::Bb => &[Role::Ckpt, Role::Proj],
         }
+    }
+
+    /// The role to record for this sub-role given the role already decided. A decided role
+    /// the sub-role admits is kept, so `Bb` over a projector stays a projector; anything
+    /// else resolves to the first role the sub-role names.
+    pub fn role_with(self, decided: Role) -> Role {
+        let roles = self.roles();
+        if roles.contains(&decided) {
+            return decided;
+        }
+        roles.first().copied().unwrap_or(Role::Unk)
     }
 
     pub const fn label(self) -> &'static str {
@@ -362,9 +387,9 @@ mod tests {
     #[test]
     fn sub_role_aliases_narrow_their_role() {
         assert_eq!(Role::sub_role_from_alias("ip-adapter"), Some(SubRole::Ipa));
-        assert_eq!(SubRole::Ipa.role(), Role::Lora);
-        assert_eq!(SubRole::Mot.role(), Role::Ctrl);
-        assert_eq!(SubRole::Tok.role(), Role::Emb);
+        assert_eq!(SubRole::Ipa.roles(), &[Role::Lora]);
+        assert_eq!(SubRole::Mot.roles(), &[Role::Ctrl]);
+        assert_eq!(SubRole::Tok.roles(), &[Role::Emb]);
         assert_eq!(Role::sub_role_from_alias("complete"), Some(SubRole::Cmp));
         assert_eq!(Role::sub_role_from_alias("all-in-one"), Some(SubRole::Cmp));
         assert_eq!(Role::sub_role_from_alias("backbone"), Some(SubRole::Bb));
@@ -372,8 +397,8 @@ mod tests {
             Role::sub_role_from_alias("needs-pairing"),
             Some(SubRole::Bb)
         );
-        assert_eq!(SubRole::Cmp.role(), Role::Ckpt);
-        assert_eq!(SubRole::Bb.role(), Role::Ckpt);
+        assert_eq!(SubRole::Cmp.roles(), &[Role::Ckpt]);
+        assert!(SubRole::Bb.roles().contains(&Role::Ckpt));
         assert_eq!(SubRole::Cmp.label(), "COMPLETE");
         assert_eq!(SubRole::Bb.label(), "NEEDS PAIRING");
         for sub in SubRole::iter() {
@@ -383,13 +408,41 @@ mod tests {
                 "{} resolves from its own spelling",
                 sub.as_str()
             );
-            assert_eq!(
-                Role::from_alias(sub.as_str()),
-                Some(sub.role()),
-                "{} reaches its role through the grammar",
+            let reached = Role::from_alias(sub.as_str()).expect("a sub-role spelling names a role");
+            assert!(
+                sub.roles().contains(&reached),
+                "{} reaches one of its roles through the grammar",
                 sub.as_str()
             );
         }
+    }
+
+    #[test]
+    fn sub_role_bb_now_answers_to_both_ckpt_and_proj() {
+        assert_eq!(SubRole::Bb.roles(), &[Role::Ckpt, Role::Proj]);
+        assert!(!SubRole::Cmp.roles().contains(&Role::Proj));
+        assert_eq!(SubRole::Bb.role_with(Role::Proj), Role::Proj);
+        assert_eq!(SubRole::Bb.role_with(Role::Ckpt), Role::Ckpt);
+        assert_eq!(SubRole::Bb.role_with(Role::Unk), Role::Ckpt);
+        assert_eq!(SubRole::Ipa.role_with(Role::Proj), Role::Lora);
+        for sub in SubRole::iter() {
+            assert!(
+                !sub.roles().is_empty(),
+                "{} names at least one role",
+                sub.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn role_proj_is_an_adapter_with_its_own_alias() {
+        assert!(Role::ADAPTERS.contains(&Role::Proj));
+        assert!(Role::Proj.is_adapter() && !Role::Proj.is_host());
+        assert_eq!(Role::from_alias("mmproj"), Some(Role::Proj));
+        assert_eq!(Role::from_alias("projector"), Some(Role::Proj));
+        assert_eq!(Role::Proj.as_str(), "proj");
+        assert_eq!(Role::Proj.code(), "PROJ");
+        assert_eq!(Role::Proj.label(), "PROJECTOR");
     }
 
     #[test]

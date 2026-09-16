@@ -343,7 +343,7 @@ pub fn facts(row: &SearchRow) -> Vec<Fact> {
                 facts.push(Fact::new("resolution", resolution));
             }
         }
-        Role::Ctrl | Role::Upsc | Role::Vae | Role::Emb | Role::Ds | Role::Unk => {}
+        Role::Ctrl | Role::Upsc | Role::Vae | Role::Emb | Role::Ds | Role::Proj | Role::Unk => {}
     }
     facts
 }

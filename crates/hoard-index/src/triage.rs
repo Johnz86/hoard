@@ -99,14 +99,18 @@ fn hidden_dim(tensors: &TensorSummary) -> Option<u64> {
 
 /// Rejects a verdict that names a role and a sub-role belonging to a different one.
 ///
-/// Every sub-role belongs to exactly one role, so `role: ctrl` with `sub_role: ipa` is not
-/// a decision the index can record either way; whichever field were applied last would
-/// silently become the answer.
+/// A sub-role belongs to the roles [`SubRole::roles`] names and no others, so `role: ctrl`
+/// with `sub_role: ipa` is not a decision the index can record either way; whichever field
+/// were applied last would silently become the answer.
 pub fn check_verdict(role: Option<Role>, sub_role: Option<SubRole>) -> Result<()> {
     match (role, sub_role) {
-        (Some(role), Some(sub)) if sub.role() != role => Err(IndexError::Query(format!(
+        (Some(role), Some(sub)) if !sub.roles().contains(&role) => Err(IndexError::Query(format!(
             "sub-role {sub} belongs to {}, not to {role}",
-            sub.role()
+            sub.roles()
+                .iter()
+                .map(|owner| owner.as_str())
+                .collect::<Vec<&str>>()
+                .join(" or ")
         ))),
         (Some(_) | None, Some(_) | None) => Ok(()),
     }
@@ -135,7 +139,7 @@ pub fn apply_override(
     }
     if let Some(sub) = sub_role {
         inference.sub_role = Some(sub);
-        inference.role = sub.role();
+        inference.role = sub.role_with(inference.role);
         inference.role_confidence = 1.0;
         inference.evidence.push(Evidence::new(
             "sub_role",

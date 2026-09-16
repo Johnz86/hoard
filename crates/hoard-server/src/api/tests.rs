@@ -1775,6 +1775,10 @@ async fn sources_scans_and_jobs_are_listed() {
         "every seeded path is still waiting for a content hash"
     );
     assert_eq!(
+        sources[0]["pending_bytes"], 12_760_032_640_u64,
+        "and the bytes those paths hold are owed beside them"
+    );
+    assert_eq!(
         sources[0]["can_scan"], true,
         "the configuration names this root, so a scan will take it"
     );

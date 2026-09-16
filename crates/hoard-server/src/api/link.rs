@@ -305,6 +305,7 @@ pub const fn comfy_directory(role: Role) -> &'static str {
         Role::Emb => "embeddings",
         Role::Llm => "llm",
         Role::Ds => "datasets",
+        Role::Proj => "clip_vision",
         Role::Unk => "unclassified",
     }
 }
@@ -319,6 +320,7 @@ const fn a1111_directory(role: Role) -> &'static str {
         Role::Emb => "embeddings",
         Role::Llm => "llm",
         Role::Ds => "datasets",
+        Role::Proj => "mmproj",
         Role::Unk => "unclassified",
     }
 }

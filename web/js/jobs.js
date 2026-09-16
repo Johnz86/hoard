@@ -51,12 +51,18 @@ export function renderScansView(app) {
                 el("span", { class: "align-right", text: String(source.files ?? "—") }),
                 el("span", { class: "align-right", text: String(source.blobs ?? "—") }),
                 el("span", { class: "align-right", text: fmtBytes(source.bytes) }),
-                el("span", { class: "align-right", text: String(source.pending_hashes ?? 0) }),
+                el("span", { class: "align-right", text: pendingText(source) }),
                 el("span", { class: "align-right mono-dim", text: fmtAge(source.last_scan) }),
                 el("span", { class: "align-right" }, scanAction(app, source))
             )
         )
     );
+}
+
+function pendingText(source) {
+    const files = source.pending_hashes ?? 0;
+    if (!files) return "0";
+    return `${files} (${fmtBytes(source.pending_bytes ?? 0)})`;
 }
 
 function scanAction(app, source) {

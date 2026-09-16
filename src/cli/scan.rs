@@ -131,6 +131,7 @@ mod tests {
                 files_done: 12,
                 files_total: 130,
                 bytes_done: 26_400_000_000,
+                bytes_total: 314_000_000_000,
                 rate_bps: Some(239_075_328),
             }),
             "Hashing: 12/130 files, 26.4 GB read at 239.1 MB/s"

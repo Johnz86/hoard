@@ -82,6 +82,7 @@
     --role-emb: var(--role-unk);
     --role-ds: var(--role-unk);
     --role-llm: var(--role-unk);
+    --role-proj: var(--role-unk);
 }
 
 :root[data-density="roomy"] {
@@ -792,6 +793,7 @@ input.field:focus {
 .r-emb { --role-color: var(--role-emb); }
 .r-ds { --role-color: var(--role-ds); }
 .r-llm { --role-color: var(--role-llm); }
+.r-proj { --role-color: var(--role-proj); }
 .r-unk { --role-color: var(--role-unk); }
 
 .cell-name {
@@ -1834,7 +1836,7 @@ input.field:focus {
 
 .scan-grid {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 110px 90px 90px 100px 90px 120px 80px;
+    grid-template-columns: minmax(0, 1fr) 110px 90px 90px 100px 140px 120px 80px;
     gap: 12px;
 }
 

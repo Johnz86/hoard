@@ -501,6 +501,60 @@ fn pending_hashes_are_counted_without_a_scan() -> Result<()> {
 }
 
 #[test]
+fn pending_bytes_tracks_what_pending_hashes_already_tracks_in_files() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("models");
+    fs::create_dir_all(&input)?;
+    let mut sizes: Vec<u64> = Vec::new();
+    for index in 0..3 {
+        let path = input.join(format!("w{index}.safetensors"));
+        fs::write(&path, lora_header_named(&"block".repeat(index + 1)))?;
+        sizes.push(fs::metadata(&path)?.len());
+    }
+    assert!(
+        sizes[0] != sizes[1] && sizes[1] != sizes[2],
+        "the fixture files differ in size: {sizes:?}"
+    );
+    let owed: u64 = sizes.iter().sum();
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    assert_eq!(catalog.pending_hashes()?, 3);
+    assert_eq!(catalog.pending_hash_bytes()?, owed);
+
+    catalog.hash_pending(&config, |_| {})?;
+    assert_eq!(catalog.pending_hashes()?, 0);
+    assert_eq!(catalog.pending_hash_bytes()?, 0);
+
+    let touched = input.join("w1.safetensors");
+    fs::write(&touched, lora_header_named(&"rewritten".repeat(4)))?;
+    let rewritten = fs::metadata(&touched)?.len();
+    assert_ne!(rewritten, sizes[1], "the rewrite changed the file's size");
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    assert_eq!(catalog.pending_hashes()?, 1);
+    assert_eq!(
+        catalog.pending_hash_bytes()?,
+        rewritten,
+        "only the file that lost its digest is owed, at its current size"
+    );
+    assert_eq!(catalog.sources()?[0].pending_bytes, rewritten);
+    Ok(())
+}
+
+#[test]
 fn totals_follow_the_sweep() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (input, config) = loose_fixture(directory.path())?;

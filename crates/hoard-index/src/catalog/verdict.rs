@@ -130,7 +130,7 @@ pub(super) fn apply_override(record: &mut ArtifactRecord, verdict: &Override) {
     }
     if let Some(sub_role) = verdict.sub_role {
         record.artifact.sub_role = Some(sub_role);
-        record.artifact.role = sub_role.role();
+        record.artifact.role = sub_role.role_with(record.artifact.role);
         record.artifact.role_confidence = 1.0;
     }
     if let Some(base) = &verdict.base {

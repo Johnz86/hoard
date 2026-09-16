@@ -88,7 +88,7 @@ phase, and the follow-ups under `### Phase 11` carry their own acceptance criter
 | Repo | `type/org/name`: a git clone, a Hub cache repo, or a bare directory adopted as one | `RepoId` |
 | Revision | A commit, branch or tag; loose repos get one synthetic sha from their content | `CommitSha` |
 | Entry | A path inside a revision pointing at a blob, on a node | (revision, path, node) |
-| Role | ckpt, lora, ctrl, upsc, vae, emb, llm, ds, unk; sub-roles ipa, tok, mot, cmp, bb | inferred, reviewable |
+| Role | ckpt, lora, ctrl, upsc, vae, emb, llm, ds, proj, unk; sub-roles ipa, tok, mot, cmp, bb | inferred, reviewable |
 | State | served, local, pulling, stale, remote, triage | derived per entry and node |
 | Shelf | A named query | query string |
 | Loadout | Pinned entries with weights | TOML document |
@@ -144,8 +144,8 @@ phase, and the follow-ups under `### Phase 11` carry their own acceptance criter
   unclassified items. Confirm assigns role and base; reject records the path as noise so
   future scans skip it. Overrides survive rescans.
 - B5 Compatibility is directional (see `docs/design/ui-spec.md`): adapters (lora, ctrl,
-  vae, emb, upsc) resolve against hosts (ckpt, llm) with the same base or base `any`;
-  never adapter to adapter, never datasets.
+  vae, emb, upsc, proj) resolve against hosts (ckpt, llm) with the same base or base
+  `any`; never adapter to adapter, never datasets.
 - B6 Every inferred field records its source (tensor, config, metadata, frontmatter,
   folder hint, user) for the DERIVED FACTS panel.
 

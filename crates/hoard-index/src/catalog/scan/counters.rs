@@ -112,6 +112,15 @@ struct Contribution {
     files: i64,
     bytes: i64,
     owed: i64,
+    owed_bytes: i64,
+}
+
+/// What a pass moved in one source's hashing debt: the files still owing a sha256 and the
+/// bytes they hold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OwedShift {
+    files: i64,
+    bytes: i64,
 }
 
 /// What a pass moved in the counts derived from its entries: each repository's present
@@ -148,13 +157,14 @@ impl DerivedShift {
         slot.bytes = slot.bytes.saturating_add(sign.saturating_mul(bytes));
         if owes_a_hash(entry) {
             slot.owed = slot.owed.saturating_add(sign);
+            slot.owed_bytes = slot.owed_bytes.saturating_add(sign.saturating_mul(bytes));
         }
     }
 
     /// Writes what has accumulated onto the repositories, sources and nodes it names, and
     /// starts again empty.
     pub(in crate::catalog) fn flush(&mut self, transaction: &RwTransaction<'_>) -> Result<()> {
-        let mut owed: HashMap<String, i64> = HashMap::new();
+        let mut owed: HashMap<String, OwedShift> = HashMap::new();
         for (repo_id, moved) in self.repositories.drain() {
             if moved == Contribution::default() {
                 continue;
@@ -162,8 +172,10 @@ impl DerivedShift {
             let Some(stored) = transaction.get().primary::<Repository>(repo_id)? else {
                 continue;
             };
-            if moved.owed != 0 {
-                *owed.entry(stored.source.clone()).or_default() += moved.owed;
+            if moved.owed != 0 || moved.owed_bytes != 0 {
+                let debt = owed.entry(stored.source.clone()).or_default();
+                debt.files = debt.files.saturating_add(moved.owed);
+                debt.bytes = debt.bytes.saturating_add(moved.owed_bytes);
             }
             if moved.files == 0 && moved.bytes == 0 {
                 continue;
@@ -179,7 +191,8 @@ impl DerivedShift {
                 continue;
             };
             transaction.upsert(Source {
-                pending_hashes: shifted_u64(stored.pending_hashes, moved),
+                pending_hashes: shifted_u64(stored.pending_hashes, moved.files),
+                pending_bytes: shifted_u64(stored.pending_bytes, moved.bytes),
                 ..stored
             })?;
         }

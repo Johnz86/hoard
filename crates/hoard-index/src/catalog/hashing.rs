@@ -51,14 +51,19 @@ pub struct HashReport {
 }
 
 /// Where a hashing pass has got to while it is still running: the files it has finished
-/// against the files it was owed when it started, the bytes it has read through them, and
-/// what it read them at over the last half second. `rate_bps` is absent until the first
-/// timed sample of the pass.
+/// and the bytes it has settled, each against what it was owed when it started, and what
+/// it read them at over the last half second.
+///
+/// `bytes_done` counts a file the digest memo answered for as settled without reading it,
+/// so a pass whose every file is recalled still reaches `bytes_total`. `rate_bps` counts
+/// only bytes streamed off the disk, so a recall never inflates it, and it is absent until
+/// the first timed sample of the pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HashProgress {
     pub files_done: u64,
     pub files_total: u64,
     pub bytes_done: u64,
+    pub bytes_total: u64,
     pub rate_bps: Option<u64>,
 }
 
@@ -134,8 +139,8 @@ impl Catalog {
         self.open_pass()?;
         let mut counters = Counters::load(&self.database, self.stored_triage()?)?;
         let mut report = HashReport::default();
-        let files_total = self.pending_hashes()?;
-        let opened = match files_total {
+        let owed = self.pending_debt()?;
+        let opened = match owed.files {
             0 => None,
             _ => Some(HashMemo::open(self.memo_directory())?),
         };
@@ -150,7 +155,7 @@ impl Catalog {
                     stop,
                     sender: &sender,
                     memo,
-                    files_total,
+                    owed,
                 },
                 &mut progress,
             );
@@ -178,12 +183,14 @@ impl Catalog {
         let workers = config.hash_workers();
         let threshold = config.lfs_threshold;
         let stop = pass.stop;
-        let files_total = pass.files_total;
+        let files_total = pass.owed.files;
+        let bytes_total = pass.owed.bytes;
         let (work_tx, work_rx) = mpsc::sync_channel::<Pending>(workers);
         let work_rx = Arc::new(Mutex::new(work_rx));
         let hashed = AtomicU64::new(0);
         let unreadable = AtomicU64::new(0);
         let bytes = AtomicU64::new(0);
+        let recalled_bytes = AtomicU64::new(0);
         let rate = AtomicU64::new(RATE_UNKNOWN);
         let interrupted = AtomicBool::new(false);
         let reporting = Mutex::new(progress);
@@ -192,7 +199,10 @@ impl Catalog {
         let snapshot = || HashProgress {
             files_done: hashed.load(Ordering::Relaxed),
             files_total,
-            bytes_done: bytes.load(Ordering::Relaxed),
+            bytes_done: bytes
+                .load(Ordering::Relaxed)
+                .saturating_add(recalled_bytes.load(Ordering::Relaxed)),
+            bytes_total,
             rate_bps: match rate.load(Ordering::Relaxed) {
                 RATE_UNKNOWN => None,
                 measured => Some(measured),
@@ -305,6 +315,7 @@ impl Catalog {
                 memo: pass.memo,
                 threshold,
                 hashed: &hashed,
+                recalled_bytes: &recalled_bytes,
                 interrupted: &interrupted,
             };
             let walked = self.page_pending(&pager, nudge_progress);
@@ -390,11 +401,23 @@ impl Catalog {
     /// How many present files are still waiting for a content hash, as the writers that
     /// stored them left each source's count.
     pub fn pending_hashes(&self) -> Result<u64> {
+        Ok(self.pending_debt()?.files)
+    }
+
+    /// How many bytes those files hold, which is what a hashing pass actually has to read.
+    pub fn pending_hash_bytes(&self) -> Result<u64> {
+        Ok(self.pending_debt()?.bytes)
+    }
+
+    /// Both counts from one scan of one snapshot, so a writer committing between two reads
+    /// cannot leave a pass reporting bytes and files that disagree about what it was owed.
+    fn pending_debt(&self) -> Result<PendingDebt> {
         let read = self.database.r_transaction()?;
-        let mut owed = 0_u64;
+        let mut owed = PendingDebt::default();
         for source in read.scan().primary::<Source>()?.all()? {
             let source: Source = source?;
-            owed = owed.saturating_add(source.pending_hashes);
+            owed.files = owed.files.saturating_add(source.pending_hashes);
+            owed.bytes = owed.bytes.saturating_add(source.pending_bytes);
         }
         Ok(owed)
     }
@@ -513,17 +536,29 @@ struct Digest {
 /// stat'd.
 type Pending = (Entry, PathBuf, Option<FileStamp>);
 
+/// What a pass is owed when it opens: the files still carrying no sha256 and the bytes
+/// they hold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PendingDebt {
+    files: u64,
+    bytes: u64,
+}
+
 /// What every stage of one pass shares: where a finished digest goes, the memo it is
 /// recalled from and remembered in, and what the pass was owed when it started.
 struct Pass<'a> {
     stop: &'a Stop,
     sender: &'a mpsc::SyncSender<Digest>,
     memo: Option<&'a HashMemo>,
-    files_total: u64,
+    owed: PendingDebt,
 }
 
 /// What a pass's pager hands each candidate to: the queue the workers read, the channel a
-/// digest the memo already knows skips straight to, and the count both of them raise.
+/// digest the memo already knows skips straight to, and the counts both of them raise.
+///
+/// `recalled_bytes` carries what the memo answered for, which no worker streams and so no
+/// read loop counts. Progress owes those bytes to the total either way, while the rate a
+/// pass reports stays a measure of bytes actually read off the disk.
 struct Pager<'a> {
     stop: &'a Stop,
     work_tx: &'a mpsc::SyncSender<Pending>,
@@ -531,6 +566,7 @@ struct Pager<'a> {
     memo: Option<&'a HashMemo>,
     threshold: u64,
     hashed: &'a AtomicU64,
+    recalled_bytes: &'a AtomicU64,
     interrupted: &'a AtomicBool,
 }
 
@@ -550,6 +586,7 @@ impl Pager<'_> {
             .is_ok();
         if sent {
             self.hashed.fetch_add(1, Ordering::Relaxed);
+            self.recalled_bytes.fetch_add(entry.size, Ordering::Relaxed);
         }
         sent
     }

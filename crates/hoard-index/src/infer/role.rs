@@ -1,9 +1,10 @@
 use hoard_core::{Base, Evidence, EvidenceSource, Role, SubRole, TensorSummary};
 
 use super::rules::{
-    self, CLASS_NAME_ROLES, CROSS_ATTENTION_DIMS, DIFFUSION_ARCHITECTURES, DIFFUSION_KEYS,
-    FILENAME_ROLE_HINTS, FOLDER_ROLE_HINTS, KeyMatch, LATENT_DIFFUSION_KEYS, ROLE_RULES,
-    TEXT_ENCODER_BODY_RULE, TEXT_ENCODER_KEYS, TOKENIZER_FILES,
+    self, CAUSAL_LM_EMBED_KEYS, CLASS_NAME_ROLES, CROSS_ATTENTION_DIMS, DIFFUSION_ARCHITECTURES,
+    DIFFUSION_KEYS, FILENAME_ROLE_HINTS, FOLDER_ROLE_HINTS, KeyMatch, LATENT_DIFFUSION_KEYS,
+    METADATA_TRUE, PROJECTOR_ARCHITECTURE, PROJECTOR_TYPE, ROLE_RULES, TEXT_ENCODER_BODY_RULE,
+    TEXT_ENCODER_KEYS, TOKENIZER_FILES, VISION_ENCODER_KEY,
 };
 use super::{Accumulator, InferInput, ROLE_FLOOR};
 
@@ -36,6 +37,7 @@ pub(crate) fn infer_role(input: &InferInput<'_>) -> RoleVerdict {
         tensor_rules(tensors, &mut roles, &mut sub_roles);
         embedding_shape_rule(input, tensors, &mut roles);
         architecture_rule(tensors, &mut roles);
+        projector_rule(tensors, &mut roles, &mut sub_roles);
     }
     config_rules(input, &mut roles);
     name_rules(input, &mut roles, &mut sub_roles);
@@ -50,7 +52,7 @@ pub(crate) fn infer_role(input: &InferInput<'_>) -> RoleVerdict {
     let sub_role = sub_roles
         .best()
         .map(|(sub, _)| sub)
-        .filter(|sub| sub.role() == role);
+        .filter(|sub| sub.roles().contains(&role));
     let sub_role = if role == Role::Ckpt {
         input.tensors.and_then(pairing_sub_role)
     } else {
@@ -128,7 +130,11 @@ fn embedding_shape_rule(
 }
 
 fn architecture_rule(tensors: &TensorSummary, roles: &mut Accumulator<Role>) {
-    if let Some(architecture) = tensors.metadata.get("general.architecture") {
+    if let Some(architecture) = tensors
+        .metadata
+        .get("general.architecture")
+        .filter(|value| !value.trim().eq_ignore_ascii_case(PROJECTOR_ARCHITECTURE))
+    {
         let normalized = architecture.to_ascii_lowercase();
         let role = if names_a_diffusion_architecture(&normalized) {
             Role::Ckpt
@@ -162,6 +168,71 @@ fn push_architecture(roles: &mut Accumulator<Role>, role: Role, key: &str, norma
             rules::METADATA_STRONG,
         )
         .with_detail(format!("{key} {normalized}")),
+    );
+}
+
+fn projector_rule(
+    tensors: &TensorSummary,
+    roles: &mut Accumulator<Role>,
+    sub_roles: &mut Accumulator<SubRole>,
+) {
+    if names_value(tensors, "general.type", PROJECTOR_TYPE) {
+        push_projector(
+            roles,
+            sub_roles,
+            EvidenceSource::Metadata,
+            rules::METADATA_STRONG,
+            format!("general.type {PROJECTOR_TYPE}"),
+        );
+        return;
+    }
+    if names_value(tensors, "general.architecture", PROJECTOR_ARCHITECTURE)
+        && names_value(tensors, VISION_ENCODER_KEY, METADATA_TRUE)
+    {
+        push_projector(
+            roles,
+            sub_roles,
+            EvidenceSource::Metadata,
+            rules::METADATA_STRONG,
+            format!("general.architecture {PROJECTOR_ARCHITECTURE} with {VISION_ENCODER_KEY}"),
+        );
+        return;
+    }
+    if KeyMatch::Segment("mm").matches(tensors)
+        && KeyMatch::Segment("v").matches(tensors)
+        && !KeyMatch::AnyOf(CAUSAL_LM_EMBED_KEYS).matches(tensors)
+    {
+        push_projector(
+            roles,
+            sub_roles,
+            EvidenceSource::Tensor,
+            rules::TENSOR_PATTERN,
+            "mm and v tensor keys without language model embeddings".to_owned(),
+        );
+    }
+}
+
+fn names_value(tensors: &TensorSummary, key: &str, expected: &str) -> bool {
+    tensors
+        .metadata
+        .get(key)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
+}
+
+fn push_projector(
+    roles: &mut Accumulator<Role>,
+    sub_roles: &mut Accumulator<SubRole>,
+    source: EvidenceSource,
+    confidence: f32,
+    detail: String,
+) {
+    roles.push(
+        Role::Proj,
+        Evidence::new("role", Role::Proj.as_str(), source, confidence).with_detail(detail.clone()),
+    );
+    sub_roles.push(
+        SubRole::Bb,
+        Evidence::new("sub_role", SubRole::Bb.as_str(), source, confidence).with_detail(detail),
     );
 }
 
@@ -396,6 +467,114 @@ mod tests {
 
     fn input<'a>(path: &'a Path, name: &'a str) -> InferInput<'a> {
         InferInput::new(ArtifactFormat::Safetensors, path, name, 1_000_000)
+    }
+
+    fn projector_tensors() -> TensorSummary {
+        tensors(&[
+            ("v.blk.0.attn_q.weight", &[1152, 1152]),
+            ("v.patch_embd.weight", &[1152, 3, 14, 14]),
+            ("mm.0.weight", &[2560, 1152]),
+            ("mm.2.weight", &[2560, 2560]),
+        ])
+    }
+
+    fn projector_verdict(summary: &TensorSummary, file_name: &str) -> RoleVerdict {
+        let path = Path::new("/models/lmstudio/gemma-3-4b-it-GGUF").join(file_name);
+        infer_role(
+            &InferInput::new(ArtifactFormat::Gguf, &path, file_name, 851_251_200)
+                .with_tensors(summary),
+        )
+    }
+
+    #[test]
+    fn a_projector_naming_its_own_type_is_role_proj_needs_pairing() {
+        let summary = with_metadata(
+            projector_tensors(),
+            &[
+                ("general.type", "mmproj"),
+                ("clip.projector_type", "pixtral"),
+            ],
+        );
+        let verdict = projector_verdict(&summary, "mmproj-Ministral-3-14B-F16.gguf");
+        assert_eq!(verdict.role, Role::Proj);
+        assert_eq!(verdict.sub_role, Some(SubRole::Bb));
+        assert!(verdict.confidence >= rules::METADATA_STRONG);
+        assert!(
+            verdict.evidence.iter().any(|item| {
+                item.field == "role"
+                    && item.value == Role::Proj.as_str()
+                    && item.detail.as_deref() == Some("general.type mmproj")
+            }),
+            "the verdict says which key named the projector: {:?}",
+            verdict.evidence
+        );
+    }
+
+    #[test]
+    fn a_projector_known_only_by_its_architecture_and_vision_flag_is_role_proj() {
+        let summary = with_metadata(
+            projector_tensors(),
+            &[
+                ("general.architecture", "clip"),
+                ("clip.has_vision_encoder", "true"),
+                ("clip.projector_type", "gemma3"),
+            ],
+        );
+        let verdict = projector_verdict(&summary, "mmproj-model-f16.gguf");
+        assert_eq!(verdict.role, Role::Proj);
+        assert_eq!(verdict.sub_role, Some(SubRole::Bb));
+        assert!(verdict.confidence >= rules::METADATA_STRONG);
+        assert!(
+            verdict
+                .evidence
+                .iter()
+                .all(|item| item.value != Role::Llm.as_str()),
+            "an architecture of clip names no language model: {:?}",
+            verdict.evidence
+        );
+    }
+
+    #[test]
+    fn a_projector_known_only_by_its_tensor_keys_is_role_proj() {
+        let summary = with_metadata(
+            projector_tensors(),
+            &[("clip.projector_type", "qwen3vl_merger")],
+        );
+        let verdict = projector_verdict(&summary, "vision-tower-bf16.gguf");
+        assert_eq!(verdict.role, Role::Proj);
+        assert_eq!(verdict.sub_role, Some(SubRole::Bb));
+        assert!(verdict.confidence >= rules::TENSOR_PATTERN);
+        assert!(
+            verdict
+                .evidence
+                .iter()
+                .any(|item| { item.field == "role" && item.source == EvidenceSource::Tensor }),
+            "the tensor keys are the evidence: {:?}",
+            verdict.evidence
+        );
+    }
+
+    #[test]
+    fn a_causal_lm_is_not_mistaken_for_a_projector() {
+        let summary = with_metadata(
+            tensors(&[
+                ("blk.0.attn_q.weight", &[5120, 5120]),
+                ("token_embd.weight", &[131072, 5120]),
+                ("output_norm.weight", &[5120]),
+            ]),
+            &[
+                ("general.architecture", "mistral3"),
+                ("general.type", "model"),
+            ],
+        );
+        let file_name = "Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf";
+        let path = Path::new("/models/mistralai").join(file_name);
+        let verdict = infer_role(
+            &InferInput::new(ArtifactFormat::Gguf, &path, file_name, 8_589_934_592)
+                .with_tensors(&summary),
+        );
+        assert_eq!(verdict.role, Role::Llm);
+        assert_eq!(verdict.sub_role, None);
     }
 
     #[test]

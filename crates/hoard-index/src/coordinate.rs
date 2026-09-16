@@ -389,7 +389,7 @@ fn hashing_progress(catalog: &Catalog, job: JobId, update: HashProgress) {
             phase: Some(HASHING.to_owned()),
             progress: (update.files_done as f32 / update.files_total.max(1) as f32).min(1.0),
             bytes: update.bytes_done,
-            total: None,
+            total: Some(update.bytes_total),
             rate_bps: update.rate_bps,
         },
     );
@@ -585,6 +585,7 @@ mod tests {
                 files_done: 3,
                 files_total: 4,
                 bytes_done: 4096,
+                bytes_total: 16_384,
                 rate_bps: Some(512),
             },
         );
@@ -594,7 +595,11 @@ mod tests {
         assert_eq!(record.progress, 0.75);
         assert_eq!(record.bytes, 4096);
         assert_eq!(record.rate_bps, Some(512));
-        assert_eq!(record.total, None, "no byte total is known this wave");
+        assert_eq!(
+            record.total,
+            Some(16_384),
+            "the job row carries the bytes the pass owes"
+        );
         assert_eq!(record.state, JobState::Running);
 
         hashing_progress(
@@ -604,6 +609,7 @@ mod tests {
                 files_done: 9,
                 files_total: 4,
                 bytes_done: 8192,
+                bytes_total: 16_384,
                 rate_bps: None,
             },
         );

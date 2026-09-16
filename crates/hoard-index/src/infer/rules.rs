@@ -14,6 +14,16 @@ pub const FILENAME_HINT: f32 = 0.4;
 pub const FOLDER_HINT: f32 = 0.35;
 pub const CONFLICT: f32 = 0.5;
 
+/// What a llama.cpp vision projector calls itself in `general.type`.
+pub const PROJECTOR_TYPE: &str = "mmproj";
+/// What a vision projector carries in `general.architecture`: its own file format, not a
+/// family, which is why it never reaches the base rail.
+pub const PROJECTOR_ARCHITECTURE: &str = "clip";
+/// The flag a projector sets that predates `general.type`.
+pub const VISION_ENCODER_KEY: &str = "clip.has_vision_encoder";
+/// What a GGUF boolean reads as once the sniffer has rendered it into a summary.
+pub const METADATA_TRUE: &str = "true";
+
 /// One term of a tensor key rule, evaluated against a sniffed header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyMatch {
@@ -746,6 +756,7 @@ pub const FILENAME_ROLE_HINTS: &[(&str, Role, Option<SubRole>)] = &[
     ("esrgan", Role::Upsc, None),
     ("swinir", Role::Upsc, None),
     ("unet", Role::Ckpt, None),
+    ("mmproj", Role::Proj, Some(SubRole::Bb)),
 ];
 
 /// File names that are tokenizers whatever the folder says.
@@ -803,6 +814,14 @@ pub const BASE_ALIASES: &[(&str, &str)] = &[
     ("pony", "pony"),
     ("illustrious", "illustrious"),
 ];
+
+/// Descriptors a `clip.projector_type` appends to the family it projects into, trimmed
+/// after normalization so `qwen3vl_merger` names `qwen3vl`.
+pub const PROJECTOR_DESCRIPTORS: &[&str] = &["merger", "projector", "adapter"];
+
+/// `clip.projector_type` values that name a topology rather than a family, so they record
+/// no base at all.
+pub const PROJECTOR_SHAPES: &[&str] = &["mlp", "mlpnorm", "ldp", "ldpv2", "resampler"];
 
 /// GGML file type ids as they appear in GGUF `general.file_type`.
 pub const GGUF_FILE_TYPES: &[(u32, &str)] = &[
@@ -1092,7 +1111,8 @@ mod tests {
             );
             assert!(rule.confidence > 0.0 && rule.confidence <= 1.0);
             assert!(
-                rule.sub_role.is_none_or(|sub| sub.role() == rule.role),
+                rule.sub_role
+                    .is_none_or(|sub| sub.roles().contains(&rule.role)),
                 "sub-role of {} disagrees with its role",
                 rule.detail
             );

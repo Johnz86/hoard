@@ -10,6 +10,7 @@
   --role-emb: oklch(0.74 0.15 100);
   --role-ds: oklch(0.7 0.15 22);
   --role-llm: oklch(0.8 0.02 80);
+  --role-proj: oklch(0.72 0.15 285);
   --role-unk: oklch(0.6 0.012 75);
 
   --state-served: oklch(0.76 0.15 155);
