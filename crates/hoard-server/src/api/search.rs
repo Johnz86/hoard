@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use hoard_core::format_size;
 use hoard_index::IndexError;
 use hoard_index::catalog::{QueryPage, QueryRequest};
-use hoard_index::row::DiskPressure;
+use hoard_index::row::{DiskPressure, FacetBucket};
 use hoard_index::search::{FACET_DIMENSIONS, Facets, ParsedQuery, SortSpec, parse, quoted};
 
 use crate::api::common::{
@@ -16,6 +16,9 @@ use crate::api::common::{
 };
 use crate::error::ApiResult;
 use crate::state::AppState;
+
+/// The grammar key a base bucket and a brand family over it both select on.
+const BASE_KEY: &str = "base";
 
 /// Everything `GET /api/v1/search` accepts.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -37,6 +40,9 @@ pub struct FacetBucketView {
     pub active: bool,
     pub token: String,
     pub query: String,
+    /// The brand family the rail nests this bucket under: null on a family row itself and
+    /// on every bucket the rail lists flat.
+    pub group: Option<String>,
 }
 
 /// The facet rail: six dimensions, each counted with its own key removed, plus the DISK
@@ -51,6 +57,9 @@ pub struct FacetsView {
     pub node: Vec<FacetBucketView>,
     pub disk_pressure: DiskPressureView,
     pub base_total: u64,
+    /// One row per brand whose base buckets the rail nests, each selecting the union of
+    /// exactly the members that carry its `value` as their `group`.
+    pub base_families: Vec<FacetBucketView>,
 }
 
 /// The DISK PRESSURE summary and the line the rail prints under the bar.
@@ -177,17 +186,47 @@ fn facets(counted: &Facets, query: &ParsedQuery) -> FacetsView {
     {
         *rendered = buckets
             .iter()
-            .map(|bucket| FacetBucketView {
-                label: bucket.label.clone().unwrap_or_else(|| bucket.value.clone()),
-                count: bucket.count,
-                active: bucket.active,
-                token: format!("{key}:{}", quoted(&bucket.value)),
-                query: select_query(query, key, &bucket.value),
-                value: bucket.value.clone(),
-            })
+            .map(|bucket| bucket_view(bucket, key, &bucket.value, query))
             .collect();
     }
+    view.base_families = counted
+        .base_families
+        .iter()
+        .map(|family| bucket_view(family, BASE_KEY, &members_of(counted, &family.value), query))
+        .collect();
     view
+}
+
+/// One bucket as the UI reads it. `selection` is the value its token and query select,
+/// which is the bucket's own value everywhere but a brand family, whose row selects the
+/// union of its members rather than its brand key.
+fn bucket_view(
+    bucket: &FacetBucket,
+    key: &str,
+    selection: &str,
+    query: &ParsedQuery,
+) -> FacetBucketView {
+    FacetBucketView {
+        label: bucket.label.clone().unwrap_or_else(|| bucket.value.clone()),
+        count: bucket.count,
+        active: bucket.active,
+        token: format!("{key}:{}", quoted(selection)),
+        query: select_query(query, key, selection),
+        group: bucket.group.clone(),
+        value: bucket.value.clone(),
+    }
+}
+
+/// The base values one brand family heads, comma joined in the order the rail lists them,
+/// which is the `base:` value the grammar reads as the union of exactly those members.
+fn members_of(counted: &Facets, family: &str) -> String {
+    counted
+        .base
+        .iter()
+        .filter(|bucket| bucket.group.as_deref() == Some(family))
+        .map(|bucket| bucket.value.as_str())
+        .collect::<Vec<&str>>()
+        .join(",")
 }
 
 impl FacetsView {
@@ -225,4 +264,75 @@ fn summary(total: u64, nodes: u64) -> String {
 
 fn cursor_key(raw: &str, sort: Option<&str>, dir: Option<&str>) -> String {
     format!("{raw}|{}", sort_key(sort, dir))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bucket(value: &str, count: u64, group: Option<&str>) -> FacetBucket {
+        FacetBucket {
+            value: value.to_owned(),
+            label: None,
+            count,
+            active: false,
+            group: group.map(str::to_owned),
+        }
+    }
+
+    fn grouped() -> Facets {
+        Facets {
+            base: vec![
+                bucket("qwen3", 5, Some("qwen")),
+                bucket("qwen35moe", 2, Some("qwen")),
+                bucket("qwenimage2512", 4, None),
+            ],
+            base_families: vec![FacetBucket {
+                label: Some("QWEN".to_owned()),
+                ..bucket("qwen", 5, None)
+            }],
+            base_total: 3,
+            ..Facets::default()
+        }
+    }
+
+    #[test]
+    fn a_family_row_selects_the_union_of_its_members_and_never_its_brand_key() {
+        let view = facets(&grouped(), &parse("role:llm"));
+        let family = &view.base_families[0];
+        assert_eq!(family.value, "qwen");
+        assert_eq!(family.label, "QWEN");
+        assert_eq!(family.count, 5);
+        assert_eq!(family.group, None);
+        assert_eq!(family.token, "base:qwen3,qwen35moe");
+        assert_eq!(family.query, "role:llm base:qwen3,qwen35moe");
+    }
+
+    #[test]
+    fn a_grouped_member_names_its_family_and_a_flat_bucket_names_none() {
+        let view = facets(&grouped(), &parse(""));
+        assert_eq!(view.base[0].group.as_deref(), Some("qwen"));
+        assert_eq!(view.base[1].group.as_deref(), Some("qwen"));
+        assert_eq!(view.base[2].group, None);
+        assert_eq!(view.base[2].query, "base:qwenimage2512");
+        assert_eq!(
+            view.base.len(),
+            3,
+            "grouping adds no bucket to the dimension it groups"
+        );
+    }
+
+    #[test]
+    fn a_rail_holding_no_family_carries_an_empty_list() {
+        let view = facets(
+            &Facets {
+                base: vec![bucket("sdxl", 2, None)],
+                base_total: 1,
+                ..Facets::default()
+            },
+            &parse(""),
+        );
+        assert!(view.base_families.is_empty());
+        assert_eq!(view.base[0].token, "base:sdxl");
+    }
 }

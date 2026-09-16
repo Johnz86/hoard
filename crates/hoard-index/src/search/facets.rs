@@ -28,6 +28,10 @@ pub struct Facets {
     /// How many distinct bases the result set holds, before the rail was cut to the
     /// largest of them, so the rail can say what it is not showing.
     pub base_total: u64,
+    /// One entry per brand whose surviving base buckets the rail nests, counted as the
+    /// union of exactly those buckets. Never a dimension of its own: the buckets it heads
+    /// are still in `base`, each carrying this entry's `value` as its `group`.
+    pub base_families: Vec<FacetBucket>,
 }
 
 impl Facets {
@@ -35,6 +39,7 @@ impl Facets {
         for (buckets, (key, _)) in self.dimensions_mut().into_iter().zip(FACET_DIMENSIONS) {
             mark_active(buckets, query, key);
         }
+        mark_families(&mut self.base_families, &self.base);
     }
 
     /// The six dimensions in the order [`FACET_DIMENSIONS`] names them.
@@ -58,6 +63,23 @@ impl Facets {
             &mut self.precision,
             &mut self.node,
         ]
+    }
+}
+
+/// A brand family is selected when every bucket it heads is, because its row selects the
+/// union of exactly those buckets and nothing else.
+///
+/// It is deliberately not marked by [`mark_active`]: a brand key is not a stored base value
+/// and is shorter than every member it names, so the base key's prefix rule would light a
+/// family up for values it never holds - `base:qwenimage2512` would mark `QWEN`, the very
+/// artifact the family is built to exclude.
+pub fn mark_families(families: &mut [FacetBucket], base: &[FacetBucket]) {
+    for family in families {
+        let mut members = base
+            .iter()
+            .filter(|bucket| bucket.group.as_deref() == Some(family.value.as_str()))
+            .peekable();
+        family.active = members.peek().is_some() && members.all(|bucket| bucket.active);
     }
 }
 
@@ -133,6 +155,7 @@ mod tests {
             label: None,
             count: 1,
             active: false,
+            group: None,
         }
     }
 
@@ -189,6 +212,7 @@ mod tests {
             node: vec![bucket("workstation")],
             disk_pressure: DiskPressure::default(),
             base_total: 1,
+            base_families: Vec::new(),
         };
         facets.mark_query(&parse(
             "role:lora layout:loras base:sdxl fmt:gguf prec:fp16 node:workstation",
@@ -199,6 +223,64 @@ mod tests {
         assert!(facets.format[0].active);
         assert!(facets.precision[0].active);
         assert!(facets.node[0].active);
+    }
+
+    fn member(value: &str, family: &str) -> FacetBucket {
+        FacetBucket {
+            group: Some(family.to_owned()),
+            ..bucket(value)
+        }
+    }
+
+    fn qwen(raw: &str) -> Facets {
+        let mut facets = Facets {
+            base: vec![
+                member("qwen35moe", "qwen"),
+                member("qwen3vl", "qwen"),
+                bucket("qwenimage2512"),
+            ],
+            base_families: vec![bucket("qwen")],
+            ..Facets::default()
+        };
+        facets.mark_query(&parse(raw));
+        facets
+    }
+
+    #[test]
+    fn a_family_is_marked_only_when_every_member_it_heads_is_selected() {
+        let one = qwen("base:qwen35moe");
+        assert!(
+            !one.base_families[0].active,
+            "one member selected is not the family selected"
+        );
+        assert!(one.base[0].active && !one.base[1].active);
+        let whole = qwen("base:qwen35moe,qwen3vl");
+        assert!(
+            whole.base_families[0].active,
+            "the union its own row selects marks the family"
+        );
+    }
+
+    #[test]
+    fn a_value_sharing_the_brands_prefix_never_marks_the_family() {
+        let unrelated = qwen("base:qwenimage2512");
+        assert!(
+            !unrelated.base_families[0].active,
+            "the family excludes qwen-image from its count and from its mark alike"
+        );
+        assert!(unrelated.base[2].active, "the flat bucket is still marked");
+        assert!(!unrelated.base[0].active && !unrelated.base[1].active);
+    }
+
+    #[test]
+    fn a_family_heading_no_surviving_member_is_never_marked() {
+        let mut facets = Facets {
+            base: vec![bucket("gemma3")],
+            base_families: vec![bucket("gemma")],
+            ..Facets::default()
+        };
+        facets.mark_query(&parse("base:gemma3"));
+        assert!(!facets.base_families[0].active);
     }
 
     #[test]

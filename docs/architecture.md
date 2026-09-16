@@ -178,7 +178,7 @@ hoard/
           pulls.rs           a pull in flight and the file it lands
           tests/             shared fixtures in mod.rs; scan, revisions, storage, codec, reads,
                              mirror, counts, rescan, index, paging, collapse, usage, hashing,
-                             recovery
+                             recovery, brands
         row.rs               SearchRow, FacetBucket, DiskPressure: what a search answers with
         time.rs              reading and writing the instants the catalog stores
         search/
@@ -186,6 +186,7 @@ hoard/
           token.rs           token kinds and the parsed strip
           context.rs         sort keys, compat targets, the context a query compiles against
           facets.rs          per-dimension counts excluding own key, disk pressure
+          brands.rs          the brand a base root belongs to, for the rail's grouping alone
         shard.rs             groups a model split across files into one artifact
         triage.rs            queue, confirm, reject, noise list
         watch.rs             notify-driven rescan requests for the scan lane

@@ -24,11 +24,11 @@ parquet arrow jsonl csv readme config unknown`.
              "warnings": [] },
   "facets": {
     "role": [ { "value": "lora", "label": "LoRA", "count": 412, "active": true,
-                "token": "role:lora", "query": "role:lora" } ],
+                "token": "role:lora", "query": "role:lora", "group": null } ],
     "layout": [], "base": [], "format": [], "precision": [], "node": [],
     "disk_pressure": { "reclaimable_bytes": 333000000000, "duplicate_blobs": 47,
                         "label": "310.0 GB reclaimable — 47 duplicate blobs" },
-    "base_total": 213 },
+    "base_total": 213, "base_families": [] },
   "rows": [ {
     "artifact_id": "a_01H...", "blob_sha256": "9f2c...41ab", "role": "lora", "sub_role": null,
     "role_confidence": 0.98, "org": "kohya", "name": "film-grain-35mm", "base": "sdxl 1.0",
@@ -62,6 +62,22 @@ marked active, and a query naming it still answers.
 before the rail added any family root and before it was cut to 32, so a rail showing fewer
 buckets than `base_total` is hiding the rest and can say so. It answers only for `base`;
 no other dimension is capped.
+
+`facets.base_families` is one row per brand whose surviving `facets.base` buckets the rail
+nests under it, and is empty whenever no brand holds two of them. A family row's `value` is
+the brand key and its `label` the brand as a user names it, while its `token` and `query`
+select the union of exactly the member values (`base:qwen3,qwen35moe`), never the brand key
+as a prefix: two unrelated products sharing a string root are never counted together. Its
+`count` is that union's own count, so an artifact two members both hold is counted once,
+which is why a family's count is not the sum of its members'. Its `active` is read off those
+members rather than off its own value: true only while every bucket carrying it as `group` is
+itself active, so a query naming one member, or naming an unrelated base that merely starts
+with the brand key, leaves the family row unselected and its row still opens the whole
+brand. `group` is null on a family
+row itself and on every bucket the rail lists flat; on a grouped bucket in `facets.base` it
+names the family that heads it. A grouped bucket is still in `facets.base`, with the same
+`value`, `count`, `token` and `query` it carries ungrouped, so a client that ignores
+`base_families` renders exactly the flat rail it rendered before.
 
 `shard_count` is how many files the model spans: a checkpoint split into
 `model-00001-of-00040.safetensors` and its siblings is one row whose `size` is the whole

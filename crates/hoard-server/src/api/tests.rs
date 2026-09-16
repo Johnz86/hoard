@@ -585,6 +585,16 @@ async fn search_answers_the_documented_shape() {
         body["facets"]["base"].as_array().expect("base").len() as u64,
         "this world holds fewer bases than the rail caps at, so it hides none"
     );
+    assert_eq!(
+        body["facets"]["base_families"],
+        json!([]),
+        "a rail whose bases share no brand groups nothing"
+    );
+    assert_eq!(
+        body["facets"]["base"][0]["group"],
+        Value::Null,
+        "a bucket the rail lists flat names no family"
+    );
 }
 
 /// A safetensors header with one tensor, which is enough for a scan to make an artifact of

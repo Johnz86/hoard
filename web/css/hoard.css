@@ -595,6 +595,15 @@ input.field:focus {
 .facet-label.is-empty { color: var(--dim); }
 .facet-row.is-active .facet-label { color: var(--text); }
 
+.facet-row.is-family .facet-label {
+    color: var(--text);
+    letter-spacing: 0.06em;
+}
+
+.facet-row.is-grouped {
+    padding-left: 18px;
+}
+
 .facet-count {
     color: var(--dim);
     font-size: 11px;

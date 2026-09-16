@@ -10,6 +10,7 @@ use hoard_core::{EntryId, RepoRowId};
 
 use crate::error::{IndexError, Result};
 use crate::row::{FacetBucket, SearchRow};
+use crate::search::brands;
 use crate::search::facets::quoted;
 use crate::search::{
     CompatTarget, CompileContext, FACET_DIMENSIONS, Facets, ParsedQuery, SortKey, SortSpec,
@@ -303,6 +304,7 @@ impl Catalog {
         let mut dimensions: [Vec<FacetBucket>; FACET_DIMENSIONS.len()] =
             std::array::from_fn(|_| Vec::new());
         let mut base_total = 0_u64;
+        let mut base_families = Vec::new();
         for (index, (key, _)) in FACET_DIMENSIONS.iter().enumerate() {
             let excluded = query::compile(&pass.parsed.tokens, Some(key), pass.bound)?;
             let narrowed = match pass.parsed.tokens_with_key(key).next() {
@@ -322,6 +324,7 @@ impl Catalog {
                 }
                 order_buckets(&mut buckets);
                 buckets.truncate(BASE_RAIL);
+                base_families = pass.brand_families(excluded.as_ref(), &mut buckets)?;
             }
             dimensions[index] = buckets;
         }
@@ -335,6 +338,7 @@ impl Catalog {
             node,
             disk_pressure: self.disk_pressure()?,
             base_total,
+            base_families,
         };
         facets.mark_query(pass.parsed);
         Ok(facets)
@@ -608,5 +612,59 @@ impl FacetPass<'_> {
                 as u64,
             QueryPath::Collapse => self.searcher.search(&scoped, &CollapsedCount)?,
         })
+    }
+
+    /// The brands the rail's surviving base buckets belong to, one entry per brand holding
+    /// two or more of them, and the `group` written onto each bucket an entry heads.
+    ///
+    /// A family is counted by running the very query its row offers - the union of exactly
+    /// the member values, through the same grammar a typed `base:a,b` compiles through - so
+    /// an artifact two members both hold is counted once and a row can never open a result
+    /// its count disagrees with. A brand is never a prefix: only a value
+    /// [`brands::brand_of`] names joins one, which is what keeps `qwenimage` out of `QWEN`.
+    fn brand_families(
+        &self,
+        excluded: &dyn Query,
+        buckets: &mut [FacetBucket],
+    ) -> Result<Vec<FacetBucket>> {
+        let mut grouped: Vec<(&'static str, &'static str, Vec<usize>)> = Vec::new();
+        for (position, bucket) in buckets.iter().enumerate() {
+            let Some((key, label)) = brands::brand_of(&bucket.value) else {
+                continue;
+            };
+            match grouped.iter_mut().find(|(held, _, _)| *held == key) {
+                Some((_, _, members)) => members.push(position),
+                None => grouped.push((key, label, vec![position])),
+            }
+        }
+        let mut families = Vec::with_capacity(grouped.len());
+        for (key, label, members) in grouped {
+            if members.len() < 2 {
+                continue;
+            }
+            let union = {
+                let values: Vec<&str> = members
+                    .iter()
+                    .map(|position| buckets[*position].value.as_str())
+                    .collect();
+                let parsed = parse(&format!("base:{}", values.join(",")));
+                query::compile(&parsed.tokens, None, self.bound)?
+            };
+            let count = self.count(BooleanQuery::intersection(vec![
+                excluded.box_clone(),
+                union,
+            ]))?;
+            for position in members {
+                buckets[position].group = Some(key.to_owned());
+            }
+            families.push(FacetBucket {
+                value: key.to_owned(),
+                label: Some(label.to_owned()),
+                count,
+                active: false,
+                group: None,
+            });
+        }
+        Ok(families)
     }
 }

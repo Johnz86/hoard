@@ -5,6 +5,7 @@
 //! opens a database, so every rule the UI relies on is a unit test rather than a fixture.
 //! The compiler that turns tokens into a search over the catalog lives beside the catalog.
 
+pub mod brands;
 pub mod context;
 pub mod facets;
 pub mod grammar;

@@ -123,9 +123,19 @@ Count `—` when zero. A row whose label the rail cannot show whole recovers it 
 22 characters the column fits. A short label that is its own value carries no tooltip,
 because repeating it says nothing. BASE ARCHITECTURE prints `27 of 213 — showing the most
 common` (mono 11px, `--dim`) under its rows whenever the rail holds fewer bases than the
-result set does; a section of more than fifteen rows carries a filter field above them
+result set does, counted over the base buckets alone so a family header never inflates it.
+BASE ARCHITECTURE is the one two-tier section: where two or more of its surviving buckets
+share a brand the server names, the brand heads them as a family row (`--text` label, 0.06em
+letter-spacing, the union of its members' count) with its members indented 18px beneath it,
+and the buckets no family heads follow flat in their own order. A brand holding one bucket
+gets no header, so the hierarchy appears only where it resolves something. A family row
+selects the union of exactly its members, never a prefix, and its mark is filled only while
+every member it heads is selected, so the header a click on one member reaches still opens
+the whole brand. A section of more than fifteen rows carries a filter field above them
 (mono 11.5px, full width) that shows and hides the rows already drawn and asks the server
-for nothing. Below, SAVED SHELVES list (mono 11.5px, `--muted`, amber on hover,
+for nothing; a family and its members filter as one, so a header stays while any member it
+heads matches and a member stays while its brand's name matches, and neither is left on
+screen without the other. Below, SAVED SHELVES list (mono 11.5px, `--muted`, amber on hover,
 count in `--dim` then `›` at right). The triage queue sorts first among the shelves and the
 SAVED SHELVES title carries its count, `SAVED SHELVES (25)`, so the number of artifacts
 waiting to be classified is on screen without opening anything; the title drops the count

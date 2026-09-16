@@ -1,3 +1,4 @@
+mod brands;
 mod codec;
 mod collapse;
 mod counts;
