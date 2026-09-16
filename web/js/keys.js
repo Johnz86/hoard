@@ -13,7 +13,6 @@ const SHEET = [
         ["↵", "open the repo under the cursor"],
         ["SPC", "toggle selection"],
         ["L", "add to the loadout"],
-        ["S", "serve it on the LAN"],
         ["Y", "yank the pull command"]
     ]],
     ["DETAIL", [
@@ -133,9 +132,6 @@ export function initKeys(app) {
         } else if (key === "l") {
             event.preventDefault();
             app.addToLoadout(app.cursorRow());
-        } else if (key === "s") {
-            event.preventDefault();
-            app.serve(app.cursorRow());
         } else if (key === "y") {
             event.preventDefault();
             app.yank(app.cursorRow());

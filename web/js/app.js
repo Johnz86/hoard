@@ -94,7 +94,6 @@ const app = {
     addToLoadout,
     removeFromLoadout,
     yank,
-    serve,
     copyCommand,
     openDrawer,
     closeDrawer,
@@ -122,12 +121,6 @@ function selfNodeName() {
     const nodes = state.nodes || [];
     const own = nodes.find((node) => node.self) || nodes[0];
     return (own && own.name) || "this node";
-}
-
-function selfNodeUrl() {
-    const nodes = state.nodes || [];
-    const own = nodes.find((node) => node.self) || nodes[0];
-    return (own && own.url) || "http://hoard.lan";
 }
 
 function resultLine() {
@@ -454,7 +447,7 @@ async function yank(row) {
     if (!row || !row.artifact_id) return;
     try {
         const command = await api.pullCommand(row.artifact_id);
-        await copyCommand(command.git);
+        await copyCommand(command.hf);
     } catch (error) {
         toast(`yank failed · ${error.message}`);
     }
@@ -464,11 +457,6 @@ async function copyCommand(text) {
     if (!text) return;
     const ok = await copyText(text);
     toast(ok ? `copied: ${text}` : `copy blocked by the browser · ${text}`);
-}
-
-function serve(row) {
-    if (!row) return;
-    toast(`served ${row.name} → ${selfNodeUrl()}/${row.org}/${row.name}`);
 }
 
 function openDrawer() {
@@ -597,7 +585,6 @@ function paintFooter() {
         ["↵", "open"],
         ["SPC", "select"],
         ["L", "loadout"],
-        ["S", "serve"],
         ["Y", "yank"],
         ["/", "search"],
         ["?", "keys"]

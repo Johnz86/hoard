@@ -108,10 +108,14 @@ short. The server logs the window at `debug`; nothing in the response names it.
   "banner" }`. A row carries `artifact_id`, `role`, `role_code`, `org`, `name`, `repo`,
   `detail`, `size`, `size_human`, `state`, `state_label`, `pull_progress`; `total` is how
   many candidates the rule accepted, which can exceed `rows.len()` when `limit` truncates.
-- `GET /api/v1/artifacts/{id}/pull-command`: `{ "git": "git clone http://hoard.lan:7099/org/name",
-  "hf": "HF_ENDPOINT=http://hoard.lan:7099 hf download org/name", "path": "/srv/..." }`. The
-  `hf` command appends ` --repo-type dataset|space` for a repo of that type; models carry no
-  flag.
+- `GET /api/v1/artifacts/{id}/pull-command`: `{ "git": null,
+  "hf": "HF_ENDPOINT=http://hoard.lan:7099 hf download org/name file.safetensors",
+  "path": "/srv/..." }`. The `hf` command appends ` --repo-type dataset|space` for a repo of
+  that type; models carry no flag. `git` is a `git clone` line only when the repository's
+  source is a git clone this node can serve over the git face, and `null` otherwise; `hf`
+  appends the artifact's own path, or the two `--include` globs
+  (`"<stem>-*-of-<total>.<ext>"` and `"<stem>.<ext>.index.json"`) that name a shard set, or
+  nothing at all for the repository-level command the repo page and the generated card print.
 - `PUT /api/v1/artifacts/{id}/override { "role", "base", "sub_role" }`, at least one of the
   three set or 400. `DELETE` clears.
 - `GET /api/v1/blobs/{sha256}`: `{ "sha256", "size", "size_human", "path_count",

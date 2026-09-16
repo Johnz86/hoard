@@ -15,6 +15,7 @@ use hoard_index::catalog::{
     Catalog, Dedupe, EntryDetail, RepositoryDetail, RepositoryFilter, RevisionDetail,
 };
 use hoard_index::catalog::{PullRow, UsageDay};
+use hoard_index::config::SourceKind;
 use hoard_index::discover::RefKind;
 use hoard_index::row::SearchRow;
 use hoard_index::shard::parse_shard_name;
@@ -258,7 +259,7 @@ pub async fn detail(
     let host = state.node_name().to_owned();
     let public = public_host(state.public_url());
     let now = Timestamp::now();
-    let commands = pull_commands(&state, &repo, None);
+    let url = state.public_url().to_owned();
     let catalog = Arc::clone(state.catalog());
     let view = blocking(move || {
         describe(
@@ -269,7 +270,7 @@ pub async fn detail(
                 host,
                 public,
             },
-            commands,
+            &url,
             now,
         )
     })
@@ -289,7 +290,7 @@ struct Header {
 fn describe(
     catalog: &Catalog,
     header: &Header,
-    commands: PullCommands,
+    url: &str,
     now: Timestamp,
 ) -> Result<RepoView, IndexError> {
     let record = require_repository(catalog, &header.repo)?;
@@ -328,7 +329,7 @@ fn describe(
         facts: repo_facts(catalog, primary, now)?,
         refs,
         paths,
-        pull: PullCommands { path, ..commands },
+        pull: pull_commands(url, &header.repo, record.kind, None, path),
         rows: rows.iter().map(RowView::from).collect(),
     })
 }
@@ -384,7 +385,7 @@ pub async fn readme(
     let probe = repo.clone();
     let revision = wanted.clone();
     let catalog = Arc::clone(state.catalog());
-    let (path, fallback) = blocking(move || {
+    let (path, fallback, kind) = blocking(move || {
         let record = require_repository(&catalog, &probe)?;
         let resolved = require_revision(&catalog, &record, &revision)?;
         let entries = catalog.revision_entries(record.id, resolved.ordinal, Dedupe::Ignore)?;
@@ -394,7 +395,7 @@ pub async fn readme(
             .and_then(|entry| entry.abs_path.clone())
             .map(PathBuf::from);
         let rows = catalog.repository_rows(record.id, REPO_ARTIFACTS)?;
-        Ok((path, pick_primary(&rows).cloned()))
+        Ok((path, pick_primary(&rows).cloned(), record.kind))
     })
     .await?;
 
@@ -404,7 +405,10 @@ pub async fn readme(
     };
     let (text, generated) = match source {
         Some(text) => (text, false),
-        None => (generated_card(&state, &repo, fallback.as_ref()), true),
+        None => (
+            generated_card(state.public_url(), &repo, kind, fallback.as_ref()),
+            true,
+        ),
     };
     let document = tokio::task::spawn_blocking(move || parse_readme(&text))
         .await
@@ -662,8 +666,13 @@ async fn read_card(path: &std::path::Path) -> Option<String> {
 
 /// The card hoard writes when upstream never shipped one: what the index knows, and how to
 /// pull the repository it describes.
-fn generated_card(state: &AppState, repo: &RepoId, primary: Option<&SearchRow>) -> String {
-    let commands = pull_commands(state, repo, None);
+fn generated_card(
+    url: &str,
+    repo: &RepoId,
+    kind: SourceKind,
+    primary: Option<&SearchRow>,
+) -> String {
+    let commands = pull_commands(url, repo, kind, None, None);
     let mut text = format!(
         "# {}\n\nNo upstream card was recovered for this repository. This page is generated \
          from hoard's index record.\n\n## What we know\n\n",
@@ -685,10 +694,13 @@ fn generated_card(state: &AppState, repo: &RepoId, primary: Option<&SearchRow>) 
         }
         None => text.push_str("- nothing has been classified in this repository yet\n"),
     }
-    text.push_str(&format!(
-        "\n## Pull it\n\n```\n{}\n{}\n```\n",
-        commands.git, commands.hf
-    ));
+    text.push_str("\n## Pull it\n\n```\n");
+    if let Some(git) = commands.git.as_deref() {
+        text.push_str(git);
+        text.push('\n');
+    }
+    text.push_str(&commands.hf);
+    text.push_str("\n```\n");
     text
 }
 

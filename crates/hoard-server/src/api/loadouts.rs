@@ -18,7 +18,7 @@ use hoard_net::identity::NodeIdentity;
 use hoard_net::{PullRequest, Puller, PullerConfig};
 
 use crate::api::artifacts::artifact_id;
-use crate::api::common::{authorize, blocking};
+use crate::api::common::{authorize, blocking, shell_quoted};
 use crate::api::link::{self, Profile};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -835,25 +835,6 @@ fn comfy_script(view: &LoadoutView) -> String {
         ));
     }
     text
-}
-
-/// One argument of a generated script, quoted so a name carrying a space, a quote or a
-/// shell metacharacter is one word rather than several.
-///
-/// Single quotes, because nothing inside them is expanded. `$COMFYUI` is the one thing the
-/// script does expand, so it is written outside these quotes and the untrusted half of the
-/// path is concatenated to it.
-fn shell_quoted(value: &str) -> String {
-    let mut quoted = String::with_capacity(value.len() + 2);
-    quoted.push('\'');
-    for character in value.chars() {
-        match character {
-            '\'' => quoted.push_str("'\\''"),
-            other => quoted.push(other),
-        }
-    }
-    quoted.push('\'');
-    quoted
 }
 
 fn loadout_id(raw: &str) -> ApiResult<LoadoutId> {

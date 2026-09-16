@@ -974,7 +974,7 @@ async fn compatibility_is_directional_and_never_pairs_two_adapters() {
 }
 
 #[tokio::test]
-async fn a_pull_command_prints_git_hf_and_the_path() {
+async fn a_pull_command_scopes_hf_to_the_file_and_carries_no_dead_git_line() {
     let world = seeded();
     let body = get(
         &world.state,
@@ -984,8 +984,9 @@ async fn a_pull_command_prints_git_hf_and_the_path() {
     assert_eq!(
         body,
         json!({
-            "git": "git clone http://hoard.lan:7099/kohya/film-grain-35mm",
-            "hf": "HF_ENDPOINT=http://hoard.lan:7099 hf download kohya/film-grain-35mm",
+            "git": null,
+            "hf": "HF_ENDPOINT=http://hoard.lan:7099 hf download kohya/film-grain-35mm \
+                   'film-grain-35mm.safetensors'",
             "path": "/mnt/vault/loras/film-grain-35mm.safetensors"
         })
     );
@@ -997,8 +998,9 @@ async fn a_pull_command_prints_git_hf_and_the_path() {
     .await;
     assert_eq!(
         dataset["hf"],
-        "HF_ENDPOINT=http://hoard.lan:7099 hf download squad --repo-type dataset"
+        "HF_ENDPOINT=http://hoard.lan:7099 hf download squad --repo-type dataset 'train.parquet'"
     );
+    assert_eq!(dataset["git"], Value::Null);
 }
 
 #[tokio::test]
@@ -1148,9 +1150,10 @@ async fn a_repository_detail_carries_the_header_refs_and_pull_box() {
     assert_eq!(body["refs"][0]["kind"], "branch");
     assert_eq!(body["refs"][0]["current"], true);
     assert_eq!(body["refs"][1]["kind"], "tag");
+    assert_eq!(body["pull"]["git"], Value::Null);
     assert_eq!(
-        body["pull"]["git"],
-        "git clone http://hoard.lan:7099/stability/sdxl-base-1.0"
+        body["pull"]["hf"],
+        "HF_ENDPOINT=http://hoard.lan:7099 hf download stability/sdxl-base-1.0"
     );
     let fact_keys: Vec<&str> = body["facts"]
         .as_array()
@@ -1294,7 +1297,11 @@ async fn a_card_renders_frontmatter_and_falls_back_to_a_generated_one() {
     assert!(html.contains("No upstream card was recovered"), "{html}");
     assert!(html.contains("film grain, 35mm, halation"), "{html}");
     assert!(
-        html.contains("git clone http://hoard.lan:7099/kohya/film-grain-35mm"),
+        !html.contains("git clone"),
+        "an hf-cache repository has no git face; the card printed one anyway: {html}"
+    );
+    assert!(
+        html.contains("HF_ENDPOINT=http://hoard.lan:7099 hf download kohya/film-grain-35mm"),
         "{html}"
     );
 }

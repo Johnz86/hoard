@@ -6,14 +6,15 @@ use axum::http::HeaderMap;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use hoard_core::{ArtifactId, Base, Evidence, Role, Sha256, SubRole, format_size};
+use hoard_core::{ArtifactId, Base, Evidence, RepoId, Role, Sha256, SubRole, format_size};
 use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, EntryDetail};
+use hoard_index::config::SourceKind;
 use hoard_index::row::SearchRow;
 
 use crate::api::common::{
-    EntryView, Fact, PLUGS_INTO_LIMIT, PullCommands, RowView, authorize, blocking, clamp_limit,
-    entry_views, facts, pull_commands,
+    EntryView, Fact, PLUGS_INTO_LIMIT, PullArtifact, PullCommands, RowView, authorize, blocking,
+    clamp_limit, entry_views, facts, pull_commands,
 };
 use crate::api::compat::{CompatRowView, CompatView, compat_for};
 use crate::error::{ApiError, ApiResult};
@@ -197,10 +198,23 @@ pub async fn pull_command(
 ) -> ApiResult<Json<PullCommands>> {
     let id = artifact_id(&id)?;
     let catalog = Arc::clone(state.catalog());
-    let row = blocking(move || require_row(&catalog, id)).await?;
-    let repo = hoard_core::RepoId::parse_qualified(&row.repo).map_err(ApiError::from)?;
-    let path = row.abs_path.clone().or(Some(row.path.clone()));
-    Ok(Json(pull_commands(&state, &repo, path)))
+    let (row, repo, kind) = blocking(move || {
+        let row = require_row(&catalog, id)?;
+        let repo = RepoId::parse_qualified(&row.repo)?;
+        let kind = catalog
+            .repository(&repo)?
+            .map_or(SourceKind::Auto, |record| record.kind);
+        Ok((row, repo, kind))
+    })
+    .await?;
+    let path = row.abs_path.clone().or_else(|| Some(row.path.clone()));
+    Ok(Json(pull_commands(
+        state.public_url(),
+        &repo,
+        kind,
+        Some(PullArtifact::from(&row)),
+        path,
+    )))
 }
 
 pub async fn put_override(

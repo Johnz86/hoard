@@ -278,19 +278,12 @@ function rightRail(app, repo) {
             "div",
             null,
             el("div", { class: "rail-title", text: "PULL TO THIS MACHINE" }),
-            el(
-                "div",
-                { class: "code-box" },
-                el("div", { class: "code-comment", text: "# git, refs preserved" }),
-                el("div", { class: "code-line", text: pull.git || "" }),
-                el("div", { class: "code-comment", text: "# or python, unchanged" }),
-                el("div", { class: "code-line" }, highlightUrl(pull.hf || ""))
-            ),
+            pullBox(pull),
             el("button", {
                 class: "btn btn-wide",
                 type: "button",
                 text: "COPY",
-                onClick: () => app.copyCommand(pull.git || "")
+                onClick: () => app.copyCommand(pull.git || pull.hf || "")
             })
         ),
         el(
@@ -316,6 +309,19 @@ function rightRail(app, repo) {
             )
         )
     );
+}
+
+function pullBox(pull) {
+    const lines = [];
+    if (pull.git) {
+        lines.push(el("div", { class: "code-comment", text: "# git, refs preserved" }));
+        lines.push(el("div", { class: "code-line", text: pull.git }));
+        lines.push(el("div", { class: "code-comment", text: "# or python, unchanged" }));
+    } else {
+        lines.push(el("div", { class: "code-comment", text: "# python, unchanged" }));
+    }
+    lines.push(el("div", { class: "code-line" }, highlightUrl(pull.hf || "")));
+    return el("div", { class: "code-box" }, lines);
 }
 
 export function renderDetail(app) {

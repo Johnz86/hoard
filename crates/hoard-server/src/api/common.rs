@@ -11,8 +11,11 @@ use hoard_core::{
 };
 use hoard_index::IndexError;
 use hoard_index::catalog::EntryDetail;
+use hoard_index::config::SourceKind;
 use hoard_index::row::SearchRow;
 use hoard_index::search::{SortKey, SortSpec};
+use hoard_index::shard::parse_shard_name;
+use hoard_mirror::git::is_clonable;
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -449,27 +452,99 @@ fn plural(count: i64, unit: &str) -> String {
     }
 }
 
-/// The three ways to fetch a repository from this node, as the PULL TO THIS MACHINE box
-/// and the `Y` yank both print them.
+/// The ways to fetch a repository from this node, as the PULL TO THIS MACHINE box and the
+/// `Y` yank both print them. `git` is absent for a source this node cannot serve over the
+/// git face.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PullCommands {
-    pub git: String,
+    pub git: Option<String>,
     pub hf: String,
     pub path: Option<String>,
 }
 
-pub fn pull_commands(state: &AppState, repo: &RepoId, path: Option<String>) -> PullCommands {
-    let url = state.public_url().trim_end_matches('/');
+/// The one artifact a pull command names, when it names one rather than the repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullArtifact<'a> {
+    pub path: &'a str,
+    pub shard_count: u32,
+}
+
+impl<'a> From<&'a SearchRow> for PullArtifact<'a> {
+    fn from(row: &'a SearchRow) -> Self {
+        Self {
+            path: &row.path,
+            shard_count: row.shard_count,
+        }
+    }
+}
+
+pub fn pull_commands(
+    url: &str,
+    repo: &RepoId,
+    kind: SourceKind,
+    artifact: Option<PullArtifact<'_>>,
+    path: Option<String>,
+) -> PullCommands {
+    let url = url.trim_end_matches('/');
     let reference = repo.reference();
     let repo_type = match repo.repo_type() {
         RepoType::Models => String::new(),
         other => format!(" --repo-type {}", other.singular()),
     };
+    let scope = artifact.map_or_else(String::new, |artifact| {
+        hf_scope(artifact.path, artifact.shard_count)
+    });
     PullCommands {
-        git: format!("git clone {url}/{reference}"),
-        hf: format!("HF_ENDPOINT={url} hf download {reference}{repo_type}"),
+        git: is_clonable(kind).then(|| format!("git clone {url}/{reference}")),
+        hf: format!("HF_ENDPOINT={url} hf download {reference}{repo_type}{scope}"),
         path,
     }
+}
+
+fn hf_scope(path: &str, shard_count: u32) -> String {
+    if shard_count <= 1 {
+        return format!(" {}", shell_quoted(path));
+    }
+    let (directory, file) = match path.rsplit_once('/') {
+        Some((dir, file)) => (format!("{dir}/"), file),
+        None => (String::new(), path),
+    };
+    let Some(shard) = parse_shard_name(file) else {
+        return String::new();
+    };
+    let total_and_dot = file
+        .strip_suffix(shard.extension)
+        .and_then(|base| base.rsplit_once("-of-"))
+        .map_or_else(
+            || format!("{:05}.", shard.total),
+            |(_, suffix)| suffix.to_owned(),
+        );
+    let weights = format!(
+        "{directory}{}-*-of-{total_and_dot}{}",
+        shard.stem, shard.extension
+    );
+    let index = format!("{directory}{}.{}.index.json", shard.stem, shard.extension);
+    format!(
+        " --include {} --include {}",
+        shell_quoted(&weights),
+        shell_quoted(&index)
+    )
+}
+
+/// Quotes a value for a POSIX shell: wrapped in single quotes, with every embedded single
+/// quote closed, escaped and reopened. Safe for any byte a path or a repo reference carries,
+/// space, `$`, backtick and all.
+pub(crate) fn shell_quoted(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for character in value.chars() {
+        match character {
+            '\'' => quoted.push_str("'\\''"),
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Reads `type/org/name` back out of the three path segments of a repo route.
@@ -580,6 +655,181 @@ mod tests {
         assert_eq!(state_label(State::Served, None, None), "SERVED");
         assert_eq!(state_label(State::Pulling, Some(0.64), None), "PULLING 64%");
         assert_eq!(state_label(State::Remote, None, Some("x")), "REMOTE");
+    }
+
+    #[test]
+    fn a_single_file_artifact_scopes_the_hf_line_to_its_path() {
+        let repo = RepoId::parse_qualified("models/comfy/loras").expect("repo parses");
+        let commands = pull_commands(
+            "http://127.0.0.1:7099",
+            &repo,
+            SourceKind::Loose,
+            Some(PullArtifact {
+                path: "Flux_2-Turbo-LoRA_comfyui.safetensors",
+                shard_count: 1,
+            }),
+            None,
+        );
+        assert_eq!(
+            commands.hf,
+            "HF_ENDPOINT=http://127.0.0.1:7099 hf download comfy/loras \
+             'Flux_2-Turbo-LoRA_comfyui.safetensors'"
+        );
+    }
+
+    #[test]
+    fn a_shard_set_scopes_the_hf_line_to_two_include_globs() {
+        let repo = RepoId::parse_qualified("models/mistralai/Ministral-3-14B-Instruct-2512")
+            .expect("repo parses");
+        let commands = pull_commands(
+            "http://127.0.0.1:7099",
+            &repo,
+            SourceKind::HfCache,
+            Some(PullArtifact {
+                path: "model-00001-of-00010.safetensors",
+                shard_count: 10,
+            }),
+            None,
+        );
+        assert_eq!(
+            commands.hf,
+            "HF_ENDPOINT=http://127.0.0.1:7099 hf download mistralai/Ministral-3-14B-Instruct-2512 \
+             --include 'model-*-of-00010.safetensors' \
+             --include 'model.safetensors.index.json'"
+        );
+    }
+
+    #[test]
+    fn a_shard_set_inside_a_subdirectory_keeps_its_directory_in_both_globs() {
+        let repo = RepoId::parse_qualified("models/org/checkpoint").expect("repo parses");
+        let commands = pull_commands(
+            "http://127.0.0.1:7099",
+            &repo,
+            SourceKind::HfCache,
+            Some(PullArtifact {
+                path: "unet/diffusion_pytorch_model-00001-of-00002.safetensors",
+                shard_count: 2,
+            }),
+            None,
+        );
+        assert_eq!(
+            commands.hf,
+            "HF_ENDPOINT=http://127.0.0.1:7099 hf download org/checkpoint \
+             --include 'unet/diffusion_pytorch_model-*-of-00002.safetensors' \
+             --include 'unet/diffusion_pytorch_model.safetensors.index.json'"
+        );
+    }
+
+    #[test]
+    fn a_shard_set_without_five_digit_padding_keeps_its_own_width() {
+        let repo = RepoId::parse_qualified("models/org/checkpoint").expect("repo parses");
+        let commands = pull_commands(
+            "http://127.0.0.1:7099",
+            &repo,
+            SourceKind::HfCache,
+            Some(PullArtifact {
+                path: "model-1-of-2.safetensors",
+                shard_count: 2,
+            }),
+            None,
+        );
+        assert_eq!(
+            commands.hf,
+            "HF_ENDPOINT=http://127.0.0.1:7099 hf download org/checkpoint \
+             --include 'model-*-of-2.safetensors' \
+             --include 'model.safetensors.index.json'"
+        );
+    }
+
+    #[test]
+    fn a_set_grouped_without_shard_names_falls_back_to_the_repository_command() {
+        let repo = RepoId::parse_qualified("models/org/checkpoint").expect("repo parses");
+        let commands = pull_commands(
+            "http://127.0.0.1:7099",
+            &repo,
+            SourceKind::HfCache,
+            Some(PullArtifact {
+                path: "model.safetensors",
+                shard_count: 4,
+            }),
+            None,
+        );
+        assert_eq!(
+            commands.hf,
+            "HF_ENDPOINT=http://127.0.0.1:7099 hf download org/checkpoint"
+        );
+    }
+
+    #[test]
+    fn a_path_carrying_a_space_is_shell_quoted() {
+        let repo = RepoId::parse_qualified("models/org/name").expect("repo parses");
+        let commands = pull_commands(
+            "http://127.0.0.1:7099",
+            &repo,
+            SourceKind::HfCache,
+            Some(PullArtifact {
+                path: "a checkpoint.safetensors",
+                shard_count: 1,
+            }),
+            None,
+        );
+        assert_eq!(
+            commands.hf,
+            "HF_ENDPOINT=http://127.0.0.1:7099 hf download org/name 'a checkpoint.safetensors'"
+        );
+    }
+
+    #[test]
+    fn a_dataset_flag_lands_before_the_file_and_after_the_reference() {
+        let repo = RepoId::parse_ref(RepoType::Datasets, "squad").expect("repo parses");
+        let commands = pull_commands(
+            "http://hoard.lan:7099",
+            &repo,
+            SourceKind::HfCache,
+            Some(PullArtifact {
+                path: "train.parquet",
+                shard_count: 1,
+            }),
+            None,
+        );
+        assert_eq!(
+            commands.hf,
+            "HF_ENDPOINT=http://hoard.lan:7099 hf download squad --repo-type dataset 'train.parquet'"
+        );
+    }
+
+    #[test]
+    fn git_answers_only_for_a_clonable_repository() {
+        let repo = RepoId::parse_qualified("models/org/name").expect("repo parses");
+        let clonable = pull_commands("http://hoard.lan:7099", &repo, SourceKind::Git, None, None);
+        assert_eq!(
+            clonable.git.as_deref(),
+            Some("git clone http://hoard.lan:7099/org/name")
+        );
+        let cached = pull_commands(
+            "http://hoard.lan:7099",
+            &repo,
+            SourceKind::HfCache,
+            None,
+            None,
+        );
+        assert_eq!(cached.git, None);
+    }
+
+    #[test]
+    fn no_artifact_names_the_repository_command() {
+        let repo = RepoId::parse_qualified("models/org/name").expect("repo parses");
+        let commands = pull_commands(
+            "http://hoard.lan:7099",
+            &repo,
+            SourceKind::HfCache,
+            None,
+            None,
+        );
+        assert_eq!(
+            commands.hf,
+            "HF_ENDPOINT=http://hoard.lan:7099 hf download org/name"
+        );
     }
 
     #[test]

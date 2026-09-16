@@ -173,7 +173,7 @@ role bar + role code + state at top, name 15px sans 600, `org base · prec · si
 `oklch(0.25 0.015 65)` fill.
 
 Footer key hints (`--panel`, mono 11px): `J/K move`, `↵ open`, `SPC select`,
-`L loadout`, `S serve`, `/ search`, and at right `n selected` or
+`L loadout`, `Y yank`, `/ search`, `? keys`, and at right `n selected` or
 `double-click a row to open it`.
 
 Inspector rail (288px, `--panel`, left rule, 16px padding, 20px gaps): INSPECTOR label,
@@ -215,7 +215,8 @@ Body 26px 30px padding. Optional YAML FRONTMATTER box (dashed border, mono 11.5p
 `--amb`). Then blocks: h1, h2, p, li (amber middot in an 18px column), code (`--bg` fill,
 mono 12px, pre-wrap), quote (2px amber left border, `--muted`). When no README exists the
 page is generated from the index record: "No upstream card was recovered..." with What we
-know (role, base, trigger words) and Pull it (`git clone` command).
+know (role, base, trigger words) and Pull it (the working command, `git clone` only when the
+repository can be cloned).
 
 COMPAT: banner `RESOLVED FROM TENSOR KEYS AND RANK — NOT FROM THE MODEL CARD ·
 <N host checkpoints accept X | N adapters resolve against X>`; rows grid
@@ -227,9 +228,12 @@ amber, others alternate `--panel2` / `--rule`), footer `aug 28` and `38 pulls ·
 RECENT PULLS grid `130px 150px minmax(0,1fr) 100px`: when, who (client host), what
 (path), rate in `--green`.
 
-Right rail (340px, `--panel`): PULL TO THIS MACHINE code box (`# git, refs preserved`,
-`git clone http://hoard.lan/org/name`, `# or python, unchanged`,
-`HF_ENDPOINT=http://hoard.lan:7099` with the URL in amber) and a COPY button; DERIVED
+Right rail (340px, `--panel`): PULL TO THIS MACHINE code box, whose git block
+(`# git, refs preserved`, `git clone http://hoard.lan/org/name`) is shown only for a
+repository this node can serve over the git face, followed by `# or python, unchanged`
+(`# python, unchanged` when no git line precedes it) and
+`HF_ENDPOINT=http://hoard.lan:7099` with the URL in amber; the COPY button copies the first
+line shown. DERIVED
 FACTS list (same shape as inspector facts, plus `first seen`, `pulls on lan`); PATHS ON
 DISK list (`path · node`, symlinks shown as `laptop · symlink`).
 
@@ -255,8 +259,8 @@ Global: `Esc` blurs the search field, else closes the drawer, else leaves detail
 `/` focuses search (prevent default). Keys are ignored while typing in an input.
 
 Index: `j`/`↓` and `k`/`↑` move the cursor (clamped), `Enter` opens, `Space` toggles
-selection, `L` adds cursor row to the loadout, `S` serves it (toast), `Y` yanks the pull
-command, `?` shows the key sheet (proposal footer).
+selection, `L` adds cursor row to the loadout, `Y` yanks the pull command, `?` shows the key
+sheet (proposal footer).
 
 Detail: `[` and `]` cycle FILES, REFS, CARD, COMPAT, USAGE; `L` adds the repo to the
 loadout; `Esc` returns to the index.
