@@ -160,7 +160,7 @@ pub(super) fn count_buckets(summary: &Summary, dimension: usize) -> Result<Vec<F
             label: tally.label,
             count: tally.count,
             active: false,
-            group: None,
+            members: Vec::new(),
         })
         .collect();
     order_buckets(&mut buckets);

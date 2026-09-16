@@ -39,19 +39,47 @@ fn brand_fixture(populations: &[(&str, usize)]) -> Result<(TempDir, Catalog)> {
     Ok((directory, catalog))
 }
 
-fn family<'a>(page: &'a QueryPage, key: &str) -> Option<&'a crate::row::FacetBucket> {
-    page.facets
-        .base_families
-        .iter()
-        .find(|bucket| bucket.value == key)
-}
-
-fn base_bucket<'a>(page: &'a QueryPage, value: &str) -> &'a crate::row::FacetBucket {
+fn base_row<'a>(page: &'a QueryPage, value: &str) -> &'a crate::row::FacetBucket {
     page.facets
         .base
         .iter()
         .find(|bucket| bucket.value == value)
-        .expect("the rail holds the seeded base")
+        .expect("the rail holds the row")
+}
+
+fn base_values(page: &QueryPage) -> Vec<&str> {
+    page.facets
+        .base
+        .iter()
+        .map(|bucket| bucket.value.as_str())
+        .collect()
+}
+
+fn members(page: &QueryPage, value: &str) -> Vec<String> {
+    base_row(page, value).members.clone()
+}
+
+#[test]
+fn a_brand_row_stands_alone_and_its_members_are_not_rows() -> Result<()> {
+    let (_directory, catalog) =
+        brand_fixture(&[("qwen3", 3), ("qwen35moe", 2), ("qwenimage2512", 4)])?;
+    let page = search(&catalog, "")?;
+    assert_eq!(
+        base_values(&page),
+        vec!["qwen", "qwenimage2512"],
+        "a brand replaces the rows it claims rather than heading them"
+    );
+    assert_eq!(members(&page, "qwen"), vec!["qwen3", "qwen35moe"]);
+    assert!(
+        base_row(&page, "qwenimage2512").members.is_empty(),
+        "a row no brand claims stands for itself alone"
+    );
+    assert_eq!(
+        page.facets.base_shown, 3,
+        "base_shown counts the exact base terms the rows stand for, not the row count, so \
+         the cap note never claims a consolidated variant is hidden"
+    );
+    Ok(())
 }
 
 #[test]
@@ -63,78 +91,61 @@ fn a_brand_row_unions_its_members_and_never_prefixes_them() -> Result<()> {
         ("gemma3", 1),
     ])?;
     let page = search(&catalog, "")?;
-    let qwen = family(&page, "qwen").expect("the qwen family is grouped");
+    let qwen = base_row(&page, "qwen");
     assert_eq!(qwen.label.as_deref(), Some("QWEN"));
     assert_eq!(
         qwen.count, 5,
-        "the family counts its two members and never the unrelated qwen-image family"
+        "the row counts its two members and never the unrelated qwen-image family"
     );
-    assert_eq!(base_bucket(&page, "qwenimage2512").group, None);
-    let members: Vec<&str> = page
-        .facets
-        .base
-        .iter()
-        .filter(|bucket| bucket.group.as_deref() == Some("qwen"))
-        .map(|bucket| bucket.value.as_str())
-        .collect();
     assert_eq!(
-        members,
+        members(&page, "qwen"),
         vec!["qwen3", "qwen35moe"],
-        "the grouped members are the rail's own, in the order the rail lists them"
+        "the members are the rail's own, in the order the rail listed them"
     );
     assert_eq!(
         search(&catalog, "base:qwen3,qwen35moe")?.total,
         qwen.count,
-        "the query a family row opens counts what the family row says"
+        "the query a brand row opens counts what the brand row says"
     );
+    assert_eq!(base_row(&page, "qwenimage2512").count, 4);
     Ok(())
 }
 
 #[test]
-fn a_family_counts_each_artifact_once() -> Result<()> {
+fn a_brand_row_counts_each_artifact_once() -> Result<()> {
     let (_directory, catalog) = brand_fixture(&[("qwen3", 1), ("qwen35", 1)])?;
     let page = search(&catalog, "")?;
-    let qwen = family(&page, "qwen").expect("the qwen family is grouped");
-    let members = base_bucket(&page, "qwen3").count + base_bucket(&page, "qwen35").count;
+    let separate = search(&catalog, "base:qwen3")?.total + search(&catalog, "base:qwen35")?.total;
     assert_eq!(
-        members, 4,
-        "the prefix rule counts each artifact in both buckets, so the two counts overlap"
+        separate, 4,
+        "the prefix rule answers each artifact for both members, so the two counts overlap"
     );
     assert_eq!(
-        qwen.count, 2,
+        base_row(&page, "qwen").count,
+        2,
         "the union counts an artifact its members share once, not once per member"
     );
     Ok(())
 }
 
 #[test]
-fn a_brand_with_one_surviving_member_is_not_grouped() -> Result<()> {
-    let (_directory, catalog) = brand_fixture(&[("gemma3", 2), ("lfm2", 1)])?;
+fn a_brand_with_one_member_is_still_a_brand_row() -> Result<()> {
+    let (_directory, catalog) = brand_fixture(&[("gemma3", 2)])?;
     let page = search(&catalog, "")?;
-    assert!(
-        page.facets.base_families.is_empty(),
-        "a brand holding one bucket is the flat row it always was"
-    );
-    assert_eq!(base_bucket(&page, "gemma3").group, None);
-    assert_eq!(base_bucket(&page, "lfm2").group, None);
-    Ok(())
-}
-
-#[test]
-fn a_family_row_is_active_when_the_query_selects_it() -> Result<()> {
-    let (_directory, catalog) = brand_fixture(&[("gemma3", 2), ("gemma4", 2)])?;
-    let page = search(&catalog, "base:gemma3,gemma4")?;
-    let gemma = family(&page, "gemma").expect("the gemma family is grouped");
-    assert!(gemma.active, "the family row the query selects is marked");
     assert_eq!(
-        gemma.count, 4,
-        "the family is counted over the set the base key does not narrow"
+        base_values(&page),
+        vec!["gemma"],
+        "the rail's vocabulary is the brand's, however many variants happen to be held"
     );
+    let gemma = base_row(&page, "gemma");
+    assert_eq!(gemma.label.as_deref(), Some("GEMMA"));
+    assert_eq!(gemma.count, 2);
+    assert_eq!(members(&page, "gemma"), vec!["gemma3"]);
     Ok(())
 }
 
 #[test]
-fn a_query_holding_one_member_leaves_the_family_row_unmarked() -> Result<()> {
+fn a_brand_row_is_active_only_when_its_whole_union_is_selected() -> Result<()> {
     let (_directory, catalog) = brand_fixture(&[
         ("qwen35moe", 2),
         ("qwen3vl", 2),
@@ -144,43 +155,48 @@ fn a_query_holding_one_member_leaves_the_family_row_unmarked() -> Result<()> {
     ])?;
     let one = search(&catalog, "base:qwen35moe")?;
     assert!(
-        !family(&one, "qwen")
-            .expect("the qwen family is grouped")
-            .active,
-        "the header a click on one member reaches is not already selected"
+        !base_row(&one, "qwen").active,
+        "one member is not the whole union a click on the row issues"
     );
-    assert!(base_bucket(&one, "qwen35moe").active);
-    assert!(!base_bucket(&one, "qwen3vl").active);
     assert!(
-        !family(&one, "gemma")
-            .expect("the gemma family is grouped")
-            .active,
-        "a family the query never names is untouched"
+        !base_row(&one, "gemma").active,
+        "a brand the query never names is untouched"
     );
     let whole = search(&catalog, "base:qwen35moe,qwen3vl")?;
     assert!(
-        family(&whole, "qwen")
-            .expect("the qwen family is grouped")
-            .active,
-        "the query the family row itself opens marks it"
+        base_row(&whole, "qwen").active,
+        "the query the brand row itself opens marks it"
+    );
+    let unrelated = search(&catalog, "base:qwenimage2512")?;
+    let qwen = base_row(&unrelated, "qwen");
+    assert!(
+        !qwen.active,
+        "qwen-image is neither counted by the brand nor marks it"
+    );
+    assert!(base_row(&unrelated, "qwenimage2512").active);
+    assert_eq!(
+        qwen.count, 4,
+        "the brand still counts its own two members, over the set the base key does not narrow"
+    );
+    assert_eq!(
+        base_values(&search(&catalog, "")?),
+        vec!["gemma", "qwen", "qwenimage2512"],
+        "a brand row is re-sorted by its own union count, not left at its first member's rank"
     );
     Ok(())
 }
 
 #[test]
-fn a_query_for_an_unrelated_product_never_marks_the_brand_it_shares_a_prefix_with() -> Result<()> {
-    let (_directory, catalog) =
-        brand_fixture(&[("qwen35moe", 2), ("qwen3vl", 2), ("qwenimage2512", 3)])?;
-    let page = search(&catalog, "base:qwenimage2512")?;
-    let qwen = family(&page, "qwen").expect("the qwen family is grouped");
-    assert!(
-        !qwen.active,
-        "qwen-image is neither counted by the qwen family nor marks it"
-    );
-    assert!(base_bucket(&page, "qwenimage2512").active);
-    assert_eq!(
-        qwen.count, 4,
-        "the family still counts its own two members, over the set the base key does not narrow"
-    );
+fn a_base_no_brand_claims_is_its_own_row() -> Result<()> {
+    let (_directory, catalog) = brand_fixture(&[("sdxl", 2), ("qwenimage2512", 1)])?;
+    let page = search(&catalog, "")?;
+    for value in ["sdxl", "qwenimage2512"] {
+        let row = base_row(&page, value);
+        assert!(
+            row.members.is_empty(),
+            "{value} names no brand anchor and stands for itself"
+        );
+        assert_eq!(row.label.as_deref(), Some(value));
+    }
     Ok(())
 }

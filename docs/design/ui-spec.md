@@ -122,20 +122,18 @@ Count `—` when zero. A row whose label the rail cannot show whole recovers it 
 `label (value)` whenever the two differ, and as the label alone when it is longer than the
 22 characters the column fits. A short label that is its own value carries no tooltip,
 because repeating it says nothing. BASE ARCHITECTURE prints `27 of 213 — showing the most
-common` (mono 11px, `--dim`) under its rows whenever the rail holds fewer bases than the
-result set does, counted over the base buckets alone so a family header never inflates it.
-BASE ARCHITECTURE is the one two-tier section: where two or more of its surviving buckets
-share a brand the server names, the brand heads them as a family row (`--text` label, 0.06em
-letter-spacing, the union of its members' count) with its members indented 18px beneath it,
-and the buckets no family heads follow flat in their own order. A brand holding one bucket
-gets no header, so the hierarchy appears only where it resolves something. A family row
-selects the union of exactly its members, never a prefix, and its mark is filled only while
-every member it heads is selected, so the header a click on one member reaches still opens
-the whole brand. A section of more than fifteen rows carries a filter field above them
-(mono 11.5px, full width) that shows and hides the rows already drawn and asks the server
-for nothing; a family and its members filter as one, so a header stays while any member it
-heads matches and a member stays while its brand's name matches, and neither is left on
-screen without the other. Below, SAVED SHELVES list (mono 11.5px, `--muted`, amber on hover,
+common` (mono 11px, `--dim`) under its rows whenever the rail stands for fewer bases than the
+result set holds, counted over the bases the rows stand for so a brand row never deflates it.
+BASE ARCHITECTURE renders one row per brand and one row per base value no brand claims, sorted
+together by count like every other section, with no header, no indentation and no second tier.
+A brand row's label and value differ (`QWEN`/`qwen`) so it carries a tooltip naming the exact
+values it stands for, the same hover mechanism every truncated label already uses. It selects
+the union of exactly those values, never a prefix, and its mark is filled only while every one
+of them is selected, so the row a click on one variant reaches still opens the whole brand. A
+brand holding one value is a brand row too, so the rail's vocabulary does not flip between a
+brand name and an architecture string. No section carries a filter field of its own: the
+search bar above the rail is the one place a query is typed.
+Below, SAVED SHELVES list (mono 11.5px, `--muted`, amber on hover,
 count in `--dim` then `›` at right). The triage queue sorts first among the shelves and the
 SAVED SHELVES title carries its count, `SAVED SHELVES (25)`, so the number of artifacts
 waiting to be classified is on screen without opening anything; the title drops the count

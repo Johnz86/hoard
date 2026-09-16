@@ -72,11 +72,11 @@ pub struct FacetBucket {
     pub label: Option<String>,
     pub count: u64,
     pub active: bool,
-    /// The brand key this bucket is nested under on the rail, when the rail groups it.
+    /// The exact base values this row stands for.
     ///
-    /// Presentation only: a grouped bucket carries the same `value` and the same count it
-    /// carries ungrouped, and nothing about how a base is stored or matched depends on it.
-    pub group: Option<String>,
+    /// Empty on a bucket the rail lists on its own; on a brand row, every value the rail would
+    /// otherwise have shown separately, in the order they would have appeared.
+    pub members: Vec<String>,
 }
 
 /// The DISK PRESSURE summary under the facet rail.

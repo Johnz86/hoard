@@ -304,7 +304,7 @@ impl Catalog {
         let mut dimensions: [Vec<FacetBucket>; FACET_DIMENSIONS.len()] =
             std::array::from_fn(|_| Vec::new());
         let mut base_total = 0_u64;
-        let mut base_families = Vec::new();
+        let mut base_shown = 0_u64;
         for (index, (key, _)) in FACET_DIMENSIONS.iter().enumerate() {
             let excluded = query::compile(&pass.parsed.tokens, Some(key), pass.bound)?;
             let narrowed = match pass.parsed.tokens_with_key(key).next() {
@@ -324,7 +324,9 @@ impl Catalog {
                 }
                 order_buckets(&mut buckets);
                 buckets.truncate(BASE_RAIL);
-                base_families = pass.brand_families(excluded.as_ref(), &mut buckets)?;
+                base_shown = buckets.len() as u64;
+                buckets = pass.consolidate_brands(excluded.as_ref(), buckets)?;
+                order_buckets(&mut buckets);
             }
             dimensions[index] = buckets;
         }
@@ -338,7 +340,7 @@ impl Catalog {
             node,
             disk_pressure: self.disk_pressure()?,
             base_total,
-            base_families,
+            base_shown,
         };
         facets.mark_query(pass.parsed);
         Ok(facets)
@@ -614,57 +616,51 @@ impl FacetPass<'_> {
         })
     }
 
-    /// The brands the rail's surviving base buckets belong to, one entry per brand holding
-    /// two or more of them, and the `group` written onto each bucket an entry heads.
+    /// The rail's base rows once every brand has claimed the buckets belonging to it: one row
+    /// per brand, standing where its first member stood and carrying the values it stands for,
+    /// and every bucket no brand claims passed through as it was.
     ///
-    /// A family is counted by running the very query its row offers - the union of exactly
-    /// the member values, through the same grammar a typed `base:a,b` compiles through - so
-    /// an artifact two members both hold is counted once and a row can never open a result
-    /// its count disagrees with. A brand is never a prefix: only a value
-    /// [`brands::brand_of`] names joins one, which is what keeps `qwenimage` out of `QWEN`.
-    fn brand_families(
+    /// A brand row is counted by running the very query it offers - the union of exactly the
+    /// member values, through the same grammar a typed `base:a,b` compiles through - so an
+    /// artifact two members both hold is counted once and a row can never open a result its
+    /// count disagrees with. The brand key itself is never the query: only a value
+    /// [`brands::brand_of`] claims joins a row, which is what keeps `qwenimage` out of `QWEN`.
+    fn consolidate_brands(
         &self,
         excluded: &dyn Query,
-        buckets: &mut [FacetBucket],
+        buckets: Vec<FacetBucket>,
     ) -> Result<Vec<FacetBucket>> {
-        let mut grouped: Vec<(&'static str, &'static str, Vec<usize>)> = Vec::new();
-        for (position, bucket) in buckets.iter().enumerate() {
+        let mut rows: Vec<FacetBucket> = Vec::with_capacity(buckets.len());
+        let mut claimed: Vec<(&'static str, usize)> = Vec::new();
+        for bucket in buckets {
             let Some((key, label)) = brands::brand_of(&bucket.value) else {
+                rows.push(bucket);
                 continue;
             };
-            match grouped.iter_mut().find(|(held, _, _)| *held == key) {
-                Some((_, _, members)) => members.push(position),
-                None => grouped.push((key, label, vec![position])),
+            match claimed.iter().find(|(held, _)| *held == key) {
+                Some((_, position)) => rows[*position].members.push(bucket.value),
+                None => {
+                    claimed.push((key, rows.len()));
+                    rows.push(FacetBucket {
+                        value: key.to_owned(),
+                        label: Some(label.to_owned()),
+                        count: 0,
+                        active: false,
+                        members: vec![bucket.value],
+                    });
+                }
             }
         }
-        let mut families = Vec::with_capacity(grouped.len());
-        for (key, label, members) in grouped {
-            if members.len() < 2 {
-                continue;
-            }
+        for (_, position) in claimed {
             let union = {
-                let values: Vec<&str> = members
-                    .iter()
-                    .map(|position| buckets[*position].value.as_str())
-                    .collect();
-                let parsed = parse(&format!("base:{}", values.join(",")));
+                let parsed = parse(&format!("base:{}", rows[position].members.join(",")));
                 query::compile(&parsed.tokens, None, self.bound)?
             };
-            let count = self.count(BooleanQuery::intersection(vec![
+            rows[position].count = self.count(BooleanQuery::intersection(vec![
                 excluded.box_clone(),
                 union,
             ]))?;
-            for position in members {
-                buckets[position].group = Some(key.to_owned());
-            }
-            families.push(FacetBucket {
-                value: key.to_owned(),
-                label: Some(label.to_owned()),
-                count,
-                active: false,
-                group: None,
-            });
         }
-        Ok(families)
+        Ok(rows)
     }
 }

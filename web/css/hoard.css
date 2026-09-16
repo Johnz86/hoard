@@ -595,15 +595,6 @@ input.field:focus {
 .facet-label.is-empty { color: var(--dim); }
 .facet-row.is-active .facet-label { color: var(--text); }
 
-.facet-row.is-family .facet-label {
-    color: var(--text);
-    letter-spacing: 0.06em;
-}
-
-.facet-row.is-grouped {
-    padding-left: 18px;
-}
-
 .facet-count {
     color: var(--dim);
     font-size: 11px;
@@ -614,13 +605,6 @@ input.field:focus {
     font-size: 11px;
     color: var(--dim);
     padding: 5px 4px 0;
-}
-
-input.field.rail-filter {
-    width: 100%;
-    font-size: 11.5px;
-    padding: 3px 6px;
-    margin-bottom: 5px;
 }
 
 .shelf-row {

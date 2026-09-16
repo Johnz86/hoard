@@ -24,11 +24,11 @@ parquet arrow jsonl csv readme config unknown`.
              "warnings": [] },
   "facets": {
     "role": [ { "value": "lora", "label": "LoRA", "count": 412, "active": true,
-                "token": "role:lora", "query": "role:lora", "group": null } ],
+                "token": "role:lora", "query": "role:lora", "members": [] } ],
     "layout": [], "base": [], "format": [], "precision": [], "node": [],
     "disk_pressure": { "reclaimable_bytes": 333000000000, "duplicate_blobs": 47,
                         "label": "310.0 GB reclaimable — 47 duplicate blobs" },
-    "base_total": 213, "base_families": [] },
+    "base_total": 213, "base_shown": 27 },
   "rows": [ {
     "artifact_id": "a_01H...", "blob_sha256": "9f2c...41ab", "role": "lora", "sub_role": null,
     "role_confidence": 0.98, "org": "kohya", "name": "film-grain-35mm", "base": "sdxl 1.0",
@@ -51,7 +51,7 @@ folder spelling onto its canonical layout the way `role:` folds its aliases (`la
 matches `diffusion_models`), and warns on a value naming neither a canonical layout nor a
 folder spelling.
 
-`facets.base` carries at most 32 buckets. A bucket's `count` is the prefix-rule count,
+`facets.base` is counted over at most 32 buckets. A bucket's `count` is the prefix-rule count,
 which is how many artifacts the query the bucket opens answers, so a family bucket counts
 the versions under it. The 32 are the largest by that count among the most populous bases by
 exact term together with the family roots those bases extend, so a root that few artifacts
@@ -59,25 +59,27 @@ carry exactly but many extend is on the rail. A base outside the 32 is not shown
 marked active, and a query naming it still answers.
 
 `facets.base_total` is how many distinct bases the result set holds by exact term, counted
-before the rail added any family root and before it was cut to 32, so a rail showing fewer
-buckets than `base_total` is hiding the rest and can say so. It answers only for `base`;
+before the rail added any family root and before it was cut to 32, so a rail standing for
+fewer bases than `base_total` is hiding the rest and can say so. It answers only for `base`;
 no other dimension is capped.
 
-`facets.base_families` is one row per brand whose surviving `facets.base` buckets the rail
-nests under it, and is empty whenever no brand holds two of them. A family row's `value` is
-the brand key and its `label` the brand as a user names it, while its `token` and `query`
-select the union of exactly the member values (`base:qwen3,qwen35moe`), never the brand key
-as a prefix: two unrelated products sharing a string root are never counted together. Its
-`count` is that union's own count, so an artifact two members both hold is counted once,
-which is why a family's count is not the sum of its members'. Its `active` is read off those
-members rather than off its own value: true only while every bucket carrying it as `group` is
-itself active, so a query naming one member, or naming an unrelated base that merely starts
-with the brand key, leaves the family row unselected and its row still opens the whole
-brand. `group` is null on a family
-row itself and on every bucket the rail lists flat; on a grouped bucket in `facets.base` it
-names the family that heads it. A grouped bucket is still in `facets.base`, with the same
-`value`, `count`, `token` and `query` it carries ungrouped, so a client that ignores
-`base_families` renders exactly the flat rail it rendered before.
+`facets.base` is one flat list: a bucket the server groups under no brand stands for itself,
+and where a brand claims one or more buckets it replaces them with a single row rather than
+heading them. A brand row's `value` is the brand key and its `label` the brand as a user names
+it, while its `members` holds the exact base values it stands for, in the order the rail would
+have listed them. `members` is empty on every row that stands for itself. A row's `token` and
+`query` select `members` as a union (`base:qwen3,qwen35moe`), never the brand key as a prefix:
+two unrelated products sharing a string root are never counted together. A brand row's `count`
+is that union's own count, so an artifact two members both hold is counted once, which is why
+it is not the sum of its members'. Its `active` is read off its members rather than off its own
+value: true only while every member is itself selected, so a query naming one member, or naming
+an unrelated base that merely starts with the brand key, leaves the row unselected and its
+click still opens the whole brand.
+
+`facets.base_shown` is how many exact bases the rows of `facets.base` stand for, counted after
+the rail was cut to 32 and before brands claimed their members, which is the number `base_total`
+is compared against: a brand row makes `facets.base` shorter than `base_shown` without hiding
+anything.
 
 `shard_count` is how many files the model spans: a checkpoint split into
 `model-00001-of-00040.safetensors` and its siblings is one row whose `size` is the whole

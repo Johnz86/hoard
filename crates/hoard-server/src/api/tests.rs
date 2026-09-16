@@ -586,14 +586,13 @@ async fn search_answers_the_documented_shape() {
         "this world holds fewer bases than the rail caps at, so it hides none"
     );
     assert_eq!(
-        body["facets"]["base_families"],
-        json!([]),
-        "a rail whose bases share no brand groups nothing"
+        body["facets"]["base_shown"], base_total,
+        "a rail whose bases share no brand shows each of them as its own row"
     );
     assert_eq!(
-        body["facets"]["base"][0]["group"],
-        Value::Null,
-        "a bucket the rail lists flat names no family"
+        body["facets"]["base"][0]["members"],
+        json!([]),
+        "a bucket the rail lists on its own stands for no other value"
     );
 }
 

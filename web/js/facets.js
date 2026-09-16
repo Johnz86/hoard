@@ -11,7 +11,6 @@ const SECTIONS = [
 const DISK_BARS = 6;
 const AMBER_SHARE = 0.7;
 const BASE_SECTION = "BASE ARCHITECTURE";
-const FILTER_ROWS = 15;
 const LABEL_FITS = 22;
 
 export function facetToken(item, key) {
@@ -31,16 +30,17 @@ function selectFacet(app, item, key) {
 function facetTitle(item) {
     const value = String(item.value ?? "");
     const label = String(item.label || value);
+    if (item.members?.length) return `${label} (${item.members.join(", ")})`;
     if (label !== value) return `${label} (${value})`;
     return label.length > LABEL_FITS ? label : null;
 }
 
-function facetRow(app, item, key, tier = "") {
+function facetRow(app, item, key) {
     const count = Number(item.count) || 0;
     return el(
         "div",
         {
-            class: `facet-row${tier}${item.active ? " is-active" : ""}`,
+            class: `facet-row${item.active ? " is-active" : ""}`,
             onClick: () => selectFacet(app, item, key)
         },
         el("span", { class: "facet-mark" }),
@@ -93,58 +93,9 @@ function baseCapNote(facets, shown) {
     });
 }
 
-function railFilter(rows) {
-    const input = el("input", {
-        class: "field rail-filter",
-        type: "text",
-        placeholder: "filter",
-        spellcheck: "false",
-        onInput: () => {
-            const needle = input.value.trim().toLowerCase();
-            for (const row of rows) row.node.hidden = !!needle && !row.text.includes(needle);
-        }
-    });
-    return input;
-}
-
-function facetText(item) {
-    return String(item.label || item.value || "");
-}
-
-function baseItems(facets) {
-    const buckets = facets.base || [];
-    const families = facets.base_families || [];
-    const headed = new Set(families.map((family) => family.value));
-    const items = [];
-    for (const family of families) {
-        const members = buckets.filter((item) => item.group === family.value);
-        items.push({
-            item: family,
-            key: "base",
-            tier: " is-family",
-            text: [family, ...members].map(facetText).join(" ")
-        });
-        for (const member of members) {
-            items.push({
-                item: member,
-                key: "base",
-                tier: " is-grouped",
-                text: `${facetText(member)} ${facetText(family)}`
-            });
-        }
-    }
-    for (const item of buckets) {
-        if (!item.group || !headed.has(item.group)) {
-            items.push({ item, key: "base", tier: "", text: facetText(item) });
-        }
-    }
-    return items;
-}
-
 function sectionItems(section, facets) {
-    if (section.title === BASE_SECTION) return baseItems(facets);
     return section.groups.flatMap(([field, key]) =>
-        (facets[field] || []).map((item) => ({ item, key, tier: "", text: facetText(item) }))
+        (facets[field] || []).map((item) => ({ item, key }))
     );
 }
 
@@ -153,18 +104,14 @@ export function renderFacets(app) {
     const blocks = SECTIONS.map((section) => {
         const items = sectionItems(section, facets);
         if (!items.length) return null;
-        const rows = items.map(({ item, key, tier, text }) => ({
-            node: facetRow(app, item, key, tier),
-            text: text.toLowerCase()
-        }));
+        const rows = items.map(({ item, key }) => facetRow(app, item, key));
         return el(
             "div",
             { class: "rail-block" },
             el("div", { class: "rail-title", text: section.title }),
-            rows.length > FILTER_ROWS ? railFilter(rows) : null,
-            rows.map((row) => row.node),
+            rows,
             section.title === BASE_SECTION
-                ? baseCapNote(facets, (facets.base || []).length)
+                ? baseCapNote(facets, Number(facets.base_shown) || 0)
                 : null
         );
     }).filter(Boolean);
