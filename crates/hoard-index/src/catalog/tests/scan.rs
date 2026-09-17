@@ -1,6 +1,6 @@
 use super::*;
 
-fn running_as_root() -> bool {
+pub(super) fn running_as_root() -> bool {
     use std::os::unix::fs::MetadataExt;
     fs::metadata("/proc/self").is_ok_and(|metadata| metadata.uid() == 0)
 }
@@ -186,20 +186,17 @@ fn exactly_one_document_per_artifact_is_primary_and_it_is_the_preferred_entry() 
     fs::create_dir_all(input.join("a"))?;
     fs::create_dir_all(input.join("b"))?;
     fs::write(input.join("a/one.csv"), "x,y\n1,2\n")?;
-    std::os::unix::fs::symlink(input.join("a/one.csv"), input.join("b/two.csv"))?;
+    fs::write(input.join("b/two.csv"), "x,y\n1,2\n")?;
     fs::write(input.join("solo.csv"), "x,y\n3,4\n")?;
     let config = IndexConfig {
-        sources: vec![SourceConfig {
-            follow_symlinks: true,
-            ..source(&input, "files")
-        }],
+        sources: vec![source(&input, "files")],
         ..IndexConfig::default()
     };
     let catalog = Catalog::scan_sources(
         &directory.path().join("native"),
         "n",
         &config,
-        HashPolicy::Never,
+        HashPolicy::Now,
         |_, _| {},
     )?;
     catalog.rebuild_search(|_| {})?;
@@ -538,7 +535,8 @@ fn a_fetched_lfs_weight_is_an_artifact_and_an_unfetched_pointer_is_not() -> Resu
     assert!(crate::catalog::scan::creates_artifact(
         sniffed.format,
         &presence,
-        &crate::catalog::scan::EntryRole::Standalone
+        &crate::catalog::scan::EntryRole::Standalone,
+        sniffed.tensors.as_ref()
     ));
 
     let pointer = directory.path().join("pointer.safetensors");
@@ -555,7 +553,8 @@ fn a_fetched_lfs_weight_is_an_artifact_and_an_unfetched_pointer_is_not() -> Resu
     assert!(!crate::catalog::scan::creates_artifact(
         sniffed.format,
         &presence,
-        &crate::catalog::scan::EntryRole::Standalone
+        &crate::catalog::scan::EntryRole::Standalone,
+        sniffed.tensors.as_ref()
     ));
     Ok(())
 }
@@ -818,8 +817,12 @@ fn path_counts_are_final_on_the_artifact() -> Result<()> {
     catalog.rebuild_search(|_| {})?;
     let rows = search(&catalog, "")?;
     assert!(
-        rows.rows.iter().all(|row| row.path_count == 2 && row.dupe),
+        rows.rows.iter().all(|row| row.path_count == 2),
         "every assembled row reads the final count"
+    );
+    assert!(
+        rows.rows.iter().all(|row| !row.dupe),
+        "two paths onto one inode are one copy, whatever the path count says"
     );
     Ok(())
 }
@@ -871,7 +874,7 @@ fn an_entry_is_the_only_per_file_record() -> Result<()> {
 }
 
 #[test]
-fn a_second_path_does_not_rename_the_artifact() -> Result<()> {
+fn a_second_path_through_one_inode_is_not_a_duplicate() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let input = directory.path().join("files");
     fs::create_dir_all(input.join("a"))?;
@@ -900,7 +903,10 @@ fn a_second_path_does_not_rename_the_artifact() -> Result<()> {
         "the first path names the artifact"
     );
     assert_eq!(rows.rows[0].path_count, 2);
-    assert!(rows.rows[0].dupe);
+    assert!(
+        !rows.rows[0].dupe,
+        "one file reached by two paths is not two copies"
+    );
     Ok(())
 }
 
@@ -936,6 +942,17 @@ fn two_copies_in_one_unit_share_one_record_without_a_cache() -> Result<()> {
         "the identity key sees the row this transaction wrote a moment ago"
     );
     assert_eq!(records[0].path_count, 2, "both copies are its paths");
+    assert_eq!(
+        records[0].copies, 2,
+        "two files with two inodes are two copies"
+    );
+    assert!(
+        search(&catalog, "dupe:true")?
+            .rows
+            .iter()
+            .any(|row| row.dupe),
+        "and one of them is reclaimable"
+    );
     assert_eq!(
         records[0].name, "a-copy.safetensors",
         "the first path names it"
@@ -1182,8 +1199,8 @@ fn two_snapshots_sharing_content_are_named_the_same_way_round_in_either_order() 
     );
     assert_eq!(
         alone_first,
-        ["consolidated.safetensors", "model"],
-        "the shared file is named as the file it is and the set is named as a set"
+        ["model.safetensors", "styler"],
+        "the set spells its own path and the shared file takes the repository that holds it alone"
     );
     Ok(())
 }
@@ -1359,8 +1376,8 @@ fn two_shard_sets_in_one_directory_are_told_apart_by_stem() -> Result<()> {
     names.sort_unstable();
     assert_eq!(
         names,
-        ["draft", "model"],
-        "two sets at the root are named by stem"
+        ["draft.safetensors", "model.safetensors"],
+        "two sets at the root are named by the file each of them is"
     );
     Ok(())
 }
@@ -1405,5 +1422,125 @@ fn shards_group_across_chunk_boundaries() -> Result<()> {
         "the set is one artifact even with 300 files between its shards"
     );
     assert_eq!(set[0].path, "model-00001-of-00002.safetensors");
+    Ok(())
+}
+
+fn zero_tensor_header() -> Vec<u8> {
+    crate::sniff::tests::safetensors_fixture(r#"{"__metadata__":{"format":"pt"}}"#)
+}
+
+#[test]
+fn a_zero_tensor_safetensors_file_creates_no_artifact() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("models");
+    fs::create_dir_all(&input)?;
+    fs::write(input.join("placeholder.safetensors"), zero_tensor_header())?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+
+    let read = catalog.database.r_transaction()?;
+    let entries: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.rel_path.as_str())
+            .collect::<Vec<_>>(),
+        ["placeholder.safetensors"],
+        "the file is still a path the catalog knows"
+    );
+    assert_eq!(
+        read.len().primary::<ArtifactRecord>()?,
+        0,
+        "a header that parsed and held no tensors is not a model"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_shard_sets_zero_tensor_anchor_does_not_anchor_the_set() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let shards = llm_shards();
+    let index = br#"{"metadata":{},"weight_map":{"model.layers.0.self_attn.q_proj.weight":"model-00001-of-00010.safetensors","model.layers.1.self_attn.q_proj.weight":"model-00002-of-00010.safetensors"}}"#.to_vec();
+    let mut files: Vec<(String, Vec<u8>)> = vec![
+        ("model.safetensors.index.json".to_owned(), index),
+        (
+            "model-00001-of-00010.safetensors".to_owned(),
+            shards[0].clone(),
+        ),
+        (
+            "model-00002-of-00010.safetensors".to_owned(),
+            shards[1].clone(),
+        ),
+    ];
+    for number in 3..=10 {
+        files.push((
+            format!("model-{number:05}-of-00010.safetensors"),
+            zero_tensor_header(),
+        ));
+    }
+    let borrowed: Vec<(&str, Vec<u8>)> = files
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+        .collect();
+    hf_cache_repo(&hub, "nvidia", "Nemotron-NVFP4", &borrowed)?;
+    let catalog = scan_hub(directory.path(), &hub)?;
+
+    let rows = search(&catalog, "")?;
+    assert_eq!(
+        rows.total, 1,
+        "eight placeholder blobs are not a second model"
+    );
+    assert_eq!(
+        rows.rows[0].shard_count, 2,
+        "the surviving artifact is the set the index document declared"
+    );
+    assert_eq!(
+        rows.rows[0].path, "model-00001-of-00010.safetensors",
+        "the artifact rides on the shard that holds weights"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_unparseable_tensor_format_file_still_creates_an_artifact_for_triage() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("models");
+    fs::create_dir_all(&input)?;
+    let mut truncated = 4096u64.to_le_bytes().to_vec();
+    truncated.extend_from_slice(br#"{"weight":{"dty"#);
+    fs::write(input.join("broken.safetensors"), truncated)?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+
+    let read = catalog.database.r_transaction()?;
+    assert_eq!(
+        read.len().primary::<ArtifactRecord>()?,
+        1,
+        "a header hoard cannot read is a file for a human to look at, not one to drop"
+    );
     Ok(())
 }

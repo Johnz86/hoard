@@ -18,6 +18,9 @@ use crate::sniff::{self, SniffResult};
 /// few hundred kilobytes of tensors; anything larger is not one of these documents.
 pub(super) const INDEX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The sidecar a quantized repository states its scheme in, beside its model config.
+const QUANT_CONFIG: &str = "hf_quant_config.json";
+
 /// A cache blob is content addressed, so the file the entry points at carries no name and
 /// no format was ever decided for it. The document is read as the JSON it is.
 pub(super) fn index_document(
@@ -36,6 +39,7 @@ pub(super) fn index_document(
 #[derive(Debug, Default)]
 pub(super) struct InferenceContext {
     configs: Vec<(String, serde_json::Value)>,
+    quant_configs: Vec<(String, serde_json::Value)>,
     frontmatter: Option<Vec<(String, String)>>,
     card: Option<String>,
 }
@@ -58,6 +62,13 @@ impl InferenceContext {
                     .configs
                     .push((directory_of(rel_path).to_owned(), config.clone()));
             }
+            if let Some(config) = &result.config
+                && name == QUANT_CONFIG
+            {
+                context
+                    .quant_configs
+                    .push((directory_of(rel_path).to_owned(), config.clone()));
+            }
             if let Some(readme) = &result.readme
                 && name == "readme.md"
                 && depth < card_depth
@@ -69,6 +80,9 @@ impl InferenceContext {
         }
         context
             .configs
+            .sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
+        context
+            .quant_configs
             .sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
         context
     }
@@ -85,12 +99,26 @@ impl InferenceContext {
     /// never simply the shallowest in the revision: a `config.json` beside one file must
     /// not describe unrelated weights in a sibling directory.
     pub(super) fn config_for(&self, rel_path: &str) -> Option<&serde_json::Value> {
-        let directory = directory_of(rel_path);
-        self.configs
-            .iter()
-            .find(|(prefix, _)| covers(prefix, directory))
-            .map(|(_, config)| config)
+        nearest(&self.configs, rel_path)
     }
+
+    /// As [`InferenceContext::config_for`], over the quantization sidecars alone, so a
+    /// scheme is read from the document that states one rather than from whichever config
+    /// happens to sit nearest.
+    pub(super) fn quant_config_for(&self, rel_path: &str) -> Option<&serde_json::Value> {
+        nearest(&self.quant_configs, rel_path)
+    }
+}
+
+fn nearest<'a>(
+    documents: &'a [(String, serde_json::Value)],
+    rel_path: &str,
+) -> Option<&'a serde_json::Value> {
+    let directory = directory_of(rel_path);
+    documents
+        .iter()
+        .find(|(prefix, _)| covers(prefix, directory))
+        .map(|(_, document)| document)
 }
 
 /// True when a config living in `prefix` governs a file in `directory`.
@@ -102,6 +130,9 @@ fn covers(prefix: &str, directory: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// The documents that describe a model itself. The quantization sidecar is deliberately not
+/// one of them: it is kept on its own list, because a config lookup that could answer with it
+/// would shadow the `config.json` beside it whenever the two tie on directory depth.
 fn is_model_config(name: &str) -> bool {
     matches!(name, "config.json" | "model_index.json")
 }
@@ -113,21 +144,42 @@ pub(super) struct Naming<'a> {
     pub(super) single: bool,
 }
 
-/// What the row reads: the repository when it holds this model alone, the directory the
-/// shards share when they sit in one, and the name they have in common otherwise. No
-/// single shard's file name describes the model.
+/// What the row reads: the repository when a hub or git repository holds this model alone,
+/// and otherwise the set's own path inside the revision, `<directory>/<stem>.<extension>`.
+/// No single shard's file name describes the model, and a directory alone does not say
+/// which of the models inside it this is.
 pub(super) fn shard_label(naming: &Naming<'_>, set: &ShardSet) -> String {
-    if naming.single {
-        return naming.repo.name().to_owned();
+    match naming.kind {
+        SourceKind::HfCache | SourceKind::Git if naming.single => {
+            return naming.repo.name().to_owned();
+        }
+        SourceKind::HfCache | SourceKind::Git | SourceKind::Loose | SourceKind::Auto => {}
     }
-    match file_name(&set.directory) {
+    let named = match set.extension.as_str() {
         "" => set.stem.clone(),
-        directory => directory.to_owned(),
+        extension => format!("{}.{extension}", set.stem),
+    };
+    match set.directory.as_str() {
+        "" => named,
+        directory => format!("{directory}/{named}"),
     }
 }
 
-/// Two sets of one revision that would read the same are told apart by their stems.
-pub(super) fn disambiguate_labels(labels: &mut [String], stems: &[String]) {
+/// Two sets of one revision that would read the same are told apart by how many files each
+/// holds, which is the one thing about them a reader can check against the disk, and then by
+/// the file their first shard is, which no two sets of one directory can share.
+pub(super) fn disambiguate_labels(
+    labels: &mut [String],
+    member_counts: &[usize],
+    anchors: &[&str],
+) {
+    disambiguate_by(labels, |set| format!(" ({} files)", member_counts[set]));
+    disambiguate_by(labels, |set| format!(" {}", anchors[set]));
+}
+
+/// Appends the suffix to every label more than one set carries, leaving a label already
+/// unique alone. A second round therefore only reaches the sets the first could not separate.
+fn disambiguate_by(labels: &mut [String], suffix: impl Fn(usize) -> String) {
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for label in labels.iter() {
         *counts.entry(label.as_str()).or_default() += 1;
@@ -136,9 +188,9 @@ pub(super) fn disambiguate_labels(labels: &mut [String], stems: &[String]) {
         .iter()
         .map(|label| counts.get(label.as_str()).copied().unwrap_or_default() > 1)
         .collect();
-    for ((label, stem), shared) in labels.iter_mut().zip(stems).zip(shared) {
+    for (set, (label, shared)) in labels.iter_mut().zip(shared).enumerate() {
         if shared {
-            *label = format!("{label}/{stem}");
+            label.push_str(&suffix(set));
         }
     }
 }
@@ -199,6 +251,37 @@ mod tests {
 
     use super::*;
 
+    fn document(config: serde_json::Value) -> SniffResult {
+        SniffResult {
+            format: hoard_core::ArtifactFormat::Config,
+            tensors: None,
+            readme: None,
+            config: Some(config),
+            size: 64,
+            lfs_pointer: None,
+        }
+    }
+
+    #[test]
+    fn a_quantization_sidecar_never_shadows_the_model_config_beside_it() {
+        let model = document(serde_json::json!({"architectures": ["Qwen3ForCausalLM"]}));
+        let sidecar = document(serde_json::json!({"quantization": {"quant_algo": "FP8"}}));
+        let context = InferenceContext::from_results(
+            [("hf_quant_config.json", &sidecar), ("config.json", &model)].into_iter(),
+        );
+
+        assert_eq!(
+            context.config_for("model.safetensors"),
+            Some(&serde_json::json!({"architectures": ["Qwen3ForCausalLM"]})),
+            "the model config answers for the weights beside it, whatever the walk order was"
+        );
+        assert_eq!(
+            context.quant_config_for("model.safetensors"),
+            Some(&serde_json::json!({"quantization": {"quant_algo": "FP8"}})),
+            "and the sidecar still answers on its own list"
+        );
+    }
+
     #[test]
     fn a_config_only_governs_its_own_directory_subtree() {
         let context = InferenceContext {
@@ -209,6 +292,7 @@ mod tests {
                 ),
                 (String::new(), serde_json::json!({"model_type": "root"})),
             ],
+            quant_configs: Vec::new(),
             frontmatter: None,
             card: None,
         };
@@ -303,11 +387,12 @@ mod tests {
     }
 
     #[test]
-    fn a_shard_set_reads_as_its_directory_and_ties_are_broken_by_stem() {
+    fn a_shard_set_is_named_by_its_directory_stem_and_extension() {
         let repo = RepoId::parse_ref(RepoType::Models, "org/name").expect("a repository parses");
         let set = |directory: &str, stem: &str| ShardSet {
             directory: directory.to_owned(),
             stem: stem.to_owned(),
+            extension: "safetensors".to_owned(),
             members: Vec::new(),
             declared_total: None,
         };
@@ -317,24 +402,59 @@ mod tests {
                 &set("unet", "model")
             ),
             "name",
-            "a repository holding one model names it"
+            "a hub repository holding one model names it"
+        );
+        assert_eq!(
+            shard_label(
+                &naming(&repo, SourceKind::Loose, true),
+                &set("unet", "model")
+            ),
+            "unet/model.safetensors",
+            "a loose folder holding one set is not a repository that named it"
         );
         assert_eq!(
             shard_label(
                 &naming(&repo, SourceKind::Loose, false),
                 &set("a/unet", "model")
             ),
-            "unet"
+            "a/unet/model.safetensors",
+            "a set under a directory carries the whole path to it"
         );
         assert_eq!(
             shard_label(&naming(&repo, SourceKind::Loose, false), &set("", "model")),
-            "model",
-            "a set at the root has only its stem to go by"
+            "model.safetensors",
+            "a set at the root still spells the file its shards are"
         );
 
         let mut labels = vec!["unet".to_owned(), "unet".to_owned(), "vae".to_owned()];
-        let stems = vec!["high".to_owned(), "low".to_owned(), "vae".to_owned()];
-        disambiguate_labels(&mut labels, &stems);
-        assert_eq!(labels, vec!["unet/high", "unet/low", "vae"]);
+        disambiguate_labels(&mut labels, &[2, 8, 3], &["a.safetensors"; 3]);
+        assert_eq!(labels, vec!["unet (2 files)", "unet (8 files)", "vae"]);
+    }
+
+    #[test]
+    fn sets_that_share_a_file_count_too_are_told_apart_by_their_first_shard() {
+        let mut labels = vec![
+            "unet/model.safetensors".to_owned(),
+            "unet/model.safetensors".to_owned(),
+            "vae/model.safetensors".to_owned(),
+        ];
+        disambiguate_labels(
+            &mut labels,
+            &[4, 4, 4],
+            &[
+                "model-00001-of-00004.safetensors",
+                "model-00001-of-00008.safetensors",
+                "model-00001-of-00004.safetensors",
+            ],
+        );
+        assert_eq!(
+            labels,
+            vec![
+                "unet/model.safetensors (4 files) model-00001-of-00004.safetensors",
+                "unet/model.safetensors (4 files) model-00001-of-00008.safetensors",
+                "vae/model.safetensors",
+            ],
+            "a count that separates nothing falls through to the file the set is anchored on"
+        );
     }
 }

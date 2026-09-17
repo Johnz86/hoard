@@ -84,7 +84,9 @@ call per path.
 ```
 
 Index-synthesized repos (loose files, HF cache snapshots) expose exactly one commit per
-revision.
+revision. A loose folder's one revision carries a real sha: the content fingerprint its own
+files hash to, so `x-repo-commit` and every `resolve` URL name a sha the index can answer for
+rather than one nothing on this node knows.
 
 ### Resolve (file bytes)
 
@@ -188,7 +190,8 @@ All error headers are lower-case. Bodies are JSON when shown.
 ## Revision resolution
 
 1. Index: if the repo is held locally, `main`, a tag or a sha resolves against the index
-   (HF cache `refs/*`, git clone refs, or the single synthetic revision of a loose folder).
+   (HF cache `refs/*`, git clone refs, or the single synthetic revision of a loose folder,
+   whose sha is the fingerprint of the folder's own contents).
 2. Upstream (online, proxy allowed): `HEAD /api/{type}/{ref}` proves visibility, then
    `GET /api/{type}/{ref}/revision/{rev}` yields `sha`. Results are cached in memory with a
    TTL and on disk under the metadata cache.

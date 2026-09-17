@@ -443,9 +443,7 @@ impl Catalog {
             }));
             if let Some(entry) = best {
                 let deduped = match entry.artifact_id {
-                    Some(id) => reader
-                        .record(id)?
-                        .is_some_and(|record| record.path_count > 1),
+                    Some(id) => reader.record(id)?.is_some_and(|record| record.copies > 1),
                     None => false,
                 };
                 found.push((*sha, reader.detail(&entry, deduped)?));

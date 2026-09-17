@@ -13,7 +13,7 @@ export function factRows(facts) {
 }
 
 function plugLabel(plug) {
-    const name = plug.org ? `${plug.org}/${plug.name}` : plug.name;
+    const name = `${plug.prefix || ""}${plug.name}`;
     return `${String(plug.role || "").toLowerCase()} · ${name}`;
 }
 

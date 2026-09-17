@@ -5,6 +5,7 @@ mod counts;
 mod hashing;
 mod index;
 mod mirror;
+mod naming;
 mod paging;
 mod reads;
 /// Interrupting a stage at a chosen commit and comparing what the next run completes to
@@ -31,6 +32,7 @@ use hoard_core::{
 
 use crate::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
 
+use crate::discover::loose::{ContentPart, synthetic_sha};
 use crate::discover::{DiscoveredEntry, RefKind};
 use crate::error::{IndexError, Result};
 use crate::row::SearchRow;
@@ -477,7 +479,7 @@ fn queued_tensors() -> TensorSummary {
     TensorSummary {
         tensor_count: 2,
         params: 1_024,
-        dtypes: BTreeMap::from([("F16".to_owned(), 2_u32)]),
+        dtypes: BTreeMap::from([("F16".to_owned(), 1_024_u64)]),
         key_prefixes: vec![("lora_unet".to_owned(), 2)],
         samples: vec![TensorSample {
             name: "lora_unet_down.weight".to_owned(),

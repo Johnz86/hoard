@@ -195,7 +195,12 @@ function compatTab(app) {
                     el("span", { class: "role-mark" }),
                     el("span", { class: "role-code", text: roleCode(item) })
                 ),
-                el("span", { class: "compat-name", text: item.name }),
+                el(
+                    "span",
+                    { class: "compat-name" },
+                    item.prefix ? el("span", { class: "cell-org", text: item.prefix }) : null,
+                    item.name
+                ),
                 el("span", { class: "compat-detail", text: dash(item.detail) }),
                 el("span", { class: "compat-size", text: sizeText(item) }),
                 el("span", {

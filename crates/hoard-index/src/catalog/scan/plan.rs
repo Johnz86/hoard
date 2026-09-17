@@ -67,12 +67,27 @@ impl Presence {
     }
 }
 
+/// A tensor container whose header parsed and reported nothing: a placeholder, not a model.
+///
+/// Only safetensors and GGUF answer this question: their sniffers yield no summary at all
+/// for a header they could not read, so an empty summary means the header was read and held
+/// nothing. A pickle container yields a summary either way, and a file hoard cannot parse
+/// must still reach triage rather than quietly stop being an artifact.
+fn has_no_tensors(format: ArtifactFormat, tensors: Option<&TensorSummary>) -> bool {
+    matches!(format, ArtifactFormat::Safetensors | ArtifactFormat::Gguf)
+        && tensors.is_some_and(|summary| summary.tensor_count == 0)
+}
+
 pub(in crate::catalog) fn creates_artifact(
     format: ArtifactFormat,
     presence: &Presence,
     role: &EntryRole,
+    tensors: Option<&TensorSummary>,
 ) -> bool {
-    format.is_artifact() && !presence.pointer_bytes && !matches!(role, EntryRole::Member)
+    format.is_artifact()
+        && !presence.pointer_bytes
+        && !matches!(role, EntryRole::Member)
+        && !has_no_tensors(format, tensors)
 }
 
 /// What one file that becomes an artifact contributes: only such a file pays for inference
@@ -90,6 +105,7 @@ pub(super) struct PreparedEntry<'a> {
     pub(super) role: EntryRole,
     pub(super) org: Option<String>,
     pub(super) name: String,
+    pub(super) named_by_repo: bool,
 }
 
 /// One model split across files, as the revision's grouping pass settled it.
@@ -271,7 +287,11 @@ pub(super) fn revision_plan<'a>(
 
 /// One label per unit, in unit order: a set's disambiguated label, and nothing for a chunk
 /// of files that each stand for themselves.
-pub(super) fn set_labels(naming: &Naming<'_>, units: &[Unit]) -> Vec<Option<String>> {
+pub(super) fn set_labels(
+    naming: &Naming<'_>,
+    units: &[Unit],
+    entries: &[DiscoveredEntry],
+) -> Vec<Option<String>> {
     let sets: Vec<&ShardSet> = units
         .iter()
         .filter_map(|unit| match unit {
@@ -280,8 +300,16 @@ pub(super) fn set_labels(naming: &Naming<'_>, units: &[Unit]) -> Vec<Option<Stri
         })
         .collect();
     let mut labels: Vec<String> = sets.iter().map(|set| shard_label(naming, set)).collect();
-    let stems: Vec<String> = sets.iter().map(|set| set.stem.clone()).collect();
-    disambiguate_labels(&mut labels, &stems);
+    let member_counts: Vec<usize> = sets.iter().map(|set| set.members.len()).collect();
+    let anchors: Vec<&str> = sets
+        .iter()
+        .map(|set| {
+            entries
+                .get(set.anchor())
+                .map_or("", |entry| file_name(&entry.rel_path))
+        })
+        .collect();
+    disambiguate_labels(&mut labels, &member_counts, &anchors);
     let mut per_unit: Vec<Option<String>> = Vec::with_capacity(units.len());
     per_unit.extend(labels.into_iter().map(Some));
     per_unit.resize(units.len(), None);
@@ -322,13 +350,12 @@ fn unit_roles(
         Unit::Set(set) => set,
         Unit::Chunk(_) => return alone(),
     };
-    let anchored = sniffed
-        .first()
-        .and_then(Option::as_ref)
-        .is_some_and(|result| result.format.is_artifact())
+    let anchor = sniffed.first().and_then(Option::as_ref);
+    let anchored = anchor.is_some_and(|result| result.format.is_artifact())
         && presences
             .first()
-            .is_some_and(|presence| !presence.pointer_bytes);
+            .is_some_and(|presence| !presence.pointer_bytes)
+        && !anchor.is_some_and(|result| has_no_tensors(result.format, result.tensors.as_ref()));
     if !anchored {
         return alone();
     }
@@ -436,13 +463,6 @@ fn prepare_entry<'a>(
     let format = sniffed
         .as_ref()
         .map_or(ArtifactFormat::Unknown, |result| result.format);
-    let creates_artifact = creates_artifact(format, &presence, &role);
-    let path = inference_path(
-        plan.naming.root_path,
-        &entry.rel_path,
-        entry.abs_path.as_deref(),
-    );
-    let file = file_name(&entry.rel_path);
     let (size, tensors, label) = match &role {
         EntryRole::Anchor(facts) => (
             facts.bytes,
@@ -455,6 +475,13 @@ fn prepare_entry<'a>(
             None,
         ),
     };
+    let creates_artifact = creates_artifact(format, &presence, &role, tensors);
+    let path = inference_path(
+        plan.naming.root_path,
+        &entry.rel_path,
+        entry.abs_path.as_deref(),
+    );
+    let file = file_name(&entry.rel_path);
     let artifact = creates_artifact
         .then(|| -> Result<ArtifactDraft> {
             let mut input = InferInput::new(format, &path, file, size);
@@ -465,6 +492,7 @@ fn prepare_entry<'a>(
                     .as_ref()
                     .or_else(|| plan.context.config_for(&entry.rel_path));
             }
+            input.quant_config = plan.context.quant_config_for(&entry.rel_path);
             input.frontmatter = plan.context.frontmatter();
             Ok(ArtifactDraft {
                 identity: identity(entry, &presence)?,
@@ -473,10 +501,12 @@ fn prepare_entry<'a>(
         })
         .transpose()?;
     let (org, name) = artifact_name(&plan.naming, &entry.rel_path, label);
+    let named_by_repo = name == plan.naming.repo.name();
     Ok(PreparedEntry {
         discovered: entry,
         artifact,
         name,
+        named_by_repo,
         org,
         presence,
         sniffed,

@@ -535,7 +535,7 @@ pub(in crate::catalog) fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
         path: entry.rel_path.clone(),
         abs_path: entry.placed.resolve(&repository.root_path, &entry.rel_path),
         path_count: artifact.path_count,
-        dupe: artifact.path_count > 1,
+        dupe: artifact.copies > 1,
         triage: entry.triage,
         last_used: *last_used,
         repo: repository.repo.qualified(),

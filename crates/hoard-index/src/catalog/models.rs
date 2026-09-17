@@ -125,7 +125,16 @@ pub(super) struct ArtifactRecord {
     pub(super) name: String,
     pub(super) org: Option<String>,
     pub(super) path_count: u32,
+    /// How many distinct copies of the bytes those paths amount to. Two paths reaching one
+    /// inode are one copy, so nothing is reclaimable by deleting either of them.
+    pub(super) copies: u32,
     pub(super) group_bytes: Option<u64>,
+    /// True when the set this artifact stands for found fewer files than it declares.
+    pub(super) incomplete: bool,
+    /// True when `name` is the name of the repository this naming was chosen in, decided
+    /// when it was chosen. Comparing two namings has to read each one's own answer: the
+    /// repository a later pass happens to be walking says nothing about either of them.
+    pub(super) named_by_repo: bool,
     pub(super) shard_count: Option<u32>,
     pub(super) triage_cleared: bool,
     pub(super) first_seen: String,
@@ -263,6 +272,10 @@ pub(super) struct Entry {
     pub(super) git_sha1: Option<GitSha1>,
     pub(super) mtime: Option<i64>,
     pub(super) inode: Option<u64>,
+    /// The cheap xxh3-of-edges identity of these bytes, kept only for an entry of a loose
+    /// folder, whose revision sha is derived from it. A rescan reuses it for every path
+    /// whose stamp did not move, so an unchanged folder reads no file at all.
+    pub(super) fingerprint: Option<String>,
     pub(super) node: i64,
     pub(super) pass: u64,
     pub(super) pull_progress: Option<f32>,

@@ -436,7 +436,7 @@ fn mystery_tensors() -> TensorSummary {
     TensorSummary {
         tensor_count: 2,
         params: 1_024,
-        dtypes: [("F16".to_owned(), 2u32)].into_iter().collect(),
+        dtypes: [("F16".to_owned(), 1_024u64)].into_iter().collect(),
         key_prefixes: vec![("lora_unet".to_owned(), 2)],
         samples: vec![TensorSample {
             name: "lora_unet_down.weight".to_owned(),

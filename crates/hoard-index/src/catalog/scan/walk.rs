@@ -12,6 +12,7 @@ use crate::hash::FileStamp;
 use super::RescanReport;
 use super::counters::Counters;
 use super::plan::{PreparedEntry, Unit};
+use super::revisions::Fingerprints;
 use super::store::ScanSettings;
 
 /// What one pass over the sources has settled so far: which stored rows it recognised, and
@@ -71,6 +72,10 @@ impl Walk {
 pub(super) struct WalkedRepo {
     pub(super) id: i64,
     pub(super) ordinals: Vec<u32>,
+    /// The fingerprint of every present path of a loose repository, settled before the walk
+    /// so the revision sha and the entries it is derived from agree. Empty for every other
+    /// source kind, whose revisions are named by a commit.
+    pub(super) fingerprints: Fingerprints,
 }
 
 /// The discovered entries of one revision of one repository, with the identity the catalog

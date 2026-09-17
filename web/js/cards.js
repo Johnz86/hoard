@@ -5,7 +5,7 @@ function card(app, item, index) {
     const classes = ["card", roleClass(item.role)];
     if (index === app.state.cursor) classes.push("is-cursor");
     if (app.state.selection.has(item.artifact_id)) classes.push("is-selected");
-    const line = [item.org ? `${item.org}/` : "", dash(item.base)].join("");
+    const line = [item.prefix || "", dash(item.base)].join("");
     return el(
         "div",
         {

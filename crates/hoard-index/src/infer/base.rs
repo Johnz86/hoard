@@ -90,7 +90,8 @@ pub(crate) fn infer_base(input: &InferInput<'_>, role: Role) -> BaseVerdict {
         .into_iter()
         .filter(|(candidate, _, _)| *candidate == base)
         .reduce(|best, next| if next.2 > best.2 { next } else { best })
-        .map(|(_, label, _)| label);
+        .map(|(_, label, _)| label)
+        .filter(|label| Base::new(label) == base);
 
     let mut evidence = bases.into_evidence();
     if base.is_any() && evidence.is_empty() {
@@ -374,7 +375,10 @@ mod tests {
             Role::Lora,
         );
         assert_eq!(verdict.base, Base::new("sdxl"));
-        assert_eq!(verdict.label.as_deref(), Some("sdxl_base_v1-0"));
+        assert_eq!(
+            verdict.label, None,
+            "sdxl_base_v1-0 does not spell sdxl, so the base's own name is what reads"
+        );
         assert!(verdict.confidence >= rules::METADATA_STRONG);
     }
 
@@ -397,7 +401,10 @@ mod tests {
             Role::Ckpt,
         );
         assert_eq!(verdict.base, Base::new("sdxl"));
-        assert_eq!(verdict.label.as_deref(), Some("StableDiffusionXLPipeline"));
+        assert_eq!(
+            verdict.label, None,
+            "a pipeline class name is not a spelling of the family it names"
+        );
     }
 
     #[test]
@@ -497,13 +504,46 @@ mod tests {
     }
 
     #[test]
+    fn a_label_survives_only_when_it_spells_its_own_base() {
+        let kept = with_metadata(
+            tensors(&[("blk.0.attn_q.weight", &[4096, 4096])]),
+            &[("general.architecture", "nemotron_h")],
+        );
+        let path = Path::new("/models/llm/nemotron.gguf");
+        let verdict = infer_base(&input(path, "nemotron.gguf").with_tensors(&kept), Role::Llm);
+        assert_eq!(verdict.base, Base::new("nemotron_h"));
+        assert_eq!(
+            verdict.label.as_deref(),
+            Some("nemotron_h"),
+            "a raw spelling the alias table does not shorten is its base's own spelling"
+        );
+
+        let config = json!({"_class_name": "StableDiffusionXLPipeline"});
+        let dropped = infer_base(
+            &InferInput::new(
+                ArtifactFormat::Diffusers,
+                Path::new("/models/sdxl/model_index.json"),
+                "model_index.json",
+                512,
+            )
+            .with_config(&config),
+            Role::Ckpt,
+        );
+        assert_eq!(dropped.base, Base::new("sdxl"));
+        assert_eq!(
+            dropped.label, None,
+            "a spelling the alias table maps onto a shorter family names that family, not itself"
+        );
+    }
+
+    #[test]
     fn a_projector_types_family_replaces_the_clip_architecture() {
         let claims = [
-            ("gemma3", "gemma3"),
-            ("qwen3vl_merger", "qwen3vl"),
-            ("pixtral", "pixtral"),
+            ("gemma3", "gemma3", Some("gemma3")),
+            ("qwen3vl_merger", "qwen3vl", None),
+            ("pixtral", "pixtral", Some("pixtral")),
         ];
-        for (projector_type, family) in claims {
+        for (projector_type, family, expected) in claims {
             let summary = with_metadata(
                 tensors(&[
                     ("v.blk.0.attn_q.weight", &[1152, 1152]),
@@ -521,7 +561,7 @@ mod tests {
                 Role::Proj,
             );
             assert_eq!(verdict.base, Base::new(family), "{projector_type}");
-            assert_eq!(verdict.label.as_deref(), Some(projector_type));
+            assert_eq!(verdict.label.as_deref(), expected, "{projector_type}");
             assert!(
                 verdict
                     .evidence

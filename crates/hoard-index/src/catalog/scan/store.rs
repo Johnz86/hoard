@@ -17,10 +17,14 @@ use crate::infer::Inference;
 
 use super::counters::{Counters, blank_summary, next_id};
 use super::plan::{ArtifactDraft, EntryRole, PreparedEntry};
+use super::revisions::Fingerprints;
 
 pub(super) struct EntryContext<'a> {
     pub(super) repo: &'a DiscoveredRepo,
     pub(super) repo_id: i64,
+    /// What the pass settled for this repository's paths before the walk, so an entry is
+    /// written with the fingerprint its revision's sha was derived from.
+    pub(super) fingerprints: &'a Fingerprints,
     pub(super) revision: &'a DiscoveredRevision,
     pub(super) settings: ScanSettings,
     pub(super) kind: SourceKind,
@@ -88,10 +92,7 @@ fn store_entry(
         None => None,
     };
     let stored = match &record {
-        Some(record) => Some((
-            record.id,
-            artifact_triage(&prepared, record, context.settings.triage),
-        )),
+        Some(record) => Some((record.id, artifact_triage(record, context.settings.triage))),
         None => anchor,
     };
     let triage = stored.is_some_and(|(_, triage)| triage);
@@ -124,6 +125,10 @@ fn store_entry(
         git_sha1: prepared.presence.git_sha1,
         mtime: prepared.discovered.stamp.map(|stamp| stamp.mtime),
         inode: prepared.discovered.stamp.map(|stamp| stamp.inode),
+        fingerprint: context
+            .fingerprints
+            .get(&prepared.discovered.rel_path)
+            .cloned(),
         node: LOCAL_NODE,
         pass: 0,
         pull_progress: None,
@@ -134,26 +139,25 @@ fn store_entry(
 }
 
 /// A set that found fewer files than it declares cannot be served whatever its header says.
-fn artifact_triage(prepared: &PreparedEntry<'_>, record: &ArtifactRecord, confidence: f32) -> bool {
-    let incomplete = match &prepared.role {
-        EntryRole::Anchor(facts) => facts.incomplete,
-        EntryRole::Standalone | EntryRole::Member => false,
-    };
-    record.artifact.needs_triage(confidence) || incomplete
+fn artifact_triage(record: &ArtifactRecord, confidence: f32) -> bool {
+    record.artifact.needs_triage(confidence) || record.incomplete
 }
 
 /// Which of two namings of one identity the record keeps.
 ///
 /// The unit holding more of the content names it, because a shard set describes a model its
-/// anchor's file name does not; equal content is settled by the smaller name, so that two
-/// revisions naming one file differently agree whichever of them the walk reaches first.
+/// anchor's file name does not; at equal content a naming that spells the repository beats
+/// one that spells a path inside it, because the repository is what a reader looked the
+/// model up by; what is left is settled by the smaller name, so that two revisions naming
+/// one file differently agree whichever of them the walk reaches first.
 fn names_better(candidate: &ArtifactRecord, stored: &ArtifactRecord) -> bool {
     naming_key(candidate) < naming_key(stored)
 }
 
-fn naming_key(record: &ArtifactRecord) -> (Reverse<u64>, &str, &str) {
+fn naming_key(record: &ArtifactRecord) -> (Reverse<u64>, bool, &str, &str) {
     (
         Reverse(record.group_bytes.unwrap_or(record.artifact.size)),
+        !record.named_by_repo,
         record.name.as_str(),
         record.org.as_deref().unwrap_or_default(),
     )
@@ -280,6 +284,8 @@ pub(in crate::catalog) struct RecordFacts<'a> {
     pub(in crate::catalog) tensors: Option<TensorSummary>,
     pub(in crate::catalog) group_bytes: Option<u64>,
     pub(in crate::catalog) shard_count: Option<u32>,
+    pub(in crate::catalog) incomplete: bool,
+    pub(in crate::catalog) named_by_repo: bool,
     /// When the catalog first recorded this artifact. A record being rewritten passes what
     /// it already carries, so nothing reads the clock for a row that has been seen before.
     pub(in crate::catalog) first_seen: Option<String>,
@@ -291,11 +297,12 @@ fn artifact_record(
     draft: &ArtifactDraft,
     first_seen: Option<String>,
 ) -> (ArtifactRecord, ArtifactDetail) {
-    let (tensors, group_bytes, shard_count) = match &prepared.role {
+    let (tensors, group_bytes, shard_count, incomplete) = match &prepared.role {
         EntryRole::Anchor(facts) => (
             facts.tensors.clone(),
             Some(facts.bytes),
             Some(facts.shard_count),
+            facts.incomplete,
         ),
         EntryRole::Standalone | EntryRole::Member => (
             prepared
@@ -304,6 +311,7 @@ fn artifact_record(
                 .and_then(|sniffed| sniffed.tensors.clone()),
             None,
             None,
+            false,
         ),
     };
     record_of(RecordFacts {
@@ -321,6 +329,8 @@ fn artifact_record(
         tensors,
         group_bytes,
         shard_count,
+        incomplete,
+        named_by_repo: prepared.named_by_repo,
         first_seen,
     })
 }
@@ -338,6 +348,8 @@ pub(in crate::catalog) fn record_of(facts: RecordFacts<'_>) -> (ArtifactRecord, 
         tensors,
         group_bytes,
         shard_count,
+        incomplete,
+        named_by_repo,
         first_seen,
     } = facts;
     let record = ArtifactRecord {
@@ -346,6 +358,7 @@ pub(in crate::catalog) fn record_of(facts: RecordFacts<'_>) -> (ArtifactRecord, 
         name,
         org,
         path_count: 1,
+        copies: 1,
         artifact: Artifact {
             id: ArtifactId::new(id),
             blob: BlobId::new(id),
@@ -368,6 +381,8 @@ pub(in crate::catalog) fn record_of(facts: RecordFacts<'_>) -> (ArtifactRecord, 
         },
         group_bytes,
         shard_count,
+        incomplete,
+        named_by_repo,
         triage_cleared: false,
         first_seen: first_seen.unwrap_or_else(|| jiff::Timestamp::now().to_string()),
     };
@@ -383,4 +398,94 @@ pub(in crate::catalog) fn settle_repositories(transaction: &RwTransaction<'_>) -
         transaction.upsert(summary)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use hoard_core::{Base, Role};
+
+    use super::*;
+
+    fn named(name: &str, group_bytes: Option<u64>, named_by_repo: bool) -> ArtifactRecord {
+        ArtifactRecord {
+            id: 1,
+            identity: 7,
+            artifact: Artifact {
+                id: ArtifactId::new(1),
+                blob: BlobId::new(1),
+                sha256: None,
+                size: 1_024,
+                format: ArtifactFormat::Safetensors,
+                role: Role::Lora,
+                sub_role: None,
+                role_confidence: 0.99,
+                base: Base::any(),
+                base_label: None,
+                base_confidence: 0.9,
+                precision: None,
+                quant: None,
+                rank: None,
+                alpha: None,
+                params: None,
+                context: None,
+                trigger: None,
+            },
+            name: name.to_owned(),
+            org: None,
+            path_count: 1,
+            copies: 1,
+            group_bytes,
+            incomplete: false,
+            named_by_repo,
+            shard_count: None,
+            triage_cleared: false,
+            first_seen: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_repository_naming_beats_a_path_naming_at_equal_bytes() {
+        let by_repo = named("Ministral-8B-Instruct", None, true);
+        let lexically_smaller = named("consolidated.safetensors", None, false);
+        let lexically_larger = named("zzz/model.safetensors", None, false);
+
+        assert!(
+            names_better(&by_repo, &lexically_smaller),
+            "the repository names the model even when a path sorts ahead of it"
+        );
+        assert!(
+            !names_better(&lexically_smaller, &by_repo),
+            "and the same pair settles the same way whichever the walk reaches first"
+        );
+        assert!(names_better(&by_repo, &lexically_larger));
+        assert!(!names_better(&lexically_larger, &by_repo));
+    }
+
+    #[test]
+    fn a_naming_is_ranked_by_what_it_was_not_by_the_repository_being_walked() {
+        let by_repo = named("Ministral-8B-Instruct", None, true);
+        let by_path = named("consolidated.safetensors", None, false);
+
+        assert!(
+            names_better(&by_repo, &by_path) && !names_better(&by_path, &by_repo),
+            "each record carries its own answer, so no third repository can reorder the pair"
+        );
+
+        let coincidence = named("Ministral-8B-Instruct", None, false);
+        assert!(
+            names_better(&by_repo, &coincidence),
+            "a name that merely reads like a repository's is still a path naming"
+        );
+    }
+
+    #[test]
+    fn more_content_still_outranks_a_repository_naming() {
+        let by_repo = named("Ministral-8B-Instruct", None, true);
+        let whole_set = named("model.safetensors", Some(8_192), false);
+
+        assert!(
+            names_better(&whole_set, &by_repo),
+            "a set holding the whole model names it over a repository naming one file of it"
+        );
+    }
 }

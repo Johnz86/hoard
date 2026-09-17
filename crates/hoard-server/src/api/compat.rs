@@ -7,7 +7,7 @@ use hoard_index::catalog::{Catalog, QueryRequest};
 use hoard_index::row::SearchRow;
 use hoard_index::search::{CompatTarget, CompileContext, SortKey, SortSpec};
 
-use crate::api::common::{MIDDOT, state_label};
+use crate::api::common::{MIDDOT, row_prefix, state_label};
 
 const COMPAT_QUERY: &str = "compat:subject";
 
@@ -34,6 +34,8 @@ pub struct CompatRowView {
     pub state: State,
     pub state_label: String,
     pub pull_progress: Option<f32>,
+    /// As [`crate::api::common::RowView::prefix`].
+    pub prefix: String,
 }
 
 impl From<&SearchRow> for CompatRowView {
@@ -51,6 +53,7 @@ impl From<&SearchRow> for CompatRowView {
             state: row.state,
             state_label: state_label(row.state, row.pull_progress, None),
             pull_progress: row.pull_progress,
+            prefix: row_prefix(&row.repo, &row.name),
         }
     }
 }

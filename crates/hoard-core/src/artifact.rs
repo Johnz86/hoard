@@ -207,8 +207,14 @@ impl TensorSample {
 pub struct TensorSummary {
     pub tensor_count: u32,
     pub params: u64,
-    /// dtype spelling to tensor count, ordered so the dominant dtype is stable.
-    pub dtypes: BTreeMap<String, u32>,
+    /// dtype spelling to how many elements are stored in it, ordered so the dominant dtype
+    /// is stable. Elements and not tensors, because a quantized file carries more small
+    /// float scale tensors than it does packed weight tensors.
+    ///
+    /// A pickle container is the exception: it declares no shapes, so its dtypes cannot be
+    /// weighed and are reported one apiece. [`TensorSummary::precision`] settles that tie in
+    /// favour of a float rather than reading it as a weight count.
+    pub dtypes: BTreeMap<String, u64>,
     /// Leading key segments to how many tensors carry them, most frequent first.
     pub key_prefixes: Vec<(String, u32)>,
     pub samples: Vec<TensorSample>,
@@ -217,7 +223,7 @@ pub struct TensorSummary {
 }
 
 impl TensorSummary {
-    /// The dtype carrying the most tensors, whatever it holds.
+    /// The dtype carrying the most elements, whatever it holds.
     pub fn dominant_dtype(&self) -> Option<&str> {
         self.dtypes
             .iter()
@@ -227,8 +233,10 @@ impl TensorSummary {
 
     /// The precision the PREC column shows: the dominant weight dtype, which skips the
     /// index and mask tensors a model carries beside its weights. Ties go to the narrower
-    /// float, which is where a mixed file keeps its bulk weights. A file of nothing but
-    /// integers still reports what it holds.
+    /// float, which is where a mixed file keeps its bulk weights, and a non-float loses
+    /// every tie to a float, because a header that cannot weigh its dtypes at all reports
+    /// them one apiece and must not read as quantized on the strength of that. A file of
+    /// nothing but integers still reports what it holds.
     pub fn precision(&self) -> Option<Precision> {
         let weight_dtype = self
             .dtypes
@@ -237,7 +245,7 @@ impl TensorSummary {
             .min_by_key(|(dtype, count)| {
                 (
                     Reverse(**count),
-                    float_bits(dtype).unwrap_or_default(),
+                    float_bits(dtype).unwrap_or(u32::MAX),
                     dtype.as_str(),
                 )
             })
@@ -289,11 +297,14 @@ fn float_bits(dtype: &str) -> Option<u32> {
     }
 }
 
-/// True for the index, offset and mask dtypes a model carries beside its weights. A
-/// quantization scheme is not one of them: it is what the weights themselves are stored in.
+/// True for the index, offset and mask dtypes a model carries beside its weights. The
+/// narrow integers are not among them: an 8 or 4 bit integer is what a quantized model
+/// stores its weights in, so excluding it would leave precision reading the float scales.
 fn is_index_dtype(dtype: &str) -> bool {
-    let precision = Precision::from_dtype(dtype);
-    precision.as_str().starts_with("int") || precision.as_str() == "bool"
+    matches!(
+        Precision::from_dtype(dtype).as_str(),
+        "int32" | "int64" | "bool"
+    )
 }
 
 /// A blob interpreted. The same bytes on twenty paths remain one artifact.
@@ -359,7 +370,20 @@ mod tests {
         assert!(!Precision::new("fp16").is_quantized());
     }
 
-    fn summary_of(dtypes: &[(&str, u32)]) -> TensorSummary {
+    fn summarized(tensors: &[(&str, &str, &[u64])]) -> TensorSummary {
+        let mut dtypes: BTreeMap<String, u64> = BTreeMap::new();
+        for (_, dtype, shape) in tensors {
+            let elements = shape.iter().copied().fold(1u64, u64::saturating_mul);
+            *dtypes.entry((*dtype).to_owned()).or_default() += elements;
+        }
+        TensorSummary {
+            tensor_count: tensors.len() as u32,
+            dtypes,
+            ..TensorSummary::default()
+        }
+    }
+
+    fn summary_of(dtypes: &[(&str, u64)]) -> TensorSummary {
         TensorSummary {
             dtypes: dtypes
                 .iter()
@@ -378,10 +402,11 @@ mod tests {
             Some("fp32".to_owned())
         );
 
-        let mixed = summary_of(&[("BF16", 283), ("F32", 170), ("U8", 340)]);
+        let mixed = summary_of(&[("BF16", 2_000_000), ("F32", 100_000), ("U8", 4_000)]);
         assert_eq!(
             mixed.precision().map(|value| value.as_str().to_owned()),
-            Some("bf16".to_owned())
+            Some("bf16".to_owned()),
+            "a handful of mask elements beside the weights decides nothing"
         );
 
         let integers = summary_of(&[("I8", 8), ("U8", 4)]);
@@ -397,6 +422,63 @@ mod tests {
         );
 
         assert_eq!(TensorSummary::default().precision(), None);
+    }
+
+    #[test]
+    fn precision_follows_elements_not_tensor_count() {
+        let packed = summarized(&[
+            ("model.layers.0.weight", "F8_E4M3", &[4096, 4096]),
+            ("model.layers.0.weight_scale", "F32", &[4096]),
+            ("model.layers.1.weight_scale", "F32", &[4096]),
+            ("model.layers.2.weight_scale", "F32", &[4096]),
+        ]);
+        assert_eq!(
+            packed.precision().map(|value| value.as_str().to_owned()),
+            Some("fp8".to_owned()),
+            "three scale tensors do not outweigh one weight matrix"
+        );
+
+        let quantized = summarized(&[
+            ("model.layers.0.qweight", "U8", &[4096, 2048]),
+            ("model.layers.0.scales", "BF16", &[4096, 16]),
+            ("model.layers.0.zeros", "BF16", &[4096, 16]),
+        ]);
+        assert_eq!(
+            quantized.precision().map(|value| value.as_str().to_owned()),
+            Some("int8".to_owned()),
+            "packed weights are what the file is stored in, not its float scales"
+        );
+    }
+
+    #[test]
+    fn is_index_dtype_excludes_only_int32_int64_and_bool() {
+        for excluded in ["I32", "INT32", "I64", "INT64", "BOOL"] {
+            assert!(is_index_dtype(excluded), "{excluded}");
+        }
+        for kept in [
+            "I8", "U8", "INT8", "I16", "INT16", "F16", "BF16", "F32", "Q4_K",
+        ] {
+            assert!(!is_index_dtype(kept), "{kept}");
+        }
+    }
+
+    #[test]
+    fn a_non_float_loses_every_tie_to_a_float() {
+        let unweighed = summary_of(&[("F16", 1), ("ByteStorage", 1)]);
+        assert_eq!(
+            unweighed.precision().map(|value| value.as_str().to_owned()),
+            Some("fp16".to_owned()),
+            "a header that reports its dtypes one apiece is not evidence of quantization"
+        );
+
+        let outweighed = summary_of(&[("F16", 1), ("U8", 2)]);
+        assert_eq!(
+            outweighed
+                .precision()
+                .map(|value| value.as_str().to_owned()),
+            Some("int8".to_owned()),
+            "but a non-float that actually holds more still wins"
+        );
     }
 
     #[test]

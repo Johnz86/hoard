@@ -160,20 +160,17 @@ fn disk_pressure_is_summarised_after_every_sweep() -> Result<()> {
     fs::create_dir_all(input.join("a"))?;
     fs::create_dir_all(input.join("b"))?;
     fs::write(input.join("a/one.csv"), "x,y\n1,2\n")?;
-    std::os::unix::fs::symlink(input.join("a/one.csv"), input.join("b/two.csv"))?;
+    fs::write(input.join("b/two.csv"), "x,y\n1,2\n")?;
     fs::write(input.join("a/solo.csv"), "x,y\n3,4\n")?;
     let config = IndexConfig {
-        sources: vec![SourceConfig {
-            follow_symlinks: true,
-            ..source(&input, "files")
-        }],
+        sources: vec![source(&input, "files")],
         ..IndexConfig::default()
     };
     let catalog = Catalog::scan_sources(
         &directory.path().join("native"),
         "n",
         &config,
-        HashPolicy::Never,
+        HashPolicy::Now,
         |_, _| {},
     )?;
     let pressure = catalog.disk_pressure()?;
@@ -183,12 +180,7 @@ fn disk_pressure_is_summarised_after_every_sweep() -> Result<()> {
         fs::metadata(input.join("a/one.csv"))?.len()
     );
     fs::remove_file(input.join("b/two.csv"))?;
-    catalog.rescan(
-        &config,
-        HashPolicy::Never,
-        RescanScope::Configured,
-        |_, _| {},
-    )?;
+    catalog.rescan(&config, HashPolicy::Now, RescanScope::Configured, |_, _| {})?;
     let after = catalog.disk_pressure()?;
     assert_eq!(after.reclaimable_bytes, 0);
     assert_eq!(after.duplicate_blobs, 0);

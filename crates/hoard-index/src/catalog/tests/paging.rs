@@ -54,6 +54,7 @@ fn duplicate_paths_collapse_after_correlated_entry_filtering() -> Result<()> {
         .primary(artifact_id)?
         .ok_or_else(|| IndexError::Catalog("missing fixture artifact".into()))?;
     artifact.path_count = 2;
+    artifact.copies = 2;
     transaction.upsert(artifact)?;
     let mut repository: Repository = transaction
         .get()

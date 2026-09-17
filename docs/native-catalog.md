@@ -339,6 +339,15 @@ the catalog at `<data_dir>/native`.
 
 - Existing HF-cache, Git and loose-source discovery feeds the store directly. Header sniffing
   and inference reuse the existing Rust implementations.
+- A loose folder's one revision carries the sha its own contents fingerprint to: the sorted
+  `(relative path, fingerprint, size)` triples of every entry whose bytes this disk holds,
+  hashed to the 20 bytes a revision is named by. The Hub face, `x-repo-commit` and
+  `hf download` therefore answer from the index rather than reaching huggingface.co. A
+  synthetic revision is still matched across scans by name, so changing the folder's content
+  moves the one revision's sha rather than accreting a second revision. Each such entry keeps
+  the fingerprint the sha was derived from, so a rescan opens only the paths whose inode,
+  mtime or size moved and folds the stored fingerprint in for every other: an unchanged loose
+  folder costs no read at all, which is what the hourly watcher reconciliation does.
 - A revision's documents (README, configs, index files) are sniffed first and give every
   later unit its inference context; each shard set and each chunk of 1,024 standalone files
   is then sniffed in parallel, prepared and committed as its own transaction, so memory grows
@@ -358,8 +367,12 @@ the catalog at `<data_dir>/native`.
 - Only weight and dataset formats become artifacts; every file is still an entry record.
 - Shard sets, whether named `model-<n>-of-<m>` or listed by a `*.index.json` weight map,
   become one artifact anchored on the lowest shard. Members are entries pointing at that
-  artifact with no search row; the anchor carries the whole model's size and shard count, and
-  an incomplete set is triage.
+  artifact with no search row; the anchor carries the whole model's size, shard count and
+  `incomplete` flag, and an incomplete set is triage. A file whose safetensors or GGUF header
+  parsed and reported zero tensors is not a model: it creates no artifact and anchors no set.
+  A file whose header would not parse at all still becomes an artifact, so it reaches triage.
+  A set is named `<directory>/<stem>.<extension>`, its own path inside the revision, and two
+  sets that would read the same are told apart by how many files each holds.
 - An unreadable file keeps its path and is recorded as an absent entry with no artifact; a
   git-lfs pointer stub is absent with the pointer's size and hash; a fetched LFS weight is an
   ordinary artifact.
@@ -376,11 +389,19 @@ the catalog at `<data_dir>/native`.
   appended, and one the walk no longer finds keeps its slot so the entries filed under it
   still resolve, giving up its refs so a name that has moved answers where it moved to.
 - An artifact reached from two revisions is named by the unit that holds more of its
-  content, and by the smaller name when they hold the same: a shard set outranks the file
-  its anchor is, and two revisions naming one file differently agree whichever of them the
-  walk reaches first.
+  content; at equal content a naming that spells the repository beats one that spells a path
+  inside it, and the smaller name settles what is left: a shard set outranks the file its
+  anchor is, and two revisions naming one file differently agree whichever of them the walk
+  reaches first. Whether a naming spelled its repository is recorded on the record as
+  `named_by_repo` when the name is chosen, never recomputed against whichever repository a
+  later pass happens to be walking, so the comparison is a property of the two records and
+  cannot settle differently depending on which one the walk reaches first.
 - Ids come from a persisted allocator; the generation increments per rescan; artifact path
-  counts are swept from the entry index after every scan and orphaned artifacts are removed.
+  counts and copy counts are swept from the entry index after every scan and orphaned
+  artifacts are removed. `path_count` is how many paths reach the artifact; `copies` is how
+  many distinct inodes those paths amount to, so a file reached through a symlink is one
+  copy and nothing about it is reclaimable. The `dupe` mark, the `deduped` flag and the
+  summary's reclaimable bytes all read `copies`, never `path_count`.
 - A rescan over the whole configuration deletes a stored source the configuration no longer
   names, with its entries, its repositories and the artifacts that lose their last path. A
   path of a dropped source is not a path this node stopped holding, it is a path this catalog
@@ -754,7 +775,7 @@ whole token. Every token kind compiles:
 - `hash:` (`sha:`, `sha256:`) matches a sha256 exactly or by prefix, and a git blob sha
   exactly.
 - `trigger:` (`triggers:`) matches the whole trigger string or one of its words.
-- `dupe:` (`duplicate:`) selects artifacts reached by more than one path.
+- `dupe:` (`duplicate:`) selects artifacts whose bytes exist as more than one file.
 - `size:` compares a byte count with `<`, `<=`, `>`, `>=` or none for equality; a bare number
   is megabytes, so byte counts need the `b` suffix.
 - `used:` compares an age in days against when an artifact was last served: `<Nd` and `<=Nd`

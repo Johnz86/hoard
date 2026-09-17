@@ -190,38 +190,71 @@ impl Catalog {
 }
 
 /// Whether the sweep changed what the search index should hold for this artifact.
+///
+/// An artifact no present path backs is removed and its entries are orphaned, which is what
+/// a scan that no longer finds a file means. [`recount_artifact`] is the half of this a
+/// writer wants when a path was retired rather than lost.
 pub(in crate::catalog) fn sweep_artifact(transaction: &RwTransaction<'_>, id: i64) -> Result<bool> {
     let referencing = paths_of_artifact(transaction, id)?;
     let Some(record) = transaction.get().primary::<ArtifactRecord>(id)? else {
         return Ok(false);
     };
-    match present_paths(&referencing, record.shard_count) {
-        0 => {
-            for entry in referencing {
-                transaction.upsert(Entry {
-                    artifact_id: None,
-                    ..entry
-                })?;
-            }
-            transaction.remove(record)?;
-            if let Some(detail) = transaction.get().primary::<ArtifactDetail>(id)? {
-                transaction.remove(detail)?;
-            }
-            if let Some(text) = transaction.get().primary::<SearchText>(id)? {
-                transaction.remove(text)?;
-            }
-            return Ok(true);
-        }
-        paths if paths != record.path_count => {
-            transaction.upsert(ArtifactRecord {
-                path_count: paths,
-                ..record
+    if present_paths(&referencing, record.shard_count) == 0 {
+        for entry in referencing {
+            transaction.upsert(Entry {
+                artifact_id: None,
+                ..entry
             })?;
-            return Ok(true);
         }
-        _ => {}
+        transaction.remove(record)?;
+        if let Some(detail) = transaction.get().primary::<ArtifactDetail>(id)? {
+            transaction.remove(detail)?;
+        }
+        if let Some(text) = transaction.get().primary::<SearchText>(id)? {
+            transaction.remove(text)?;
+        }
+        return Ok(true);
+    }
+    if recount(transaction, record, &referencing)? {
+        return Ok(true);
     }
     Ok(false)
+}
+
+/// Rewrites one artifact's path and copy counts from the entries that reference it, leaving
+/// the record itself alone however few paths are left.
+///
+/// A retired path is a path this node stopped serving, not one that stopped existing: a peer
+/// may still hold every copy, and the artifact has to stay in the index to say so. That is
+/// the whole difference from [`sweep_artifact`].
+pub(in crate::catalog) fn recount_artifact(
+    transaction: &RwTransaction<'_>,
+    id: i64,
+) -> Result<bool> {
+    let referencing = paths_of_artifact(transaction, id)?;
+    let Some(record) = transaction.get().primary::<ArtifactRecord>(id)? else {
+        return Ok(false);
+    };
+    recount(transaction, record, &referencing)
+}
+
+/// Whether the record's stored counts had to move to match its entries.
+fn recount(
+    transaction: &RwTransaction<'_>,
+    record: ArtifactRecord,
+    referencing: &[Entry],
+) -> Result<bool> {
+    let paths = present_paths(referencing, record.shard_count);
+    let copies = distinct_paths(referencing, record.shard_count);
+    if paths == record.path_count && copies == record.copies {
+        return Ok(false);
+    }
+    transaction.upsert(ArtifactRecord {
+        path_count: paths,
+        copies,
+        ..record
+    })?;
+    Ok(true)
 }
 
 /// Marks every artifact of one revision for indexing, which is what a card the revision
@@ -246,10 +279,7 @@ pub(in crate::catalog) fn log_revision_artifacts(
 }
 
 /// Every path pointing at one artifact, which is the bound on recounting what it holds.
-pub(in crate::catalog) fn paths_of_artifact(
-    transaction: &RwTransaction<'_>,
-    id: i64,
-) -> Result<Vec<Entry>> {
+fn paths_of_artifact(transaction: &RwTransaction<'_>, id: i64) -> Result<Vec<Entry>> {
     Ok(transaction
         .scan()
         .secondary::<Entry>(EntryKey::artifact_id)?
@@ -259,15 +289,39 @@ pub(in crate::catalog) fn paths_of_artifact(
 
 /// How many copies of an artifact its paths amount to: the paths whose bytes are on a node,
 /// counted in whole shard sets rather than in files.
-pub(in crate::catalog) fn present_paths(referencing: &[Entry], shard_count: Option<u32>) -> u32 {
+fn present_paths(referencing: &[Entry], shard_count: Option<u32>) -> u32 {
     let present = referencing
         .iter()
         .filter(|entry| entry.state != State::Remote)
         .count();
+    in_whole_sets(present, shard_count)
+}
+
+/// How many real copies of an artifact its present paths amount to: two paths sharing one
+/// inode are one file reached twice, and deleting either reclaims nothing. A path with no
+/// captured inode counts as its own copy rather than being merged with another's.
+fn distinct_paths(referencing: &[Entry], shard_count: Option<u32>) -> u32 {
+    let mut inodes: HashSet<u64> = HashSet::new();
+    let mut unstamped = 0usize;
+    for entry in referencing
+        .iter()
+        .filter(|entry| entry.state != State::Remote)
+    {
+        match entry.inode {
+            Some(inode) => {
+                inodes.insert(inode);
+            }
+            None => unstamped += 1,
+        }
+    }
+    in_whole_sets(inodes.len() + unstamped, shard_count)
+}
+
+fn in_whole_sets(files: usize, shard_count: Option<u32>) -> u32 {
     let shards = usize::try_from(shard_count.unwrap_or(1))
         .unwrap_or(1)
         .max(1);
-    u32::try_from(present.div_ceil(shards)).unwrap_or(u32::MAX)
+    u32::try_from(files.div_ceil(shards)).unwrap_or(u32::MAX)
 }
 
 pub(super) fn shard_count_of(
@@ -304,4 +358,90 @@ pub(super) fn sweep_taken(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::catalog::models::Placement;
+
+    use super::*;
+
+    fn entry(id: i64, inode: Option<u64>, state: State) -> Entry {
+        Entry {
+            id,
+            repo_id: 1,
+            artifact_id: Some(1),
+            revision: 0,
+            rel_path: format!("weights-{id}.safetensors"),
+            fingerprint: None,
+            placed: Placement::UnderRoot,
+            size: 1_024,
+            state,
+            triage: false,
+            preference: 0,
+            lfs_pointer: false,
+            is_symlink: false,
+            sha256: None,
+            content: None,
+            git_sha1: None,
+            mtime: None,
+            inode,
+            node: 1,
+            pass: 0,
+            pull_progress: None,
+        }
+    }
+
+    #[test]
+    fn a_path_with_no_captured_inode_counts_as_its_own_copy() {
+        let unstamped = [
+            entry(1, None, State::Served),
+            entry(2, None, State::Served),
+            entry(3, None, State::Local),
+        ];
+        assert_eq!(
+            distinct_paths(&unstamped, None),
+            3,
+            "nothing proves two unstamped paths are one file, so neither is merged away"
+        );
+
+        let mixed = [
+            entry(1, Some(90), State::Local),
+            entry(2, Some(90), State::Local),
+            entry(3, None, State::Served),
+        ];
+        assert_eq!(
+            distinct_paths(&mixed, None),
+            2,
+            "one inode reached twice is one copy, and the unstamped path is another"
+        );
+    }
+
+    #[test]
+    fn a_remote_path_is_neither_a_copy_nor_a_present_path() {
+        let entries = [
+            entry(1, Some(90), State::Local),
+            entry(2, None, State::Remote),
+            entry(3, Some(91), State::Remote),
+        ];
+        assert_eq!(distinct_paths(&entries, None), 1);
+        assert_eq!(present_paths(&entries, None), 1);
+    }
+
+    #[test]
+    fn copies_are_counted_in_whole_shard_sets() {
+        let two_sets_of_three: Vec<Entry> = (1..=6)
+            .map(|id| entry(id, Some(100 + id as u64), State::Local))
+            .collect();
+        assert_eq!(distinct_paths(&two_sets_of_three, Some(3)), 2);
+
+        let one_set_reached_twice: Vec<Entry> = (1..=6)
+            .map(|id| entry(id, Some(100 + (id as u64 % 3)), State::Local))
+            .collect();
+        assert_eq!(
+            distinct_paths(&one_set_reached_twice, Some(3)),
+            1,
+            "a three shard set reached through two directories is one copy of the model"
+        );
+    }
 }

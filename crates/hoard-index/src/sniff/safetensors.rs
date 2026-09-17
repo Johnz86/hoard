@@ -165,8 +165,8 @@ mod tests {
         let summary = kohya_summary();
         assert_eq!(summary.tensor_count, 4);
         assert_eq!(summary.params, 10_240 + 10_240 + 1 + 12_288);
-        assert_eq!(summary.dtypes.get("F16"), Some(&3));
-        assert_eq!(summary.dtypes.get("F32"), Some(&1));
+        assert_eq!(summary.dtypes.get("F16"), Some(&(10_240 + 10_240 + 1)));
+        assert_eq!(summary.dtypes.get("F32"), Some(&12_288));
         assert_eq!(summary.dominant_dtype(), Some("F16"));
     }
 

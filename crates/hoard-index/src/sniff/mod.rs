@@ -333,9 +333,10 @@ pub(crate) fn summarize_tensors(mut tensors: Vec<TensorSample>) -> TensorSummary
         .iter()
         .map(TensorSample::element_count)
         .fold(0u64, u64::saturating_add);
-    let mut dtypes: BTreeMap<String, u32> = BTreeMap::new();
+    let mut dtypes: BTreeMap<String, u64> = BTreeMap::new();
     for tensor in &tensors {
-        *dtypes.entry(tensor.dtype.clone()).or_default() += 1;
+        let stored = dtypes.entry(tensor.dtype.clone()).or_default();
+        *stored = stored.saturating_add(tensor.element_count());
     }
     let key_prefixes = prefix_histogram(&tensors);
     let selected = select_samples(&tensors);
@@ -560,7 +561,11 @@ pub(crate) mod tests {
         assert_eq!(forward, reversed);
         assert_eq!(forward.tensor_count, 2);
         assert_eq!(forward.params, 10);
-        assert_eq!(forward.dtypes.get("F16"), Some(&1));
+        assert_eq!(
+            forward.dtypes.get("F16"),
+            Some(&6),
+            "the histogram counts elements, and a [2,3] tensor holds six"
+        );
         assert_eq!(forward.samples.len(), 2);
     }
 

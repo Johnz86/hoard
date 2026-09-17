@@ -286,22 +286,25 @@ fn config_rules(input: &InferInput<'_>, roles: &mut Accumulator<Role>) {
     }
 }
 
+/// True only when the config names an architecture that actually generates text. A layer
+/// count and a model type describe every transformer ever written, vision backbones
+/// included, so they name no language model on their own.
 fn causal_language_model(input: &InferInput<'_>) -> bool {
     let architectures = input
         .config
         .and_then(|config| config.get("architectures"))
         .and_then(serde_json::Value::as_array);
-    let declares_lm_head = architectures.is_some_and(|entries| {
+    architectures.is_some_and(|entries| {
         entries
             .iter()
             .filter_map(serde_json::Value::as_str)
             .any(|entry| {
-                entry.contains("ForCausalLM") || entry.contains("ForConditionalGeneration")
+                entry.contains("ForCausalLM")
+                    || entry.contains("ForConditionalGeneration")
+                    || entry.contains("LMHeadModel")
+                    || entry.contains("ForSeq2SeqLM")
             })
-    });
-    declares_lm_head
-        || (input.config_str("model_type").is_some()
-            && input.config_u64("num_hidden_layers").is_some())
+    })
 }
 
 fn has_lora_config_keys(config: &serde_json::Value) -> bool {
@@ -978,5 +981,42 @@ mod tests {
         );
         assert_eq!(verdict.role, Role::Ckpt);
         assert!(verdict.confidence >= rules::CONFIG_STRONG);
+    }
+
+    fn config_input<'a>(config: &'a serde_json::Value, path: &'a Path) -> InferInput<'a> {
+        InferInput::new(ArtifactFormat::Transformers, path, "config.json", 4096).with_config(config)
+    }
+
+    #[test]
+    fn an_unrecognized_vision_backbone_earns_no_llm_evidence_from_its_config() {
+        let config = json!({
+            "model_type": "dinov3_vit",
+            "architectures": ["DINOv3ViTModel"],
+            "num_hidden_layers": 24,
+        });
+        let path = Path::new("/models/facebook/config.json");
+        assert!(
+            !causal_language_model(&config_input(&config, path)),
+            "a layer count and a model type describe every transformer, not a language model"
+        );
+    }
+
+    #[test]
+    fn every_real_lm_architecture_string_still_matches() {
+        let path = Path::new("/models/acme/config.json");
+        for architecture in [
+            "NemotronHForCausalLM",
+            "Mistral3ForConditionalGeneration",
+            "GptOssForCausalLM",
+            "Qwen3ForCausalLM",
+            "SomeModelLMHeadModel",
+            "SomeModelForSeq2SeqLM",
+        ] {
+            let config = json!({"architectures": [architecture]});
+            assert!(
+                causal_language_model(&config_input(&config, path)),
+                "{architecture}"
+            );
+        }
     }
 }

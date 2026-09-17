@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 
 use hoard_core::CommitSha;
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::catalog::models::{Ref, Repository, Revision, repository_key};
-use crate::discover::{DiscoveredRepo, RevisionName};
+use crate::discover::loose::{ContentPart, synthetic_sha};
+use crate::discover::{DiscoveredEntry, DiscoveredRepo, RevisionName};
+use crate::hash::{FileStamp, fingerprint};
 
 /// The stored shape of a discovered repository. `present` is what the copy already on
 /// record counted, because rediscovering a repository does not move a single file, and
@@ -40,22 +43,91 @@ enum RevisionKey {
     Named(String),
 }
 
-fn revision_key(sha: Option<CommitSha>, name: &str) -> RevisionKey {
+/// A synthetic revision is matched by name even though it carries a sha, because its sha
+/// moves with the folder's content: matching by sha would make every edit a new revision
+/// rather than the same one changed.
+fn revision_key(synthetic: bool, sha: Option<CommitSha>, name: &str) -> RevisionKey {
     match sha {
-        Some(sha) => RevisionKey::Commit(sha),
-        None => RevisionKey::Named(name.to_owned()),
+        Some(sha) if !synthetic => RevisionKey::Commit(sha),
+        Some(_) | None => RevisionKey::Named(name.to_owned()),
     }
+}
+
+/// The fingerprint of every path of one repository, by relative path.
+pub(super) type Fingerprints = HashMap<String, String>;
+
+/// What a stored entry proves about a path without opening it: the stamp the last scan saw
+/// and the fingerprint it read at that stamp.
+pub(super) struct Fingerprinted {
+    pub(super) stamp: FileStamp,
+    pub(super) fingerprint: String,
+}
+
+/// The fingerprint of every present path of a loose repository, reading only the paths whose
+/// stamp moved since the last scan.
+///
+/// A fingerprint is a function of the bytes, and a path whose inode, mtime and size all match
+/// what the catalog stored holds the bytes it held then, which is the same thing the walk's
+/// own unchanged-revision fast path already trusts. An unchanged folder therefore opens no
+/// file at all. A path whose fingerprint cannot be read is skipped; the next scan re-reads it.
+pub(super) fn revision_fingerprints(
+    repo: &DiscoveredRepo,
+    held: &HashMap<String, Fingerprinted>,
+) -> Fingerprints {
+    let present: Vec<&DiscoveredEntry> = repo
+        .revisions
+        .iter()
+        .filter(|revision| revision.name == RevisionName::Synthetic)
+        .flat_map(|revision| revision.entries.iter())
+        .filter(|entry| entry.abs_path.is_some())
+        .collect();
+    present
+        .par_iter()
+        .filter_map(|entry| {
+            let path = entry.abs_path.as_ref()?;
+            let unchanged = held
+                .get(&entry.rel_path)
+                .filter(|known| entry.stamp == Some(known.stamp));
+            let digest = match unchanged {
+                Some(known) => known.fingerprint.clone(),
+                None => fingerprint(path, entry.size).ok()?,
+            };
+            Some((entry.rel_path.clone(), digest))
+        })
+        .collect()
+}
+
+/// The sha a loose folder's one revision carries: the fingerprint of every entry whose bytes
+/// this disk holds, folded into the content sha the Hub face answers with.
+fn synthetic_revision_sha(entries: &[DiscoveredEntry], fingerprints: &Fingerprints) -> CommitSha {
+    let mut parts: Vec<ContentPart<'_>> = entries
+        .iter()
+        .filter_map(|entry| {
+            Some(ContentPart {
+                rel_path: entry.rel_path.as_str(),
+                fingerprint: fingerprints.get(&entry.rel_path)?,
+                size: entry.size,
+            })
+        })
+        .collect();
+    synthetic_sha(&mut parts)
 }
 
 /// The shape discovery just gave one revision of a repository, before it is matched against
 /// what the catalog already holds.
-fn discovered_revision(repo: &DiscoveredRepo, position: usize) -> Revision {
+fn discovered_revision(
+    repo: &DiscoveredRepo,
+    position: usize,
+    fingerprints: &Fingerprints,
+) -> Revision {
     let revision = &repo.revisions[position];
     Revision {
         name: revision_name(repo, position),
         sha: match revision.name {
             RevisionName::Commit(sha) => Some(sha),
-            RevisionName::Synthetic => None,
+            RevisionName::Synthetic => {
+                Some(synthetic_revision_sha(&revision.entries, fingerprints))
+            }
         },
         title: revision.title.clone(),
         author: revision.author.clone(),
@@ -86,11 +158,16 @@ fn discovered_revision(repo: &DiscoveredRepo, position: usize) -> Revision {
 pub(super) fn merged_revisions(
     stored: &[Revision],
     repo: &DiscoveredRepo,
+    fingerprints: &Fingerprints,
 ) -> (Vec<Revision>, Vec<usize>) {
+    let synthetic = repo
+        .revisions
+        .iter()
+        .any(|revision| revision.name == RevisionName::Synthetic);
     let mut slots: HashMap<RevisionKey, usize> = HashMap::with_capacity(stored.len());
     for (slot, revision) in stored.iter().enumerate() {
         slots
-            .entry(revision_key(revision.sha, &revision.name))
+            .entry(revision_key(synthetic, revision.sha, &revision.name))
             .or_insert(slot);
     }
     let mut merged: Vec<Revision> = stored
@@ -102,8 +179,8 @@ pub(super) fn merged_revisions(
         .collect();
     let mut ordinals = Vec::with_capacity(repo.revisions.len());
     for position in 0..repo.revisions.len() {
-        let found = discovered_revision(repo, position);
-        let slot = match slots.remove(&revision_key(found.sha, &found.name)) {
+        let found = discovered_revision(repo, position, fingerprints);
+        let slot = match slots.remove(&revision_key(synthetic, found.sha, &found.name)) {
             Some(slot) => {
                 merged[slot] = found;
                 slot

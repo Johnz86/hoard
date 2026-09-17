@@ -66,6 +66,8 @@ pub struct ShardSet {
     pub directory: String,
     /// What the set would be called without its shard suffix.
     pub stem: String,
+    /// The file extension its members share, without the dot.
+    pub extension: String,
     /// How many files the set says it has: the `-of-<total>` its names spell, or the count
     /// of distinct files its `weight_map` points at. `None` when nothing declared one.
     pub declared_total: Option<u32>,
@@ -176,10 +178,16 @@ fn declared_set(
     for position in &members {
         claimed[*position] = true;
     }
+    let extension = members
+        .first()
+        .and_then(|anchor| file_name(candidates[*anchor].rel_path).rsplit_once('.'))
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
     Some(ShardSet {
         members,
         directory: directory.to_owned(),
         stem: index_stem(file).to_owned(),
+        extension,
         declared_total,
     })
 }
@@ -228,6 +236,7 @@ fn named_sets<'a>(candidates: &[ShardCandidate<'a>], claimed: &mut [bool]) -> Ve
                 members,
                 directory: key.directory.to_owned(),
                 stem: key.stem.to_owned(),
+                extension: key.extension,
                 declared_total: Some(key.total),
             })
         })
@@ -375,7 +384,7 @@ mod tests {
         TensorSummary {
             tensor_count: names.len() as u32,
             params,
-            dtypes: [(dtype.to_owned(), names.len() as u32)]
+            dtypes: [(dtype.to_owned(), names.len() as u64 * 4)]
                 .into_iter()
                 .collect(),
             key_prefixes: names
@@ -571,7 +580,7 @@ mod tests {
 
         assert_eq!(merged.tensor_count, 3);
         assert_eq!(merged.params, 3_500);
-        assert_eq!(merged.dtypes.get("F16"), Some(&3));
+        assert_eq!(merged.dtypes.get("F16"), Some(&12));
         assert_eq!(merged.samples.len(), 3);
         assert_eq!(
             merged

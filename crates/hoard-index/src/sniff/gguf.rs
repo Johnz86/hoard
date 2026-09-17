@@ -475,9 +475,12 @@ mod tests {
         let summary = llama_summary();
         assert_eq!(summary.tensor_count, 4);
         assert_eq!(summary.params, 4096 * 32000 * 2 + 4096 * 4096 + 4096);
-        assert_eq!(summary.dtypes.get("Q4_K"), Some(&2));
-        assert_eq!(summary.dtypes.get("Q6_K"), Some(&1));
-        assert_eq!(summary.dtypes.get("F32"), Some(&1));
+        assert_eq!(
+            summary.dtypes.get("Q4_K"),
+            Some(&(4096 * 32000 + 4096 * 4096))
+        );
+        assert_eq!(summary.dtypes.get("Q6_K"), Some(&(4096 * 32000)));
+        assert_eq!(summary.dtypes.get("F32"), Some(&4096));
         assert_eq!(summary.dominant_dtype(), Some("Q4_K"));
         assert!(
             summary
@@ -509,7 +512,7 @@ mod tests {
         let path = write(&dir, "v2.gguf", &bytes);
         let summary = summarize(&path).expect("v2 parses");
         assert_eq!(summary.tensor_count, 1);
-        assert_eq!(summary.dtypes.get("Q8_0"), Some(&1));
+        assert_eq!(summary.dtypes.get("Q8_0"), Some(&64));
     }
 
     #[test]

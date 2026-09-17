@@ -314,7 +314,7 @@ impl Catalog {
             return Ok(Vec::new());
         };
         let entries = reader.entries_of_artifact(id.get())?;
-        let deduped = record.path_count > 1;
+        let deduped = record.copies > 1;
         let mut details = Vec::with_capacity(entries.len());
         for entry in &entries {
             details.push(reader.detail(entry, deduped)?);
@@ -464,9 +464,9 @@ impl Catalog {
         let mut details = Vec::with_capacity(entries.len());
         for entry in &entries {
             let deduped = match (dedupe, entry.artifact_id) {
-                (Dedupe::Resolve, Some(id)) => reader
-                    .record(id)?
-                    .is_some_and(|record| record.path_count > 1),
+                (Dedupe::Resolve, Some(id)) => {
+                    reader.record(id)?.is_some_and(|record| record.copies > 1)
+                }
                 (Dedupe::Resolve, None) | (Dedupe::Ignore, _) => false,
             };
             details.push(reader.detail(entry, deduped)?);
@@ -488,9 +488,7 @@ impl Catalog {
             return Ok(None);
         };
         let deduped = match entry.artifact_id {
-            Some(id) => reader
-                .record(id)?
-                .is_some_and(|record| record.path_count > 1),
+            Some(id) => reader.record(id)?.is_some_and(|record| record.copies > 1),
             None => false,
         };
         reader.detail(&entry, deduped).map(Some)

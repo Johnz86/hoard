@@ -150,7 +150,7 @@ Table (`min-width: 1010px`), sticky header, nine columns:
 | # | Header | Width | Align | Cell |
 | --- | --- | --- | --- | --- |
 | 1 | ROLE | 54px | left | 3x13px role color bar + 10px role code in `--muted` |
-| 2 | NAME | 1fr | left | org in `--dim` then name in `--text`, ellipsis |
+| 2 | NAME | 1fr | left | the row's `prefix` in `--dim` then name in `--text`, ellipsis |
 | 3 | BASE | 100px | left | `--muted` |
 | 4 | FORMAT | 96px | left | `--muted` |
 | 5 | PREC | 62px | left | `--muted` |
@@ -279,12 +279,12 @@ Leading `~` forces fuzzy matching over everything indexed. Comma inside a value 
 | `role:` | alias table: checkpoint/ckpt/base/model/complete/cmp/backbone/bb, lora/lycoris/locon/adapter/ip-adapter/ipa, controlnet/ctrl/control/motion, upscaler/upsc/upscale/esrgan, vae, embedding/emb/textualinversion, llm/language model/text, dataset/ds/data, proj/projector/mmproj/vision-projector, ?/unknown/unclassified/triage |
 | `base:` | architecture family, compared with spaces and dots stripped (`sdxl`, `sd15`, `flux`, `wan`, `llama`, `qwen`) |
 | `fmt:` / `format:` | container: safetensors, gguf, diffusers, pth, pt, parquet, jsonl.gz |
-| `prec:` / `precision:` | fp16, bf16, fp32, q4_k_m, q8_0, ... |
+| `prec:` / `precision:` | fp16, bf16, fp32, fp8, int8, nvfp4, nf4, q4_k_m, q8_0, ... |
 | `node:` | which machine holds the bytes |
 | `layout:` | the ComfyUI or A1111 folder the entry's repository was filed under (`checkpoints`, `diffusion_models`, `text_encoders`, `loras`, `controlnet`, `vae`, `upscale_models`, ...), or `hub repo`, `git clone`, `(unplaced)`; folds a folder spelling onto its canonical layout the way `role:` folds its aliases |
 | `state:` | served, local, pulling, stale, remote, triage |
 | `rev:` / `tag:` | revision, branch or tag name |
-| `dupe:true` | blobs with more than one path |
+| `dupe:true` | blobs whose bytes exist as more than one file |
 | `compat:<repo>` | directional compatibility against that repo |
 | `size:<400mb` / `size:>10gb` | comparison with kb/mb/gb/tb units, default mb |
 | `used:>30d` | last access age (proposal) |

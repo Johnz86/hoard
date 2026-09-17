@@ -120,9 +120,9 @@ impl Evidence {
 
         let tensor_count = self.storage_count / copies;
         let count = if single_class { tensor_count.max(1) } else { 1 };
-        let dtypes: BTreeMap<String, u32> = classes
+        let dtypes: BTreeMap<String, u64> = classes
             .iter()
-            .map(|class| (storage_dtype(class), count))
+            .map(|class| (storage_dtype(class), u64::from(count)))
             .collect();
 
         let mut metadata = BTreeMap::new();

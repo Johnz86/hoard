@@ -207,6 +207,25 @@ pub struct RowView {
     pub role_code: String,
     pub dupe: bool,
     pub triage: bool,
+    /// What a row prints before its name so the repository a name was chosen from is always
+    /// visible: `org/` when the name is the repository's own, else `org/repository/`.
+    pub prefix: String,
+}
+
+/// The dim text a row prints before its name.
+///
+/// It is read off the qualified `repo`, never off an artifact's `org`, because a loose
+/// artifact has no `org` at all and its repository is the folder path that holds it.
+pub fn row_prefix(repo: &str, name: &str) -> String {
+    let Ok(parsed) = RepoId::parse_qualified(repo) else {
+        return String::new();
+    };
+    match (parsed.org(), name == parsed.name()) {
+        (Some(org), true) => format!("{org}/"),
+        (Some(org), false) => format!("{org}/{}/", parsed.name()),
+        (None, true) => String::new(),
+        (None, false) => format!("{}/", parsed.name()),
+    }
 }
 
 impl From<&SearchRow> for RowView {
@@ -245,6 +264,7 @@ impl From<&SearchRow> for RowView {
             role_code: row.role.code().to_owned(),
             dupe: row.dupe,
             triage: row.triage,
+            prefix: row_prefix(&row.repo, &row.name),
         }
     }
 }
@@ -850,5 +870,38 @@ mod tests {
         assert_eq!(repo_type_of("datasets/org/name"), RepoType::Datasets);
         assert_eq!(repo_type_of("models/name"), RepoType::Models);
         assert_eq!(repo_type_of("loose-folder"), RepoType::Models);
+    }
+
+    #[test]
+    fn row_prefix_is_org_only_for_the_repositorys_own_name() {
+        assert_eq!(row_prefix("models/Qwen/Qwen3-0.6B", "Qwen3-0.6B"), "Qwen/");
+    }
+
+    #[test]
+    fn row_prefix_names_the_repository_for_a_path_naming() {
+        assert_eq!(
+            row_prefix(
+                "models/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+                "speech_tokenizer/model.safetensors"
+            ),
+            "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/"
+        );
+    }
+
+    #[test]
+    fn row_prefix_for_a_loose_artifact_uses_the_repos_own_folder_name_not_org() {
+        assert_eq!(
+            row_prefix(
+                "models/comfy/diffusion_models",
+                "Wan2_1-I2V-14B-480p_fp8_e4m3fn_scaled_KJ.safetensors"
+            ),
+            "comfy/diffusion_models/"
+        );
+    }
+
+    #[test]
+    fn an_orgless_repository_naming_itself_prints_no_prefix() {
+        assert_eq!(row_prefix("datasets/squad", "squad"), "");
+        assert_eq!(row_prefix("datasets/squad", "train.parquet"), "squad/");
     }
 }

@@ -866,6 +866,243 @@ fn a_revision_that_lost_a_shard_is_prepared_again_though_its_survivors_are_uncha
     Ok(())
 }
 
+fn loose_folder(directory: &Path) -> (PathBuf, IndexConfig) {
+    let input = directory.join("models");
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    (input, config)
+}
+
+fn content_sha(repo: &RepositoryDetail, paths: &[String]) -> Result<CommitSha> {
+    let root = Path::new(&repo.root_path);
+    let fingerprinted: Vec<(&str, String, u64)> = paths
+        .iter()
+        .map(|rel_path| {
+            let absolute = root.join(rel_path);
+            let size = fs::metadata(&absolute)?.len();
+            Ok((
+                rel_path.as_str(),
+                crate::hash::fingerprint(&absolute, size)?,
+                size,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let mut parts: Vec<ContentPart<'_>> = fingerprinted
+        .iter()
+        .map(|(rel_path, digest, size)| ContentPart {
+            rel_path,
+            fingerprint: digest,
+            size: *size,
+        })
+        .collect();
+    Ok(synthetic_sha(&mut parts))
+}
+
+#[test]
+fn a_loose_revisions_sha_is_its_content_fingerprint() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_folder(directory.path());
+    fs::create_dir_all(input.join("loras"))?;
+    fs::write(input.join("loras/keep.safetensors"), lora_header())?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+
+    let detail = only_repository(&catalog)?;
+    assert_eq!(detail.revisions.len(), 1, "a loose folder has one revision");
+    let paths = paths_of_revision(&catalog, &detail, 0)?;
+    assert_eq!(
+        detail.revisions[0].sha,
+        Some(content_sha(&detail, &paths)?),
+        "a loose revision carries the sha its own contents hash to"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_unchanged_loose_folder_keeps_its_one_revision_across_a_rescan() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_folder(directory.path());
+    fs::create_dir_all(input.join("loras"))?;
+    fs::write(input.join("loras/keep.safetensors"), lora_header())?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let before = only_repository(&catalog)?;
+
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+
+    let after = only_repository(&catalog)?;
+    assert_eq!(
+        after.revisions.len(),
+        1,
+        "a rescan of an unchanged folder adds no revision"
+    );
+    assert_eq!(
+        after.revisions[0].sha, before.revisions[0].sha,
+        "the same bytes name the same revision"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_changed_loose_file_moves_its_folders_revision_sha_in_place() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_folder(directory.path());
+    fs::create_dir_all(input.join("loras"))?;
+    fs::write(input.join("loras/keep.safetensors"), lora_header())?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let before = only_repository(&catalog)?;
+
+    fs::write(
+        input.join("loras/keep.safetensors"),
+        lora_header_named("lora_up"),
+    )?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+
+    let after = only_repository(&catalog)?;
+    assert_eq!(
+        after.revisions.len(),
+        1,
+        "changed content updates the one revision rather than accreting another"
+    );
+    assert_ne!(
+        after.revisions[0].sha, before.revisions[0].sha,
+        "changed bytes name a different revision"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_unchanged_loose_folder_is_rescanned_without_reading_a_byte() -> Result<()> {
+    if crate::catalog::tests::scan::running_as_root() {
+        return Ok(());
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_folder(directory.path());
+    fs::create_dir_all(input.join("loras"))?;
+    let weights = input.join("loras/keep.safetensors");
+    fs::write(&weights, lora_header())?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let before = only_repository(&catalog)?;
+    assert!(
+        stored_fingerprints(&catalog)?
+            .iter()
+            .all(|held| held.is_some()),
+        "a loose entry keeps the fingerprint its revision sha was derived from"
+    );
+
+    fs::set_permissions(&weights, fs::Permissions::from_mode(0o000))?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    fs::set_permissions(&weights, fs::Permissions::from_mode(0o644))?;
+
+    let after = only_repository(&catalog)?;
+    assert_eq!(
+        after.revisions[0].sha, before.revisions[0].sha,
+        "an unchanged stamp reuses the stored fingerprint, so the file is never opened"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_changed_loose_file_is_the_only_one_reread() -> Result<()> {
+    if crate::catalog::tests::scan::running_as_root() {
+        return Ok(());
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir()?;
+    let (input, config) = loose_folder(directory.path());
+    fs::create_dir_all(input.join("loras"))?;
+    let edited = input.join("loras/edited.safetensors");
+    let untouched = input.join("loras/untouched.safetensors");
+    fs::write(&edited, lora_header())?;
+    fs::write(&untouched, plain_header())?;
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    let before = only_repository(&catalog)?;
+
+    fs::write(&edited, lora_header_named("lora_up"))?;
+    fs::set_permissions(&untouched, fs::Permissions::from_mode(0o000))?;
+    catalog.rescan(
+        &config,
+        HashPolicy::Never,
+        RescanScope::Configured,
+        |_, _| {},
+    )?;
+    fs::set_permissions(&untouched, fs::Permissions::from_mode(0o644))?;
+
+    let after = only_repository(&catalog)?;
+    assert_eq!(after.revisions.len(), 1);
+    assert_ne!(
+        after.revisions[0].sha, before.revisions[0].sha,
+        "the edited file moves the folder's sha"
+    );
+    let paths = paths_of_revision(&catalog, &after, 0)?;
+    assert_eq!(paths.len(), 2);
+    assert_eq!(
+        after.revisions[0].sha,
+        Some(content_sha(&after, &paths)?),
+        "and the file nothing touched still counts toward the sha, \
+         so its stored fingerprint was reused rather than reread"
+    );
+    Ok(())
+}
+
+fn stored_fingerprints(catalog: &Catalog) -> Result<Vec<Option<String>>> {
+    let read = catalog.database.r_transaction()?;
+    let entries: Vec<Entry> = read
+        .scan()
+        .primary()?
+        .all()?
+        .collect::<native_db::db_type::Result<_>>()?;
+    Ok(entries.into_iter().map(|entry| entry.fingerprint).collect())
+}
+
 fn only_artifact(catalog: &Catalog) -> Result<ArtifactRecord> {
     let read = catalog.database.r_transaction()?;
     let mut records: Vec<ArtifactRecord> = read

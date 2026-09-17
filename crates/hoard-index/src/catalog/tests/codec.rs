@@ -431,7 +431,11 @@ fn a_stored_detail_keeps_the_samples_the_inspector_shows_and_no_more() -> Result
         tensors as u64 * 16 * 64,
         "so are the parameters it counted"
     );
-    assert_eq!(header.dtypes.get("F16").copied(), Some(tensors as u32));
+    assert_eq!(
+        header.dtypes.get("F16").copied(),
+        Some(tensors as u64 * 16 * 64),
+        "the dtype histogram counts elements, not tensors"
+    );
     assert_eq!(
         header.metadata.get("ss_network_dim").map(String::as_str),
         Some("16"),

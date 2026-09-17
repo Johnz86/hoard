@@ -47,7 +47,7 @@ impl SummaryPart {
         };
         let bytes = record.group_bytes.unwrap_or(record.artifact.size);
         let present = record.path_count > 0;
-        let copies = u64::from(record.path_count.saturating_sub(1));
+        let copies = u64::from(record.copies.saturating_sub(1));
         Self {
             artifacts: 1,
             present: u64::from(present),
@@ -385,4 +385,62 @@ pub(in crate::catalog) fn next_id(counter: &mut u64) -> Result<i64> {
         .ok_or_else(|| IndexError::Catalog("catalog identity space exhausted".into()))?;
     *counter = id as u64;
     Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use hoard_core::{Artifact, ArtifactFormat, ArtifactId, Base, BlobId, Role};
+
+    use super::*;
+
+    fn record(path_count: u32, copies: u32) -> ArtifactRecord {
+        ArtifactRecord {
+            id: 1,
+            identity: 7,
+            artifact: Artifact {
+                id: ArtifactId::new(1),
+                blob: BlobId::new(1),
+                sha256: None,
+                size: 4_096,
+                format: ArtifactFormat::Safetensors,
+                role: Role::Lora,
+                sub_role: None,
+                role_confidence: 0.99,
+                base: Base::any(),
+                base_label: None,
+                base_confidence: 0.9,
+                precision: None,
+                quant: None,
+                rank: None,
+                alpha: None,
+                params: None,
+                context: None,
+                trigger: None,
+            },
+            name: "lora.safetensors".to_owned(),
+            org: None,
+            path_count,
+            copies,
+            group_bytes: None,
+            shard_count: None,
+            incomplete: false,
+            named_by_repo: false,
+            triage_cleared: false,
+            first_seen: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn summary_part_reclaimable_bytes_follows_copies_not_path_count() {
+        let three_paths_two_files = SummaryPart::of(Some(&record(3, 2)), 0.5);
+        assert_eq!(
+            three_paths_two_files.reclaimable_bytes, 4_096,
+            "one of the two real files is reclaimable, not two of the three paths"
+        );
+        assert_eq!(three_paths_two_files.duplicates, 1);
+
+        let two_paths_one_file = SummaryPart::of(Some(&record(2, 1)), 0.5);
+        assert_eq!(two_paths_one_file.reclaimable_bytes, 0);
+        assert_eq!(two_paths_one_file.duplicates, 0);
+    }
 }

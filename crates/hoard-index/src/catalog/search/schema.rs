@@ -191,7 +191,7 @@ impl Fields {
         if let Some(org) = repository.repo.org() {
             document.add_text(self.repo_org, org);
         }
-        document.add_u64(self.dupe, u64::from(artifact.path_count > 1));
+        document.add_u64(self.dupe, u64::from(artifact.copies > 1));
         document.add_u64(self.primary, u64::from(*primary));
         if let Some(used) = last_used {
             document.add_i64(self.last_used, used.as_second());

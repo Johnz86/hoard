@@ -4,14 +4,17 @@ use native_db::transaction::RwTransaction;
 
 use crate::catalog::Catalog;
 use crate::catalog::models::{
-    ArtifactRecord, Entry, Repository, RepositoryKey, Source, repository_key,
+    ArtifactRecord, Entry, EntryKey, LocationKey, Repository, RepositoryKey, Source, repository_key,
 };
 use crate::config::{IndexConfig, SourceConfig, SourceKind};
-use crate::discover::DiscoveredRepo;
+use crate::discover::{DiscoveredRepo, RevisionName};
 use crate::error::{IndexError, Result};
+use crate::hash::FileStamp;
 
 use super::counters::Counters;
-use super::revisions::{merged_revisions, repository};
+use super::revisions::{
+    Fingerprinted, Fingerprints, merged_revisions, repository, revision_fingerprints,
+};
 use super::store::settle_repositories;
 use super::walk::WalkedRepo;
 
@@ -117,7 +120,15 @@ impl Catalog {
                 ),
                 None => (counters.next_repo()?, (0, 0), Vec::new()),
             };
-            let (revisions, slots) = merged_revisions(&held, repo);
+            let fingerprints = match repo
+                .revisions
+                .iter()
+                .any(|revision| revision.name == RevisionName::Synthetic)
+            {
+                true => revision_fingerprints(repo, &held_fingerprints(&transaction, id)?),
+                false => Fingerprints::new(),
+            };
+            let (revisions, slots) = merged_revisions(&held, repo, &fingerprints);
             let ordinals = slots
                 .into_iter()
                 .map(|slot| {
@@ -126,12 +137,50 @@ impl Catalog {
                 })
                 .collect::<Result<Vec<u32>>>()?;
             transaction.upsert(repository(id, &source.name, repo, present, revisions))?;
-            walked.push(WalkedRepo { id, ordinals });
+            walked.push(WalkedRepo {
+                id,
+                ordinals,
+                fingerprints,
+            });
         }
         settle_repositories(&transaction)?;
         transaction.commit()?;
         Ok(walked)
     }
+}
+
+/// What the catalog already knows about the bytes of one repository's paths, so a rescan
+/// fingerprints only the files whose stamp moved. A row missing any part of its stamp or
+/// carrying no fingerprint proves nothing and is left out, which costs that path one read.
+fn held_fingerprints(
+    transaction: &RwTransaction<'_>,
+    repo_id: i64,
+) -> Result<HashMap<String, Fingerprinted>> {
+    let mut held = HashMap::new();
+    for entry in transaction
+        .scan()
+        .secondary::<Entry>(EntryKey::location)?
+        .start_with(LocationKey::repository(repo_id))?
+    {
+        let entry: Entry = entry?;
+        let (Some(inode), Some(mtime), Some(fingerprint)) =
+            (entry.inode, entry.mtime, entry.fingerprint)
+        else {
+            continue;
+        };
+        held.insert(
+            entry.rel_path,
+            Fingerprinted {
+                stamp: FileStamp {
+                    inode,
+                    mtime,
+                    size: entry.size,
+                },
+                fingerprint,
+            },
+        );
+    }
+    Ok(held)
 }
 
 fn held_by_source(

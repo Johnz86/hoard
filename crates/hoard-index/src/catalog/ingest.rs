@@ -15,8 +15,8 @@ use super::models::{
 };
 use super::read::Reader;
 use super::scan::{
-    CHUNK, Counters, RecordFacts, log_changes, next_id, paths_of_artifact, preference,
-    present_paths, record_of, settle_repositories, tensor_keys,
+    CHUNK, Counters, RecordFacts, log_changes, next_id, preference, record_of, recount_artifact,
+    settle_repositories, tensor_keys,
 };
 use super::{Catalog, EntryDetail};
 
@@ -154,27 +154,22 @@ impl Catalog {
         Ok(retired)
     }
 
+    /// Settles the path and copy counts of every artifact a retirement touched.
+    ///
+    /// [`recount_artifact`] rather than the full sweep: retiring a path leaves the entry in
+    /// place as a remote row, and an artifact every node but this one still holds must not
+    /// be deleted for having no local path.
     fn recount_retired_paths(&self, counters: &mut Counters) -> Result<()> {
         let mut ids = counters.take_touched().into_iter();
         while ids.len() > 0 {
             let transaction = self.database.rw_transaction()?;
             for id in ids.by_ref().take(CHUNK) {
                 counters.capture_summary(&transaction, id)?;
-                let stored: Option<ArtifactRecord> = transaction.get().primary(id)?;
-                let Some(record) = stored else {
-                    continue;
-                };
-                let paths = present_paths(
-                    &paths_of_artifact(&transaction, record.id)?,
-                    record.shard_count,
-                );
-                if paths != record.path_count {
-                    transaction.upsert(ArtifactRecord {
-                        path_count: paths,
-                        ..record
-                    })?;
+                if recount_artifact(&transaction, id)? {
+                    counters.pending.push(id);
                 }
             }
+            log_changes(&transaction, counters)?;
             counters.settle_summary(&transaction)?;
             transaction.commit()?;
         }
@@ -226,6 +221,7 @@ impl Ingesting<'_, '_> {
             artifact_id,
             revision: ordinal,
             rel_path: file.rel_path.clone(),
+            fingerprint: None,
             placed: Placement::Absent,
             size: file.size,
             state: State::Served,
@@ -375,6 +371,7 @@ impl Ingesting<'_, '_> {
             id,
             identity,
             name: file_name.to_owned(),
+            named_by_repo: file_name == file.repo.name(),
             org: file.repo.org().map(str::to_owned),
             sha256: Some(file.sha256),
             size: file.size,
@@ -383,6 +380,7 @@ impl Ingesting<'_, '_> {
             tensors: None,
             group_bytes: None,
             shard_count: None,
+            incomplete: false,
             first_seen: None,
         });
         let triage = record.artifact.needs_triage(self.triage);
@@ -399,19 +397,31 @@ impl Ingesting<'_, '_> {
         }))
     }
 
-    /// Moves one record's path count, which is what marks an artifact deduplicated and what
-    /// the sweep would otherwise have to recount.
+    /// Moves one record's path and copy counts, which is what the sweep would otherwise
+    /// have to recount.
+    ///
+    /// The two move together because a served entry carries no inode, so it is its own copy
+    /// by [`distinct_paths`]'s conservative rule. Counting here rather than recomputing is
+    /// what lets the entry be written afterwards; the sweep at the end of the call settles
+    /// anything this arithmetic could not see.
     fn count_path(&mut self, id: i64, by: i32) -> Result<()> {
         let Some(stored) = self.transaction.get().primary::<ArtifactRecord>(id)? else {
             return Ok(());
         };
-        let path_count = match by.is_negative() {
-            true => stored.path_count.saturating_sub(1),
-            false => stored.path_count.saturating_add(1),
+        let (path_count, copies) = match by.is_negative() {
+            true => (
+                stored.path_count.saturating_sub(1),
+                stored.copies.saturating_sub(1),
+            ),
+            false => (
+                stored.path_count.saturating_add(1),
+                stored.copies.saturating_add(1),
+            ),
         };
         self.touch(id)?;
         self.transaction.upsert(ArtifactRecord {
             path_count,
+            copies,
             ..stored
         })?;
         Ok(())

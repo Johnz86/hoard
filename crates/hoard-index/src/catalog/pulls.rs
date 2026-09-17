@@ -244,6 +244,7 @@ fn blank_entry(previous: Option<Entry>) -> Entry {
         artifact_id: None,
         revision: 0,
         rel_path: String::new(),
+        fingerprint: None,
         placed: Placement::Absent,
         size: 0,
         state: State::Remote,
@@ -367,8 +368,10 @@ fn filed_artifact(
     if let Some(stored) = stored {
         counters.touch(transaction, stored.id)?;
         let path_count = stored.path_count.saturating_add(1);
+        let copies = stored.copies.saturating_add(1);
         transaction.upsert(ArtifactRecord {
             path_count,
+            copies,
             ..stored
         })?;
         return Ok(stored.id);
@@ -384,6 +387,7 @@ fn filed_artifact(
         id,
         identity,
         name: name.to_owned(),
+        named_by_repo: repo_of(transaction, file.slot)?.is_some_and(|repo| repo.name() == name),
         org: repo_of(transaction, file.slot)?.and_then(|repo| repo.org().map(str::to_owned)),
         sha256: Some(file.sha256),
         size: file.sniff.size,
@@ -392,6 +396,7 @@ fn filed_artifact(
         tensors: file.sniff.tensors.clone(),
         group_bytes: None,
         shard_count: None,
+        incomplete: false,
         first_seen: None,
     });
     transaction.upsert(SearchText {

@@ -69,7 +69,7 @@ function row(app, item, index) {
         el(
             "span",
             { class: "cell-name" },
-            item.org ? el("span", { class: "cell-org", text: `${item.org}/` }) : null,
+            item.prefix ? el("span", { class: "cell-org", text: item.prefix }) : null,
             item.name
         ),
         el("span", { class: "cell-muted", text: dash(item.base) }),

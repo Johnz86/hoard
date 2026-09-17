@@ -100,7 +100,7 @@ impl DiscoveredEntry {
 }
 
 /// How a revision is named. Git and cache revisions carry the commit they came from; a
-/// loose folder has none until its contents have been fingerprinted.
+/// loose folder is named by the sha its own contents fingerprint to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevisionName {
     Commit(CommitSha),

@@ -31,7 +31,8 @@ parquet arrow jsonl csv readme config unknown`.
     "base_total": 213, "base_shown": 27 },
   "rows": [ {
     "artifact_id": "a_01H...", "blob_sha256": "9f2c...41ab", "role": "lora", "sub_role": null,
-    "role_confidence": 0.98, "org": "kohya", "name": "film-grain-35mm", "base": "sdxl 1.0",
+    "role_confidence": 0.98, "org": "kohya", "prefix": "kohya/", "name": "film-grain-35mm",
+    "base": "sdxl 1.0",
     "format": "safetensors", "precision": "fp16", "size": 239075328, "rank": 32, "alpha": 16,
     "params": null, "context": null, "quant": null, "revision": "main", "revision_sha": "462c3cb...",
     "node": "workstation", "layout": "loras", "state": "served", "pull_progress": null,
@@ -40,6 +41,14 @@ parquet arrow jsonl csv readme config unknown`.
   "next_cursor": "...", "total": 212, "nodes": 3, "summary": "212 ARTIFACTS · 3 NODES"
 }
 ```
+
+A row's `prefix` is what the UI prints in `--dim` before the name, so the repository a name
+was chosen from is always on screen. It is derived in Rust from the row's qualified `repo`,
+never from `org`: it is `org/` when the name is the repository's own name, and
+`org/repository/` when the name is a path inside the repository or the artifact's own file
+name. A loose artifact carries no `org` at all, so its prefix comes from the folder path its
+repository is (`comfy/diffusion_models/`). An orgless repository naming its one artifact
+prints nothing. `CompatRowView` carries the same field, built by the same function.
 
 `facets.layout` is the folder discovery filed the entry's repository under, which is the
 placement decision the tree already carries rather than anything inference concluded: a
@@ -105,8 +114,8 @@ short. The server logs the window at `debug`; nothing in the response names it.
   `duplicates`, `plugs_into` (first four compatible artifacts), `usage` summary,
   `override_applied`.
 - `GET /api/v1/artifacts/{id}/compat?limit=`: `{ "rows", "total", "rule", "heading",
-  "banner" }`. A row carries `artifact_id`, `role`, `role_code`, `org`, `name`, `repo`,
-  `detail`, `size`, `size_human`, `state`, `state_label`, `pull_progress`; `total` is how
+  "banner" }`. A row carries `artifact_id`, `role`, `role_code`, `org`, `prefix`, `name`,
+  `repo`, `detail`, `size`, `size_human`, `state`, `state_label`, `pull_progress`; `total` is how
   many candidates the rule accepted, which can exceed `rows.len()` when `limit` truncates.
 - `GET /api/v1/artifacts/{id}/pull-command`: `{ "git": null,
   "hf": "HF_ENDPOINT=http://hoard.lan:7099 hf download org/name file.safetensors",

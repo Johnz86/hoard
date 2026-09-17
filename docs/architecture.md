@@ -179,7 +179,7 @@ hoard/
           pulls.rs           a pull in flight and the file it lands
           tests/             shared fixtures in mod.rs; scan, revisions, storage, codec, reads,
                              mirror, counts, rescan, index, paging, collapse, usage, hashing,
-                             recovery, brands
+                             recovery, brands, naming
         row.rs               SearchRow, FacetBucket, DiskPressure: what a search answers with
         time.rs              reading and writing the instants the catalog stores
         search/
@@ -217,6 +217,8 @@ hoard/
         resolve.rs           revision -> sha, local first
         ingest.rs            completed cache entries into the index
         usage.rs             served-request log and the sink that batches it
+      tests/
+        loose_revision.rs    the index answers a loose folder's sha without upstream
     hoard-net/               node identity, mDNS discovery, digest gossip, peer pulls
       src/
         identity.rs          NodeId, name, advertised URL and the _hoard._tcp TXT record

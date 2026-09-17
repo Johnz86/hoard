@@ -29,6 +29,9 @@ pub struct InferInput<'a> {
     pub format: ArtifactFormat,
     pub tensors: Option<&'a TensorSummary>,
     pub config: Option<&'a serde_json::Value>,
+    /// The `hf_quant_config.json` nearest this file, which names a quantization scheme the
+    /// model config does not always carry.
+    pub quant_config: Option<&'a serde_json::Value>,
     pub frontmatter: Option<&'a [(String, String)]>,
     pub path: &'a Path,
     pub file_name: &'a str,
@@ -41,6 +44,7 @@ impl<'a> InferInput<'a> {
             format,
             tensors: None,
             config: None,
+            quant_config: None,
             frontmatter: None,
             path,
             file_name,
@@ -55,6 +59,11 @@ impl<'a> InferInput<'a> {
 
     pub fn with_config(mut self, config: &'a serde_json::Value) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    pub fn with_quant_config(mut self, quant_config: &'a serde_json::Value) -> Self {
+        self.quant_config = Some(quant_config);
         self
     }
 
@@ -304,8 +313,6 @@ pub(crate) mod fixtures {
     use hoard_core::{TensorSample, TensorSummary};
 
     pub(crate) fn tensors(samples: &[(&str, &[u64])]) -> TensorSummary {
-        let mut dtypes = BTreeMap::new();
-        dtypes.insert("F16".to_owned(), samples.len() as u32);
         let samples: Vec<TensorSample> = samples
             .iter()
             .map(|(name, shape)| TensorSample {
@@ -314,6 +321,11 @@ pub(crate) mod fixtures {
                 shape: shape.to_vec(),
             })
             .collect();
+        let mut dtypes = BTreeMap::new();
+        dtypes.insert(
+            "F16".to_owned(),
+            samples.iter().map(TensorSample::element_count).sum::<u64>(),
+        );
         TensorSummary {
             tensor_count: samples.len() as u32,
             params: samples.iter().map(TensorSample::element_count).sum(),
@@ -1019,7 +1031,10 @@ mod acceptance {
             inference.trigger.as_deref(),
             Some("myconcept, 1girl, outdoors")
         );
-        assert_eq!(inference.base_label.as_deref(), Some("sd_v1-5"));
+        assert_eq!(
+            inference.base_label, None,
+            "sd_v1-5 is an alias of sd15, not a spelling of it"
+        );
     }
 
     #[test]

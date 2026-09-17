@@ -267,6 +267,7 @@ impl Seeding<'_, '_> {
             artifact_id,
             revision,
             rel_path: seed.rel_path.clone(),
+            fingerprint: None,
             placed: placement_in(
                 self.transaction,
                 repo_id,
@@ -328,8 +329,11 @@ impl Seeding<'_, '_> {
             name: seed.name.clone(),
             org: seed.org.clone(),
             path_count: 1,
+            copies: 1,
+            named_by_repo: false,
             group_bytes: seed.group_bytes,
             shard_count: seed.shard_count,
+            incomplete: false,
             triage_cleared: false,
             first_seen: SEEDED_AT.to_owned(),
         })?;

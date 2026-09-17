@@ -33,9 +33,7 @@ pub(super) use self::store::{
     RecordFacts, collapse_key, preference, preferred_entry, record_of, settle_repositories,
     tensor_keys,
 };
-pub(super) use self::sweep::{
-    log_revision_artifacts, paths_of_artifact, present_paths, sweep_artifact,
-};
+pub(super) use self::sweep::{log_revision_artifacts, recount_artifact, sweep_artifact};
 pub(super) use self::walk::location_hash;
 #[cfg(test)]
 pub(super) use self::walk::stamp_moved;
@@ -273,6 +271,7 @@ impl Catalog {
                         let context = EntryContext {
                             repo,
                             repo_id: walked.id,
+                            fingerprints: &walked.fingerprints,
                             revision,
                             settings: walk.settings,
                             kind,
@@ -282,7 +281,7 @@ impl Catalog {
                         let sets = shard_sets_by_name(&revision.entries, &documents);
                         let units = revision_units(&revision.entries, sets);
                         let plan = revision_plan(&context, documents, &units);
-                        let labels = set_labels(&plan.naming, &units);
+                        let labels = set_labels(&plan.naming, &units, &revision.entries);
                         let mut card_written = false;
                         for (unit, label) in units.iter().zip(labels) {
                             if stop.load(Ordering::Relaxed) {
