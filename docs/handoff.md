@@ -3,6 +3,38 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest wave: read the whole header before naming the base
+
+Every base and role rule matched against a 64-name sample, and the sampler's own keyword list
+covered 25 of the 92 fragments the rules name, so three 2,515-tensor SDXL checkpoints carried
+no base although each holds `label_emb`. The sniffer now answers every rule's name test over
+all of a header's tensor names into `TensorSummary::markers`, a vocabulary derived from the
+rule tables themselves and never stored, and guarantees a sample slot to each tensor a rule
+reads a shape from. Families are named by the exact keys ComfyUI detects them by, a LoRA by
+the modules it patches, and a proven architecture is refined by a lineage from the file name
+or the one folder the file sits in (`sdxlpony`, `sdxlillustrious`), which `base:sdxl` still
+finds. A latent upscaler is no longer `any` and `mxfp4` is a precision. On this workstation's
+files, checkpoints with a base went 23 of 55 to 48 of 55 and LoRAs 21 of 37 to 36 of 37,
+`base:sdxl` 2 to 5, `prec:mxfp4` 0 to 1, and the compat list of `flux-2-klein-4b` 46 to 43:
+the four LTX latent upscalers left it and the Flux autoencoder joined.
+`catalog::FORMAT_VERSION` is 13: the catalog is deleted and rebuilt from disk.
+
+Three things the wider read forced. `SWINIR_KEYS` lost `patch_embed.norm`, which every Swin
+and ViT backbone carries and which read `birefnet.safetensors` as an upscaler that then
+applied to every host; the remaining terms keep every SwinIR file here, and `role:upsc` still
+counts 45. A lineage is read from the file name and the immediate parent folder only, never
+from the rest of an absolute path, so a home directory named `pony` relabels nothing. `base:`
+now filters one way, from the architecture down: `base:sdxl` answers 5 and `base:sdxlpony`
+answers 1 rather than every plain `sdxl` file as well; `compat:` keeps the two-way test,
+which is where that notion belongs.
+
+One row still differs from what the previous review left: `diffusiongemma-26B-A4B-it-NVFP4`
+reads `llm` from its `model.layers.`/`embed_tokens` pair rather than staying in triage, and
+that is accepted. `ltx-2-19b-distilled-lora-384.safetensors` reads `qwenimage`, which is
+correct: the file is byte-identical to `Qwen-Image-Lightning-4steps-V1.0.safetensors`. The
+rail's brand row for `sdxl` was not added: `search/brands.rs` holds a pinned test forbidding
+an sdxl anchor, which is a decision to take rather than a test to edit.
+
 ## Latest wave: the page describes the artifact that was opened
 
 A repository page described the largest weights file of `main` whatever the index row opened
@@ -44,7 +76,7 @@ and 1 against this workstation's caches where each answered 0; a `~` token match
 as a prefix in any order. The `hf` pull line of an artifact held outside `main` carries
 `--revision <sha>`, so artifact `a_14`'s copied command downloads its 5 files instead of none.
 Nothing stored changed shape and `catalog::FORMAT_VERSION` stays 12. Left open by the
-2026-09-17 review: the one-shard-of-N model and base identification.
+2026-09-17 review: the one-shard-of-N model.
 
 ## Latest wave: a format bump no longer costs a rehash
 

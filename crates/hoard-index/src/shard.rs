@@ -306,8 +306,8 @@ fn digits(value: &str) -> Option<u32> {
 
 /// The tensor summary of a whole model, formed from the header of each of its shards.
 ///
-/// Counts and parameters add up, samples are drawn a round at a time so no shard fills the
-/// budget alone, and the first shard to carry a metadata key keeps it.
+/// Counts, parameters and markers add up, samples are drawn a round at a time so no shard
+/// fills the budget alone, and the first shard to carry a metadata key keeps it.
 pub fn merge_tensor_summaries(parts: &[&TensorSummary]) -> TensorSummary {
     let mut merged = TensorSummary::default();
     let mut prefixes: BTreeMap<&str, u32> = BTreeMap::new();
@@ -328,6 +328,18 @@ pub fn merge_tensor_summaries(parts: &[&TensorSummary]) -> TensorSummary {
                 .entry(key.clone())
                 .or_insert_with(|| value.clone());
         }
+        merged
+            .markers
+            .fragments
+            .extend(part.markers.fragments.iter().cloned());
+        merged
+            .markers
+            .prefixes
+            .extend(part.markers.prefixes.iter().cloned());
+        merged
+            .markers
+            .keys
+            .extend(part.markers.keys.iter().cloned());
     }
     merged.key_prefixes = ranked_prefixes(prefixes);
     merged.samples = spread_samples(parts);
@@ -395,25 +407,20 @@ mod tests {
     }
 
     fn summary(names: &[&str], dtype: &str, params: u64) -> TensorSummary {
+        let samples: Vec<TensorSample> = names
+            .iter()
+            .map(|name| TensorSample {
+                name: (*name).to_owned(),
+                dtype: dtype.to_owned(),
+                shape: vec![2, 2],
+            })
+            .collect();
         TensorSummary {
-            tensor_count: names.len() as u32,
             params,
             dtypes: [(dtype.to_owned(), names.len() as u64 * 4)]
                 .into_iter()
                 .collect(),
-            key_prefixes: names
-                .iter()
-                .map(|name| (crate::sniff::key_prefix(name).to_owned(), 1))
-                .collect(),
-            samples: names
-                .iter()
-                .map(|name| TensorSample {
-                    name: (*name).to_owned(),
-                    dtype: dtype.to_owned(),
-                    shape: vec![2, 2],
-                })
-                .collect(),
-            metadata: BTreeMap::new(),
+            ..crate::sniff::summarize_tensors(samples)
         }
     }
 
@@ -619,6 +626,21 @@ mod tests {
                 .find(|(prefix, _)| prefix == "model")
                 .map(|(_, count)| *count),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn merged_shards_carry_the_markers_of_every_shard() {
+        let first = summary(&["first_stage_model.decoder.conv_in.weight"], "F16", 1_000);
+        let second = summary(&["double_blocks.0.img_attn.qkv.weight"], "F16", 1_000);
+        let merged = merge_tensor_summaries(&[&first, &second]);
+
+        assert!(merged.has_prefix("first_stage_model."));
+        assert!(merged.has_fragment("double_blocks."));
+        assert_eq!(
+            merged.markers.fragments.len(),
+            first.markers.fragments.len() + second.markers.fragments.len(),
+            "no shard's fragments are dropped and none is counted twice"
         );
     }
 

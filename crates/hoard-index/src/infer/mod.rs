@@ -6,6 +6,7 @@
 //! agreeing source closes part of the remaining gap, which keeps confidence monotone.
 
 mod base;
+mod families;
 mod lora;
 mod precision;
 mod role;
@@ -308,8 +309,6 @@ impl<T: Clone + PartialEq> Accumulator<T> {
 
 #[cfg(test)]
 pub(crate) mod fixtures {
-    use std::collections::BTreeMap;
-
     use hoard_core::{TensorSample, TensorSummary};
 
     pub(crate) fn tensors(samples: &[(&str, &[u64])]) -> TensorSummary {
@@ -321,19 +320,7 @@ pub(crate) mod fixtures {
                 shape: shape.to_vec(),
             })
             .collect();
-        let mut dtypes = BTreeMap::new();
-        dtypes.insert(
-            "F16".to_owned(),
-            samples.iter().map(TensorSample::element_count).sum::<u64>(),
-        );
-        TensorSummary {
-            tensor_count: samples.len() as u32,
-            params: samples.iter().map(TensorSample::element_count).sum(),
-            dtypes,
-            key_prefixes: crate::sniff::prefix_histogram(&samples),
-            samples,
-            metadata: BTreeMap::new(),
-        }
+        crate::sniff::summarize_tensors(samples)
     }
 
     pub(crate) fn with_metadata(

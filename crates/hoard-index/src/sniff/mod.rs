@@ -6,6 +6,7 @@
 
 pub mod dataset;
 pub mod gguf;
+mod markers;
 pub mod pickle;
 pub mod readme;
 pub mod safetensors;
@@ -26,37 +27,6 @@ const PROBE_BYTES: u64 = 4096;
 const DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) const MAX_PREFIXES: usize = 32;
 pub(crate) const MAX_SAMPLES: usize = 64;
-/// Key fragments that always earn a sample slot because inference reads them.
-const SAMPLE_KEYWORDS: [&str; 21] = [
-    "lora_down",
-    "lora_up",
-    "alpha",
-    "cross_attn",
-    "to_k",
-    "to_v",
-    "context_embedder",
-    "img_in",
-    "time_embed",
-    "t_embedder",
-    "adaLN",
-    "model.diffusion_model",
-    "first_stage_model",
-    "double_blocks",
-    "single_blocks",
-    "joint_blocks",
-    "noise_refiner",
-    "conv_first",
-    "conv_body",
-    "RRDB_trunk",
-    "conv_before_upsample",
-];
-
-/// How many sample slots the keyword pass may claim.
-///
-/// The remainder is reserved for the even spread below. Without a reserve, a large model
-/// whose keys all contain a keyword fills every slot from one region of the key list, and
-/// the structural keys the role and base rules read are never sampled at all.
-const KEYWORD_BUDGET: usize = MAX_SAMPLES / 2;
 
 const ZIP_MAGIC: &[u8; 4] = b"PK\x03\x04";
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
@@ -339,6 +309,7 @@ pub(crate) fn summarize_tensors(mut tensors: Vec<TensorSample>) -> TensorSummary
         *stored = stored.saturating_add(tensor.element_count());
     }
     let key_prefixes = prefix_histogram(&tensors);
+    let markers = markers::markers_of(&tensors);
     let selected = select_samples(&tensors);
     let tensor_count = tensors.len() as u32;
     let samples = tensors
@@ -353,6 +324,7 @@ pub(crate) fn summarize_tensors(mut tensors: Vec<TensorSample>) -> TensorSummary
         key_prefixes,
         samples,
         metadata: BTreeMap::new(),
+        markers,
     }
 }
 
@@ -371,21 +343,42 @@ pub(crate) fn prefix_histogram(tensors: &[TensorSample]) -> Vec<(String, u32)> {
     prefixes
 }
 
-fn first_keyword_matches(tensors: &[TensorSample]) -> [Option<usize>; SAMPLE_KEYWORDS.len()] {
-    let mut first = [None; SAMPLE_KEYWORDS.len()];
-    let mut unmatched = SAMPLE_KEYWORDS.len();
+/// The first tensor naming each shape-bearing key, preferring one with an input and an
+/// output dimension: a bias sorts before its weight and carries no width of its own.
+fn select_shape_bearers(tensors: &[TensorSample], selected: &mut BTreeSet<usize>) {
+    let keys: Vec<&str> = crate::infer::rules::shape_bearing_keys().collect();
+    let mut projections: Vec<Option<usize>> = vec![None; keys.len()];
+    let mut vectors: Vec<Option<usize>> = vec![None; keys.len()];
+    let mut pending = keys.len();
     for (index, tensor) in tensors.iter().enumerate() {
-        if unmatched == 0 {
+        if pending == 0 {
             break;
         }
-        for (slot, keyword) in first.iter_mut().zip(SAMPLE_KEYWORDS) {
-            if slot.is_none() && tensor.name.contains(keyword) {
-                *slot = Some(index);
-                unmatched -= 1;
+        if tensor.shape.is_empty() {
+            continue;
+        }
+        let projection = tensor.shape.len() >= 2;
+        for ((named, vector), key) in projections.iter_mut().zip(&mut vectors).zip(&keys) {
+            if named.is_some() || !tensor.name.contains(key) {
+                continue;
+            }
+            match projection {
+                true => {
+                    *named = Some(index);
+                    pending -= 1;
+                }
+                false => *vector = vector.or(Some(index)),
             }
         }
     }
-    first
+    for slot in projections.into_iter().zip(vectors) {
+        if selected.len() >= MAX_SAMPLES {
+            break;
+        }
+        if let Some(index) = slot.0.or(slot.1) {
+            selected.insert(index);
+        }
+    }
 }
 
 fn select_samples(tensors: &[TensorSample]) -> BTreeSet<usize> {
@@ -401,23 +394,7 @@ fn select_samples(tensors: &[TensorSample]) -> BTreeSet<usize> {
     {
         selected.insert(index);
     }
-    for index in first_keyword_matches(tensors).into_iter().flatten() {
-        if selected.len() >= KEYWORD_BUDGET {
-            break;
-        }
-        selected.insert(index);
-    }
-    for (index, tensor) in tensors.iter().enumerate() {
-        if selected.len() >= KEYWORD_BUDGET {
-            break;
-        }
-        if SAMPLE_KEYWORDS
-            .iter()
-            .any(|keyword| tensor.name.contains(keyword))
-        {
-            selected.insert(index);
-        }
-    }
+    select_shape_bearers(tensors, &mut selected);
     let stride = (tensors.len() / MAX_SAMPLES).max(1);
     for index in (0..tensors.len()).step_by(stride) {
         if selected.len() >= MAX_SAMPLES {
@@ -440,7 +417,7 @@ pub(crate) mod tests {
     use crate::infer::{InferInput, infer};
 
     #[test]
-    fn keyword_matches_cannot_starve_the_structural_spread() {
+    fn the_even_spread_fills_every_slot_the_named_keys_leave() {
         let mut tensors: Vec<TensorSample> = (0..600)
             .map(|index| sample(&format!("blocks.{index}.attn.to_k.weight"), "F16", &[8, 8]))
             .collect();
@@ -458,14 +435,15 @@ pub(crate) mod tests {
             selected.iter().any(|index| *index > last / 2),
             "the spread must reach the far end of the key list, got {selected:?}"
         );
-        assert!(
-            selected.len() > KEYWORD_BUDGET,
-            "the reserved slots must actually be filled by the spread"
+        assert_eq!(
+            selected.len(),
+            MAX_SAMPLES,
+            "every slot the named keys leave is filled by the spread"
         );
     }
 
     #[test]
-    fn every_sample_keyword_keeps_a_slot_of_its_own() {
+    fn every_shape_bearing_key_keeps_a_slot_of_its_own() {
         let mut tensors: Vec<TensorSample> = (0..600)
             .map(|index| {
                 sample(
@@ -504,7 +482,56 @@ pub(crate) mod tests {
             .with_tensors(&summary),
         );
         assert_eq!(inferred.role, Role::Ckpt);
-        assert_eq!(inferred.base, Base::new("sdxl"));
+        assert_eq!(
+            inferred.base,
+            Base::new("sdxl pony"),
+            "the header proves sdxl and the file name refines it"
+        );
+        assert!(inferred.base.matches(&Base::new("sdxl")));
+    }
+
+    #[test]
+    fn a_marker_is_found_among_thousands_of_names_the_sample_never_reaches() {
+        let mut tensors: Vec<TensorSample> = (0..3_000)
+            .map(|index| {
+                sample(
+                    &format!("model.diffusion_model.output_blocks.{index:04}.weight"),
+                    "F16",
+                    &[8, 8],
+                )
+            })
+            .collect();
+        tensors.insert(
+            1_700,
+            sample(
+                "model.diffusion_model.label_emb.0.0.weight",
+                "F16",
+                &[1280, 2816],
+            ),
+        );
+        for index in 0..40 {
+            tensors.push(sample(
+                &format!("model.diffusion_model.input_blocks.{index:04}.attn1.to_k.weight"),
+                "F16",
+                &[640, 640],
+            ));
+        }
+        tensors.push(sample(
+            "model.diffusion_model.input_blocks.4.1.attn2.to_k.weight",
+            "F16",
+            &[640, 2048],
+        ));
+
+        let summary = summarize_tensors(tensors);
+        assert!(summary.has_fragment("label_emb"));
+        assert!(summary.samples.len() <= MAX_SAMPLES);
+        assert_eq!(
+            summary
+                .find_fragment("attn2.to_k")
+                .map(|tensor| tensor.shape.clone()),
+            Some(vec![640, 2048]),
+            "the cross-attention projection keeps a slot of its own"
+        );
     }
 
     #[test]
@@ -570,11 +597,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn samples_are_capped_and_keep_the_first_largest_and_keyword_keys() {
+    fn samples_are_capped_and_keep_the_first_largest_and_shape_bearing_keys() {
         let mut tensors: Vec<TensorSample> = (0..500)
             .map(|index| sample(&format!("blk.{index:03}.weight"), "F16", &[8]))
             .collect();
-        tensors.push(sample("zz.lora_down.weight", "F16", &[4]));
+        tensors.push(sample("zz.lora_down.weight", "F16", &[4, 8]));
         tensors.push(sample("mm.big.weight", "F16", &[4096, 4096]));
         let summary = summarize_tensors(tensors);
         assert_eq!(summary.samples.len(), MAX_SAMPLES);

@@ -131,10 +131,12 @@ hoard/
           safetensors.rs     header and __metadata__ via bounded File reads
           gguf.rs            metadata via the hand-written v2/v3 header parser
           pickle.rs          zip listing for .ckpt/.pt/.pth/.bin
+          markers.rs         the rule vocabulary found among every tensor name, one AC pass
           readme.rs          frontmatter and body
           dataset.rs         parquet, arrow, jsonl, csv
         infer/
-          rules.rs           key prefix and shape signature tables
+          rules.rs           key prefix and shape signature tables, the marker vocabulary
+          families.rs        a family by the exact keys ComfyUI detects it by, a LoRA by module
           role.rs  base.rs  lora.rs  precision.rs  trigger.rs
         hash/                fingerprint, sha256, git blob sha1
         catalog/             the native_db + Tantivy catalog: the index

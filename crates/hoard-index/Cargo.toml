@@ -12,6 +12,7 @@ fixtures = []
 
 [dependencies]
 hoard-core.workspace = true
+aho-corasick.workspace = true
 ignore.workspace = true
 notify.workspace = true
 globset.workspace = true

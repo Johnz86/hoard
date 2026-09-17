@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -201,6 +201,18 @@ impl TensorSample {
     }
 }
 
+/// The rule vocabulary found among ALL of a file's tensor names.
+///
+/// A fragment some name contains, a prefix some name starts with, and a key some name equals
+/// once its wrapper prefix is stripped. The sniffer fills it while it still holds every name,
+/// so a rule's name test never depends on which tensors earned a sample slot.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Markers {
+    pub fragments: BTreeSet<String>,
+    pub prefixes: BTreeSet<String>,
+    pub keys: BTreeSet<String>,
+}
+
 /// What header sniffing learned about a tensor file. The inference rules read only this,
 /// which keeps them unit testable against synthetic fixtures.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -220,6 +232,9 @@ pub struct TensorSummary {
     pub samples: Vec<TensorSample>,
     /// safetensors `__metadata__` or GGUF key/value metadata, verbatim.
     pub metadata: BTreeMap<String, String>,
+    /// Never stored: inference only ever runs straight after a fresh sniff.
+    #[serde(skip)]
+    pub markers: Markers,
 }
 
 impl TensorSummary {
@@ -255,24 +270,22 @@ impl TensorSummary {
             .map(Precision::from_dtype)
     }
 
+    /// True when a tensor name starts with this prefix, read from [`Markers`]: a term no rule
+    /// names was never looked for and answers false whatever the header holds.
     pub fn has_prefix(&self, prefix: &str) -> bool {
-        self.key_prefixes
-            .iter()
-            .any(|(key, _)| key.starts_with(prefix))
-            || self
-                .samples
-                .iter()
-                .any(|sample| sample.name.starts_with(prefix))
+        self.markers.prefixes.contains(prefix)
     }
 
+    /// True when a tensor name contains this fragment, read from [`Markers`]: a term no rule
+    /// names was never looked for and answers false whatever the header holds.
     pub fn has_fragment(&self, fragment: &str) -> bool {
-        self.key_prefixes
-            .iter()
-            .any(|(key, _)| key.contains(fragment))
-            || self
-                .samples
-                .iter()
-                .any(|sample| sample.name.contains(fragment))
+        self.markers.fragments.contains(fragment)
+    }
+
+    /// True when a tensor name equals this key once its wrapper prefix is stripped, read from
+    /// [`Markers`]: a key no rule names was never looked for and answers false.
+    pub fn has_key(&self, key: &str) -> bool {
+        self.markers.keys.contains(key)
     }
 
     pub fn sample(&self, name: &str) -> Option<&TensorSample> {
@@ -368,6 +381,37 @@ mod tests {
         assert_eq!(Precision::from_dtype("F8_E4M3").as_str(), "fp8");
         assert!(Precision::new("Q4_K_M").is_quantized());
         assert!(!Precision::new("fp16").is_quantized());
+    }
+
+    #[test]
+    fn a_stored_summary_round_trips_without_its_markers() {
+        let summary = TensorSummary {
+            tensor_count: 2,
+            params: 20,
+            dtypes: BTreeMap::from([("F16".to_owned(), 20)]),
+            key_prefixes: vec![("blk".to_owned(), 2)],
+            samples: vec![TensorSample {
+                name: "blk.0.attn_q.weight".to_owned(),
+                dtype: "F16".to_owned(),
+                shape: vec![4, 5],
+            }],
+            metadata: BTreeMap::from([("general.architecture".to_owned(), "llama".to_owned())]),
+            markers: Markers {
+                fragments: BTreeSet::from(["lm_head".to_owned()]),
+                prefixes: BTreeSet::from(["blk.".to_owned()]),
+                keys: BTreeSet::from(["head.modulation".to_owned()]),
+            },
+        };
+        let json = serde_json::to_string(&summary).expect("a summary serializes");
+        assert!(!json.contains("markers"));
+        let read: TensorSummary = serde_json::from_str(&json).expect("a summary deserializes");
+        assert_eq!(read.markers, Markers::default());
+        assert_eq!(read.tensor_count, summary.tensor_count);
+        assert_eq!(read.params, summary.params);
+        assert_eq!(read.dtypes, summary.dtypes);
+        assert_eq!(read.key_prefixes, summary.key_prefixes);
+        assert_eq!(read.samples, summary.samples);
+        assert_eq!(read.metadata, summary.metadata);
     }
 
     fn summarized(tensors: &[(&str, &str, &[u64])]) -> TensorSummary {
@@ -525,6 +569,11 @@ mod tests {
                 shape: vec![32, 320],
             }],
             metadata: BTreeMap::new(),
+            markers: Markers {
+                fragments: BTreeSet::from([".lora_down".to_owned()]),
+                prefixes: BTreeSet::from(["lora_unet".to_owned()]),
+                keys: BTreeSet::new(),
+            },
         };
         assert_eq!(summary.dominant_dtype(), Some("F16"));
         assert_eq!(

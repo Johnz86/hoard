@@ -446,6 +446,7 @@ fn mystery_tensors() -> TensorSummary {
             shape: vec![32, 768],
         }],
         metadata: Default::default(),
+        ..Default::default()
     }
 }
 

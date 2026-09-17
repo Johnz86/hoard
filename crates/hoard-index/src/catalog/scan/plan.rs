@@ -121,7 +121,7 @@ pub(in crate::catalog) struct GroupFacts {
 /// more piece of a model another shard already stands for.
 pub(in crate::catalog) enum EntryRole {
     Standalone,
-    Anchor(GroupFacts),
+    Anchor(Box<GroupFacts>),
     Member,
 }
 
@@ -365,7 +365,7 @@ fn unit_roles(
         presences,
         label.unwrap_or_default().to_owned(),
     );
-    std::iter::once(EntryRole::Anchor(facts))
+    std::iter::once(EntryRole::Anchor(Box::new(facts)))
         .chain(std::iter::repeat_with(|| EntryRole::Member).take(sniffed.len().saturating_sub(1)))
         .collect()
 }

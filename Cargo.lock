@@ -1991,6 +1991,7 @@ dependencies = [
 name = "hoard-index"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "bincode",
  "gix",
  "globset",

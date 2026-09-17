@@ -26,6 +26,7 @@ fn compact_records_round_trip_without_changing_public_views() -> Result<()> {
             shape: vec![32, 640, u64::MAX],
         }],
         metadata: BTreeMap::from([("format".to_owned(), "pt".to_owned())]),
+        ..Default::default()
     };
     let evidence: Vec<Evidence> = [
         EvidenceSource::Tensor,
@@ -265,6 +266,7 @@ fn cold_records_read_back_through_the_inspector() -> Result<()> {
             ("format".to_owned(), "pt".to_owned()),
             ("ss_comment".to_owned(), format!("run {index}")),
         ]),
+        ..Default::default()
     };
     let entry = |index: usize, card: &String| SeedEntry {
         node: LOCAL_NODE,

@@ -8,6 +8,9 @@ use super::rules::{self, CONTEXT_CONFIG_KEYS, GGUF_FILE_TYPES};
 /// weights are quantized but no document said in which scheme.
 const QUANT_FILENAME_TOKENS: &[&str] = &["nvfp4", "fp4", "int4", "int8", "awq", "gptq", "bnb"];
 
+/// `quant_method` values that name a scheme rather than the producer that wrote the file.
+const SCHEME_METHODS: &[&str] = &["mxfp4"];
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DerivedVerdict {
     pub precision: Option<Precision>,
@@ -146,9 +149,18 @@ fn config_quant_scheme(config: Option<&Value>, quant_config: Option<&Value>) -> 
         .and_then(|document| document.get("quantization"))
         .and_then(|block| block.get("quant_algo"))
         .and_then(Value::as_str);
+    let method = block
+        .and_then(|block| block.get("quant_method"))
+        .and_then(Value::as_str)
+        .filter(|raw| {
+            SCHEME_METHODS
+                .iter()
+                .any(|scheme| raw.trim().eq_ignore_ascii_case(scheme))
+        });
     algo.or(format)
         .or(bnb)
         .or(sidecar)
+        .or(method)
         .map(|scheme| scheme.trim().to_ascii_lowercase())
         .filter(|scheme| !scheme.is_empty())
 }
@@ -371,6 +383,39 @@ mod tests {
             "a sidecar answers when the model config named no scheme"
         );
         assert_eq!(config_quant_scheme(None, None), None);
+    }
+
+    #[test]
+    fn mxfp4_is_a_precision_and_modelopt_is_not() {
+        assert_eq!(
+            config_quant_scheme(
+                Some(&json!({"quantization_config": {"quant_method": "mxfp4"}})),
+                None
+            )
+            .as_deref(),
+            Some("mxfp4")
+        );
+        for producer in ["compressed-tensors", "modelopt", "bitsandbytes"] {
+            assert_eq!(
+                config_quant_scheme(
+                    Some(&json!({"quantization_config": {"quant_method": producer}})),
+                    None
+                ),
+                None,
+                "{producer} names who wrote the file, not the scheme"
+            );
+        }
+        assert_eq!(
+            config_quant_scheme(
+                Some(&json!({
+                    "quantization_config": {"quant_algo": "NVFP4", "quant_method": "mxfp4"}
+                })),
+                None
+            )
+            .as_deref(),
+            Some("nvfp4"),
+            "the stated algorithm still answers first"
+        );
     }
 
     #[test]

@@ -74,6 +74,7 @@ hex = "0.4"
 # text, search grammar, documents
 winnow = "1.0"
 regex = "1.13"
+aho-corasick = "1.1"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 humansize = "2.1"
 

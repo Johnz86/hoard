@@ -13,7 +13,7 @@ const EMBEDDING_MAX_SIZE: u64 = 16 * 1024 * 1024;
 
 /// A checkpoint that loads alone: a denoiser with the text encoder it is conditioned on, or
 /// the latent diffusion layout that carries both beside its autoencoder.
-const COMPLETE_CHECKPOINT_KEYS: &[KeyMatch] = &[
+pub(crate) const COMPLETE_CHECKPOINT_KEYS: &[KeyMatch] = &[
     KeyMatch::AllOf(&[
         KeyMatch::AnyOf(DIFFUSION_KEYS),
         KeyMatch::AnyOf(TEXT_ENCODER_KEYS),

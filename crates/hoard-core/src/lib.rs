@@ -14,7 +14,7 @@ pub mod loadout;
 pub mod role;
 pub mod state;
 
-pub use artifact::{Artifact, ArtifactFormat, Precision, TensorSample, TensorSummary};
+pub use artifact::{Artifact, ArtifactFormat, Markers, Precision, TensorSample, TensorSummary};
 pub use compat::{CompatRule, CompatSubject, compatible};
 pub use error::HoardError;
 pub use evidence::{Evidence, EvidenceSource};

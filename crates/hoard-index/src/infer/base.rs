@@ -1,11 +1,18 @@
 use hoard_core::{Base, Evidence, EvidenceSource, Role, TensorSample, TensorSummary};
 
+use super::families::{ADAPTER_RULES, FAMILY_RULES, txt_norm_family};
 use super::rules::{
-    self, BASE_ALIASES, BASE_RULES, CROSS_ATTENTION_DIMS, CROSS_ATTENTION_KEYS, KeyMatch,
-    PROJECTION_KEYS, PROJECTOR_ARCHITECTURE, PROJECTOR_DESCRIPTORS, PROJECTOR_SHAPES,
-    UNET_BODY_KEYS,
+    self, BASE_ALIASES, BASE_RULES, BaseRule, CROSS_ATTENTION_DIMS, CROSS_ATTENTION_KEYS,
+    FIRST_CONVOLUTION_KEYS, KeyMatch, LINEAGES, PROJECTION_KEYS, PROJECTOR_ARCHITECTURE,
+    PROJECTOR_DESCRIPTORS, PROJECTOR_SHAPES, UNET_BODY_KEYS,
 };
 use super::{Accumulator, InferInput};
+
+/// The class name a diffusers style config states, and the word that makes one latent.
+const CLASS_KEY: &str = "_class_name";
+const LATENT_CLASS: &str = "latent";
+/// How many channels an image has at most, alpha included.
+const PIXEL_CHANNELS: u64 = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BaseVerdict {
@@ -75,7 +82,7 @@ pub(crate) fn infer_base(input: &InferInput<'_>, role: Role) -> BaseVerdict {
     let mut labels: Vec<(Base, String, f32)> = Vec::new();
 
     if let Some(tensors) = input.tensors {
-        tensor_rules(tensors, &mut bases);
+        tensor_rules(tensors, role, &mut bases);
         cross_attention_rule(tensors, &mut bases);
         metadata_rules(tensors, &mut bases, &mut labels);
     }
@@ -83,7 +90,7 @@ pub(crate) fn infer_base(input: &InferInput<'_>, role: Role) -> BaseVerdict {
 
     let (base, confidence) = match bases.best() {
         Some(best) => best,
-        None if role == Role::Upsc => (Base::any(), rules::TENSOR_WEAK),
+        None if role == Role::Upsc && !reads_a_latent(input) => (Base::any(), rules::TENSOR_WEAK),
         None => (Base::new(""), 0.0),
     };
     let label = labels
@@ -94,6 +101,13 @@ pub(crate) fn infer_base(input: &InferInput<'_>, role: Role) -> BaseVerdict {
         .filter(|label| Base::new(label) == base);
 
     let mut evidence = bases.into_evidence();
+    let (base, label) = match lineage_refinement(input, &base) {
+        Some((spelling, found)) => {
+            evidence.push(found);
+            (Base::new(spelling), Some(spelling.to_owned()))
+        }
+        None => (base, label),
+    };
     if base.is_any() && evidence.is_empty() {
         evidence.push(
             Evidence::new(
@@ -113,8 +127,114 @@ pub(crate) fn infer_base(input: &InferInput<'_>, role: Role) -> BaseVerdict {
     }
 }
 
-fn tensor_rules(tensors: &TensorSummary, bases: &mut Accumulator<Base>) {
-    for rule in BASE_RULES.iter().filter(|rule| rule.matches(tensors)) {
+/// The lineage a proven architecture is refined by, named by the file itself or by the one
+/// folder it sits in. A lineage token never names an architecture of its own.
+fn lineage_refinement(input: &InferInput<'_>, base: &Base) -> Option<(&'static str, Evidence)> {
+    LINEAGES
+        .iter()
+        .filter(|(_, architecture, _)| *base == Base::new(architecture))
+        .find_map(|(token, architecture, label)| {
+            let (source, named) = lineage_source(input, token)?;
+            let evidence = Evidence::new(
+                "base",
+                Base::new(label).as_str(),
+                source,
+                rules::FILENAME_HINT,
+            )
+            .with_detail(format!(
+                "{named} names the {token} lineage of {architecture}"
+            ));
+            Some((*label, evidence))
+        })
+}
+
+/// The file name, then the one directory the file sits in. Nothing above it: the path is
+/// absolute, so a home directory or a volume named `pony` would otherwise relabel every
+/// proven SDXL model on the machine.
+fn lineage_source<'a>(input: &InferInput<'a>, token: &str) -> Option<(EvidenceSource, &'a str)> {
+    if names_word(input.file_name, token) {
+        return Some((EvidenceSource::Filename, input.file_name));
+    }
+    let folder = input.path.parent()?.file_name()?.to_str()?;
+    names_word(folder, token).then_some((EvidenceSource::FolderHint, folder))
+}
+
+/// True when the token stands as a word of its own in the text: bounded by a character that
+/// is not a letter or a digit, or by the case step that separates `cyberrealistic` from
+/// `Pony`. A run of capitals is one word, so `ponyXL` names the lineage and `PONYTAIL_V1`
+/// does not, and neither does `ponytail`.
+fn names_word(text: &str, token: &str) -> bool {
+    let raw = text.as_bytes();
+    text.to_ascii_lowercase()
+        .match_indices(token)
+        .any(|(start, found)| {
+            let end = start + found.len();
+            let opens = match start.checked_sub(1).map(|index| raw[index]) {
+                None => true,
+                Some(before) => !before.is_ascii_alphanumeric() || steps_case(before, raw[start]),
+            };
+            let closes = match raw.get(end) {
+                None => true,
+                Some(after) => !after.is_ascii_alphanumeric() || steps_case(raw[end - 1], *after),
+            };
+            opens && closes
+        })
+}
+
+/// The lower to upper step that starts a word inside a camel-cased name.
+fn steps_case(before: u8, after: u8) -> bool {
+    (before.is_ascii_lowercase() || before.is_ascii_digit()) && after.is_ascii_uppercase()
+}
+
+/// True when an upscaler works on a latent space rather than on pixels: its config names a
+/// latent class, or its first convolution takes more channels than an image has.
+fn reads_a_latent(input: &InferInput<'_>) -> bool {
+    let class_named = input
+        .metadata("config")
+        .and_then(|config| serde_json::from_str::<serde_json::Value>(config).ok())
+        .as_ref()
+        .and_then(|config| config.get(CLASS_KEY))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| input.config_str(CLASS_KEY))
+        .is_some_and(|class| class.to_ascii_lowercase().contains(LATENT_CLASS));
+    class_named
+        || input.tensors.is_some_and(|tensors| {
+            FIRST_CONVOLUTION_KEYS
+                .iter()
+                .find_map(|key| tensors.find_fragment(key))
+                .and_then(|sample| sample.shape.get(1))
+                .is_some_and(|channels| *channels > PIXEL_CHANNELS)
+        })
+}
+
+/// Every tensor rule the role allows: the pattern tier for anything, the exact-key family
+/// tier for anything but a standalone autoencoder, whose tensors are shared between latent
+/// spaces, and the module tier only for an adapter, whose modules are its host's.
+fn tensor_rules(tensors: &TensorSummary, role: Role, bases: &mut Accumulator<Base>) {
+    push_matching(BASE_RULES, tensors, bases);
+    if role == Role::Vae {
+        return;
+    }
+    push_matching(FAMILY_RULES, tensors, bases);
+    if let Some(family) = txt_norm_family(tensors) {
+        bases.push(
+            Base::new(family),
+            Evidence::new(
+                "base",
+                family,
+                EvidenceSource::Tensor,
+                rules::TENSOR_PATTERN,
+            )
+            .with_detail("the width its caption normalization is built around"),
+        );
+    }
+    if matches!(role, Role::Lora | Role::Ctrl) {
+        push_matching(ADAPTER_RULES, tensors, bases);
+    }
+}
+
+fn push_matching(rules: &[BaseRule], tensors: &TensorSummary, bases: &mut Accumulator<Base>) {
+    for rule in rules.iter().filter(|rule| rule.matches(tensors)) {
         bases.push(
             Base::new(rule.base),
             Evidence::new("base", rule.base, EvidenceSource::Tensor, rule.confidence)
@@ -217,22 +337,60 @@ fn metadata_rules(
             },
         );
     }
-    if let Some((base, raw)) = tensors
-        .metadata
-        .get("ss_sd_model_name")
-        .and_then(|raw| alias_base(raw).map(|base| (base, raw)))
-    {
+    if let Some(raw) = tensors.metadata.get("modelspec.architecture") {
+        let named = raw.split('/').next().unwrap_or(raw);
         record(
             bases,
             labels,
             BaseClaim {
-                base,
+                base: canonical_base(named),
                 raw,
-                key: "ss_sd_model_name",
+                key: "modelspec.architecture",
                 source: EvidenceSource::Metadata,
-                confidence: rules::METADATA_WEAK,
+                confidence: stated_confidence(named),
             },
         );
+    }
+    if let Some(raw) = tensors.metadata.get("model_type") {
+        record(
+            bases,
+            labels,
+            BaseClaim {
+                base: canonical_base(raw),
+                raw,
+                key: "model_type",
+                source: EvidenceSource::Metadata,
+                confidence: stated_confidence(raw),
+            },
+        );
+    }
+    for key in ["ss_sd_model_name", "base_model"] {
+        if let Some((base, raw)) = tensors
+            .metadata
+            .get(key)
+            .and_then(|raw| alias_base(raw).map(|base| (base, raw)))
+        {
+            record(
+                bases,
+                labels,
+                BaseClaim {
+                    base,
+                    raw,
+                    key,
+                    source: EvidenceSource::Metadata,
+                    confidence: rules::METADATA_WEAK,
+                },
+            );
+        }
+    }
+}
+
+/// How far a stated architecture is trusted: a spelling the alias table knows names a family
+/// hoard has seen, and one it does not know invents a family token out of free text.
+fn stated_confidence(raw: &str) -> f32 {
+    match alias_base(raw) {
+        Some(_) => rules::METADATA_STRONG,
+        None => rules::METADATA_WEAK,
     }
 }
 
@@ -405,6 +563,292 @@ mod tests {
             verdict.label, None,
             "a pipeline class name is not a spelling of the family it names"
         );
+    }
+
+    #[test]
+    fn an_sdxl_checkpoint_of_2500_tensors_is_sdxl() {
+        let mut samples: Vec<hoard_core::TensorSample> = (0..2_500)
+            .map(|index| hoard_core::TensorSample {
+                name: format!("model.diffusion_model.output_blocks.{index:04}.0.weight"),
+                dtype: "F16".to_owned(),
+                shape: vec![640, 640],
+            })
+            .collect();
+        for (name, shape) in [
+            (
+                "model.diffusion_model.label_emb.0.0.weight",
+                vec![1280, 2816],
+            ),
+            (
+                "model.diffusion_model.input_blocks.0.0.weight",
+                vec![320, 4, 3, 3],
+            ),
+            (
+                "conditioner.embedders.1.model.token_embedding.weight",
+                vec![49408, 1280],
+            ),
+        ] {
+            samples.push(hoard_core::TensorSample {
+                name: name.to_owned(),
+                dtype: "F16".to_owned(),
+                shape,
+            });
+        }
+        let summary = crate::sniff::summarize_tensors(samples);
+        let path = Path::new("/models/checkpoints/big.safetensors");
+        let inferred = crate::infer::infer(
+            &InferInput::new(
+                ArtifactFormat::Safetensors,
+                path,
+                "big.safetensors",
+                6_000_000_000,
+            )
+            .with_tensors(&summary),
+        );
+        assert_eq!(inferred.role, Role::Ckpt);
+        assert_eq!(inferred.base, Base::new("sdxl"));
+    }
+
+    #[test]
+    fn modelspec_architecture_names_the_base_before_the_slash() {
+        let summary = with_metadata(
+            tensors(&[(
+                "diffusion_model.blocks.0.cross_attn.k_proj.lora_down.weight",
+                &[16, 1024],
+            )]),
+            &[("modelspec.architecture", "anima-preview/lora")],
+        );
+        let path = Path::new("/models/loras/detailer.safetensors");
+        let verdict = infer_base(
+            &input(path, "detailer.safetensors").with_tensors(&summary),
+            Role::Lora,
+        );
+        assert_eq!(verdict.base, Base::new("anima"));
+        assert_eq!(
+            verdict.label, None,
+            "anima-preview/lora is not a spelling of anima"
+        );
+        assert!(verdict.confidence >= rules::METADATA_STRONG);
+    }
+
+    #[test]
+    fn a_stated_architecture_no_table_knows_is_weak_evidence() {
+        let known = with_metadata(
+            tensors(&[("blocks.0.attn.qkv.weight", &[64, 64])]),
+            &[("modelspec.architecture", "anima-preview/lora")],
+        );
+        let path = Path::new("/models/loras/x.safetensors");
+        let verdict = infer_base(
+            &input(path, "x.safetensors").with_tensors(&known),
+            Role::Lora,
+        );
+        assert_eq!(verdict.base, Base::new("anima"));
+        assert!(verdict.confidence >= rules::METADATA_STRONG);
+
+        let invented = with_metadata(
+            tensors(&[("blocks.0.attn.qkv.weight", &[64, 64])]),
+            &[("model_type", "infinitetalk-multi")],
+        );
+        let verdict = infer_base(
+            &input(path, "x.safetensors").with_tensors(&invented),
+            Role::Lora,
+        );
+        assert_eq!(verdict.base, Base::new("infinitetalk-multi"));
+        assert!(
+            verdict.confidence <= rules::METADATA_WEAK,
+            "a family token invented out of free text is a guess, found {}",
+            verdict.confidence
+        );
+    }
+
+    #[test]
+    fn a_vae_is_named_by_metadata_and_never_by_tensors() {
+        let shared = &[
+            ("encoder.conv_in.weight", [128u64, 3, 3, 3].as_slice()),
+            ("decoder.conv_in.weight", [128, 16, 3, 3].as_slice()),
+            ("head.modulation", [1, 2, 5120].as_slice()),
+        ];
+        let path = Path::new("/models/vae/wan_2.1_vae.safetensors");
+        let anonymous = tensors(shared);
+        let verdict = infer_base(
+            &input(path, "wan_2.1_vae.safetensors").with_tensors(&anonymous),
+            Role::Vae,
+        );
+        assert!(
+            verdict.base.is_empty(),
+            "two latent spaces share these tensors, found {}",
+            verdict.base.as_str()
+        );
+
+        let declared = with_metadata(tensors(shared), &[("model_type", "HunyuanVideo15VAE")]);
+        let verdict = infer_base(
+            &input(path, "hunyuan_vae.safetensors").with_tensors(&declared),
+            Role::Vae,
+        );
+        assert_eq!(verdict.base, Base::new("hunyuanvideo"));
+    }
+
+    fn sdxl_header() -> TensorSummary {
+        tensors(&[
+            (
+                "model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn2.to_k.weight",
+                &[640, 2048],
+            ),
+            ("model.diffusion_model.label_emb.0.0.weight", &[1280, 2816]),
+        ])
+    }
+
+    #[test]
+    fn a_folder_or_file_name_refines_a_proven_sdxl() {
+        let header = sdxl_header();
+        let claims = [
+            (
+                "/models/checkpoints/pony/x.safetensors",
+                "x.safetensors",
+                "sdxl pony",
+            ),
+            (
+                "/models/checkpoints/cyberrealisticPony_v160.safetensors",
+                "cyberrealisticPony_v160.safetensors",
+                "sdxl pony",
+            ),
+            (
+                "/models/checkpoints/Illustrious/y.safetensors",
+                "y.safetensors",
+                "sdxl illustrious",
+            ),
+        ];
+        for (path, name, label) in claims {
+            let verdict = infer_base(
+                &input(Path::new(path), name).with_tensors(&header),
+                Role::Ckpt,
+            );
+            assert_eq!(verdict.base, Base::new(label), "{path}");
+            assert_eq!(verdict.label.as_deref(), Some(label), "{path}");
+            assert!(verdict.base.matches(&Base::new("sdxl")), "{path}");
+            assert!(verdict.confidence >= rules::TENSOR_SHAPE, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_lineage_token_never_names_an_architecture() {
+        let flux = tensors(&[
+            ("double_blocks.0.img_attn.qkv.weight", &[9216, 3072]),
+            ("single_blocks.0.linear1.weight", &[21504, 3072]),
+        ]);
+        let path = Path::new("/models/checkpoints/pony/flux_merge.safetensors");
+        let verdict = infer_base(
+            &input(path, "flux_merge.safetensors").with_tensors(&flux),
+            Role::Ckpt,
+        );
+        assert_eq!(verdict.base, Base::new("flux"));
+
+        let nothing = tensors(&[("blocks.0.weight", &[8, 8])]);
+        let verdict = infer_base(
+            &input(path, "flux_merge.safetensors").with_tensors(&nothing),
+            Role::Ckpt,
+        );
+        assert!(verdict.base.is_empty());
+    }
+
+    #[test]
+    fn a_lineage_token_inside_a_longer_word_is_ignored() {
+        let header = sdxl_header();
+        let path = Path::new("/models/checkpoints/ponytail_v2.safetensors");
+        let verdict = infer_base(
+            &input(path, "ponytail_v2.safetensors").with_tensors(&header),
+            Role::Ckpt,
+        );
+        assert_eq!(verdict.base, Base::new("sdxl"));
+    }
+
+    #[test]
+    fn a_lineage_word_above_the_parent_folder_names_nothing() {
+        let header = sdxl_header();
+        let path = Path::new("/home/pony/models/checkpoints/x.safetensors");
+        let verdict = infer_base(
+            &input(path, "x.safetensors").with_tensors(&header),
+            Role::Ckpt,
+        );
+        assert_eq!(
+            verdict.base,
+            Base::new("sdxl"),
+            "a home directory is not a filing decision about this model"
+        );
+    }
+
+    #[test]
+    fn a_lineage_token_is_a_word_of_the_name() {
+        for named in [
+            "ponyXL",
+            "Pony-v6",
+            "cyberrealisticPony",
+            "autismmixPony",
+            "pony",
+        ] {
+            assert!(names_word(named, "pony"), "{named}");
+        }
+        assert!(names_word("illustriousXL_v01", "illustrious"));
+        assert!(names_word("noobaiXL", "noobai"));
+        for other in ["ponytail", "PONYTAIL_V1", "japonyaEdit"] {
+            assert!(!names_word(other, "pony"), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_training_tag_naming_a_lineage_wins_over_sdxl() {
+        let summary = with_metadata(
+            tensors(&[("lora_unet_blocks_0_proj.lora_down.weight", &[16, 3072])]),
+            &[("ss_base_model_version", "sdxl_pony_diffusion_v6")],
+        );
+        let path = Path::new("/models/loras/style.safetensors");
+        let verdict = infer_base(
+            &input(path, "style.safetensors").with_tensors(&summary),
+            Role::Lora,
+        );
+        assert_eq!(verdict.base, Base::new("sdxlpony"));
+    }
+
+    #[test]
+    fn a_latent_upscaler_is_not_architecture_agnostic() {
+        let latent = tensors(&[
+            ("initial_conv.weight", &[1024, 128, 3, 3, 3]),
+            ("final_conv.weight", &[128, 1024, 3, 3, 3]),
+        ]);
+        let path = Path::new("/models/latent_upscale_models/ltx-2-spatial-upscaler.safetensors");
+        let verdict = infer_base(
+            &input(path, "ltx-2-spatial-upscaler.safetensors").with_tensors(&latent),
+            Role::Upsc,
+        );
+        assert!(!verdict.base.is_any(), "128 channels are a latent space");
+        assert!(verdict.base.is_empty());
+
+        let declared = with_metadata(
+            tensors(&[("initial_conv.weight", &[1024, 3, 3, 3, 3])]),
+            &[(
+                "config",
+                r#"{"_class_name": "LatentUpsampler", "in_channels": 128}"#,
+            )],
+        );
+        let verdict = infer_base(
+            &input(path, "ltx-2-spatial-upscaler.safetensors").with_tensors(&declared),
+            Role::Upsc,
+        );
+        assert!(!verdict.base.is_any(), "the class names a latent space");
+    }
+
+    #[test]
+    fn a_pixel_upscaler_is_still_any() {
+        let esrgan = tensors(&[
+            ("conv_first.weight", &[64, 3, 3, 3]),
+            ("RRDB_trunk.0.RDB1.conv1.weight", &[32, 64, 3, 3]),
+        ]);
+        let path = Path::new("/models/upscale_models/RealESRGAN_x4plus.safetensors");
+        let verdict = infer_base(
+            &input(path, "RealESRGAN_x4plus.safetensors").with_tensors(&esrgan),
+            Role::Upsc,
+        );
+        assert!(verdict.base.is_any());
     }
 
     #[test]

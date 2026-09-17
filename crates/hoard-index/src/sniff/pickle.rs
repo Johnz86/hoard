@@ -13,6 +13,7 @@ use std::path::Path;
 use hoard_core::{ArtifactFormat, TensorSample, TensorSummary};
 
 use crate::error::{IndexError, Result};
+use crate::sniff::markers::markers_of;
 use crate::sniff::{MAX_SAMPLES, prefix_histogram};
 
 const FORMAT: &str = "pickle";
@@ -116,6 +117,7 @@ impl Evidence {
             })
             .collect();
         let key_prefixes = prefix_histogram(&samples);
+        let markers = markers_of(&samples);
         samples.truncate(MAX_SAMPLES);
 
         let tensor_count = self.storage_count / copies;
@@ -149,6 +151,7 @@ impl Evidence {
             key_prefixes,
             samples,
             metadata,
+            markers,
         }
     }
 }
@@ -721,7 +724,7 @@ mod tests {
             summary.metadata.get("pickle.container").map(String::as_str),
             Some("pickle")
         );
-        assert!(summary.has_prefix("model"));
+        assert!(summary.has_prefix("first_stage_model."));
     }
 
     fn ema_pickle() -> Vec<u8> {

@@ -493,7 +493,7 @@ mod tests {
     #[test]
     fn tensor_names_become_prefixes_and_samples() {
         let summary = llama_summary();
-        assert!(summary.has_prefix("blk"));
+        assert!(summary.has_prefix("blk."));
         assert_eq!(
             summary
                 .sample("token_embd.weight")

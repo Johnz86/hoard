@@ -66,6 +66,15 @@ folder spelling onto its canonical layout the way `role:` folds its aliases (`la
 matches `diffusion_models`), and warns on a value naming neither a canonical layout nor a
 folder spelling.
 
+A base is the finest architecture the header, the metadata or the path proves, and a lineage
+is stored as a suffix of the architecture it refines rather than as a field of its own:
+`sdxlpony`, `sdxlillustrious`, `sdxlnoobai`, each labelled the way it is written
+(`sdxl pony`). `base:` filters one way, from the architecture down: `base:sdxl` finds every
+lineage stored under it and `base:sdxlpony` finds the Pony ones alone, never the files known
+only as `sdxl`. `compat:` is the two-way test, because resolving an adapter against a host of
+the bare architecture is a compatibility question and not a question about which family a
+file belongs to; a sibling lineage is never compatible.
+
 `facets.base` is counted over at most 32 buckets. A bucket's `count` is the prefix-rule count,
 which is how many artifacts the query the bucket opens answers, so a family bucket counts
 the versions under it. The 32 are the largest by that count among the most populous bases by

@@ -488,6 +488,7 @@ fn queued_tensors() -> TensorSummary {
             shape: vec![32, 768],
         }],
         metadata: BTreeMap::new(),
+        ..Default::default()
     }
 }
 

@@ -180,8 +180,8 @@ mod tests {
                 ("lora_te_text_model_encoder".to_owned(), 1),
             ]
         );
-        assert!(summary.has_prefix("lora_unet"));
-        assert!(summary.has_fragment("lora_down"));
+        assert!(summary.has_prefix("lora_unet_"));
+        assert!(summary.has_fragment(".lora_down"));
     }
 
     #[test]

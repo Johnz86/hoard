@@ -364,6 +364,29 @@ the catalog at `<data_dir>/native`.
   every stored revision would settle on its stamps. Changing a sniffing or inference rule is
   therefore a `FORMAT_VERSION` bump and nothing else; the bump deletes the catalog and scans
   the disk again, which is the only thing that puts a new rule into an index that exists.
+- A rule's name test is answered over every tensor name the header holds, never over the
+  64-name sample. `sniff::summarize_tensors` fills `TensorSummary::markers` with the rule
+  vocabulary it found while it still holds the whole key list: the fragments, the leading
+  prefixes, and the exact keys a name equals once `model.diffusion_model.`,
+  `diffusion_model.`, `model.` or `net.` is stripped. The vocabulary is derived from the rule
+  tables themselves (`infer::rules::vocabulary`), so a rule cannot name a term the sniffer
+  does not look for, and a `debug_assert` in `KeyMatch::matches` fails the rule's own test
+  when it names one. One Aho-Corasick pass per header covers the fragments. `markers` is
+  never stored (`#[serde(skip)]`): inference only ever runs straight after a fresh sniff.
+  Samples are still 64 tensors, and the sampler guarantees a slot to the first tensor naming
+  each key a rule reads a shape from, so `attn2.to_k` no longer loses its slot to `attn1.to_k`
+  on a 2,500-tensor unet. Merged shards union their markers.
+- A base is named by three tensor tiers and then refined. The pattern tier
+  (`infer::rules::BASE_RULES`) is unchanged. The exact-key tier
+  (`infer::families::FAMILY_RULES`) names a family by the keys ComfyUI's `model_detection.py`
+  detects it by, and applies to every role but `vae`, whose latent spaces share their tensors;
+  the two families that share `txt_norm.weight` part on the width it normalizes, and a third
+  width names neither of them. The module tier (`ADAPTER_RULES`) names a LoRA by the modules
+  it patches and is read only for `lora` and `ctrl`, because a host of another family carries
+  the same module names. A lineage of a proven architecture (`rules::LINEAGES`) is then read
+  from the file name or the one folder the file sits in, never from the rest of an absolute
+  path, and stored as a suffix of the architecture, `sdxl pony` as `sdxlpony`, so `base:sdxl`
+  still finds it. A lineage token never names an architecture on its own.
 - Only weight and dataset formats become artifacts; every file is still an entry record.
 - Shard sets, whether named `model-<n>-of-<m>` or listed by a `*.index.json` weight map,
   become one artifact anchored on the lowest shard. Members are entries pointing at that
@@ -762,8 +785,10 @@ whole token. Every token kind compiles:
 
 - `role:` matches the role, and narrows to a sub-role when the spelling names one, so
   `role:ip-adapter` is `lora` with sub-role `ipa`.
-- `base:` (also `arch:`) matches a family or a family it prefixes either way, and never
-  matches `any`, which is a claim about compatibility rather than about a family.
+- `base:` (also `arch:`) matches the family asked for and the families stored under it, one
+  way only, so `base:sdxl` answers for `sdxlpony` and `base:sdxlpony` does not answer for
+  `sdxl`. It never matches `any`, which is a claim about compatibility rather than about a
+  family; `compat:` keeps the other direction and `any` with it.
 - `format:` (`fmt:`), `precision:` (`prec:`, `quant:`), `state:` and `source:` (`src:`) are
   equality on that column.
 - `node:` (`host:`) matches the node, resolving `self`, `me`, `local` and `here` to this

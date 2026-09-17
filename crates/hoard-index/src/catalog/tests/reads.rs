@@ -1394,11 +1394,11 @@ fn the_base_rail_holds_at_most_the_capped_buckets_and_counts_them_by_prefix() ->
         .map(|bucket| bucket.value.as_str())
         .collect();
     shown.sort_unstable();
-    let mut expected: Vec<String> = ["fam", "fam20", "sd", "sd15", "sd21", "sdxl"]
+    let mut expected: Vec<String> = ["fam", "fam20", "sd", "sd15", "sd21"]
         .into_iter()
         .map(str::to_owned)
         .collect();
-    expected.extend((0..26).map(|index| Base::new(format!("base-{index:02}")).as_str().to_owned()));
+    expected.extend((0..27).map(|index| Base::new(format!("base-{index:02}")).as_str().to_owned()));
     expected.sort_unstable();
     assert_eq!(
         shown, expected,

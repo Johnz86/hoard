@@ -1406,6 +1406,7 @@ mod supplemental {
                 })
                 .collect(),
             metadata,
+            ..Default::default()
         }
     }
 

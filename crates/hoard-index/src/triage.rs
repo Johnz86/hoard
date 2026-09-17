@@ -173,11 +173,9 @@ mod tests {
 
     fn summary() -> TensorSummary {
         TensorSummary {
-            tensor_count: 3,
             params: 96,
             dtypes: BTreeMap::from([("F16".to_owned(), 3)]),
-            key_prefixes: vec![("weight".to_owned(), 1), ("block".to_owned(), 2)],
-            samples: vec![
+            ..crate::sniff::summarize_tensors(vec![
                 TensorSample {
                     name: "block.0.w".to_owned(),
                     dtype: "F16".to_owned(),
@@ -193,8 +191,7 @@ mod tests {
                     dtype: "F16".to_owned(),
                     shape: vec![4, 8],
                 },
-            ],
-            metadata: BTreeMap::new(),
+            ])
         }
     }
 

@@ -5,7 +5,7 @@ use hoard_core::{Evidence, EvidenceSource, TensorSummary};
 use super::rules;
 use super::{InferInput, combine};
 
-const RANK_KEYS: &[&str] = &[".lora_down", ".lora_A", "lora_A.", "lora_down."];
+pub(crate) const RANK_KEYS: &[&str] = &[".lora_down", ".lora_A", "lora_A.", "lora_down."];
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LoraVerdict {

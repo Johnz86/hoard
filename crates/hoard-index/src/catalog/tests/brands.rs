@@ -116,13 +116,36 @@ fn a_brand_row_unions_its_members_and_never_prefixes_them() -> Result<()> {
 }
 
 #[test]
+fn a_lineage_query_answers_only_that_lineage() -> Result<()> {
+    let (_directory, catalog) = brand_fixture(&[
+        ("sdxl", 3),
+        ("sdxlpony", 1),
+        ("sdxlillustrious", 1),
+        ("flux", 1),
+    ])?;
+    assert_eq!(
+        search(&catalog, "base:sdxl")?.total,
+        5,
+        "the architecture answers for every lineage stored under it"
+    );
+    assert_eq!(
+        search(&catalog, "base:sdxlpony")?.total,
+        1,
+        "a lineage answers for itself and never for the bare architecture"
+    );
+    assert_eq!(search(&catalog, "base:sdxlillustrious")?.total, 1);
+    assert_eq!(search(&catalog, "base:flux")?.total, 1);
+    Ok(())
+}
+
+#[test]
 fn a_brand_row_counts_each_artifact_once() -> Result<()> {
     let (_directory, catalog) = brand_fixture(&[("qwen3", 1), ("qwen35", 1)])?;
     let page = search(&catalog, "")?;
     let separate = search(&catalog, "base:qwen3")?.total + search(&catalog, "base:qwen35")?.total;
     assert_eq!(
-        separate, 4,
-        "the prefix rule answers each artifact for both members, so the two counts overlap"
+        separate, 3,
+        "the wider query answers the narrower family too, so the two counts overlap on it"
     );
     assert_eq!(
         base_row(&page, "qwen").count,

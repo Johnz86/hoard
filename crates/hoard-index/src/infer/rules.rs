@@ -1,4 +1,11 @@
+use std::collections::BTreeSet;
+use std::sync::OnceLock;
+
 use hoard_core::{Role, SubRole, TensorSummary};
+
+use super::families::{ADAPTER_RULES, FAMILY_RULES, TXT_NORM_SHAPE_KEYS, TXT_NORM_TERMS};
+use super::lora::RANK_KEYS;
+use super::role::COMPLETE_CHECKPOINT_KEYS;
 
 pub const TENSOR_STRONG: f32 = 0.95;
 pub const TENSOR_PATTERN: f32 = 0.9;
@@ -24,11 +31,28 @@ pub const VISION_ENCODER_KEY: &str = "clip.has_vision_encoder";
 /// What a GGUF boolean reads as once the sniffer has rendered it into a summary.
 pub const METADATA_TRUE: &str = "true";
 
+/// The key tables consulted outside [`ROLE_RULES`] and [`BASE_RULES`], which the vocabulary
+/// has to walk for the sniffer to look for their terms.
+const STANDALONE_KEY_TABLES: &[&[KeyMatch]] =
+    &[UNET_BODY_KEYS, COMPLETE_CHECKPOINT_KEYS, TXT_NORM_TERMS];
+
+/// The tables whose names a rule reads a shape from rather than a presence.
+const SHAPE_KEY_TABLES: &[&[&str]] = &[
+    CROSS_ATTENTION_KEYS,
+    PROJECTION_KEYS,
+    RANK_KEYS,
+    TXT_NORM_SHAPE_KEYS,
+    FIRST_CONVOLUTION_KEYS,
+];
+
 /// One term of a tensor key rule, evaluated against a sniffed header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyMatch {
     Prefix(&'static str),
     Fragment(&'static str),
+    /// A whole tensor name, once the wrapper prefix a checkpoint puts in front of its
+    /// denoiser is stripped. This is how ComfyUI names a family.
+    Key(&'static str),
     /// A leading key segment as the prefix histogram records it. The histogram sees every
     /// tensor, so a segment term survives a header far too large to sample whole.
     Segment(&'static str),
@@ -39,12 +63,101 @@ pub enum KeyMatch {
 impl KeyMatch {
     pub fn matches(self, tensors: &TensorSummary) -> bool {
         match self {
-            KeyMatch::Prefix(prefix) => tensors.has_prefix(prefix),
-            KeyMatch::Fragment(fragment) => tensors.has_fragment(fragment),
+            KeyMatch::Prefix(prefix) => {
+                debug_assert!(registered(&vocabulary().prefixes, prefix), "{prefix}");
+                tensors.has_prefix(prefix)
+            }
+            KeyMatch::Fragment(fragment) => {
+                debug_assert!(registered(&vocabulary().fragments, fragment), "{fragment}");
+                tensors.has_fragment(fragment)
+            }
+            KeyMatch::Key(key) => {
+                debug_assert!(registered(&vocabulary().keys, key), "{key}");
+                tensors.has_key(key)
+            }
             KeyMatch::Segment(name) => tensors.key_prefixes.iter().any(|(key, _)| key == name),
             KeyMatch::AnyOf(terms) => terms.iter().any(|term| term.matches(tensors)),
             KeyMatch::AllOf(terms) => terms.iter().all(|term| term.matches(tensors)),
         }
+    }
+}
+
+/// The terms the sniffer looks for among every tensor name, each one named by a rule.
+///
+/// Sorted and free of duplicates, so a term is looked up by binary search and the automaton
+/// the sniffer builds over the fragments carries each pattern once.
+#[derive(Debug)]
+pub struct Vocabulary {
+    pub fragments: Vec<&'static str>,
+    pub prefixes: Vec<&'static str>,
+    pub keys: Vec<&'static str>,
+}
+
+pub fn vocabulary() -> &'static Vocabulary {
+    static VOCABULARY: OnceLock<Vocabulary> = OnceLock::new();
+    VOCABULARY.get_or_init(build_vocabulary)
+}
+
+/// Key fragments a rule reads a shape from, which the sampler guarantees a slot apiece.
+pub fn shape_bearing_keys() -> impl Iterator<Item = &'static str> {
+    SHAPE_KEY_TABLES
+        .iter()
+        .flat_map(|table| table.iter().copied())
+}
+
+fn registered(terms: &[&'static str], term: &str) -> bool {
+    terms.binary_search_by(|known| (*known).cmp(term)).is_ok()
+}
+
+#[derive(Default)]
+struct Terms {
+    fragments: BTreeSet<&'static str>,
+    prefixes: BTreeSet<&'static str>,
+    keys: BTreeSet<&'static str>,
+}
+
+fn collect_term(term: &KeyMatch, terms: &mut Terms) {
+    match *term {
+        KeyMatch::Prefix(prefix) => {
+            terms.prefixes.insert(prefix);
+        }
+        KeyMatch::Fragment(fragment) => {
+            terms.fragments.insert(fragment);
+        }
+        KeyMatch::Key(key) => {
+            terms.keys.insert(key);
+        }
+        KeyMatch::Segment(_) => {}
+        KeyMatch::AnyOf(nested) | KeyMatch::AllOf(nested) => {
+            for term in nested {
+                collect_term(term, terms);
+            }
+        }
+    }
+}
+
+fn build_vocabulary() -> Vocabulary {
+    let mut terms = Terms::default();
+    for rule in ROLE_RULES {
+        for term in rule.require.iter().chain(rule.forbid) {
+            collect_term(term, &mut terms);
+        }
+    }
+    for rule in BASE_RULES.iter().chain(FAMILY_RULES).chain(ADAPTER_RULES) {
+        for term in rule.require.iter().chain(rule.forbid) {
+            collect_term(term, &mut terms);
+        }
+    }
+    for table in STANDALONE_KEY_TABLES {
+        for term in *table {
+            collect_term(term, &mut terms);
+        }
+    }
+    terms.fragments.extend(shape_bearing_keys());
+    Vocabulary {
+        fragments: terms.fragments.into_iter().collect(),
+        prefixes: terms.prefixes.into_iter().collect(),
+        keys: terms.keys.into_iter().collect(),
     }
 }
 
@@ -140,10 +253,11 @@ pub const ESRGAN_KEYS: &[KeyMatch] = &[
     KeyMatch::Fragment("conv_body."),
 ];
 
+/// A SwinIR trunk names its residual groups and the convolution that closes the body. A
+/// patch embedding norm is not among them: every Swin and ViT backbone carries one.
 pub const SWINIR_KEYS: &[KeyMatch] = &[
     KeyMatch::Fragment("residual_group"),
     KeyMatch::Fragment("conv_after_body"),
-    KeyMatch::Fragment("patch_embed.norm"),
 ];
 
 pub const CAUSAL_LM_BLOCK_KEYS: &[KeyMatch] = &[
@@ -188,7 +302,6 @@ pub const BLOCK_BODY_KEYS: &[KeyMatch] = &[
 /// Timestep conditioning, which separates a diffusion transformer from a language model.
 pub const TIMESTEP_KEYS: &[KeyMatch] = &[
     KeyMatch::Fragment("t_embedder"),
-    KeyMatch::Fragment("t_embedding"),
     KeyMatch::Fragment("time_embedding"),
     KeyMatch::Fragment("time_embed"),
     KeyMatch::Fragment("timestep_embed"),
@@ -718,6 +831,11 @@ pub const UNET_BODY_KEYS: &[KeyMatch] = &[
     KeyMatch::Fragment("to_v_ip"),
 ];
 
+/// The convolution an upscaler takes its input through, whose input channel count says
+/// whether it reads pixels or a whole latent space.
+pub const FIRST_CONVOLUTION_KEYS: &[&str] =
+    &["initial_conv.weight", "conv_first.weight", "model.0.weight"];
+
 /// Known tool layouts. A folder never decides a role on its own; it only guesses.
 pub const FOLDER_ROLE_HINTS: &[(&str, Role, Option<SubRole>)] = &[
     ("loras", Role::Lora, None),
@@ -794,6 +912,9 @@ pub const DIFFUSION_ARCHITECTURES: &[&str] =
 /// Raw base spellings, normalized to alphanumerics, mapped to the family token. Longest
 /// and most specific patterns come first.
 pub const BASE_ALIASES: &[(&str, &str)] = &[
+    ("illustrious", "sdxlillustrious"),
+    ("noobai", "sdxlnoobai"),
+    ("pony", "sdxlpony"),
     ("stablediffusionxl", "sdxl"),
     ("stablediffusion3", "sd3"),
     ("sdxl", "sdxl"),
@@ -811,8 +932,23 @@ pub const BASE_ALIASES: &[(&str, &str)] = &[
     ("stablediffusion", "sd15"),
     ("flux", "flux"),
     ("wan", "wan"),
-    ("pony", "pony"),
-    ("illustrious", "illustrious"),
+    ("hidreamo1", "hidreamo1"),
+    ("ideogram4", "ideogram4"),
+    ("minimaxh3", "minimaxh3"),
+    ("hunyuanvideo", "hunyuanvideo"),
+    ("animagine", "sdxl"),
+    ("animatediff", "sd15"),
+    ("anima", "anima"),
+];
+
+/// Lineages of a proven architecture: the token that names one, the architecture it refines
+/// and the label the BASE column prints. A lineage is stored as a suffix of its architecture,
+/// so `base:sdxl` finds every one of them and an adapter resolves against a host of the same
+/// lineage or of the bare architecture.
+pub const LINEAGES: &[(&str, &str, &str)] = &[
+    ("pony", "sdxl", "sdxl pony"),
+    ("illustrious", "sdxl", "sdxl illustrious"),
+    ("noobai", "sdxl", "sdxl noobai"),
 ];
 
 /// Descriptors a `clip.projector_type` appends to the family it projects into, trimmed
@@ -867,8 +1003,6 @@ pub const CONTEXT_CONFIG_KEYS: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use hoard_core::TensorSample;
 
     use super::*;
@@ -882,14 +1016,7 @@ mod tests {
                 shape: vec![4, 4],
             })
             .collect();
-        TensorSummary {
-            tensor_count: samples.len() as u32,
-            params: 0,
-            dtypes: BTreeMap::new(),
-            key_prefixes: crate::sniff::prefix_histogram(&samples),
-            samples,
-            metadata: BTreeMap::new(),
-        }
+        crate::sniff::summarize_tensors(samples)
     }
 
     fn role_of(names: &[&str]) -> Vec<(Role, &'static str)> {
@@ -916,10 +1043,10 @@ mod tests {
 
     #[test]
     fn a_segment_term_reads_the_prefix_histogram_not_the_sampled_names() {
-        let tensors = summary(&["decoder.up.0.conv.weight"]);
+        let tensors = summary(&["decoder.up_blocks.0.conv.weight"]);
         assert!(KeyMatch::Segment("decoder").matches(&tensors));
-        assert!(!KeyMatch::Segment("up").matches(&tensors));
-        assert!(KeyMatch::Fragment("up.0").matches(&tensors));
+        assert!(!KeyMatch::Segment("up_blocks").matches(&tensors));
+        assert!(KeyMatch::Fragment("decoder.up_blocks").matches(&tensors));
     }
 
     #[test]
@@ -959,6 +1086,78 @@ mod tests {
             &["diffusion_model.blocks.0.cross_attn.k.lora_down.weight"],
             Role::Ckpt
         ));
+    }
+
+    #[test]
+    fn every_term_a_rule_names_is_in_the_vocabulary() {
+        const TABLES: &[&[KeyMatch]] = &[
+            LORA_KEYS,
+            IP_ADAPTER_KEYS,
+            MOTION_KEYS,
+            CONTROLNET_KEYS,
+            TEXT_ENCODER_KEYS,
+            DIFFUSION_KEYS,
+            LATENT_DIFFUSION_KEYS,
+            DIT_STREAM_KEYS,
+            VIDEO_DIT_KEYS,
+            ESRGAN_KEYS,
+            SWINIR_KEYS,
+            CAUSAL_LM_BLOCK_KEYS,
+            CAUSAL_LM_EMBED_KEYS,
+            EMBEDDING_KEYS,
+            AUTOENCODER_KEYS,
+            BLOCK_BODY_KEYS,
+            TIMESTEP_KEYS,
+            ADALN_KEYS,
+            REFINER_KEYS,
+            KREA_KEYS,
+            WAN_BLOCK_KEYS,
+            TEXT_ENCODER_BODY_RULE,
+            TEXT_ENCODER_BODY_KEYS,
+            UPSCALER_BODY_KEYS,
+            UNET_BODY_KEYS,
+            COMPLETE_CHECKPOINT_KEYS,
+        ];
+        let known = vocabulary();
+        let mut named = Terms::default();
+        for table in TABLES {
+            for term in *table {
+                collect_term(term, &mut named);
+            }
+        }
+        for rule in ROLE_RULES {
+            for term in rule.require.iter().chain(rule.forbid) {
+                collect_term(term, &mut named);
+            }
+        }
+        for rule in BASE_RULES.iter().chain(FAMILY_RULES).chain(ADAPTER_RULES) {
+            for term in rule.require.iter().chain(rule.forbid) {
+                collect_term(term, &mut named);
+            }
+        }
+        named.fragments.extend(shape_bearing_keys());
+        for fragment in &named.fragments {
+            assert!(registered(&known.fragments, fragment), "{fragment}");
+        }
+        for prefix in &named.prefixes {
+            assert!(registered(&known.prefixes, prefix), "{prefix}");
+        }
+        for key in &named.keys {
+            assert!(registered(&known.keys, key), "{key}");
+        }
+        assert!(
+            known.fragments.len() >= 92,
+            "the rules name 92 distinct fragments, the vocabulary holds {}",
+            known.fragments.len()
+        );
+        assert!(registered(&known.fragments, "label_emb"));
+        assert!(registered(&known.fragments, "attn2.to_k"));
+        let mut unique = known.fragments.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), known.fragments.len());
+        assert!(known.fragments.is_sorted());
+        assert!(known.prefixes.is_sorted());
+        assert!(known.keys.is_sorted());
     }
 
     #[test]
@@ -1029,6 +1228,31 @@ mod tests {
             &["res_blocks.0.conv.weight", "upsampler.weight"],
             Role::Upsc
         ));
+    }
+
+    #[test]
+    fn a_swin_backbone_without_a_reconstruction_tail_is_not_an_upscaler() {
+        let segmenter = &[
+            "bb.patch_embed.norm.weight",
+            "bb.layers.0.blocks.0.attn.qkv.weight",
+            "decoder.conv.weight",
+            "squeeze_module.0.weight",
+        ];
+        assert!(
+            !takes_role(segmenter, Role::Upsc),
+            "a swin backbone belongs to every vision model, not to a super resolution trunk"
+        );
+
+        let swinir = &[
+            "layers.0.residual_group.blocks.0.attn.qkv.weight",
+            "conv_after_body.weight",
+            "conv_before_upsample.0.weight",
+            "conv_first.weight",
+        ];
+        assert!(
+            takes_role(swinir, Role::Upsc),
+            "the reconstruction tail is what names one"
+        );
     }
 
     #[test]
@@ -1165,6 +1389,27 @@ mod tests {
         assert!(body_rule.matches(&small));
         small.tensor_count = SEQUENTIAL_MAX_TENSORS + 1;
         assert!(!body_rule.matches(&small));
+    }
+
+    #[test]
+    fn animagine_is_sdxl_and_not_anima() {
+        let position = |needle: &str| {
+            BASE_ALIASES
+                .iter()
+                .position(|(pattern, _)| *pattern == needle)
+                .expect("pattern is listed")
+        };
+        assert!(position("animagine") < position("anima"));
+        assert!(position("animatediff") < position("anima"));
+        let named = |raw: &str| {
+            BASE_ALIASES
+                .iter()
+                .find(|(pattern, _)| raw.contains(pattern))
+                .map(|(_, family)| *family)
+        };
+        assert_eq!(named("animaginexl31"), Some("sdxl"));
+        assert_eq!(named("animatediffv3"), Some("sd15"));
+        assert_eq!(named("animapreview"), Some("anima"));
     }
 
     #[test]
