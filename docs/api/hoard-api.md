@@ -74,9 +74,12 @@ no other dimension is capped.
 
 `facets.base` is one flat list: a bucket the server groups under no brand stands for itself,
 and where a brand claims one or more buckets it replaces them with a single row rather than
-heading them. A brand row's `value` is the brand key and its `label` the brand as a user names
-it, while its `members` holds the exact base values it stands for, in the order the rail would
-have listed them. `members` is empty on every row that stands for itself. A row's `token` and
+heading them. A brand row's `value` and its `label` are both the brand key, so the row names
+a brand the way its own members spell it, while its `members` holds the exact base values it
+stands for, in the order the rail would have listed them. The `any` row sorts after every
+other base row whatever its count. `members` is empty on every row that stands for itself,
+and such a row's `label` is the architecture as it was written where it was read. A row's
+`token` and
 `query` select `members` as a union (`base:qwen3,qwen35moe`), never the brand key as a prefix:
 two unrelated products sharing a string root are never counted together. A brand row's `count`
 is that union's own count, so an artifact two members both hold is counted once, which is why

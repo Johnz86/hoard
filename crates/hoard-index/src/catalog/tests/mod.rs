@@ -36,7 +36,7 @@ use crate::discover::loose::{ContentPart, synthetic_sha};
 use crate::discover::{DiscoveredEntry, RefKind};
 use crate::error::{IndexError, Result};
 use crate::row::SearchRow;
-use crate::search::{CompileContext, SortKey, SortSpec, parse};
+use crate::search::{CompatTarget, CompileContext, SortKey, SortSpec, parse};
 
 use super::models::{
     Allocator, ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE,

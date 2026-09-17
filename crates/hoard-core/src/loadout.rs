@@ -234,13 +234,13 @@ impl Loadout {
             };
         };
         let host_base = host.base.clone().unwrap_or_else(Base::any);
-        let host_subject = CompatSubject::new(&host.path, Role::Ckpt, host_base);
+        let host_subject = CompatSubject::new(&host.path, Role::Ckpt, host_base, host.repo.clone());
         self.pins()
             .into_iter()
             .filter(|(slot, _)| *slot != LoadoutSlot::Host)
             .filter_map(|(slot, pin)| {
                 let base = pin.base.clone().unwrap_or_else(Base::any);
-                let subject = CompatSubject::new(&pin.path, slot.role(), base);
+                let subject = CompatSubject::new(&pin.path, slot.role(), base, pin.repo.clone());
                 compatible(&host_subject, &subject)
                     .is_none()
                     .then(|| LoadoutViolation {

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::id::RepoId;
 use crate::role::{Base, Role};
 
 /// The two sides of a compatibility question, reduced to what the rule reads.
@@ -8,14 +9,16 @@ pub struct CompatSubject {
     pub key: String,
     pub role: Role,
     pub base: Base,
+    pub repo: RepoId,
 }
 
 impl CompatSubject {
-    pub fn new(key: impl Into<String>, role: Role, base: Base) -> Self {
+    pub fn new(key: impl Into<String>, role: Role, base: Base, repo: RepoId) -> Self {
         Self {
             key: key.into(),
             role,
             base,
+            repo,
         }
     }
 }
@@ -56,7 +59,8 @@ impl CompatRule {
 
 /// Directional compatibility, exactly as prototyped. Adapters resolve against hosts and
 /// never against each other, which is what proves the answer is not string matching a
-/// `base` field.
+/// `base` field. Each adapter role names the hosts it plugs into, so an upscaler an image
+/// checkpoint accepts is not offered to a language model.
 pub fn compatible(host: &CompatSubject, other: &CompatSubject) -> Option<CompatRule> {
     if host.key == other.key {
         return None;
@@ -64,24 +68,38 @@ pub fn compatible(host: &CompatSubject, other: &CompatSubject) -> Option<CompatR
     if host.role == Role::Ds || other.role == Role::Ds {
         return None;
     }
-    if !host.base.matches(&other.base) {
-        return None;
-    }
-    if host.role.is_host() && other.role.is_adapter() {
+    if other.role.is_adapter() && adapter_accepts(other, host) {
         return Some(CompatRule::HostAcceptsAdapter);
     }
-    if host.role.is_adapter() && other.role.is_host() {
+    if host.role.is_adapter() && adapter_accepts(host, other) {
         return Some(CompatRule::AdapterResolvesAgainstHost);
     }
     None
+}
+
+fn adapter_accepts(adapter: &CompatSubject, host: &CompatSubject) -> bool {
+    if !adapter.role.hosts_of().contains(&host.role) {
+        return false;
+    }
+    match adapter.role {
+        Role::Proj => adapter.repo == host.repo,
+        Role::Lora | Role::Ctrl | Role::Vae | Role::Upsc | Role::Emb => {
+            host.base.matches(&adapter.base)
+        }
+        Role::Ckpt | Role::Llm | Role::Ds | Role::Unk => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn repo(reference: &str) -> RepoId {
+        RepoId::parse_qualified(reference).expect("a repository reference")
+    }
+
     fn subject(key: &str, role: Role, base: &str) -> CompatSubject {
-        CompatSubject::new(key, role, Base::new(base))
+        CompatSubject::new(key, role, Base::new(base), repo("models/acme/host-repo"))
     }
 
     #[test]
@@ -122,7 +140,12 @@ mod tests {
     #[test]
     fn base_any_matches_every_family() {
         let host = subject("ckpt", Role::Ckpt, "flux");
-        let upscaler = CompatSubject::new("upsc", Role::Upsc, Base::any());
+        let upscaler = CompatSubject::new(
+            "upsc",
+            Role::Upsc,
+            Base::any(),
+            repo("models/acme/host-repo"),
+        );
         assert_eq!(
             compatible(&host, &upscaler),
             Some(CompatRule::HostAcceptsAdapter)
@@ -137,5 +160,59 @@ mod tests {
             compatible(&llm, &lora),
             Some(CompatRule::HostAcceptsAdapter)
         );
+    }
+
+    #[test]
+    fn an_llm_no_longer_accepts_an_upscaler() {
+        let llm = subject("llm", Role::Llm, "llama");
+        let upscaler = subject("upsc", Role::Upsc, "llama");
+        assert_eq!(compatible(&llm, &upscaler), None);
+        assert_eq!(compatible(&upscaler, &llm), None);
+    }
+
+    #[test]
+    fn a_checkpoint_still_accepts_an_upscaler() {
+        let ckpt = subject("ckpt", Role::Ckpt, "sdxl");
+        let upscaler = subject("upsc", Role::Upsc, "sdxl");
+        assert_eq!(
+            compatible(&ckpt, &upscaler),
+            Some(CompatRule::HostAcceptsAdapter)
+        );
+        assert_eq!(
+            compatible(&upscaler, &ckpt),
+            Some(CompatRule::AdapterResolvesAgainstHost)
+        );
+    }
+
+    #[test]
+    fn a_projector_resolves_only_against_its_own_repos_host() {
+        let held = repo("models/lmstudio-community/gemma-4-26B-A4B-GGUF");
+        let projector = CompatSubject::new("proj", Role::Proj, Base::new(""), held.clone());
+        let sibling = CompatSubject::new("llm", Role::Llm, Base::new("llama"), held);
+        assert_eq!(
+            compatible(&sibling, &projector),
+            Some(CompatRule::HostAcceptsAdapter)
+        );
+        assert_eq!(
+            compatible(&projector, &sibling),
+            Some(CompatRule::AdapterResolvesAgainstHost)
+        );
+        let stranger = CompatSubject::new(
+            "other",
+            Role::Llm,
+            Base::new(""),
+            repo("models/someone-else/gemma-4-26B-A4B-GGUF"),
+        );
+        assert_eq!(compatible(&stranger, &projector), None);
+        assert_eq!(compatible(&projector, &stranger), None);
+    }
+
+    #[test]
+    fn a_projector_never_plugs_into_an_image_checkpoint_of_its_own_repo() {
+        let held = repo("models/lmstudio-community/gemma-4-26B-A4B-GGUF");
+        let projector = CompatSubject::new("proj", Role::Proj, Base::new("sdxl"), held.clone());
+        let ckpt = CompatSubject::new("ckpt", Role::Ckpt, Base::new("sdxl"), held);
+        assert_eq!(compatible(&ckpt, &projector), None);
+        assert_eq!(compatible(&projector, &ckpt), None);
     }
 }

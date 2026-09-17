@@ -6,7 +6,7 @@ use tantivy::Searcher;
 use tantivy::collector::Count;
 use tantivy::query::{BooleanQuery, Query};
 
-use hoard_core::{EntryId, RepoRowId};
+use hoard_core::{EntryId, RepoId, RepoRowId};
 
 use crate::error::{IndexError, Result};
 use crate::row::{FacetBucket, SearchRow};
@@ -30,7 +30,8 @@ use super::paging::{
 };
 use super::schema::Fields;
 use super::tally::{
-    BASE_DIMENSION, BASE_RAIL, SegmentTallies, base_candidates, count_buckets, order_buckets,
+    BASE_DIMENSION, BASE_RAIL, SegmentTallies, base_candidates, count_buckets, order_base_buckets,
+    order_buckets,
 };
 use super::{QueryPage, QueryRequest};
 
@@ -91,7 +92,11 @@ impl Catalog {
                 .find(|row| row.role.is_host())
                 .or_else(|| page.rows.first())
             {
-                return Ok(Some(CompatTarget::new(row.role, row.base.clone())));
+                return Ok(Some(CompatTarget::new(
+                    row.role,
+                    row.base.clone(),
+                    RepoId::parse_qualified(&row.repo)?,
+                )));
             }
         }
         Ok(None)
@@ -326,7 +331,7 @@ impl Catalog {
                 buckets.truncate(BASE_RAIL);
                 base_shown = buckets.len() as u64;
                 buckets = pass.consolidate_brands(excluded.as_ref(), buckets)?;
-                order_buckets(&mut buckets);
+                order_base_buckets(&mut buckets);
             }
             dimensions[index] = buckets;
         }
@@ -624,7 +629,7 @@ impl FacetPass<'_> {
     /// member values, through the same grammar a typed `base:a,b` compiles through - so an
     /// artifact two members both hold is counted once and a row can never open a result its
     /// count disagrees with. The brand key itself is never the query: only a value
-    /// [`brands::brand_of`] claims joins a row, which is what keeps `qwenimage` out of `QWEN`.
+    /// [`brands::brand_of`] claims joins a row, which is what keeps `qwenimage` out of `qwen`.
     fn consolidate_brands(
         &self,
         excluded: &dyn Query,
@@ -633,7 +638,7 @@ impl FacetPass<'_> {
         let mut rows: Vec<FacetBucket> = Vec::with_capacity(buckets.len());
         let mut claimed: Vec<(&'static str, usize)> = Vec::new();
         for bucket in buckets {
-            let Some((key, label)) = brands::brand_of(&bucket.value) else {
+            let Some(key) = brands::brand_of(&bucket.value) else {
                 rows.push(bucket);
                 continue;
             };
@@ -643,7 +648,7 @@ impl FacetPass<'_> {
                     claimed.push((key, rows.len()));
                     rows.push(FacetBucket {
                         value: key.to_owned(),
-                        label: Some(label.to_owned()),
+                        label: Some(key.to_owned()),
                         count: 0,
                         active: false,
                         members: vec![bucket.value],

@@ -70,7 +70,7 @@ impl Facets {
 ///
 /// A brand key is not a stored base value and is shorter than every member it names, so the
 /// base key's prefix rule would light a brand row up for values it never holds -
-/// `base:qwenimage2512` would mark `QWEN`, the very artifact the row is built to exclude. A
+/// `base:qwenimage2512` would mark `qwen`, the very artifact the row is built to exclude. A
 /// row that stands for members is selected when every one of them is, because that is the
 /// union its own click issues.
 pub fn mark_active(buckets: &mut [FacetBucket], query: &ParsedQuery, key: &str) {

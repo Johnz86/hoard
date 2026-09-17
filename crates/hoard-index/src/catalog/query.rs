@@ -10,7 +10,7 @@ use tantivy::schema::{Field, IndexRecordOption};
 
 use crate::error::{IndexError, Result};
 use crate::search::context::{HOURS_PER_DAY, MAX_SHELF_DEPTH};
-use crate::search::{CompareOp, CompileContext, SortKey, Token, TokenKind, parse};
+use crate::search::{CompareOp, CompatTarget, CompileContext, SortKey, Token, TokenKind, parse};
 
 use super::search::{
     BASE_FIELD, FORMAT_FIELD, Fields, HASH_FIELD, LAYOUT_FIELD, NODE_FIELD, ORG_FIELD,
@@ -30,7 +30,8 @@ pub(super) struct QueryFields<'a> {
 
 /// Whether answering this query needs one document per entry collapsed to its artifact, or
 /// whether primary documents alone carry every field it filters and orders on. Only `node`,
-/// `state`, `source`, `repo`, `rev` and `hash` vary between the entries of one artifact.
+/// `state`, `source`, `repo`, `rev` and `hash` vary between the entries of one artifact, and
+/// a `compat:` token joins them whenever its target resolves by repository.
 pub(super) fn needs_collapse(
     tokens: &[Token],
     context: &CompileContext,
@@ -67,12 +68,15 @@ fn filters_on_an_entry(tokens: &[Token], context: &CompileContext, depth: usize)
             | TokenKind::Revision
             | TokenKind::Hash => true,
             TokenKind::Shelf => shelf_filters_on_an_entry(token, context, depth)?,
+            TokenKind::Compat => context
+                .compat
+                .as_ref()
+                .is_some_and(CompatTarget::scopes_to_repo),
             TokenKind::Role
             | TokenKind::Base
             | TokenKind::Format
             | TokenKind::Precision
             | TokenKind::Dupe
-            | TokenKind::Compat
             | TokenKind::Size
             | TokenKind::Used
             | TokenKind::Trigger
@@ -403,19 +407,46 @@ fn compat_filter(token: &Token, fields: &QueryFields<'_>) -> Result<Box<dyn Quer
         return Ok(Box::new(EmptyQuery));
     }
     let field = fields.fields.keyword(ROLE_FIELD);
-    let allowed = any_of(
+    let repo = fields.fields.keyword(REPO_FIELD);
+    if target.role == Role::Proj {
+        return Ok(all_of(vec![
+            role_union(field, &roles),
+            term(repo, &target.repo.qualified()),
+        ]));
+    }
+    let projector = roles.contains(&Role::Proj);
+    let hosted: Vec<Role> = roles
+        .into_iter()
+        .filter(|role| *role != Role::Proj)
+        .collect();
+    let mut arms: Vec<Box<dyn Query>> = Vec::with_capacity(2);
+    if !hosted.is_empty() {
+        let allowed = role_union(field, &hosted);
+        arms.push(if target.base.is_any() {
+            allowed
+        } else {
+            all_of(vec![
+                allowed,
+                base_compat(fields.fields, target.base.as_str()),
+            ])
+        });
+    }
+    if projector {
+        arms.push(all_of(vec![
+            term(field, Role::Proj.as_str()),
+            term(repo, &target.repo.qualified()),
+        ]));
+    }
+    Ok(any_of(arms))
+}
+
+fn role_union(field: Field, roles: &[Role]) -> Box<dyn Query> {
+    any_of(
         roles
             .iter()
             .map(|role| term(field, role.as_str()))
             .collect(),
-    );
-    if target.base.is_any() {
-        return Ok(allowed);
-    }
-    Ok(all_of(vec![
-        allowed,
-        base_compat(fields.fields, target.base.as_str()),
-    ]))
+    )
 }
 
 fn shelf_filter(token: &Token, fields: &QueryFields<'_>, depth: usize) -> Result<Box<dyn Query>> {
@@ -455,9 +486,13 @@ fn all_of(mut queries: Vec<Box<dyn Query>>) -> Box<dyn Query> {
 
 #[cfg(test)]
 mod tests {
-    use hoard_core::Base;
+    use hoard_core::{Base, RepoId};
 
     use super::*;
+
+    fn repo(reference: &str) -> RepoId {
+        RepoId::parse_qualified(reference).expect("a repository reference")
+    }
     use crate::search::{CompatTarget, CompileContext, parse};
 
     fn compiled(raw: &str) -> String {
@@ -576,7 +611,11 @@ mod tests {
     fn a_compat_target_names_its_roles_and_accepts_an_agnostic_base() {
         let (_, fields) = Fields::build();
         let context = CompileContext::new("2026-09-04T00:00:00Z".parse().expect("clock"))
-            .with_compat(CompatTarget::new(Role::Ckpt, Base::new("sdxl 1.0")));
+            .with_compat(CompatTarget::new(
+                Role::Ckpt,
+                Base::new("sdxl 1.0"),
+                repo("models/acme/sdxl-base"),
+            ));
         let rendered = format!(
             "{:?}",
             compile(
@@ -595,6 +634,45 @@ mod tests {
         assert!(
             rendered.contains(ANY_BASE),
             "an artifact that plugs into anything is compatible with this host"
+        );
+        assert!(
+            !rendered.contains("proj"),
+            "a vision projector belongs to a language model, not to an image checkpoint"
+        );
+    }
+
+    #[test]
+    fn a_projector_target_compiles_to_its_repo_and_never_to_a_base() {
+        let (_, fields) = Fields::build();
+        let context = CompileContext::new("2026-09-04T00:00:00Z".parse().expect("clock"))
+            .with_compat(CompatTarget::new(
+                Role::Proj,
+                Base::new("gemma4"),
+                repo("models/lmstudio/gemma-4-GGUF"),
+            ));
+        let rendered = format!(
+            "{:?}",
+            compile(
+                &parse("compat:mmproj-gemma-4").tokens,
+                None,
+                &QueryFields {
+                    fields: &fields,
+                    context: &context,
+                },
+            )
+            .expect("compiles")
+        );
+        assert!(
+            rendered.contains("models/lmstudio/gemma-4-GGUF"),
+            "a projector's candidates are the files beside it: {rendered}"
+        );
+        assert!(
+            rendered.contains("llm"),
+            "and they are its host: {rendered}"
+        );
+        assert!(
+            !rendered.contains("gemma4") && !rendered.contains(ANY_BASE),
+            "a projector's base never decides which host it plugs into: {rendered}"
         );
     }
 

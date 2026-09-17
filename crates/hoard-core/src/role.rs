@@ -35,8 +35,19 @@ impl Role {
         Role::Upsc,
         Role::Proj,
     ];
-    /// Roles an adapter can plug into.
-    pub const HOSTS: [Role; 2] = [Role::Ckpt, Role::Llm];
+
+    /// The host roles this adapter plugs into, empty for every role that is not an adapter.
+    pub const fn hosts_of(self) -> &'static [Role] {
+        match self {
+            Role::Lora => &[Role::Ckpt, Role::Llm],
+            Role::Ctrl => &[Role::Ckpt],
+            Role::Vae => &[Role::Ckpt],
+            Role::Upsc => &[Role::Ckpt],
+            Role::Emb => &[Role::Ckpt, Role::Llm],
+            Role::Proj => &[Role::Llm],
+            Role::Ckpt | Role::Llm | Role::Ds | Role::Unk => &[],
+        }
+    }
 
     /// The grammar spelling, also the JSON and database value.
     pub const fn as_str(self) -> &'static str {
@@ -98,7 +109,9 @@ impl Role {
     }
 
     pub fn is_host(self) -> bool {
-        Self::HOSTS.contains(&self)
+        Self::ADAPTERS
+            .iter()
+            .any(|adapter| adapter.hosts_of().contains(&self))
     }
 
     /// Every accepted spelling of every role, in the order the grammar table lists them.
@@ -341,6 +354,29 @@ impl FromStr for Base {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_role_is_an_adapter_exactly_when_it_names_a_host() {
+        for role in Role::iter() {
+            assert_eq!(
+                role.is_adapter(),
+                !role.hosts_of().is_empty(),
+                "{role} disagrees with itself about being an adapter"
+            );
+            for host in role.hosts_of() {
+                assert!(
+                    matches!(host, Role::Ckpt | Role::Llm),
+                    "{role} names {host} as a host, and only a checkpoint or a language \
+                     model is one"
+                );
+                assert!(host.is_host(), "{host} is named as a host and denies it");
+            }
+        }
+        assert!(
+            !Role::Ds.is_host() && !Role::Unk.is_host(),
+            "nothing plugs into a dataset or into an unclassified file"
+        );
+    }
 
     #[test]
     fn every_grammar_alias_resolves() {

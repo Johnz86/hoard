@@ -1,5 +1,7 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
+use hoard_core::Base;
 use tantivy::SegmentOrdinal;
 
 use crate::error::Result;
@@ -202,11 +204,60 @@ pub(super) fn base_candidates(buckets: Vec<FacetBucket>) -> Vec<FacetBucket> {
     kept
 }
 
+fn by_count_then_value(left: &FacetBucket, right: &FacetBucket) -> Ordering {
+    right
+        .count
+        .cmp(&left.count)
+        .then_with(|| left.value.cmp(&right.value))
+}
+
 pub(super) fn order_buckets(buckets: &mut [FacetBucket]) {
+    buckets.sort_unstable_by(by_count_then_value);
+}
+
+/// The base rail's displayed order: [`Base::ANY`] last whatever it counts, because a row
+/// standing for every architecture answers no question the rail is asked, and the rest in
+/// [`order_buckets`]'s order among themselves.
+pub(super) fn order_base_buckets(buckets: &mut [FacetBucket]) {
     buckets.sort_unstable_by(|left, right| {
-        right
-            .count
-            .cmp(&left.count)
-            .then_with(|| left.value.cmp(&right.value))
+        (left.value == Base::ANY)
+            .cmp(&(right.value == Base::ANY))
+            .then_with(|| by_count_then_value(left, right))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bucket(value: &str, count: u64) -> FacetBucket {
+        FacetBucket {
+            value: value.to_owned(),
+            label: None,
+            count,
+            active: false,
+            members: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn any_sorts_last_whatever_its_count() {
+        let mut buckets = vec![bucket("any", 100), bucket("sdxl", 5), bucket("flux", 3)];
+        order_base_buckets(&mut buckets);
+        let values: Vec<&str> = buckets.iter().map(|bucket| bucket.value.as_str()).collect();
+        assert_eq!(values, vec!["sdxl", "flux", "any"]);
+    }
+
+    #[test]
+    fn every_other_base_bucket_keeps_the_count_then_value_order() {
+        let mut buckets = vec![
+            bucket("sdxl", 3),
+            bucket("any", 1),
+            bucket("flux", 3),
+            bucket("sd15", 9),
+        ];
+        order_base_buckets(&mut buckets);
+        let values: Vec<&str> = buckets.iter().map(|bucket| bucket.value.as_str()).collect();
+        assert_eq!(values, vec!["sd15", "flux", "sdxl", "any"]);
+    }
 }

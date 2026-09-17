@@ -1,7 +1,9 @@
 use jiff::Timestamp;
 use serde::Serialize;
 
-use hoard_core::{ArtifactId, CompatRule, CompatSubject, Role, State, compatible, format_size};
+use hoard_core::{
+    ArtifactId, CompatRule, CompatSubject, RepoId, Role, State, compatible, format_size,
+};
 use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, QueryRequest};
 use hoard_index::row::SearchRow;
@@ -88,8 +90,12 @@ pub fn compat_for(
             banner: format!("nothing resolves against {}", subject.name),
         });
     };
-    let context =
-        CompileContext::new(now).with_compat(CompatTarget::new(subject.role, subject.base.clone()));
+    let repo = RepoId::parse_qualified(&subject.repo)?;
+    let context = CompileContext::new(now).with_compat(CompatTarget::new(
+        subject.role,
+        subject.base.clone(),
+        repo.clone(),
+    ));
     let candidates = catalog
         .query(QueryRequest {
             raw: COMPAT_QUERY,
@@ -103,15 +109,23 @@ pub fn compat_for(
         subject.artifact_id.to_string(),
         subject.role,
         subject.base.clone(),
+        repo,
     );
     let mut rows: Vec<CompatRowView> = candidates
         .iter()
         .filter(|row| {
-            compatible(
-                &held,
-                &CompatSubject::new(row.artifact_id.to_string(), row.role, row.base.clone()),
-            )
-            .is_some()
+            RepoId::parse_qualified(&row.repo).is_ok_and(|repo| {
+                compatible(
+                    &held,
+                    &CompatSubject::new(
+                        row.artifact_id.to_string(),
+                        row.role,
+                        row.base.clone(),
+                        repo,
+                    ),
+                )
+                .is_some()
+            })
         })
         .map(CompatRowView::from)
         .collect();

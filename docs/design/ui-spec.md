@@ -127,10 +127,12 @@ because repeating it says nothing. BASE ARCHITECTURE prints `27 of 213 — showi
 common` (mono 11px, `--dim`) under its rows whenever the rail stands for fewer bases than the
 result set holds, counted over the bases the rows stand for so a brand row never deflates it.
 BASE ARCHITECTURE renders one row per brand and one row per base value no brand claims, sorted
-together by count like every other section, with no header, no indentation and no second tier.
-A brand row's label and value differ (`QWEN`/`qwen`) so it carries a tooltip naming the exact
-values it stands for, the same hover mechanism every truncated label already uses. It selects
-the union of exactly those values, never a prefix, and its mark is filled only while every one
+together by count like every other section, with no header, no indentation and no second tier,
+except that `any` sorts last whatever it counts and carries the tooltip `any (works with every
+architecture)`. A brand row carries its brand key as both its value and its label (`qwen`),
+so it is spelled the way its own members are, and carries a tooltip naming the exact values
+it stands for, the same hover mechanism every truncated label already uses. It selects the
+union of exactly those values, never a prefix, and its mark is filled only while every one
 of them is selected, so the row a click on one variant reaches still opens the whole brand. A
 brand holding one value is a brand row too, so the rail's vocabulary does not flip between a
 brand name and an architecture string. No section carries a filter field of its own: the
@@ -303,16 +305,16 @@ column for the delete glyph. COUNT is the shelf's own count, right-aligned and m
 when the shelf was not counted; KIND reads `builtin` or `saved`, and only a saved shelf
 carries the `×`.
 
-## Compatibility rule as prototyped
+## Compatibility rule
 
 ```
-adapters = { lora, ctrl, vae, emb, upsc }
+hosts_of = { lora: {ckpt, llm}, ctrl: {ckpt}, vae: {ckpt}, upsc: {ckpt},
+             emb: {ckpt, llm}, proj: {llm} }
 compatible(host, other):
   false if same artifact or either is a dataset
-  same_base = other.base == host.base or either base is "any"
-  if host is ckpt or llm: other is an adapter and same_base
-  if host is an adapter: other is ckpt or llm and same_base
-  else false
+  an adapter accepts a host whose role its own hosts_of names, and then
+    proj: the two are in the same repository, whatever either base says
+    every other adapter: other.base == host.base or either base is "any"
 ```
 
 ## Props exposed by the prototype

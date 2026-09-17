@@ -270,7 +270,7 @@ mod tests {
     fn grouped() -> Facets {
         Facets {
             base: vec![
-                brand("qwen", "QWEN", 5, &["qwen3", "qwen35moe"]),
+                brand("qwen", "qwen", 5, &["qwen3", "qwen35moe"]),
                 bucket("qwenimage2512", 4),
             ],
             base_total: 3,
@@ -284,7 +284,7 @@ mod tests {
         let view = facets(&grouped(), &parse("role:llm"));
         let family = &view.base[0];
         assert_eq!(family.value, "qwen");
-        assert_eq!(family.label, "QWEN");
+        assert_eq!(family.label, "qwen");
         assert_eq!(family.count, 5);
         assert_eq!(family.members, vec!["qwen3", "qwen35moe"]);
         assert_eq!(family.token, "base:qwen3,qwen35moe");

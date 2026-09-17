@@ -12,6 +12,9 @@ const DISK_BARS = 6;
 const AMBER_SHARE = 0.7;
 const BASE_SECTION = "BASE ARCHITECTURE";
 const LABEL_FITS = 22;
+const BASE_KEY = "base";
+const ANY_BASE = "any";
+const ANY_BASE_TITLE = `${ANY_BASE} (works with every architecture)`;
 
 export function facetToken(item, key) {
     if (item.token) return item.token;
@@ -27,9 +30,10 @@ function selectFacet(app, item, key) {
     app.toggleToken(facetToken(item, key));
 }
 
-function facetTitle(item) {
+function facetTitle(item, key) {
     const value = String(item.value ?? "");
     const label = String(item.label || value);
+    if (key === BASE_KEY && value === ANY_BASE) return ANY_BASE_TITLE;
     if (item.members?.length) return `${label} (${item.members.join(", ")})`;
     if (label !== value) return `${label} (${value})`;
     return label.length > LABEL_FITS ? label : null;
@@ -47,7 +51,7 @@ function facetRow(app, item, key) {
         el("span", {
             class: `facet-label${count ? "" : " is-empty"}`,
             text: item.label || item.value,
-            title: facetTitle(item)
+            title: facetTitle(item, key)
         }),
         el("span", { class: "facet-count", text: count ? String(count) : "—" })
     );

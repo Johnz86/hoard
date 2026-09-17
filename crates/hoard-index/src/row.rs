@@ -68,7 +68,9 @@ pub struct FacetBucket {
     ///
     /// `value` is the normalized matching key, so a base family reads `nemotronh` while the
     /// architecture is written `nemotron_h`. Where a bucket holds one spelling it is shown;
-    /// where it holds several the key is the only honest label for the group.
+    /// where it holds several the key is the only honest label for the group. A brand row
+    /// restates its key here rather than disagreeing with it, so the rail names a brand the
+    /// way its members spell it.
     pub label: Option<String>,
     pub count: u64,
     pub active: bool,

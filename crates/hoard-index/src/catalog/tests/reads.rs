@@ -153,6 +153,136 @@ fn a_shelf_and_a_compat_target_resolve_against_the_catalog() -> Result<()> {
     Ok(())
 }
 
+fn gguf_entry(rel_path: &str, identity: u128, name: &str, role: Role) -> SeedEntry {
+    seeded_entry(
+        rel_path,
+        2_048,
+        Some(seeded_artifact(
+            identity,
+            name,
+            Some("acme"),
+            Artifact {
+                role,
+                base: match role {
+                    Role::Proj => Base::new(""),
+                    _ => Base::new("gemma4"),
+                },
+                format: ArtifactFormat::Gguf,
+                ..seeded_facts()
+            },
+        )),
+    )
+}
+
+fn projector_catalog(directory: &TempDir) -> Result<Catalog> {
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    Catalog::open_or_scan(&config, "n", |_, _| {})
+}
+
+fn projector_fixture() -> Result<(TempDir, Catalog)> {
+    let directory = tempfile::tempdir()?;
+    let catalog = projector_catalog(&directory)?;
+    let sibling = |identity: u128, name: &str, role: Role| {
+        gguf_entry(&format!("{name}.gguf"), identity, name, role)
+    };
+    catalog.seed(&[
+        seeded_revision(
+            seeded_repo("lmstudio/gemmahome", RepoType::Models),
+            0x61,
+            vec![
+                sibling(0xA1, "mmprojhome", Role::Proj),
+                sibling(0xA2, "gemmahost", Role::Llm),
+            ],
+        ),
+        seeded_revision(
+            seeded_repo("someone/gemmaelsewhere", RepoType::Models),
+            0x62,
+            vec![
+                sibling(0xB1, "mmprojstranger", Role::Proj),
+                sibling(0xB2, "gemmastranger", Role::Llm),
+            ],
+        ),
+    ])?;
+    catalog.rebuild_search(|_| {})?;
+    Ok((directory, catalog))
+}
+
+#[test]
+fn a_projector_target_compiles_to_a_repo_term_not_a_base_clause() -> Result<()> {
+    let (_directory, catalog) = projector_fixture()?;
+    assert_eq!(
+        search(&catalog, "role:llm")?.total,
+        2,
+        "the catalog holds a second host of the same base, in another repository"
+    );
+    let page = search(&catalog, "compat:mmprojhome")?;
+    let names: Vec<&str> = page.rows.iter().map(|row| row.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["gemmahost"],
+        "a projector resolves against the host beside it, never against every host of a \
+         matching base"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_projector_finds_its_host_even_when_the_preferred_copy_is_another_repositorys() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = projector_catalog(&directory)?;
+    let beside = gguf_entry("together/gemmatwin.gguf", 0xC2, "gemmatwin", Role::Llm);
+    let preferred = SeedEntry {
+        rel_path: "apart/gemmatwin.gguf".to_owned(),
+        abs_path: Some("/data/hub/apart/gemmatwin.gguf".to_owned()),
+        state: State::Served,
+        ..beside.clone()
+    };
+    catalog.seed(&[
+        seeded_revision(
+            seeded_repo("lmstudio/gemmatogether", RepoType::Models),
+            0x63,
+            vec![
+                gguf_entry("together/mmprojtwin.gguf", 0xC1, "mmprojtwin", Role::Proj),
+                beside,
+            ],
+        ),
+        seeded_revision(
+            seeded_repo("someone/gemmaapart", RepoType::Models),
+            0x64,
+            vec![preferred],
+        ),
+    ])?;
+    catalog.rebuild_search(|_| {})?;
+    let page = search(&catalog, "compat:mmprojtwin")?;
+    let names: Vec<&str> = page.rows.iter().map(|row| row.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["gemmatwin"],
+        "the host is one artifact held in two repositories, and the copy a row is assembled \
+         from is the other one, so a repository clause read off primary documents alone \
+         would lose the projector's own sibling"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_language_model_lists_its_own_projector_and_no_other_repositorys() -> Result<()> {
+    let (_directory, catalog) = projector_fixture()?;
+    assert_eq!(
+        search(&catalog, "role:proj")?.total,
+        2,
+        "the catalog holds a second projector, in another repository"
+    );
+    let page = search(&catalog, "compat:gemmahost")?;
+    let names: Vec<&str> = page.rows.iter().map(|row| row.name.as_str()).collect();
+    assert_eq!(names, vec!["mmprojhome"]);
+    Ok(())
+}
+
 #[test]
 fn disk_pressure_is_summarised_after_every_sweep() -> Result<()> {
     let directory = tempfile::tempdir()?;

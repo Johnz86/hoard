@@ -1,7 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use hoard_core::{Base, CompatSubject, Role, compatible};
+use hoard_core::{Base, CompatSubject, RepoId, Role, compatible};
 use jiff::Timestamp;
 use strum::IntoEnumIterator;
 
@@ -95,20 +95,32 @@ impl SortSpec {
 pub struct CompatTarget {
     pub role: Role,
     pub base: Base,
+    pub repo: RepoId,
 }
 
 impl CompatTarget {
-    pub fn new(role: Role, base: Base) -> Self {
-        Self { role, base }
+    pub fn new(role: Role, base: Base, repo: RepoId) -> Self {
+        Self { role, base, repo }
     }
 
-    /// The roles that resolve against this target, derived from the domain rule so the
-    /// direction can never be written down twice and drift.
+    /// Whether the query this target compiles to carries a repository term, which it does
+    /// for exactly the pairings a projector takes part in. A repository is a fact of an
+    /// entry and not of an artifact, so such a query has to be answered from every entry of
+    /// an artifact rather than from the one document a build marked primary.
+    pub fn scopes_to_repo(&self) -> bool {
+        self.role == Role::Proj || self.allowed_roles().contains(&Role::Proj)
+    }
+
+    /// The roles that resolve against this target in principle, derived from the domain rule
+    /// so the direction can never be written down twice and drift. Every candidate carries
+    /// the target's own repository, because which repositories a projector answers is a
+    /// question for the query this list is compiled into, not for the list of roles.
     pub fn allowed_roles(&self) -> Vec<Role> {
-        let target = CompatSubject::new("target", self.role, self.base.clone());
+        let target = CompatSubject::new("target", self.role, self.base.clone(), self.repo.clone());
         Role::iter()
             .filter(|role| {
-                let candidate = CompatSubject::new("candidate", *role, self.base.clone());
+                let candidate =
+                    CompatSubject::new("candidate", *role, self.base.clone(), self.repo.clone());
                 compatible(&target, &candidate).is_some()
             })
             .collect()
@@ -172,6 +184,10 @@ fn slug(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn host_repo() -> RepoId {
+        RepoId::parse_qualified("models/acme/host-repo").expect("a repository reference")
+    }
+
     #[test]
     fn sorting_names_a_column_and_reads_its_aliases() {
         assert_eq!(SortSpec::default().key, SortKey::Name);
@@ -200,25 +216,19 @@ mod tests {
 
     #[test]
     fn a_host_compat_target_selects_only_adapters() {
-        let target = CompatTarget::new(Role::Ckpt, Base::new("sdxl 1.0"));
+        let target = CompatTarget::new(Role::Ckpt, Base::new("sdxl 1.0"), host_repo());
         let allowed = target.allowed_roles();
         assert_eq!(
             allowed,
-            vec![
-                Role::Lora,
-                Role::Ctrl,
-                Role::Upsc,
-                Role::Vae,
-                Role::Emb,
-                Role::Proj
-            ]
+            vec![Role::Lora, Role::Ctrl, Role::Upsc, Role::Vae, Role::Emb],
+            "a vision projector belongs to a language model, never to an image checkpoint"
         );
         assert!(allowed.iter().all(|role| role.is_adapter()));
     }
 
     #[test]
     fn an_adapter_compat_target_selects_only_hosts() {
-        let target = CompatTarget::new(Role::Lora, Base::new("sdxl"));
+        let target = CompatTarget::new(Role::Lora, Base::new("sdxl"), host_repo());
         let allowed = target.allowed_roles();
         assert_eq!(allowed, vec![Role::Ckpt, Role::Llm]);
         for adapter in Role::ADAPTERS {
@@ -230,8 +240,32 @@ mod tests {
     }
 
     #[test]
+    fn an_llm_compat_target_selects_its_adapters_but_not_a_checkpoint_only_one() {
+        let target = CompatTarget::new(Role::Llm, Base::new("gemma4"), host_repo());
+        let allowed = target.allowed_roles();
+        for adapter in [Role::Lora, Role::Emb, Role::Proj] {
+            assert!(
+                allowed.contains(&adapter),
+                "{adapter} plugs into a host llm"
+            );
+        }
+        for image_only in [Role::Ctrl, Role::Upsc, Role::Vae] {
+            assert!(
+                !allowed.contains(&image_only),
+                "{image_only} plugs into an image checkpoint alone"
+            );
+        }
+    }
+
+    #[test]
+    fn a_projector_compat_target_selects_only_projector_hosts() {
+        let target = CompatTarget::new(Role::Proj, Base::new(""), host_repo());
+        assert_eq!(target.allowed_roles(), vec![Role::Llm]);
+    }
+
+    #[test]
     fn a_dataset_compat_target_matches_nothing() {
-        let target = CompatTarget::new(Role::Ds, Base::new("sdxl"));
+        let target = CompatTarget::new(Role::Ds, Base::new("sdxl"), host_repo());
         assert!(target.allowed_roles().is_empty());
     }
 }

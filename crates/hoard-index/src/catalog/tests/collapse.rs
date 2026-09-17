@@ -559,6 +559,33 @@ fn entry_level_tokens_and_sorts_take_the_collapse_path() -> Result<()> {
 }
 
 #[test]
+fn a_compat_token_collapses_only_when_its_target_resolves_by_repository() -> Result<()> {
+    let target = |role: Role| {
+        CompileContext::new(jiff::Timestamp::now()).with_compat(CompatTarget::new(
+            role,
+            Base::new("gemma4"),
+            RepoId::parse_qualified("models/lmstudio/gemma-4-GGUF").expect("a reference"),
+        ))
+    };
+    assert!(
+        !query::needs_collapse(
+            &parse("compat:sdxl").tokens,
+            &target(Role::Ckpt),
+            SortKey::Name
+        )?,
+        "an image checkpoint's candidates are decided by role and base, which every entry of \
+         an artifact agrees on"
+    );
+    for role in [Role::Proj, Role::Llm] {
+        assert!(
+            query::needs_collapse(&parse("compat:gemma").tokens, &target(role), SortKey::Name)?,
+            "{role} resolves a projector by repository, and a repository is an entry's fact"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn a_layout_token_filters_on_an_entry() -> Result<()> {
     let context = CompileContext::new(jiff::Timestamp::now());
     assert!(

@@ -92,7 +92,11 @@ fn a_brand_row_unions_its_members_and_never_prefixes_them() -> Result<()> {
     ])?;
     let page = search(&catalog, "")?;
     let qwen = base_row(&page, "qwen");
-    assert_eq!(qwen.label.as_deref(), Some("QWEN"));
+    assert_eq!(
+        qwen.label.as_deref(),
+        Some("qwen"),
+        "a brand row labels itself with the key its members spell, not a second vocabulary"
+    );
     assert_eq!(
         qwen.count, 5,
         "the row counts its two members and never the unrelated qwen-image family"
@@ -138,7 +142,7 @@ fn a_brand_with_one_member_is_still_a_brand_row() -> Result<()> {
         "the rail's vocabulary is the brand's, however many variants happen to be held"
     );
     let gemma = base_row(&page, "gemma");
-    assert_eq!(gemma.label.as_deref(), Some("GEMMA"));
+    assert_eq!(gemma.label.as_deref(), Some("gemma"));
     assert_eq!(gemma.count, 2);
     assert_eq!(members(&page, "gemma"), vec!["gemma3"]);
     Ok(())
