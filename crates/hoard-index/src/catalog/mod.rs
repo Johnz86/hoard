@@ -157,7 +157,7 @@ impl Catalog {
     /// was killed publishes nothing.
     pub fn open(directory: &Path) -> Result<Self> {
         let (catalog, manifest) = Self::open_checked(directory)?;
-        catalog.seed_builtin_shelves()?;
+        catalog.seed_builtin_shelves(&manifest.node)?;
         catalog.ensure_self_row(&manifest.node)?;
         catalog.settle_interrupted_pass()?;
         catalog.prune_search_directories(manifest.search_directory.as_deref().unwrap_or_default());

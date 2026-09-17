@@ -12,8 +12,6 @@ export const COLUMNS = [
     { label: "STATE", key: "state", align: "right" }
 ];
 
-const EXAMPLE_QUERY = "compat:sdxl-base-1.0 role:lora";
-
 export function roleClass(role) {
     return `r-${String(role || "unk").toLowerCase()}`;
 }
@@ -85,7 +83,7 @@ function row(app, item, index) {
     );
 }
 
-function emptyState(app) {
+function emptyState(app, example) {
     return el(
         "div",
         { class: "empty" },
@@ -96,14 +94,14 @@ function emptyState(app) {
             "drop a token above, or try ",
             el("span", {
                 class: "empty-example",
-                text: EXAMPLE_QUERY,
-                onClick: () => app.commitQuery(EXAMPLE_QUERY, { echo: true })
+                text: example,
+                onClick: () => app.commitQuery(example, { echo: true })
             })
         )
     );
 }
 
-export function renderTable(app) {
+export function renderTable(app, example) {
     const rows = app.state.rows;
     return el(
         "div",
@@ -113,7 +111,7 @@ export function renderTable(app) {
             { class: "table" },
             header(app),
             rows.map((item, index) => row(app, item, index)),
-            rows.length ? null : emptyState(app)
+            rows.length ? null : emptyState(app, example)
         )
     );
 }

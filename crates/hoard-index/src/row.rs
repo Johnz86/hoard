@@ -43,7 +43,13 @@ pub struct SearchRow {
     pub pull_progress: Option<f32>,
     pub trigger: Option<String>,
     pub path: String,
+    /// Where the bytes sit. Every reader that opens the file, links to it or hands it to a
+    /// loadout uses this; for an hf-cache entry it is the blob, not the snapshot link.
     pub abs_path: Option<String>,
+    /// The path a person walked to the file, when that is not [`SearchRow::abs_path`].
+    /// Screens show this; nothing opens it.
+    #[serde(default)]
+    pub walked_path: Option<String>,
     pub path_count: u32,
     pub dupe: bool,
     pub triage: bool,

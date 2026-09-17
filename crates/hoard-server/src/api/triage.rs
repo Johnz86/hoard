@@ -38,13 +38,14 @@ pub struct PrefixView {
     pub count: u32,
 }
 
-/// One row of the triage queue.
+/// One row of the triage queue, with the reason the queue holds it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TriageView {
     #[serde(flatten)]
     pub row: RowView,
     pub guess: GuessView,
     pub header: HeaderView,
+    pub reason: String,
 }
 
 impl From<&TriageItem> for TriageView {
@@ -70,6 +71,7 @@ impl From<&TriageItem> for TriageView {
                 hidden_dim: item.header.hidden_dim,
                 dtype: item.header.dtype.clone(),
             },
+            reason: item.reason.clone(),
         }
     }
 }

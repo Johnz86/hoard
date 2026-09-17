@@ -51,7 +51,7 @@ impl SummaryPart {
         Self {
             artifacts: 1,
             present: u64::from(present),
-            triage: u64::from(record.artifact.needs_triage(triage)),
+            triage: u64::from(record.needs_triage(triage)),
             indexed_bytes: match present {
                 true => bytes,
                 false => 0,

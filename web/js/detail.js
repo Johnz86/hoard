@@ -306,6 +306,9 @@ function rightRail(app, repo) {
                     "div",
                     { class: "disk-path" },
                     entry.path,
+                    entry.blob_path
+                        ? el("span", { class: "disk-blob", text: ` -> ${entry.blob_path}` })
+                        : null,
                     el("span", {
                         class: "disk-node",
                         text: ` · ${entry.node}${entry.symlink ? " · symlink" : ""}`

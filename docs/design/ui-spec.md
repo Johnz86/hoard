@@ -73,7 +73,7 @@ State colors:
 | State | Meaning | Color |
 | --- | --- | --- |
 | SERVED | this node holds it and serves it on the LAN | `--green` |
-| LOCAL | held on a node, not served | `oklch(0.72 0.012 75)` |
+| LOCAL | held on this node and served on the Hub face; SERVED marks bytes the mirror fetched | `oklch(0.72 0.012 75)` |
 | PULLING nn% | transfer in progress | `--amb` |
 | STALE | pinned revision no longer matches upstream ref | `oklch(0.7 0.15 22)` |
 | REMOTE | indexed on another node, no bytes here | `oklch(0.6 0.012 75)` |

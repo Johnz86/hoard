@@ -20,7 +20,10 @@ use crate::discover::{
 use crate::error::{IndexError, Result};
 
 const REFS_DIR: &str = "refs";
-const SNAPSHOTS_DIR: &str = "snapshots";
+/// The tree of symlinks one revision of a cached repository is walked through.
+pub(crate) const SNAPSHOTS_DIR: &str = "snapshots";
+/// Where the bytes those symlinks resolve to are filed, under the repository root.
+pub(crate) const BLOBS_DIR: &str = "blobs";
 
 /// How deep `refs/` is read. Names nest at most a level or two (`refs/pr/1`), and a
 /// directory symlink pointing at an ancestor would otherwise loop until the stack is gone.

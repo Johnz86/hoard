@@ -24,7 +24,7 @@ use hoard_index::sniff::parse_readme;
 use crate::api::common::{
     DEFAULT_LIMIT, EntryView, Fact, MIDDOT, PullCommands, RowView, blocking, clamp_limit,
     decode_row_cursor, encode_row_cursor, entry_views, facts, pull_commands, relative_time,
-    repo_id, state_label,
+    repo_id, shown_path, state_label,
 };
 use crate::api::compat::{CompatView, compat_for};
 use crate::error::{ApiError, ApiResult};
@@ -303,7 +303,7 @@ fn describe(
         Some(row) => entry_views(&catalog.entries_of(row.artifact_id)?, &header.host),
         None => entry_views(&entries, &header.host),
     };
-    let path = primary.and_then(|row| row.abs_path.clone());
+    let path = primary.and_then(shown_path);
     Ok(RepoView {
         repo: record.repo.qualified(),
         repo_type: record.repo.repo_type(),
@@ -565,7 +565,7 @@ fn revision_summary(revision: &RevisionDetail, files: usize, refs: &[RefView]) -
 fn meta_line(primary: Option<&SearchRow>, entries: &[EntryDetail], now: Timestamp) -> String {
     let size: u64 = entries.iter().map(|entry| entry.size).sum();
     let mut parts = Vec::with_capacity(3);
-    if let Some(path) = primary.and_then(|row| row.abs_path.clone()) {
+    if let Some(path) = primary.and_then(shown_path) {
         parts.push(path);
     }
     parts.push(format_size(size));

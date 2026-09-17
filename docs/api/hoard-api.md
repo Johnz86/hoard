@@ -38,9 +38,15 @@ parquet arrow jsonl csv readme config unknown`.
     "node": "workstation", "layout": "loras", "state": "served", "pull_progress": null,
     "trigger": "film grain, 35mm, halation", "path": "/mnt/vault/loras/film-grain-35mm.safetensors",
     "path_count": 2, "shard_count": 1, "last_used": "2026-09-04T09:10:00Z" } ],
-  "next_cursor": "...", "total": 212, "nodes": 3, "summary": "212 ARTIFACTS · 3 NODES"
+  "next_cursor": "...", "total": 212, "nodes": 3, "summary": "212 ARTIFACTS · 3 NODES",
+  "sort": "name", "dir": "asc"
 }
 ```
+
+`sort` and `dir` are the sort the server actually applied, spelled the way the grammar spells
+a column, so the results header names it rather than guessing from what a click last asked
+for. A request naming neither gets back `name` and `asc`. The name sort orders on a
+lower-cased copy of the name, so `ae.safetensors` precedes `Z-Detail-Slider`.
 
 A row's `prefix` is what the UI prints in `--dim` before the name, so the repository a name
 was chosen from is always on screen. It is derived in Rust from the row's qualified `repo`,
@@ -113,7 +119,9 @@ short. The server logs the window at `debug`; nothing in the response names it.
 
 - `GET /api/v1/artifacts/{id}`: row fields plus `facts` (ordered key/value pairs exactly
   as the inspector shows them), `evidence` (`[{ "field", "value", "source", "detail",
-  "confidence" }]`), `entries` (`repo`, `revision`, `path`, `node`, `state`, `symlink`),
+  "confidence" }]`), `entries` (`repo`, `revision`, `path`, `blob_path`, `node`, `state`,
+  `symlink`; `path` is the path a person walked, and `blob_path` names the shortened cache
+  blob it links to when that is somewhere else, otherwise `null`),
   `duplicates`, `plugs_into` (first four compatible artifacts), `usage` summary,
   `override_applied`.
 - `GET /api/v1/artifacts/{id}/compat?limit=`: `{ "rows", "total", "rule", "heading",
@@ -135,8 +143,10 @@ short. The server logs the window at `debug`; nothing in the response names it.
 
 ## Triage
 
-- `GET /api/v1/triage`: unclassified artifacts with `guess` (`role`, `base`, `confidence`)
-  and `header` (tensor count, key prefixes, hidden dim, dtype). The count, the prefixes and
+- `GET /api/v1/triage`: artifacts still waiting for a verdict, with `guess` (`role`, `base`,
+  `confidence`), `header` (tensor count, key prefixes, hidden dim, dtype) and `reason`, the
+  sentence naming why the artifact is queued: `role unclassified`, `role vae at 0.51, below
+  0.85`, or `3 shards present, incomplete`. The count, the prefixes and
   the dtype are what the sniff measured over the whole file; the hidden dimension is read
   from the at most sixteen tensor samples the stored header keeps, thinned by a stride from
   the sniff's draw rather than taken off its front, not from every tensor the file holds. Inference itself ran over all of them before the row was written.
@@ -212,9 +222,9 @@ no `dir` at all and always uses the configured root.
 ## Sources, scans, jobs
 
 - `GET /api/v1/sources`: kind, files, bytes, last scan, `pending_hashes` and the
-  `pending_bytes` those files hold; `blobs` is kept for
-  the shape and always reads zero, the catalog counts content by artifact rather than by
-  blob. The list holds every source the catalog knows, including the ones this node does not
+  `pending_bytes` those files hold. There is no blob count: the catalog counts content by
+  artifact rather than by blob, and a column that always read zero is not one.
+  The list holds every source the catalog knows, including the ones this node does not
   scan: the mirror's downloads, the puller's landings and a peer's namespace. `can_scan` says
   whether `POST /api/v1/scan` will accept the row, which is true exactly when the
   configuration names it; `managed_by` says who writes it instead, one of `"downloads"`,

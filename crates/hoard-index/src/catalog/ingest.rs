@@ -361,7 +361,7 @@ impl Ingesting<'_, '_> {
             return Ok(Some(Classified {
                 id: stored.id,
                 created: false,
-                triage: stored.artifact.needs_triage(self.triage),
+                triage: stored.needs_triage(self.triage),
             }));
         }
         let id = next_id(&mut self.counters.artifacts)?;
@@ -383,7 +383,7 @@ impl Ingesting<'_, '_> {
             incomplete: false,
             first_seen: None,
         });
-        let triage = record.artifact.needs_triage(self.triage);
+        let triage = record.needs_triage(self.triage);
         self.transaction.upsert(SearchText {
             artifact_id: id,
             keys: tensor_keys(None),

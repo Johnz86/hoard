@@ -7,8 +7,9 @@ use strum::EnumIter;
 use crate::error::HoardError;
 
 /// Where the bytes of an entry are, from the point of view of one node. Derived, never
-/// stored as the truth: SERVED means this node holds and serves it, REMOTE means only a
-/// peer's index knows about it.
+/// stored as the truth: LOCAL means this node holds it and serves it on the Hub face,
+/// SERVED marks bytes the mirror fetched, and REMOTE means only a peer's index knows about
+/// it.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, EnumIter,
 )]

@@ -23,8 +23,7 @@ use crate::state::AppState;
 ///
 /// Sources carry no identity of their own in the catalog yet, so `id` is the source's
 /// one-based position in this listing, which is also how a scan request naming an id is
-/// read back. `blobs` reads zero because the catalog counts paths, not blobs. Sources this
-/// node does not scan are listed too, saying who does write them.
+/// read back. Sources this node does not scan are listed too, saying who does write them.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SourceView {
     pub id: SourceId,
@@ -33,7 +32,6 @@ pub struct SourceView {
     pub kind: String,
     pub node: String,
     pub files: u64,
-    pub blobs: u64,
     pub bytes: u64,
     pub bytes_human: String,
     pub last_scan: Option<Timestamp>,
@@ -116,7 +114,6 @@ fn source_view(
         kind: record.kind.as_str().to_owned(),
         node: node.to_owned(),
         files: record.file_count,
-        blobs: 0,
         bytes: record.byte_count,
         bytes_human: format_size(record.byte_count),
         last_scan: record.last_scan,

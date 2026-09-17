@@ -1,5 +1,5 @@
 import * as api from "./api.js";
-import { el, errorPanel, fmtAge, fmtBytes, fmtRate, loadingPanel, toast } from "./dom.js";
+import { dash, el, errorPanel, fmtAge, fmtBytes, fmtRate, loadingPanel, toast } from "./dom.js";
 
 export async function loadJobs(app) {
     try {
@@ -36,7 +36,6 @@ export function renderScansView(app) {
             el("span", { text: "SOURCE" }),
             el("span", { text: "KIND" }),
             el("span", { class: "align-right", text: "FILES" }),
-            el("span", { class: "align-right", text: "BLOBS" }),
             el("span", { class: "align-right", text: "BYTES" }),
             el("span", { class: "align-right", text: "PENDING" }),
             el("span", { class: "align-right", text: "LAST SCAN" }),
@@ -49,7 +48,6 @@ export function renderScansView(app) {
                 el("span", { text: source.path || source.name || source.id }),
                 el("span", { class: "mono-dim", text: source.kind || "" }),
                 el("span", { class: "align-right", text: String(source.files ?? "—") }),
-                el("span", { class: "align-right", text: String(source.blobs ?? "—") }),
                 el("span", { class: "align-right", text: fmtBytes(source.bytes) }),
                 el("span", { class: "align-right", text: pendingText(source) }),
                 el("span", { class: "align-right mono-dim", text: fmtAge(source.last_scan) }),
@@ -117,6 +115,8 @@ export function renderJobsView(app) {
         ),
         app.state.jobs.map((job) => {
             const progress = Math.round((Number(job.progress) || 0) * 100);
+            const done = job.state === "done";
+            const hashed = Number(job.bytes) > 0;
             return el(
                 "div",
                 { class: "panel-row job-grid" },
@@ -124,7 +124,7 @@ export function renderJobsView(app) {
                 el(
                     "span",
                     { class: job.error ? "st-stale" : "mono-dim" },
-                    job.error ? job.error : job.phase || ""
+                    job.error ? job.error : done ? "done" : job.phase || ""
                 ),
                 el(
                     "span",
@@ -132,8 +132,14 @@ export function renderJobsView(app) {
                     el("span", { class: "job-bar", style: { width: `${progress}%` } }),
                     el("span", { class: "job-pct", text: `${progress}%` })
                 ),
-                el("span", { class: "align-right", text: fmtBytes(job.bytes) }),
-                el("span", { class: "align-right st-served", text: fmtRate(job.rate_bps) }),
+                el("span", {
+                    class: "align-right",
+                    text: done && !hashed ? dash(null) : fmtBytes(job.bytes)
+                }),
+                el("span", {
+                    class: "align-right st-served",
+                    text: done && !hashed ? dash(null) : fmtRate(job.rate_bps)
+                }),
                 el("span", { class: "align-right mono-dim", text: fmtAge(job.started) }),
                 el(
                     "span",

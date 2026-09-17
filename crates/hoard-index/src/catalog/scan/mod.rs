@@ -68,10 +68,12 @@ impl Catalog {
     ) -> Result<Self> {
         let (directory, sources) = validate_output(directory, config)?;
         let mut catalog = Self::create(directory)?;
-        match catalog
-            .fill(node, &sources, ScanSettings::new(config, policy), progress)
-            .and_then(|()| catalog.compact())
-        {
+        let settings = ScanSettings::new(config, policy);
+        let scanned = catalog
+            .seed_builtin_shelves(node)
+            .and_then(|_| catalog.fill(node, &sources, settings, progress))
+            .and_then(|()| catalog.compact());
+        match scanned {
             Ok(()) => Ok(catalog),
             Err(error) => {
                 let directory = catalog.directory.clone();
@@ -170,7 +172,6 @@ impl Catalog {
                     search_cache: std::sync::RwLock::new(None),
                     search_lane: parking_lot::Mutex::new(()),
                 };
-                catalog.seed_builtin_shelves()?;
                 Ok(catalog)
             }
             Err(error) => {

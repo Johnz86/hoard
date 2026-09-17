@@ -19,6 +19,7 @@ use crate::search::{
 
 use crate::catalog::models::{ArtifactRecord, Entry, Manifest, Repository, Revision, Source};
 use crate::catalog::query::{self, QueryFields};
+use crate::catalog::read::walked_path;
 use crate::catalog::usage::last_used_in;
 use crate::catalog::{Catalog, OpenIndex, ShelfRecord};
 use crate::config::SourceKind;
@@ -539,6 +540,7 @@ pub(in crate::catalog) fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
         trigger: inferred.trigger.clone(),
         path: entry.rel_path.clone(),
         abs_path: entry.placed.resolve(&repository.root_path, &entry.rel_path),
+        walked_path: walked_path(entry, repository, revision),
         path_count: artifact.path_count,
         dupe: artifact.copies > 1,
         triage: entry.triage,

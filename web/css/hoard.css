@@ -1606,6 +1606,8 @@ input.field:focus {
 
 .disk-node { color: var(--dim); }
 
+.disk-blob { color: var(--dim); }
+
 /* ---------- drawer ---------- */
 
 .scrim {
@@ -1836,7 +1838,7 @@ input.field:focus {
 
 .scan-grid {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 110px 90px 90px 100px 140px 120px 80px;
+    grid-template-columns: minmax(0, 1fr) 110px 90px 100px 140px 120px 80px;
     gap: 12px;
 }
 

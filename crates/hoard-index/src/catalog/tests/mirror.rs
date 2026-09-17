@@ -72,6 +72,62 @@ fn a_served_file_is_filed_under_the_mirror_source_and_found_by_hash() -> Result<
 }
 
 #[test]
+fn a_file_landing_on_an_incomplete_set_is_filed_for_triage() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = Catalog::open_or_scan(
+        &IndexConfig {
+            data_dir: directory.path().join("native"),
+            sources: Vec::new(),
+            ..IndexConfig::default()
+        },
+        "n",
+        |_, _| {},
+    )?;
+    let sha = Sha256::from_bytes([0x51; 32]);
+    let file = ServedFile {
+        repo: RepoId::parse_ref(RepoType::Models, "qwen/partial")?,
+        commit: CommitSha::from_bytes([0x52; 20]),
+        rel_path: "model-00001-of-00003.safetensors".to_owned(),
+        size: 4096,
+        sha256: sha,
+        git_sha1: None,
+        cache_root: directory.path().join("repos"),
+    };
+    let landed = catalog.ingest_served(&file)?;
+    let id = landed
+        .artifact
+        .ok_or_else(|| IndexError::Catalog("the file is an artifact".into()))?;
+
+    let transaction = catalog.database.rw_transaction()?;
+    let stored: ArtifactRecord = transaction
+        .get()
+        .primary(id.get())?
+        .ok_or_else(|| IndexError::Catalog("the record exists".into()))?;
+    transaction.upsert(ArtifactRecord {
+        incomplete: true,
+        artifact: Artifact {
+            role: Role::Ckpt,
+            role_confidence: 0.99,
+            ..stored.artifact.clone()
+        },
+        ..stored
+    })?;
+    transaction.commit()?;
+
+    catalog.ingest_served(&file)?;
+    catalog.refresh_search(|_| {})?;
+    let row = catalog
+        .artifact_by_sha256(&sha)?
+        .ok_or_else(|| IndexError::Catalog("the row reads back".into()))?;
+    assert!(
+        row.triage,
+        "a file filed onto a set still missing pieces needs a person, whatever its role \
+         inference says"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_rescan_leaves_the_mirror_source_alone() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (_input, config) = loose_fixture(directory.path())?;

@@ -140,6 +140,16 @@ pub(super) struct ArtifactRecord {
     pub(super) first_seen: String,
 }
 
+impl ArtifactRecord {
+    /// Whether this record still wants a person, for every reader of the queue, the entry
+    /// state a scan writes and the summary count. A set that found fewer files than it
+    /// declares cannot be served whatever its header says, so an incomplete set queues
+    /// however confident its inference was.
+    pub(super) fn needs_triage(&self, threshold: f32) -> bool {
+        self.artifact.needs_triage(threshold) || self.incomplete
+    }
+}
+
 /// The node an entry's bytes sit on. Every writer names this node until peers land.
 pub const LOCAL_NODE: i64 = 1;
 

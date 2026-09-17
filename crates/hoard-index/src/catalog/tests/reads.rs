@@ -642,6 +642,504 @@ fn the_triage_queue_answers_from_the_catalog_when_no_index_exists() -> Result<()
     Ok(())
 }
 
+/// A repository holding two of the three shards it declares: classified with confidence, and
+/// queued only because the set is not all there.
+fn partial_shard_catalog(directory: &Path) -> Result<Catalog> {
+    let hub = directory.join("hub");
+    fs::create_dir(&hub)?;
+    let shards = llm_shards();
+    hf_cache_repo(
+        &hub,
+        "Qwen",
+        "Qwen3-Partial",
+        &[
+            ("model-00001-of-00003.safetensors", shards[0].clone()),
+            ("model-00003-of-00003.safetensors", shards[2].clone()),
+        ],
+    )?;
+    scan_hub(directory, &hub)
+}
+
+#[test]
+fn the_queue_holds_every_state_triage_row_not_cleared() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = partial_shard_catalog(directory.path())?;
+    let queue = catalog.triage_queue(10)?;
+    assert_eq!(queue.len(), 1, "the incomplete set is queued");
+    let item = &queue[0];
+    assert_ne!(item.row.role, Role::Unk, "its role was classified");
+    assert!(
+        item.row.role_confidence >= 0.85,
+        "above the threshold, so the missing shard is the only thing queueing it"
+    );
+    catalog.clear_triage(item.row.artifact_id)?;
+    assert!(
+        catalog.triage_queue(10)?.is_empty(),
+        "a cleared record leaves the queue"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_settled_record_leaves_the_queue_before_the_index_catches_up() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    catalog.seed(&[seeded_revision(
+        seeded_repo("misc/mystery", RepoType::Models),
+        0x93,
+        vec![SeedEntry {
+            state: State::Triage,
+            ..seeded_entry(
+                "mystery.safetensors",
+                1_024,
+                Some(seeded_artifact(
+                    0x93,
+                    "mystery",
+                    None,
+                    Artifact {
+                        role: Role::Unk,
+                        role_confidence: 0.2,
+                        ..seeded_facts()
+                    },
+                )),
+            )
+        }],
+    )])?;
+    catalog.rebuild_search(|_| {})?;
+    let queued = catalog.triage_queue(10)?;
+    assert_eq!(queued.len(), 1, "it starts queued");
+
+    let transaction = catalog.database.rw_transaction()?;
+    let stored: ArtifactRecord = transaction
+        .get()
+        .primary(queued[0].row.artifact_id.get())?
+        .ok_or_else(|| IndexError::Catalog("the queued record exists".into()))?;
+    transaction.upsert(ArtifactRecord {
+        artifact: Artifact {
+            role: Role::Lora,
+            role_confidence: 0.99,
+            ..stored.artifact.clone()
+        },
+        ..stored
+    })?;
+    transaction.commit()?;
+
+    assert_eq!(
+        search(&catalog, "state:triage")?.total,
+        1,
+        "the published index still answers with the entry it indexed"
+    );
+    assert!(
+        catalog.triage_queue(10)?.is_empty(),
+        "but a state:triage document the records no longer agree with is not a queue row"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_incomplete_sets_reason_names_its_present_count() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = partial_shard_catalog(directory.path())?;
+    let queue = catalog.triage_queue(10)?;
+    assert_eq!(
+        queue.first().map(|item| item.reason.as_str()),
+        Some("2 shards present, incomplete")
+    );
+    Ok(())
+}
+
+/// A catalog whose queue holds one artifact no rule classified and one classified below the
+/// threshold, so each reason is read on a row nothing else queues.
+fn reasoned_queue() -> Result<(TempDir, Catalog)> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let queued = |identity: u128, name: &str, artifact: Artifact| SeedEntry {
+        state: State::Triage,
+        ..seeded_entry(
+            &format!("{name}.safetensors"),
+            1_024,
+            Some(seeded_artifact(identity, name, None, artifact)),
+        )
+    };
+    catalog.seed(&[
+        seeded_revision(
+            seeded_repo("misc/mystery", RepoType::Models),
+            0x91,
+            vec![queued(
+                0x91,
+                "mystery",
+                Artifact {
+                    role: Role::Unk,
+                    role_confidence: 0.2,
+                    ..seeded_facts()
+                },
+            )],
+        ),
+        seeded_revision(
+            seeded_repo("misc/maybe-vae", RepoType::Models),
+            0x92,
+            vec![queued(
+                0x92,
+                "maybe-vae",
+                Artifact {
+                    role: Role::Vae,
+                    role_confidence: 0.51,
+                    ..seeded_facts()
+                },
+            )],
+        ),
+    ])?;
+    catalog.rebuild_search(|_| {})?;
+    Ok((directory, catalog))
+}
+
+fn reason_of(catalog: &Catalog, name: &str) -> Result<String> {
+    catalog
+        .triage_queue(10)?
+        .into_iter()
+        .find(|item| item.row.name == name)
+        .map(|item| item.reason)
+        .ok_or_else(|| IndexError::Catalog(format!("{name} is queued")))
+}
+
+#[test]
+fn an_unclassified_artifacts_reason_names_it_unclassified() -> Result<()> {
+    let (_directory, catalog) = reasoned_queue()?;
+    assert_eq!(reason_of(&catalog, "mystery")?, "role unclassified");
+    Ok(())
+}
+
+#[test]
+fn a_low_confidence_artifacts_reason_names_its_role_and_threshold() -> Result<()> {
+    let (_directory, catalog) = reasoned_queue()?;
+    assert_eq!(
+        reason_of(&catalog, "maybe-vae")?,
+        "role vae at 0.51, below 0.85"
+    );
+    Ok(())
+}
+
+/// A cache holding one file, scanned the way a hub source is: the entry is discovered
+/// through a snapshot symlink and its bytes sit in `blobs/`.
+fn hf_cache_catalog(directory: &Path) -> Result<(Catalog, PathBuf)> {
+    let hub = directory.join("hub");
+    fs::create_dir(&hub)?;
+    hf_cache_repo(
+        &hub,
+        "acme",
+        "styler",
+        &[("model.safetensors", lora_header())],
+    )?;
+    let catalog = scan_hub(directory, &hub)?;
+    Ok((catalog, hub.join("models--acme--styler")))
+}
+
+#[test]
+fn an_hf_cache_entrys_shown_path_is_its_snapshot_path_not_its_blob() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (catalog, root) = hf_cache_catalog(directory.path())?;
+    let rows = search(&catalog, "")?;
+    assert_eq!(rows.rows.len(), 1);
+    let snapshot = root
+        .join("snapshots")
+        .join("b".repeat(40))
+        .join("model.safetensors")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(rows.rows[0].walked_path.as_deref(), Some(snapshot.as_str()));
+    assert!(
+        !snapshot.contains("/blobs/"),
+        "the walked path names no blob"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_hf_cache_entrys_bytes_are_opened_at_the_blob_not_through_the_link() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (catalog, root) = hf_cache_catalog(directory.path())?;
+    let rows = search(&catalog, "")?;
+    let blob = rows.rows[0]
+        .abs_path
+        .clone()
+        .ok_or_else(|| IndexError::Catalog("a present entry names its bytes".into()))?;
+    assert!(
+        blob.starts_with(&root.join("blobs").to_string_lossy().into_owned()),
+        "the bytes are opened in the repository's blobs directory: {blob}"
+    );
+    fs::remove_dir_all(root.join("snapshots"))?;
+    assert!(
+        fs::metadata(&blob).is_ok_and(|meta| meta.is_file()),
+        "a swept snapshot tree does not cost this node bytes it still holds"
+    );
+    let entries = catalog.entries_of(rows.rows[0].artifact_id)?;
+    assert_eq!(
+        entries[0].abs_path.as_deref(),
+        Some(blob.as_str()),
+        "the Hub file face and the card reader open the same path"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_loose_or_git_entrys_shown_path_is_unchanged() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("loras");
+    fs::create_dir_all(&input)?;
+    fs::write(input.join("film-grain.safetensors"), lora_header())?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "")?;
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(
+        rows.rows[0].abs_path.as_deref(),
+        input.join("film-grain.safetensors").to_str(),
+        "a path under its own root is shown exactly as it sits"
+    );
+    assert_eq!(
+        rows.rows[0].walked_path, None,
+        "and nothing was walked to reach it but itself"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_object_placed_away_from_its_root_keeps_the_path_it_sits_at() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let object = "/data/hub/.git/lfs/objects/ab/cd/abcd";
+    catalog.seed(&[seeded_revision(
+        seeded_repo("acme/lfs-repo", RepoType::Models),
+        0x5a,
+        vec![SeedEntry {
+            abs_path: Some(object.to_owned()),
+            ..seeded_entry(
+                "model.safetensors",
+                1_024,
+                Some(seeded_artifact(0x5a, "lfs-model", None, seeded_facts())),
+            )
+        }],
+    )])?;
+    catalog.rebuild_search(|_| {})?;
+    let rows = search(&catalog, "")?;
+    assert_eq!(
+        rows.rows[0].abs_path.as_deref(),
+        Some(object),
+        "bytes outside the cache blobs directory are no snapshot link"
+    );
+    let entries = catalog.entries_of(rows.rows[0].artifact_id)?;
+    assert_eq!(
+        entries[0].walked_path, None,
+        "and no snapshot path is invented over them"
+    );
+    Ok(())
+}
+
+/// A folder that happens to keep its files in a `blobs/` directory of its own, reached
+/// directly rather than through a link, which the placement alone cannot tell from a cache.
+#[test]
+fn a_blobs_directory_reached_without_a_link_is_not_read_as_a_cache() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let stored = "/data/hub/blobs/weights.safetensors";
+    let entry = |is_symlink: bool, identity: u128, name: &str| SeedEntry {
+        abs_path: Some(stored.to_owned()),
+        is_symlink,
+        ..seeded_entry(
+            &format!("{name}.safetensors"),
+            1_024,
+            Some(seeded_artifact(identity, name, None, seeded_facts())),
+        )
+    };
+    catalog.seed(&[
+        seeded_revision(
+            seeded_repo("acme/walked", RepoType::Models),
+            0x71,
+            vec![entry(false, 0x71, "walked")],
+        ),
+        seeded_revision(
+            seeded_repo("acme/linked", RepoType::Models),
+            0x72,
+            vec![entry(true, 0x72, "linked")],
+        ),
+    ])?;
+    catalog.rebuild_search(|_| {})?;
+    let walked_path_of = |name: &str| -> Result<Option<String>> {
+        Ok(search(&catalog, "")?
+            .rows
+            .into_iter()
+            .find(|row| row.name == name)
+            .and_then(|row| row.walked_path))
+    };
+    assert_eq!(
+        walked_path_of("walked")?,
+        None,
+        "no link was followed, so no snapshot path is invented over the bytes"
+    );
+    assert!(
+        walked_path_of("linked")?.is_some_and(|path| path.contains("/snapshots/")),
+        "a blob reached through a link is the cache layout this names"
+    );
+    Ok(())
+}
+
+#[test]
+fn entry_detail_carries_the_walked_path_only_when_it_differs() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (catalog, root) = hf_cache_catalog(directory.path())?;
+    let rows = search(&catalog, "")?;
+    let entries = catalog.entries_of(rows.rows[0].artifact_id)?;
+    assert_eq!(entries.len(), 1);
+    let walked = entries[0]
+        .walked_path
+        .as_deref()
+        .ok_or_else(|| IndexError::Catalog("a cached entry names the path walked".into()))?;
+    assert_eq!(
+        walked,
+        root.join("snapshots")
+            .join("b".repeat(40))
+            .join("model.safetensors")
+            .to_str()
+            .unwrap_or_default()
+    );
+    assert_eq!(
+        entries[0].abs_path.as_deref(),
+        root.join("blobs").join(format!("{:064x}", 0)).to_str(),
+        "while the bytes stay named at the blob"
+    );
+
+    let loose = tempfile::tempdir()?;
+    let input = loose.path().join("loras");
+    fs::create_dir_all(&input)?;
+    fs::write(input.join("film-grain.safetensors"), lora_header())?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let plain = Catalog::scan_sources(
+        &loose.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+    plain.rebuild_search(|_| {})?;
+    let plain_rows = search(&plain, "")?;
+    let plain_entries = plain.entries_of(plain_rows.rows[0].artifact_id)?;
+    assert_eq!(plain_entries.len(), 1);
+    assert_eq!(
+        plain_entries[0].walked_path, None,
+        "a path that is where its bytes sit was walked to directly"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_name_sort_is_case_insensitive() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let named = |identity: u128, name: &str| {
+        seeded_revision(
+            seeded_repo(&format!("misc/r{identity:x}"), RepoType::Models),
+            identity as u8,
+            vec![seeded_entry(
+                &format!("{name}.bin"),
+                1_024,
+                Some(seeded_artifact(identity, name, None, seeded_facts())),
+            )],
+        )
+    };
+    catalog.seed(&[
+        named(0xc1, "Z-Detail-Slider"),
+        named(0xc2, "ae.safetensors"),
+    ])?;
+    catalog.rebuild_search(|_| {})?;
+    let page = catalog.query(QueryRequest {
+        raw: "",
+        sort: SortSpec::new(SortKey::Name, false),
+        limit: 10,
+        offset: 0,
+        context: &catalog.compile_context("", jiff::Timestamp::now(), Vec::new())?,
+    })?;
+    assert_eq!(
+        page.rows
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ae.safetensors", "Z-Detail-Slider"],
+        "a capital does not sort ahead of every lower-case name"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_seeded_node_shelf_names_the_configured_node() -> Result<()> {
+    let (_directory, catalog) = fixture()?;
+    catalog.seed_builtin_shelves("workstation")?;
+    let shelves = catalog.list_shelves()?;
+    let node_shelf = shelves
+        .iter()
+        .find(|shelf| shelf.name == "everything on workstation")
+        .ok_or_else(|| IndexError::Catalog("the node shelf is seeded".into()))?;
+    assert_eq!(node_shelf.query, "node:workstation");
+    assert!(node_shelf.builtin);
+    assert!(
+        !shelves
+            .iter()
+            .any(|shelf| shelf.name == "everything on laptop"),
+        "no node this catalog never ran as is named"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_seeded_triage_shelf_reads_state_triage() -> Result<()> {
+    let (_directory, catalog) = fixture()?;
+    catalog.seed_builtin_shelves("test-node")?;
+    let triage = catalog
+        .list_shelves()?
+        .into_iter()
+        .find(|shelf| shelf.name == "triage queue")
+        .ok_or_else(|| IndexError::Catalog("the triage queue is seeded".into()))?;
+    assert_eq!(triage.query, "state:triage");
+    Ok(())
+}
+
 #[test]
 fn loadouts_are_stored_by_name_and_pins_resolve_through_the_catalog() -> Result<()> {
     let (_directory, catalog, ids) = seeded_catalog()?;
@@ -1241,7 +1739,7 @@ fn shelves_settings_and_noise_live_in_the_catalog_and_noise_reaches_the_scan() -
     let updated = catalog.update_shelf(created.id, "grainy", "role:lora base:sdxl", 9)?;
     assert_eq!(updated.query, "role:lora base:sdxl");
     assert!(catalog.delete_shelf(created.id)?);
-    assert_eq!(catalog.seed_builtin_shelves()?, 6);
+    assert_eq!(catalog.seed_builtin_shelves("n")?, 6);
     assert_eq!(catalog.list_shelves()?.len(), 6, "re-seeding is idempotent");
 
     catalog.put_setting("theme", "dark")?;
@@ -1295,7 +1793,7 @@ fn the_triage_queue_leads_the_seeded_shelves() -> Result<()> {
         Some("triage queue"),
         "the rail and the SHELVES tab both draw it first"
     );
-    catalog.seed_builtin_shelves()?;
+    catalog.seed_builtin_shelves("test-node")?;
     assert_eq!(
         catalog
             .list_shelves()?
@@ -1332,11 +1830,10 @@ fn shelf_count_fixture() -> Result<(TempDir, Catalog)> {
         repositories.push(seeded_revision(
             seeded_repo(&format!("misc/mystery-{index}"), RepoType::Models),
             0x71 + index as u8,
-            vec![seeded_entry(
-                &format!("mystery-{index}.bin"),
-                1_024,
-                Some(artifact),
-            )],
+            vec![SeedEntry {
+                state: State::Triage,
+                ..seeded_entry(&format!("mystery-{index}.bin"), 1_024, Some(artifact))
+            }],
         ));
     }
     for index in 0..2_u128 {
@@ -1384,9 +1881,9 @@ fn a_shelf_reports_how_many_artifacts_its_query_answers() -> Result<()> {
     );
     assert_eq!(count_of(&counted, "flux workhorse"), Some(Some(2)));
     assert_eq!(
-        count_of(&counted, "everything on laptop"),
-        Some(Some(0)),
-        "a shelf naming a node this catalog does not hold counts nothing"
+        count_of(&counted, "everything on workstation"),
+        Some(Some(5)),
+        "the node shelf names the node this catalog runs on, so it answers everything"
     );
 
     let flux = counted

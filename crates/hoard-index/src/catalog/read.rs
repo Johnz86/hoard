@@ -12,6 +12,7 @@ use hoard_core::{
 
 use crate::config::SourceKind;
 use crate::discover::RefKind;
+use crate::discover::hf_cache::{BLOBS_DIR, SNAPSHOTS_DIR};
 use crate::error::{IndexError, Result};
 use crate::row::SearchRow;
 use crate::search::{SortKey, SortSpec};
@@ -19,8 +20,8 @@ use crate::time::parse_opt_timestamp;
 use crate::triage::{TriageHeader, header_facts};
 
 use super::models::{
-    ArtifactDetail, ArtifactRecord, Entry, EntryKey, LocationKey, Repository, RepositoryKey,
-    Revision, Source, repository_key, source_prefix,
+    ArtifactDetail, ArtifactRecord, Entry, EntryKey, LocationKey, Placement, Repository,
+    RepositoryKey, Revision, Source, repository_key, source_prefix,
 };
 use super::nodes::NodeNames;
 use super::scan::preferred_entry;
@@ -37,7 +38,14 @@ pub struct EntryDetail {
     pub revision: String,
     pub revision_sha: Option<CommitSha>,
     pub rel_path: String,
+    /// Where the bytes sit, which is what every reader that opens the file uses: the Hub
+    /// file face, the card reader, a projection's symlink target and a loadout's held line.
+    /// For an hf-cache entry this is the blob, never the snapshot link that reaches it.
     pub abs_path: Option<String>,
+    /// The path a person walked to the file, when that is not where the bytes sit. `None`
+    /// for every entry whose walked path already is [`EntryDetail::abs_path`]. Only screens
+    /// read this; nothing opens it.
+    pub walked_path: Option<String>,
     pub node: String,
     pub size: u64,
     pub state: State,
@@ -181,7 +189,7 @@ pub(super) fn repositories_of_source_in(
 }
 
 /// One row of the triage queue: the artifact as the table shows it, the guess inference
-/// recorded, and the header that produced the guess.
+/// recorded, the header that produced the guess, and why the artifact is queued at all.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TriageItem {
     pub row: SearchRow,
@@ -189,6 +197,7 @@ pub struct TriageItem {
     pub guess_base: Option<String>,
     pub confidence: f32,
     pub header: TriageHeader,
+    pub reason: String,
 }
 
 impl Catalog {
@@ -526,9 +535,12 @@ impl Catalog {
     ///
     /// The queue is a `state:triage` page of the search index in artifact id order, so a
     /// catalog holding a million settled artifacts pays for the page rather than for every
-    /// record. A verdict clears the record without moving the entry, so each page row is
-    /// still measured against its record before it is kept. A catalog with no search
-    /// directory answers the same rows from the records themselves rather than erroring.
+    /// record. The index is a cache of the records and can lag them: a verdict clears a
+    /// record without moving its entry, and a rescan settles a record before a refresh
+    /// republishes the document. Every page row is therefore measured against its own record
+    /// by the same predicate the write side used, and the query narrows what has to be read
+    /// rather than deciding what belongs. A catalog with no search directory answers the
+    /// same rows from the records themselves rather than erroring.
     pub fn triage_queue(&self, limit: u32) -> Result<Vec<TriageItem>> {
         let threshold = self.stored_triage()?;
         if !self.status()?.search_built {
@@ -554,13 +566,13 @@ impl Catalog {
                 }
                 let id = row.artifact_id.get();
                 let record: Option<ArtifactRecord> = snapshot.get().primary(id)?;
-                let Some(record) = record.filter(|record| {
-                    !record.triage_cleared && record.artifact.needs_triage(threshold)
-                }) else {
+                let Some(record) = record
+                    .filter(|record| !record.triage_cleared && record.needs_triage(threshold))
+                else {
                     continue;
                 };
                 let detail: Option<ArtifactDetail> = snapshot.get().primary(record.id)?;
-                items.push(triage_item(row, detail));
+                items.push(triage_item(row, detail, &record, threshold));
             }
             if exhausted {
                 break;
@@ -582,7 +594,7 @@ impl Catalog {
                 break;
             }
             let record: ArtifactRecord = record?;
-            if record.triage_cleared || !record.artifact.needs_triage(threshold) {
+            if record.triage_cleared || !record.needs_triage(threshold) {
                 continue;
             }
             let Some(entry) = preferred_entry(
@@ -596,7 +608,7 @@ impl Catalog {
             let last_used = last_used_in(&snapshot, record.id)?;
             let row = reader.row_of(&record, &entry, last_used)?;
             let detail: Option<ArtifactDetail> = snapshot.get().primary(record.id)?;
-            items.push(triage_item(row, detail));
+            items.push(triage_item(row, detail, &record, threshold));
         }
         Ok(items)
     }
@@ -611,7 +623,12 @@ const TRIAGE_PAGE: u32 = 64;
 
 /// The queue's guess: the strongest evidence recorded for a field, falling back to what the
 /// artifact itself carries, with the confidence of whichever answer produced the guess.
-fn triage_item(row: SearchRow, detail: Option<ArtifactDetail>) -> TriageItem {
+fn triage_item(
+    row: SearchRow,
+    detail: Option<ArtifactDetail>,
+    record: &ArtifactRecord,
+    threshold: f32,
+) -> TriageItem {
     let (tensors, evidence) = detail.map_or_else(
         || (None, Vec::new()),
         |detail| (detail.tensors, detail.evidence),
@@ -630,6 +647,7 @@ fn triage_item(row: SearchRow, detail: Option<ArtifactDetail>) -> TriageItem {
                 .clone()
                 .or_else(|| (!row.base.is_empty()).then(|| row.base.to_string()))
         });
+    let reason = triage_reason(&row, record, threshold);
     TriageItem {
         row,
         guess_role,
@@ -638,7 +656,35 @@ fn triage_item(row: SearchRow, detail: Option<ArtifactDetail>) -> TriageItem {
         header: tensors
             .map(|tensors| header_facts(&tensors))
             .unwrap_or_default(),
+        reason,
     }
+}
+
+/// Why this artifact is in the queue, in the order the predicate decides it: an unclassified
+/// role, then a role the threshold does not trust, then a set missing files it declares.
+///
+/// The incomplete case names the files present and not the total declared, because the
+/// declared total is computed at scan time and no record stores it.
+fn triage_reason(row: &SearchRow, record: &ArtifactRecord, threshold: f32) -> String {
+    if row.role == Role::Unk {
+        return "role unclassified".to_owned();
+    }
+    if row.role_confidence < threshold {
+        return format!(
+            "role {} at {:.2}, below {:.2}",
+            row.role.as_str(),
+            row.role_confidence,
+            threshold
+        );
+    }
+    let present = record.shard_count.unwrap_or(1);
+    format!(
+        "{present} shard{} present, incomplete",
+        match present == 1 {
+            true => "",
+            false => "s",
+        }
+    )
 }
 
 fn strongest<'a>(evidence: &'a [Evidence], field: &str) -> Option<&'a Evidence> {
@@ -858,6 +904,50 @@ impl<'a, 'db> Reader<'a, 'db> {
     }
 }
 
+/// Whether this entry's stored path is a cache blob some snapshot link reaches: bytes filed
+/// under the repository's own `blobs/` directory, arrived at through a symlink.
+///
+/// Both halves are needed. An LFS object sits away from its git root as well, so the
+/// placement alone does not say which layout this is, and it is reached directly rather than
+/// through a link; a loose folder that happens to hold a `blobs/` directory is not walked
+/// through a resolved link either.
+fn linked_blob(entry: &Entry, repository: &Repository) -> bool {
+    let Placement::At(blob) = &entry.placed else {
+        return false;
+    };
+    entry.is_symlink
+        && blob
+            .strip_prefix(repository.root_path.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|rest| rest.strip_prefix(BLOBS_DIR))
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The path a person walked to this entry, when that is not where its bytes sit.
+///
+/// An hf-cache entry is discovered through a snapshot symlink and stored at the blob that
+/// link resolves to. The snapshot path is what a reader opened, what a shell completes and
+/// what every screen shows, so it is offered here for screens to show. It is deliberately
+/// not what `abs_path` carries: the Hub file face, the card reader, a projection's symlink
+/// target and a loadout's held line all open `abs_path`, and a stale or swept snapshot link
+/// would lose them bytes this node still holds.
+pub(in crate::catalog) fn walked_path(
+    entry: &Entry,
+    repository: &Repository,
+    revision: &Revision,
+) -> Option<String> {
+    if !linked_blob(entry, repository) {
+        return None;
+    }
+    let sha = revision.sha?;
+    Some(format!(
+        "{}/{SNAPSHOTS_DIR}/{}/{}",
+        repository.root_path,
+        sha.to_hex(),
+        entry.rel_path
+    ))
+}
+
 fn entry_detail(
     entry: &Entry,
     repository: &Repository,
@@ -873,6 +963,7 @@ fn entry_detail(
         revision_sha: revision.sha,
         rel_path: entry.rel_path.clone(),
         abs_path: entry.placed.resolve(&repository.root_path, &entry.rel_path),
+        walked_path: walked_path(entry, repository, revision),
         node: node.to_owned(),
         size: entry.size,
         state: entry.state,

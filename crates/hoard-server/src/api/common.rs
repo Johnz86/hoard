@@ -27,6 +27,13 @@ const MAX_LIMIT: u32 = 500;
 pub const PLUGS_INTO_LIMIT: u32 = 4;
 pub const MIDDOT: &str = "\u{b7}";
 const TIMES: &str = "\u{d7}";
+/// How much of a content-addressed blob name a path list prints.
+const BLOB_NAME_CHARS: usize = 12;
+/// The cache directory a shortened blob is printed under. `hoard-index`'s
+/// `discover::hf_cache` owns this layout and names it in the same words; it is spelled again
+/// here rather than published across the crate boundary, because a view crate wanting one
+/// word of a layout is not a reason for a discovery module to export it.
+const BLOBS_DIR: &str = "blobs";
 
 const SECONDS_PER_MINUTE: i64 = 60;
 const SECONDS_PER_HOUR: i64 = 60 * SECONDS_PER_MINUTE;
@@ -253,7 +260,7 @@ impl From<&SearchRow> for RowView {
             state: row.state,
             pull_progress: row.pull_progress,
             trigger: row.trigger.clone(),
-            path: row.abs_path.clone().unwrap_or_else(|| row.path.clone()),
+            path: shown_path(row).unwrap_or_else(|| row.path.clone()),
             path_count: row.path_count,
             shard_count: row.shard_count,
             last_used: row.last_used,
@@ -283,6 +290,9 @@ pub struct EntryView {
     pub repo: String,
     pub revision: String,
     pub path: String,
+    /// Where the bytes of a symlinked path actually sit, already shortened for printing, or
+    /// nothing when `path` is where they sit.
+    pub blob_path: Option<String>,
     pub node: String,
     pub label: String,
     pub state: State,
@@ -298,9 +308,15 @@ pub fn entry_views(entries: &[EntryDetail], host: &str) -> Vec<EntryView> {
             repo: entry.repo.clone(),
             revision: entry.revision.clone(),
             path: entry
-                .abs_path
+                .walked_path
                 .clone()
+                .or_else(|| entry.abs_path.clone())
                 .unwrap_or_else(|| entry.rel_path.clone()),
+            blob_path: entry
+                .walked_path
+                .as_ref()
+                .and(entry.abs_path.as_deref())
+                .map(blob_label),
             label: match entry.is_symlink {
                 true => format!("{} {MIDDOT} symlink", entry.node),
                 false => entry.node.clone(),
@@ -311,6 +327,20 @@ pub fn entry_views(entries: &[EntryDetail], host: &str) -> Vec<EntryView> {
             symlink: entry.is_symlink,
         })
         .collect()
+}
+
+/// The path a screen prints for a row: the path a person walked when the bytes sit
+/// somewhere else, and otherwise where they sit. Never the path anything opens.
+pub fn shown_path(row: &SearchRow) -> Option<String> {
+    row.walked_path.clone().or_else(|| row.abs_path.clone())
+}
+
+/// A blob named by its own directory and the head of its file name, because the whole of a
+/// content-addressed name says no more than its first characters do.
+fn blob_label(path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let short: String = name.chars().take(BLOB_NAME_CHARS).collect();
+    format!("{BLOBS_DIR}/{short}")
 }
 
 /// The display spelling of a base family, `sdxl 1.0` rather than the `sdxl10` key.
@@ -585,6 +615,27 @@ mod tests {
 
     fn now() -> Timestamp {
         "2026-09-04T09:10:00Z".parse().expect("timestamp parses")
+    }
+
+    #[test]
+    fn a_blob_is_named_by_its_directory_and_the_head_of_its_hash() {
+        assert_eq!(
+            blob_label(
+                "/data/hub/models--acme--styler/blobs/\
+                 9f2c41ab7d3e5b6084c19af2730dd5516e8b4c2f9a0d7e3b15c86f42a9d0b731"
+            ),
+            "blobs/9f2c41ab7d3e"
+        );
+        assert_eq!(
+            blob_label("blobs/short"),
+            "blobs/short",
+            "a name shorter than the head is printed whole"
+        );
+        assert_eq!(
+            blob_label("bare"),
+            "blobs/bare",
+            "a path with no directory is still named as the blob it is"
+        );
     }
 
     #[test]

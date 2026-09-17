@@ -654,6 +654,19 @@ fn a_rescan_ahead_of_the_index() -> (AppState, TempDir) {
 }
 
 #[tokio::test]
+async fn the_search_response_echoes_the_sort_it_applied() {
+    let world = seeded();
+
+    let default = get(&world.state, "/api/v1/search").await;
+    assert_eq!(default["sort"], "name");
+    assert_eq!(default["dir"], "asc");
+
+    let asked = get(&world.state, "/api/v1/search?sort=size&dir=desc").await;
+    assert_eq!(asked["sort"], "size");
+    assert_eq!(asked["dir"], "desc");
+}
+
+#[tokio::test]
 async fn a_page_whose_row_a_rescan_replaced_still_offers_the_next_one() {
     let (state, _dir) = a_rescan_ahead_of_the_index();
 
@@ -888,6 +901,7 @@ async fn an_artifact_lists_its_evidence_entries_duplicates_and_usage() {
             "repo": "models/kohya/film-grain-35mm",
             "revision": "main",
             "path": "/mnt/vault/loras/film-grain-35mm.safetensors",
+            "blob_path": null,
             "node": "workstation",
             "label": "workstation",
             "state": "local",

@@ -22,6 +22,7 @@ const NAV = [
 ];
 const SEARCH_LIMIT = 100;
 const INSPECTOR_DELAY = 160;
+const FALLBACK_EXAMPLE = "role:lora";
 
 const state = {
     view: "index",
@@ -33,6 +34,8 @@ const state = {
     nodeCount: 0,
     sort: null,
     dir: "asc",
+    sortApplied: "name",
+    dirApplied: "asc",
     cursor: 0,
     selection: new Set(),
     viewMode: "TABLE",
@@ -127,9 +130,15 @@ function resultLine() {
     return `${state.total} ARTIFACTS · ${state.nodeCount} NODES`;
 }
 
+function exampleQuery() {
+    const answering = (state.shelves || []).find(
+        (shelf) => shelf.builtin && typeof shelf.count === "number" && shelf.count > 0
+    );
+    return (answering && answering.query) || FALLBACK_EXAMPLE;
+}
+
 function sortLabel() {
-    if (!state.sort) return "SORT USED";
-    return `SORT ${state.sort.toUpperCase()} ${state.dir === "asc" ? "↑" : "↓"}`;
+    return `SORT ${state.sortApplied.toUpperCase()} ${state.dirApplied === "asc" ? "↑" : "↓"}`;
 }
 
 function buildHash() {
@@ -266,6 +275,8 @@ async function runSearch() {
         state.query = data.query || null;
         state.total = data.total ?? state.rows.length;
         state.nodeCount = data.nodes ?? 0;
+        state.sortApplied = data.sort || state.sortApplied;
+        state.dirApplied = data.dir || state.dirApplied;
         state.cursor = Math.min(state.cursor, Math.max(state.rows.length - 1, 0));
         state.cursorArtifact = null;
     } catch (error) {
@@ -628,7 +639,7 @@ function paintIndex() {
     if (state.searchError) mount(body, errorPanel(state.searchError, () => runSearch()));
     else if (state.searching && !state.rows.length) mount(body, loadingPanel("searching the index…"));
     else if (state.viewMode === "CARDS") mount(body, renderCards(app));
-    else mount(body, renderTable(app));
+    else mount(body, renderTable(app, exampleQuery()));
     const next = body.firstElementChild;
     if (next && offset) next.scrollTop = offset;
 

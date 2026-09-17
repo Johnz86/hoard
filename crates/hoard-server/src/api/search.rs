@@ -90,6 +90,10 @@ pub struct SearchResponse {
     pub total: u64,
     pub nodes: u64,
     pub summary: String,
+    /// The sort the server applied, spelled as the grammar spells it, with its direction.
+    /// The results header prints these instead of guessing at what a click asked for.
+    pub sort: String,
+    pub dir: &'static str,
 }
 
 /// Only the parse, for the token strip while typing.
@@ -108,6 +112,11 @@ pub async fn search(
     let limit = clamp_limit(params.limit);
     let key = cursor_key(&raw, params.sort.as_deref(), params.dir.as_deref());
     let offset = decode_cursor(params.cursor.as_deref(), &key)?;
+    let applied_sort = sort.key.column().to_owned();
+    let applied_dir = match sort.descending {
+        true => "desc",
+        false => "asc",
+    };
     let page = run_query(&state, raw, sort, limit, offset).await?;
     if page.stale {
         tracing::debug!("the search index is behind the catalog and is being refreshed");
@@ -120,6 +129,8 @@ pub async fn search(
         nodes: page.nodes,
         summary: summary(page.total, page.nodes),
         query: page.query,
+        sort: applied_sort,
+        dir: applied_dir,
     }))
 }
 

@@ -92,7 +92,7 @@ fn store_entry(
         None => None,
     };
     let stored = match &record {
-        Some(record) => Some((record.id, artifact_triage(record, context.settings.triage))),
+        Some(record) => Some((record.id, record.needs_triage(context.settings.triage))),
         None => anchor,
     };
     let triage = stored.is_some_and(|(_, triage)| triage);
@@ -136,11 +136,6 @@ fn store_entry(
     counters.derived.added(&entry);
     transaction.insert(entry)?;
     Ok(stored)
-}
-
-/// A set that found fewer files than it declares cannot be served whatever its header says.
-fn artifact_triage(record: &ArtifactRecord, confidence: f32) -> bool {
-    record.artifact.needs_triage(confidence) || record.incomplete
 }
 
 /// Which of two namings of one identity the record keeps.

@@ -13,10 +13,11 @@ use crate::error::{IndexError, Result};
 use super::Catalog;
 use super::models::{Node, Noise, NoiseKey, Projection, ProjectionKey, Setting, Shelf, ShelfKey};
 
-/// The shelves hoard ships with, in the order the rail lists them. The triage queue leads,
-/// because what a node has not classified is the one shelf whose emptiness is the goal.
-const BUILTIN_SHELVES: [(&str, &str); 6] = [
-    ("triage queue", "role:?"),
+/// The fixed shelves hoard ships with, in the order the rail lists them. The triage queue
+/// leads, because what a node has not classified is the one shelf whose emptiness is the
+/// goal. A sixth shelf naming the node itself is built at seed time.
+const BUILTIN_SHELVES: [(&str, &str); 5] = [
+    ("triage queue", "state:triage"),
     (
         "sdxl \u{b7} lora \u{b7} small",
         "role:lora base:sdxl size:<400mb",
@@ -24,7 +25,6 @@ const BUILTIN_SHELVES: [(&str, &str); 6] = [
     ("flux workhorse", "base:flux"),
     ("quantised llm", "role:llm fmt:gguf"),
     ("cold + duplicate", "dupe:true"),
-    ("everything on laptop", "node:laptop"),
 ];
 
 /// A saved query as the rail, the SHELVES tab and `hoard ls` read it.
@@ -180,25 +180,40 @@ impl Catalog {
         Ok(deleted)
     }
 
-    /// Upserts the six shelves hoard ships with, by name. Idempotent; run on every open.
-    pub fn seed_builtin_shelves(&self) -> Result<usize> {
+    /// Upserts the six shelves hoard ships with, by name: the five fixed queries and one
+    /// naming `node`, the node this catalog runs on. Idempotent; run on every open.
+    ///
+    /// A node renamed between runs seeds a shelf under its new name and leaves the one its
+    /// old name made behind, because a shelf is identified by its name and nothing here
+    /// reconciles two of them.
+    pub fn seed_builtin_shelves(&self, node: &str) -> Result<usize> {
+        let node_shelf = (format!("everything on {node}"), format!("node:{node}"));
+        let shelves = BUILTIN_SHELVES
+            .iter()
+            .map(|(name, query)| (*name, *query))
+            .chain(std::iter::once((
+                node_shelf.0.as_str(),
+                node_shelf.1.as_str(),
+            )));
         let transaction = self.database.rw_transaction()?;
-        for (position, (name, query)) in BUILTIN_SHELVES.iter().enumerate() {
-            let stored: Option<Shelf> = transaction.get().secondary(ShelfKey::name, *name)?;
+        let mut seeded = 0;
+        for (position, (name, query)) in shelves.enumerate() {
+            let stored: Option<Shelf> = transaction.get().secondary(ShelfKey::name, name)?;
             let id = match stored {
                 Some(shelf) => shelf.id,
                 None => next_id::<Shelf>(&transaction)?,
             };
             transaction.upsert(Shelf {
                 id,
-                name: (*name).to_owned(),
-                query: (*query).to_owned(),
+                name: name.to_owned(),
+                query: query.to_owned(),
                 builtin: true,
                 position: position as i64,
             })?;
+            seeded += 1;
         }
         transaction.commit()?;
-        Ok(BUILTIN_SHELVES.len())
+        Ok(seeded)
     }
 
     /// Marks a path as noise. Recording the same path again keeps its id, and keeps the
