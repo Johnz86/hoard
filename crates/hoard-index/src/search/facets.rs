@@ -73,6 +73,10 @@ impl Facets {
 /// `base:qwenimage2512` would mark `qwen`, the very artifact the row is built to exclude. A
 /// row that stands for members is selected when every one of them is, because that is the
 /// union its own click issues.
+///
+/// The base value `any` is compared for equality here rather than through the compatibility
+/// wildcard: the `any` bucket is marked only by a token holding `any`, and a token holding
+/// `any` marks no bucket of another value.
 pub fn mark_active(buckets: &mut [FacetBucket], query: &ParsedQuery, key: &str) {
     for bucket in buckets {
         bucket.active = match bucket.members.is_empty() {
@@ -117,10 +121,14 @@ pub fn toggle_token(raw_query: &str, key: &str, value: &str) -> String {
 fn selects(token: &Token, value: &str) -> bool {
     if token.kind == TokenKind::Base {
         let candidate = Base::new(value);
-        return token
-            .values
-            .iter()
-            .any(|held| candidate.matches(&Base::new(held)));
+        return token.values.iter().any(|held| {
+            let held = Base::new(held);
+            match (candidate.is_any(), held.is_any()) {
+                (true, true) => true,
+                (true, false) | (false, true) => false,
+                (false, false) => candidate.matches(&held),
+            }
+        });
     }
     let candidate = value.trim();
     token
@@ -201,6 +209,42 @@ mod tests {
     }
 
     #[test]
+    fn a_base_token_never_marks_the_any_bucket() {
+        let query = parse("base:flux");
+        let mut bases = vec![bucket("flux"), bucket("any")];
+        mark_active(&mut bases, &query, "base");
+        assert!(bases[0].active && !bases[1].active);
+    }
+
+    #[test]
+    fn an_any_token_marks_only_the_any_bucket() {
+        let query = parse("base:any");
+        let mut bases = vec![bucket("flux"), bucket("sdxl10"), bucket("any")];
+        mark_active(&mut bases, &query, "base");
+        assert_eq!(
+            bases
+                .iter()
+                .map(|bucket| bucket.active)
+                .collect::<Vec<bool>>(),
+            vec![false, false, true]
+        );
+    }
+
+    #[test]
+    fn a_token_holding_any_beside_a_base_marks_both() {
+        let query = parse("base:any,flux");
+        let mut bases = vec![bucket("flux"), bucket("sdxl10"), bucket("any")];
+        mark_active(&mut bases, &query, "base");
+        assert_eq!(
+            bases
+                .iter()
+                .map(|bucket| bucket.active)
+                .collect::<Vec<bool>>(),
+            vec![true, false, true]
+        );
+    }
+
+    #[test]
     fn a_negated_token_never_marks_a_bucket_active() {
         let query = parse("-role:lora");
         let mut roles = vec![bucket("lora")];
@@ -269,6 +313,16 @@ mod tests {
     }
 
     #[test]
+    fn an_any_token_never_marks_a_brand_row() {
+        let wildcard = qwen("base:any");
+        assert!(
+            !wildcard.base[0].active,
+            "any selects no member, so it selects no brand"
+        );
+        assert!(!wildcard.base[1].active, "nor a flat bucket of its own");
+    }
+
+    #[test]
     fn a_bucket_standing_for_no_member_is_marked_on_its_own_value() {
         let mut facets = Facets {
             base: vec![bucket("gemma3"), bucket("lfm2")],
@@ -322,6 +376,14 @@ mod tests {
         assert_eq!(
             toggle_token("base:sdxl role:lora", "base", "sdxl10"),
             "role:lora"
+        );
+    }
+
+    #[test]
+    fn toggling_any_beside_a_base_adds_it_rather_than_removing_the_base() {
+        assert_eq!(
+            toggle_token("base:flux", "base", "any"),
+            "base:flux base:any"
         );
     }
 

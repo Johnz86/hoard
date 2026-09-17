@@ -3,6 +3,17 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest wave: the any bucket is active only when the query names any
+
+The base rail decided a bucket's `active` flag with `Base::matches`, whose `any` wildcard is a
+compatibility rule, so `any` lit up beside every `base:` query and `base:any` lit every row of
+the rail: on the live catalog `q=base:flux` marked 2 base buckets and `q=base:any` marked 17
+over 45 rows, where each should mark 1. `selects` in
+`crates/hoard-index/src/search/facets.rs` now compares `is_any` on both sides first and keeps
+the prefix rule for every other pair, so each marks 1 and a token holding `any` beside a base
+still marks both. `Base::matches` is unchanged, nothing stored changed and
+`catalog::FORMAT_VERSION` stays 12.
+
 ## Latest wave: a name finds its file, and a pull names the revision holding it
 
 Free text now runs through the analyzer the `text` field is indexed with and matches its words
@@ -11,11 +22,11 @@ and 1 against this workstation's caches where each answered 0; a `~` token match
 as a prefix in any order. The `hf` pull line of an artifact held outside `main` carries
 `--revision <sha>`, so artifact `a_14`'s copied command downloads its 5 files instead of none.
 Nothing stored changed shape and `catalog::FORMAT_VERSION` stays 12. Left open by the
-2026-09-17 review: the repo page's folder-level PULL box, the `any` highlight on the base
-rail, the one-shard-of-N model, and base identification. Left open with them, the loadout
-`hf-script` export (`api/loadouts.rs::hf_script`) still writes its own `hf download` line,
-with no `--revision` and naming one shard of a set; the wave that opens an artifact moves it
-onto `pull_commands` rather than fixing the line twice.
+2026-09-17 review: the repo page's folder-level PULL box, the one-shard-of-N model, and base
+identification. Left open with them, the loadout `hf-script` export
+(`api/loadouts.rs::hf_script`) still writes its own `hf download` line, with no `--revision`
+and naming one shard of a set; the wave that opens an artifact moves it onto `pull_commands`
+rather than fixing the line twice.
 
 ## Latest wave: a format bump no longer costs a rehash
 

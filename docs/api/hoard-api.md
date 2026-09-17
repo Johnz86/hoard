@@ -71,7 +71,10 @@ which is how many artifacts the query the bucket opens answers, so a family buck
 the versions under it. The 32 are the largest by that count among the most populous bases by
 exact term together with the family roots those bases extend, so a root that few artifacts
 carry exactly but many extend is on the rail. A base outside the 32 is not shown and is not
-marked active, and a query naming it still answers.
+marked active, and a query naming it still answers. The `any` bucket is active only when a
+positive `base:` token holds the value `any`, and the value `any` marks no other bucket, so
+`base:any,flux` marks both and `base:flux` does not mark `any`, although compatibility still
+reads a stored `any` as matching every base.
 
 `facets.base_total` is how many distinct bases the result set holds by exact term, counted
 before the rail added any family root and before it was cut to 32, so a rail standing for
