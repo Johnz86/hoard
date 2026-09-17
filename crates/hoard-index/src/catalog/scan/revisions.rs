@@ -32,6 +32,7 @@ pub(super) fn repository(
             .map(|path| path.to_string_lossy().into_owned()),
         default_ref: repo.default_ref.clone(),
         remote: repo.remote.clone(),
+        tool_layout: repo.tool_layout.clone(),
         revisions,
     }
 }

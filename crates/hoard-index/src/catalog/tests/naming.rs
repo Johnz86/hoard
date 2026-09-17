@@ -5,14 +5,17 @@ fn two_sets_sharing_a_directory_and_stem_are_told_apart_by_member_count() -> Res
     let directory = tempfile::tempdir()?;
     let hub = directory.path().join("hub");
     fs::create_dir(&hub)?;
-    let index = br#"{"metadata":{},"weight_map":{"a.weight":"model-00001-of-00006.safetensors","b.weight":"model-00002-of-00006.safetensors"}}"#.to_vec();
-    let mut files: Vec<(String, Vec<u8>)> =
-        vec![("model.safetensors.index.json".to_owned(), index)];
-    for number in 1..=6 {
-        files.push((
-            format!("model-{number:05}-of-00006.safetensors"),
-            shard_header(&[&format!("model.layers.{number}.mlp.up_proj.weight")], 64),
-        ));
+    let mut files: Vec<(String, Vec<u8>)> = Vec::with_capacity(6);
+    for (total, count) in [(2_u32, 2_u32), (4, 4)] {
+        for number in 1..=count {
+            files.push((
+                format!("model-{number:05}-of-{total:05}.safetensors"),
+                shard_header(
+                    &[&format!("model.layers.{total}{number}.mlp.up_proj.weight")],
+                    64,
+                ),
+            ));
+        }
     }
     let borrowed: Vec<(&str, Vec<u8>)> = files
         .iter()

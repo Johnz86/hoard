@@ -145,6 +145,11 @@ pub struct DiscoveredRepo {
     /// The URL `origin` points at, for a clone that has one; nothing for a folder that is
     /// not a clone or a clone with no remote.
     pub remote: Option<String>,
+    /// The tool whose models directory this repository is a category folder of, spelled as
+    /// `loose::ToolLayout::as_str` does. Only loose discovery of a recognized layout sets
+    /// it, so it marks the folders that hold many people's models and are nobody's
+    /// repository.
+    pub tool_layout: Option<String>,
     pub revisions: Vec<DiscoveredRevision>,
     pub refs: Vec<DiscoveredRef>,
 }
@@ -157,6 +162,7 @@ impl DiscoveredRepo {
             git_dir: None,
             default_ref: DEFAULT_REF.to_owned(),
             remote: None,
+            tool_layout: None,
             revisions: Vec::new(),
             refs: Vec::new(),
         }

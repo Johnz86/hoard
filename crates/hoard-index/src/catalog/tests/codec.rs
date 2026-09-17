@@ -120,6 +120,7 @@ fn compact_records_round_trip_without_changing_public_views() -> Result<()> {
         kind: SourceKind::HfCache,
         root_path: "/vault".into(),
         git_dir: None,
+        tool_layout: None,
         revisions: vec![SeedRevision {
             name: "main".to_owned(),
             sha: Some(commit),
@@ -321,6 +322,7 @@ fn cold_records_read_back_through_the_inspector() -> Result<()> {
         kind: SourceKind::HfCache,
         root_path: "/vault".into(),
         git_dir: None,
+        tool_layout: None,
         revisions: cards
             .iter()
             .enumerate()
@@ -507,6 +509,7 @@ fn every_record_round_trips_through_the_compact_codec() -> Result<()> {
         git_dir: Some("/vault/models/acme/.git".to_owned()),
         default_ref: "main".to_owned(),
         remote: Some("https://example.invalid/acme/round-trip".to_owned()),
+        tool_layout: Some("comfyui".to_owned()),
         revisions: vec![models::Revision {
             name: "v2".to_owned(),
             sha: Some(CommitSha::from_bytes([0x5a; 20])),
@@ -781,6 +784,7 @@ fn lean_search_fields_preserve_filters_facets_and_sorting() -> Result<()> {
         kind: SourceKind::HfCache,
         root_path: "/vault".into(),
         git_dir: None,
+        tool_layout: None,
         revisions: vec![SeedRevision {
             name: "main".to_owned(),
             sha: Some(CommitSha::from_bytes([0x99; 20])),

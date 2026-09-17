@@ -419,6 +419,7 @@ fn seeded_repo(reference: &str, repo_type: RepoType) -> SeedRepository {
         kind: SourceKind::HfCache,
         root_path: PathBuf::from("/data/hub"),
         git_dir: None,
+        tool_layout: None,
         revisions: Vec::new(),
     }
 }

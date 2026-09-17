@@ -228,6 +228,7 @@ fn a_file_that_blocks_holds_no_other_file_back() -> Result<()> {
         kind: SourceKind::Loose,
         root_path: storage.clone(),
         git_dir: None,
+        tool_layout: None,
         revisions: vec![SeedRevision {
             name: "main".to_owned(),
             sha: None,
@@ -322,6 +323,7 @@ fn hash_pending_until_reports_progress_before_a_large_file_finishes() -> Result<
         kind: SourceKind::Loose,
         root_path: storage.clone(),
         git_dir: None,
+        tool_layout: None,
         revisions: vec![SeedRevision {
             name: "main".to_owned(),
             sha: None,
@@ -587,6 +589,7 @@ fn a_stop_raised_while_a_file_is_being_read_leaves_that_file_owing() -> Result<(
         kind: SourceKind::Loose,
         root_path: storage.clone(),
         git_dir: None,
+        tool_layout: None,
         revisions: vec![SeedRevision {
             name: "main".to_owned(),
             sha: None,

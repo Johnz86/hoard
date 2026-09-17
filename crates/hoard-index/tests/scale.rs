@@ -1476,6 +1476,7 @@ mod supplemental {
                     },
                     root_path: root_path.clone(),
                     git_dir: None,
+                    tool_layout: None,
                     revisions: (0..REVISIONS)
                         .map(|revision| SeedRevision {
                             name: format!("rev{revision}"),
@@ -1587,6 +1588,7 @@ mod supplemental {
                     kind: SourceKind::Loose,
                     root_path: root_path.clone(),
                     git_dir: None,
+                    tool_layout: None,
                     revisions: vec![SeedRevision {
                         name: "main".to_owned(),
                         sha: Some(commit(index as u64)),

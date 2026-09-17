@@ -27,8 +27,9 @@ const INDEXED_EXTENSIONS: [&str; 2] = ["safetensors", "bin"];
 /// What separates a shard's own number from the size of the set it belongs to.
 const SHARD_SEPARATOR: &str = "-of-";
 
-/// A lone file is not a set, whatever its name claims.
-const MIN_MEMBERS: usize = 2;
+/// The smallest total a set declares. A file that says it is one of one, and an index
+/// document naming a single file, each describe one file rather than a set.
+const MIN_DECLARED: u32 = 2;
 
 /// One file's place in a shard set, as its name spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,12 +159,15 @@ pub fn group_shards(candidates: &[ShardCandidate<'_>]) -> Vec<ShardSet> {
         .iter()
         .filter_map(|candidate| declared_set(candidate, candidates, &positions, &mut claimed))
         .collect();
-    sets.extend(named_sets(candidates, &mut claimed));
+    let named = named_sets(candidates, &mut claimed, &sets);
+    sets.extend(named);
     sets.sort_unstable_by_key(ShardSet::anchor);
     sets
 }
 
-/// The set a `*.index.json` declares, which outranks what the file names suggest.
+/// The set a `*.index.json` declares, which outranks what the file names suggest. A document
+/// naming two or more files declares a set as soon as one of them is on disk, so a download
+/// that landed one piece of fourteen is that set, missing thirteen.
 fn declared_set(
     candidate: &ShardCandidate<'_>,
     candidates: &[ShardCandidate<'_>],
@@ -177,7 +181,10 @@ fn declared_set(
     }
     let directory = directory_of(candidate.rel_path);
     let named = weight_map_files(document);
-    let declared_total = u32::try_from(named.len()).ok();
+    let declared_total = u32::try_from(named.len()).unwrap_or(u32::MAX);
+    if declared_total < MIN_DECLARED {
+        return None;
+    }
     let mut members: Vec<usize> = named
         .into_iter()
         .filter_map(|name| positions.get(join_path(directory, name).as_str()).copied())
@@ -185,7 +192,7 @@ fn declared_set(
         .collect();
     members.sort_unstable();
     members.dedup();
-    if members.len() < MIN_MEMBERS {
+    if members.is_empty() {
         return None;
     }
     order_members(&mut members, candidates);
@@ -202,7 +209,7 @@ fn declared_set(
         directory: directory.to_owned(),
         stem: index_stem(file).to_owned(),
         extension,
-        declared_total,
+        declared_total: Some(declared_total),
     })
 }
 
@@ -214,8 +221,14 @@ struct SetKey<'a> {
     total: u32,
 }
 
-/// The sets the naming convention alone proves: one directory, one stem, one total.
-fn named_sets<'a>(candidates: &[ShardCandidate<'a>], claimed: &mut [bool]) -> Vec<ShardSet> {
+/// The sets the naming convention alone proves: one directory, one stem, one total. A stem a
+/// declared set already stands for yields nothing further, whatever total the files left over
+/// spell, so leftover pieces go back to standing for themselves.
+fn named_sets<'a>(
+    candidates: &[ShardCandidate<'a>],
+    claimed: &mut [bool],
+    declared: &[ShardSet],
+) -> Vec<ShardSet> {
     let mut buckets: BTreeMap<SetKey<'a>, Vec<(u32, usize)>> = BTreeMap::new();
     for (position, candidate) in candidates.iter().enumerate() {
         if claimed[position] {
@@ -224,7 +237,7 @@ fn named_sets<'a>(candidates: &[ShardCandidate<'a>], claimed: &mut [bool]) -> Ve
         let Some(name) = parse_shard_name(file_name(candidate.rel_path)) else {
             continue;
         };
-        if usize::try_from(name.total).unwrap_or(usize::MAX) < MIN_MEMBERS {
+        if name.total < MIN_DECLARED {
             continue;
         }
         let key = SetKey {
@@ -238,7 +251,7 @@ fn named_sets<'a>(candidates: &[ShardCandidate<'a>], claimed: &mut [bool]) -> Ve
     buckets
         .into_iter()
         .filter_map(|(key, mut ordered)| {
-            if ordered.len() < MIN_MEMBERS {
+            if stem_is_declared(declared, &key) {
                 return None;
             }
             ordered.sort_unstable();
@@ -255,6 +268,12 @@ fn named_sets<'a>(candidates: &[ShardCandidate<'a>], claimed: &mut [bool]) -> Ve
             })
         })
         .collect()
+}
+
+fn stem_is_declared(declared: &[ShardSet], key: &SetKey<'_>) -> bool {
+    declared.iter().any(|set| {
+        set.directory == key.directory && set.stem == key.stem && set.extension == key.extension
+    })
 }
 
 /// Puts the lowest numbered shard first, falling back to the path for a member whose name
@@ -521,14 +540,82 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_shard_and_a_single_file_set_stay_alone() {
+    fn one_shard_of_a_declared_fourteen_is_an_incomplete_set() {
+        let mut weights = serde_json::Map::new();
+        for number in 1..=14 {
+            weights.insert(
+                format!("model.layers.{number}.weight"),
+                Value::String(format!("model-{number:05}-of-00014.safetensors")),
+            );
+        }
+        let document = json!({ "weight_map": Value::Object(weights) });
         let paths = [
+            "model.safetensors.index.json",
             "model-00007-of-00014.safetensors",
+        ];
+        let mut found = candidates(&paths);
+        found[0] = found[0].with_index_document(&document);
+
+        let sets = group_shards(&found);
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].members, vec![1]);
+        assert_eq!(sets[0].declared_total, Some(14));
+        assert!(
+            sets[0].is_incomplete(),
+            "one file of the fourteen declared is a download that stopped, not a model"
+        );
+    }
+
+    #[test]
+    fn a_lone_file_named_one_of_three_is_an_incomplete_set() {
+        let paths = ["model-00001-of-00003.safetensors"];
+        let sets = group_shards(&candidates(&paths));
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].members, vec![0]);
+        assert_eq!(sets[0].declared_total, Some(3));
+        assert!(sets[0].is_incomplete());
+    }
+
+    #[test]
+    fn a_file_named_one_of_one_is_not_a_set() {
+        let paths = [
             "data/train-00000-of-00001.parquet",
             "model.safetensors",
             "something-of-note.safetensors",
         ];
         assert!(group_shards(&candidates(&paths)).is_empty());
+    }
+
+    #[test]
+    fn an_index_naming_one_file_declares_no_set() {
+        let document = json!({"weight_map": {"a.weight": "model.safetensors"}});
+        let paths = ["model.safetensors.index.json", "model.safetensors"];
+        let mut found = candidates(&paths);
+        found[0] = found[0].with_index_document(&document);
+
+        assert!(group_shards(&found).is_empty());
+    }
+
+    #[test]
+    fn a_declared_set_claims_its_stem_from_leftover_files() {
+        let document = json!({
+            "weight_map": {
+                "a.weight": "model-00001-of-00010.safetensors",
+                "b.weight": "model-00002-of-00010.safetensors",
+            }
+        });
+        let mut paths: Vec<String> = vec!["model.safetensors.index.json".to_owned()];
+        for number in 1..=10 {
+            paths.push(format!("model-{number:05}-of-00010.safetensors"));
+        }
+        let borrowed: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let mut found = candidates(&borrowed);
+        found[0] = found[0].with_index_document(&document);
+
+        let sets = group_shards(&found);
+        assert_eq!(sets.len(), 1, "the leftover files form no second set");
+        assert_eq!(sets[0].members, vec![1, 2]);
+        assert_eq!(sets[0].declared_total, Some(2));
     }
 
     #[test]

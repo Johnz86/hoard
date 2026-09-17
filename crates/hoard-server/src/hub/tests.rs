@@ -145,6 +145,7 @@ fn seed_repo(root: &Path, repo_type: RepoType, reference: &str) -> SeedRepositor
         kind: SourceKind::HfCache,
         root_path: root.to_path_buf(),
         git_dir: None,
+        tool_layout: None,
         revisions: Vec::new(),
     }
 }

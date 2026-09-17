@@ -32,6 +32,9 @@ pub struct SeedRepository {
     pub kind: SourceKind,
     pub root_path: PathBuf,
     pub git_dir: Option<PathBuf>,
+    /// What loose discovery of a recognized tool layout would have stored, for a seed that
+    /// stands in for a category folder.
+    pub tool_layout: Option<String>,
     pub revisions: Vec<SeedRevision>,
 }
 
@@ -173,6 +176,7 @@ impl Seeding<'_, '_> {
                 .map_or("main", |revision| revision.name.as_str())
                 .to_owned(),
             remote: None,
+            tool_layout: seed.tool_layout.clone(),
             revisions: seed
                 .revisions
                 .iter()

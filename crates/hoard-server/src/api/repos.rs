@@ -394,7 +394,7 @@ fn describe(
             PullSubject {
                 repo: &header.repo,
                 kind: record.kind,
-                bin: is_category_bin(record.kind, &record.repo, &record.source),
+                bin: is_category_bin(&record),
                 artifact: opened.row.as_ref().map(|row| PullArtifact {
                     companion: companion_of(row, &rows).map(|row| row.path.as_str()),
                     ..PullArtifact::from(row)
@@ -475,7 +475,7 @@ pub async fn readme(
             path,
             primary: opened.row.or_else(|| pick_primary(&rows).cloned()),
             kind: record.kind,
-            bin: is_category_bin(record.kind, &record.repo, &record.source),
+            bin: is_category_bin(&record),
             revision: opened.revision,
         })
     })

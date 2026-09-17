@@ -109,6 +109,9 @@ pub struct RepositoryDetail {
     pub default_ref: String,
     /// The URL a clone's `origin` names, for a repository discovery read one from.
     pub remote: Option<String>,
+    /// The tool whose models directory this repository is a category folder of, as loose
+    /// discovery recognized it. Present exactly for a folder that is nobody's repository.
+    pub tool_layout: Option<String>,
     pub node: String,
     pub revisions: Vec<RevisionDetail>,
     pub refs: Vec<RefDetail>,
@@ -538,9 +541,9 @@ impl Catalog {
     /// record. The index is a cache of the records and can lag them: a verdict clears a
     /// record without moving its entry, and a rescan settles a record before a refresh
     /// republishes the document. Every page row is therefore measured against its own record
-    /// by the same predicate the write side used, and the query narrows what has to be read
-    /// rather than deciding what belongs. A catalog with no search directory answers the
-    /// same rows from the records themselves rather than erroring.
+    /// by [`ArtifactRecord::is_queued`], and the query narrows what has to be read rather
+    /// than deciding what belongs. A catalog with no search directory answers the same rows
+    /// from the records themselves rather than erroring.
     pub fn triage_queue(&self, limit: u32) -> Result<Vec<TriageItem>> {
         let threshold = self.stored_triage()?;
         if !self.status()?.search_built {
@@ -566,9 +569,7 @@ impl Catalog {
                 }
                 let id = row.artifact_id.get();
                 let record: Option<ArtifactRecord> = snapshot.get().primary(id)?;
-                let Some(record) = record
-                    .filter(|record| !record.triage_cleared && record.needs_triage(threshold))
-                else {
+                let Some(record) = record.filter(|record| record.is_queued(threshold)) else {
                     continue;
                 };
                 let detail: Option<ArtifactDetail> = snapshot.get().primary(record.id)?;
@@ -594,7 +595,7 @@ impl Catalog {
                 break;
             }
             let record: ArtifactRecord = record?;
-            if record.triage_cleared || !record.needs_triage(threshold) {
+            if !record.is_queued(threshold) {
                 continue;
             }
             let Some(entry) = preferred_entry(
@@ -754,6 +755,7 @@ fn repository_detail(
         git_dir: repository.git_dir.clone(),
         default_ref: repository.default_ref.clone(),
         remote: repository.remote.clone(),
+        tool_layout: repository.tool_layout.clone(),
         node: names.of_source(&repository.source).to_owned(),
         revisions,
         refs,

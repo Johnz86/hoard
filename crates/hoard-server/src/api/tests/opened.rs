@@ -203,6 +203,7 @@ fn bin_repository() -> SeedRepository {
         source: "comfy".to_owned(),
         kind: SourceKind::Loose,
         root_path: std::path::PathBuf::from("/data/comfy/models/loras"),
+        tool_layout: Some("comfyui".to_owned()),
         ..seed_repo(
             "comfy/loras",
             RepoType::Models,

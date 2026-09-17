@@ -373,6 +373,7 @@ fn a_seeded_catalog_answers_like_a_scanned_one() -> Result<()> {
         kind: SourceKind::HfCache,
         root_path: "/data/hub".into(),
         git_dir: None,
+        tool_layout: None,
         revisions: vec![SeedRevision {
             name: "main".into(),
             sha: Some(CommitSha::from_bytes([0x22; 20])),
@@ -660,8 +661,30 @@ fn partial_shard_catalog(directory: &Path) -> Result<Catalog> {
     scan_hub(directory, &hub)
 }
 
+/// A repository holding one of the three shards its index document declares.
+fn lone_shard_catalog(directory: &Path) -> Result<Catalog> {
+    let hub = directory.join("hub");
+    fs::create_dir(&hub)?;
+    let shards = llm_shards();
+    let index = br#"{"metadata":{},"weight_map":{"model.layers.0.self_attn.q_proj.weight":"model-00001-of-00003.safetensors","model.layers.1.self_attn.q_proj.weight":"model-00002-of-00003.safetensors","lm_head.weight":"model-00003-of-00003.safetensors"}}"#.to_vec();
+    hf_cache_repo(
+        &hub,
+        "openai",
+        "gpt-oss-120b",
+        &[
+            (
+                "config.json",
+                br#"{"model_type":"gpt_oss","architectures":["GptOssForCausalLM"]}"#.to_vec(),
+            ),
+            ("model.safetensors.index.json", index),
+            ("model-00003-of-00003.safetensors", shards[2].clone()),
+        ],
+    )?;
+    scan_hub(directory, &hub)
+}
+
 #[test]
-fn the_queue_holds_every_state_triage_row_not_cleared() -> Result<()> {
+fn the_queue_holds_every_state_triage_row_the_set_is_still_short() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let catalog = partial_shard_catalog(directory.path())?;
     let queue = catalog.triage_queue(10)?;
@@ -673,9 +696,37 @@ fn the_queue_holds_every_state_triage_row_not_cleared() -> Result<()> {
         "above the threshold, so the missing shard is the only thing queueing it"
     );
     catalog.clear_triage(item.row.artifact_id)?;
-    assert!(
-        catalog.triage_queue(10)?.is_empty(),
-        "a cleared record leaves the queue"
+    assert_eq!(
+        catalog.triage_queue(10)?.len(),
+        1,
+        "clearing answers what an artifact is and cannot make a set complete"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_verdict_on_an_incomplete_set_leaves_it_queued_and_the_three_counts_equal() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = lone_shard_catalog(directory.path())?;
+    let queued = catalog.triage_queue(10)?;
+    assert_eq!(queued.len(), 1);
+    catalog.put_override(queued[0].row.artifact_id, Some(Role::Llm), None, None)?;
+
+    let queue = catalog.triage_queue(10)?;
+    assert_eq!(
+        queue.first().map(|item| item.reason.as_str()),
+        Some("1 shard present, incomplete"),
+        "a verdict answered its role, and the thirteen files it still lacks queue it"
+    );
+    assert_eq!(
+        catalog.totals()?.triage_artifacts,
+        queue.len() as u64,
+        "the summary counts what the queue holds"
+    );
+    assert_eq!(
+        search(&catalog, "state:triage")?.total,
+        queue.len() as u64,
+        "and so does the shelf the seeded queue reads"
     );
     Ok(())
 }
@@ -1266,6 +1317,7 @@ fn an_any_base_answers_only_its_own_bucket() -> Result<()> {
         kind: SourceKind::HfCache,
         root_path: "/data/hub".into(),
         git_dir: None,
+        tool_layout: None,
         revisions: vec![SeedRevision {
             name: "main".into(),
             sha: None,

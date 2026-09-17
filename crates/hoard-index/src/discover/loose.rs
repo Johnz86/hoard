@@ -103,6 +103,7 @@ pub fn discover(
 pub(super) struct LoosePlan {
     source_org: String,
     root_name: String,
+    layout: Option<ToolLayout>,
     organizations: Option<BTreeSet<String>>,
     units: Vec<LooseUnit>,
 }
@@ -145,6 +146,7 @@ pub(super) fn plan(
             }],
             source_org: org.to_owned(),
             root_name,
+            layout,
             organizations: None,
         });
     }
@@ -162,6 +164,7 @@ pub(super) fn plan(
     Ok(LoosePlan {
         source_org: org.to_owned(),
         root_name,
+        layout,
         organizations: Some(organizations),
         units,
     })
@@ -218,9 +221,26 @@ impl LoosePlan {
                         DiscoveredEntry::from_file(file)
                     })
                     .collect();
-                repository(root, unit, entries)
+                repository(root, unit, entries, self.tool_layout(unit))
             })
             .collect())
+    }
+
+    /// The layout a unit is a category folder of: a recognized root, a unit the source itself
+    /// names rather than a publisher inside it, and a layout whose top level folders really
+    /// are categories. ComfyUI and A1111 keep unrelated weights side by side in `loras` or
+    /// `Stable-diffusion`, so every folder of one is a category and so is the bag of files at
+    /// the root. A Kohya training root and a folder holding a `.gguf` keep one model per
+    /// folder, so only the files directly at the root are nobody's repository.
+    fn tool_layout(&self, unit: &LooseUnit) -> Option<ToolLayout> {
+        let layout = self.layout.filter(|_| unit.org == self.source_org)?;
+        match layout {
+            ToolLayout::ComfyUi | ToolLayout::A1111 => Some(layout),
+            ToolLayout::Kohya | ToolLayout::LlamaCpp => unit
+                .subtrees
+                .contains(&Subtree::RootFiles)
+                .then_some(layout),
+        }
     }
 
     fn unit_of(&self, window: &[LooseUnit], rel_path: &str) -> Option<usize> {
@@ -240,9 +260,15 @@ impl LoosePlan {
     }
 }
 
-fn repository(root: &Path, unit: &LooseUnit, entries: Vec<DiscoveredEntry>) -> DiscoveredRepo {
+fn repository(
+    root: &Path,
+    unit: &LooseUnit,
+    entries: Vec<DiscoveredEntry>,
+    layout: Option<ToolLayout>,
+) -> DiscoveredRepo {
     let repo = RepoId::new(RepoType::Models, Some(unit.org.clone()), unit.name.clone());
     let mut discovered = DiscoveredRepo::new(repo, root.to_path_buf());
+    discovered.tool_layout = layout.map(|layout| layout.as_str().to_owned());
     discovered
         .revisions
         .push(DiscoveredRevision::new(RevisionName::Synthetic, entries));
@@ -589,6 +615,108 @@ mod tests {
         let entry = &loras.revisions[0].entries[1];
         assert!(entry.present());
         assert!(entry.abs_path.as_ref().is_some_and(|path| path.is_file()));
+    }
+
+    #[test]
+    fn a_category_folder_of_a_tool_layout_carries_the_layout() {
+        let dir = TempDir::new().expect("temp dir");
+        comfy_tree(dir.path());
+        write(
+            dir.path(),
+            "zit/Z-Detail-Slider/model.safetensors",
+            b"one model",
+        );
+        write(
+            dir.path(),
+            "zit/Z-Grain/model.safetensors",
+            b"another model",
+        );
+
+        let repos = discover(
+            dir.path(),
+            "comfy",
+            false,
+            &WalkOptions::default(),
+            &NoiseFilter::default(),
+        )
+        .expect("loose root is readable");
+        let layout_of = |name: &str| {
+            repos
+                .iter()
+                .find(|repo| repo.repo.name() == name)
+                .and_then(|repo| repo.tool_layout.clone())
+        };
+        assert_eq!(layout_of("loras").as_deref(), Some("comfyui"));
+        assert_eq!(layout_of("checkpoints").as_deref(), Some("comfyui"));
+        let published: Vec<&DiscoveredRepo> = repos
+            .iter()
+            .filter(|repo| repo.repo.org() == Some("zit"))
+            .collect();
+        assert_eq!(published.len(), 2, "the publisher's models were found");
+        assert!(
+            published.iter().all(|repo| repo.tool_layout.is_none()),
+            "a publisher's model inside a recognized root is a repository of its own"
+        );
+    }
+
+    /// A llama.cpp style root: a model beside the loose files a person left at the top.
+    fn gguf_root(dir: &Path) {
+        write(dir, "ggml-model-q4_0.gguf", b"GGUF");
+        write(dir, "Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf", b"GGUF");
+        write(dir, "Qwen3-8B-GGUF/README.md", b"# card");
+    }
+
+    fn found<'a>(repos: &'a [DiscoveredRepo], name: &str) -> &'a DiscoveredRepo {
+        repos
+            .iter()
+            .find(|repo| repo.repo.name() == name)
+            .expect("the repository exists")
+    }
+
+    #[test]
+    fn a_model_folder_under_a_gguf_root_is_not_a_category_folder() {
+        let dir = TempDir::new().expect("temp dir");
+        gguf_root(dir.path());
+        assert_eq!(layout(dir.path()), Some(ToolLayout::LlamaCpp));
+
+        let repos = per_folder(dir.path(), "llama");
+        assert_eq!(
+            found(&repos, "Qwen3-8B-GGUF").tool_layout,
+            None,
+            "a folder of one model is a repository a person can pull whole"
+        );
+    }
+
+    #[test]
+    fn files_directly_in_a_gguf_root_are() {
+        let dir = TempDir::new().expect("temp dir");
+        gguf_root(dir.path());
+        let root_name = dir
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("temp dir is named");
+
+        let repos = per_folder(dir.path(), "llama");
+        assert_eq!(
+            found(&repos, root_name).tool_layout.as_deref(),
+            Some("llama.cpp"),
+            "whatever was dropped at the root is nobody's repository"
+        );
+    }
+
+    #[test]
+    fn a_per_model_folder_under_a_plain_root_carries_none() {
+        let dir = TempDir::new().expect("temp dir");
+        write(dir.path(), "gpt-oss-120b/model.safetensors", b"weights");
+        write(dir.path(), "sdxl-base/model.safetensors", b"weights");
+
+        let repos = per_folder(dir.path(), "bulk");
+        assert_eq!(repos.len(), 2);
+        assert!(
+            repos.iter().all(|repo| repo.tool_layout.is_none()),
+            "no layout was recognized, so no folder is a category folder"
+        );
     }
 
     #[test]

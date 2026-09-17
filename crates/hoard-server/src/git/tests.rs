@@ -97,6 +97,7 @@ fn seed_catalog(catalog: &Catalog, git_dir: &Path) {
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| git_dir.to_path_buf()),
                 git_dir: Some(git_dir.to_path_buf()),
+                tool_layout: None,
                 revisions: vec![SeedRevision {
                     name: "main".to_owned(),
                     sha: Some(CommitSha::from_bytes(LFS_REVISION)),
@@ -123,6 +124,7 @@ fn seed_catalog(catalog: &Catalog, git_dir: &Path) {
                 kind: SourceKind::HfCache,
                 root_path: git_dir.to_path_buf(),
                 git_dir: None,
+                tool_layout: None,
                 revisions: vec![SeedRevision {
                     name: "main".to_owned(),
                     sha: Some(CommitSha::from_bytes([0x66; 20])),

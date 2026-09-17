@@ -422,6 +422,7 @@ fn seed_repo_with_refs(
         kind: SourceKind::HfCache,
         root_path: std::path::PathBuf::from("/data/hub"),
         git_dir: None,
+        tool_layout: None,
         revisions: vec![SeedRevision {
             name: "main".to_owned(),
             sha: Some(hoard_core::CommitSha::from_bytes([byte; 20])),

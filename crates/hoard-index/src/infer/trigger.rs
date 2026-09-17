@@ -117,6 +117,9 @@ fn flatten_list(raw: &str) -> String {
 }
 
 fn from_file_name(input: &InferInput<'_>) -> Option<(String, EvidenceSource, f32, String)> {
+    if crate::shard::parse_shard_name(input.file_name).is_some() {
+        return None;
+    }
     let stem = input
         .file_name
         .rsplit_once('.')
@@ -247,6 +250,35 @@ mod tests {
         assert_eq!(
             verdict.evidence.first().map(|item| item.confidence),
             Some(rules::FILENAME_HINT)
+        );
+    }
+
+    #[test]
+    fn a_shard_file_name_is_not_a_trigger_phrase() {
+        let path = Path::new("/hub/models--mistral--Ministral/model-00001-of-00004.safetensors");
+        let verdict = infer_trigger(&InferInput::new(
+            ArtifactFormat::Safetensors,
+            path,
+            "model-00001-of-00004.safetensors",
+            8,
+        ));
+        assert_eq!(verdict.trigger, None);
+        assert!(verdict.evidence.is_empty());
+    }
+
+    #[test]
+    fn a_name_that_only_looks_like_a_shard_keeps_its_words() {
+        let path = Path::new("/models/loras/style-2-of-hearts.safetensors");
+        let verdict = infer_trigger(&InferInput::new(
+            ArtifactFormat::Safetensors,
+            path,
+            "style-2-of-hearts.safetensors",
+            8,
+        ));
+        assert_eq!(
+            verdict.trigger.as_deref(),
+            Some("style of hearts"),
+            "both numbers have to be digits for a name to be a shard's"
         );
     }
 }

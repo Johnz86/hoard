@@ -396,6 +396,37 @@ the catalog at `<data_dir>/native`.
   A file whose header would not parse at all still becomes an artifact, so it reaches triage.
   A set is named `<directory>/<stem>.<extension>`, its own path inside the revision, and two
   sets that would read the same are told apart by how many files each holds.
+- **A set is what declares two or more files, not what holds two.** A weight map naming at
+  least two files is a set as soon as one of them is present and unclaimed, so one
+  `model-00007-of-00014.safetensors` beside an index naming fifteen is that set with one
+  member: the row is triage and the queue reads `1 shard present, incomplete`. The declared
+  total is the count of distinct files the map names, never what a file name spells. A name or
+  a map declaring one file declares no set, and `-00000-of-00001` is a single file.
+- **A declared set claims its stem.** Where a weight map produced a set for one directory,
+  stem and extension, the naming convention forms nothing further from the unclaimed files of
+  that stem, whatever total their names spell: they go back to standing for themselves, and
+  the zero-tensor rule keeps a placeholder from becoming an artifact. One set left is one set
+  to name, so no `(2 files)` suffix is spoken over a second set that was never there. A
+  disambiguating suffix counts in the plural it has: `(1 file)`, then `(2 files)`.
+- A shard's own file name yields no trigger words: `infer_trigger`'s file-name fallback
+  refuses a name `shard::parse_shard_name` reads, so `model-00001-of-00004.safetensors` has no
+  trigger while `style-2-of-hearts.safetensors` keeps its words.
+- A repository carries the tool layout loose discovery recognized, `Repository::tool_layout`,
+  spelled as `ToolLayout::as_str` does. It is set exactly for a category folder of a
+  recognized root: the layout was recognized, the unit's org is the source's own, **and** the
+  layout is one whose top level folders are categories. ComfyUI and A1111 keep unrelated
+  weights side by side in `loras` or `Stable-diffusion`, so every folder of one carries the
+  layout and so does the bag of files at the root; a Kohya training root and a root holding a
+  `.gguf` keep one model per folder, so only the root-files unit carries it there. A publisher
+  folder inside such a root, a per-model folder of a plain loose source, an hf-cache
+  repository, a git clone and every mirror, pull or peer repository carry nothing, and the
+  server's category-folder test is that one field rather than a comparison of an org with a
+  source name.
+- A verdict cannot make a set complete. `ArtifactRecord::is_queued` is what the triage queue
+  reads: an incomplete record is queued whatever `triage_cleared` says, so confirming a role
+  on one leaves it in the queue with the incomplete reason and the queue, the summary's
+  `triage_artifacts` and the `state:triage` shelf stay one number. Landing the missing files,
+  or a rescan dropping a path rejected as noise, is what takes it out.
 - An unreadable file keeps its path and is recorded as an absent entry with no artifact; a
   git-lfs pointer stub is absent with the pointer's size and hash; a fetched LFS weight is an
   ordinary artifact.

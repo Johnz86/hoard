@@ -1327,6 +1327,98 @@ fn an_incomplete_shard_set_is_triage_and_counts_what_it_has() -> Result<()> {
 }
 
 #[test]
+fn the_tool_layout_survives_the_scan_and_the_read() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("models");
+    fs::create_dir_all(input.join("loras"))?;
+    fs::create_dir_all(input.join("checkpoints"))?;
+    fs::write(input.join("loras/style.safetensors"), lora_header())?;
+    fs::write(input.join("checkpoints/base.safetensors"), plain_header())?;
+    let config = IndexConfig {
+        sources: vec![source(&input, "comfy")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &directory.path().join("native"),
+        "n",
+        &config,
+        HashPolicy::Never,
+        |_, _| {},
+    )?;
+
+    let named =
+        |name: &str| RepoId::new(RepoType::Models, Some("comfy".to_owned()), name.to_owned());
+    assert_eq!(
+        repository_of(&catalog, &named("loras"))?
+            .tool_layout
+            .as_deref(),
+        Some("comfyui")
+    );
+    assert_eq!(
+        repository_of(&catalog, &named("checkpoints"))?
+            .tool_layout
+            .as_deref(),
+        Some("comfyui")
+    );
+
+    let second = tempfile::tempdir()?;
+    let hub = second.path().join("hub");
+    fs::create_dir(&hub)?;
+    hf_cache_repo(
+        &hub,
+        "Qwen",
+        "Qwen3-0.6B",
+        &[("model.safetensors", plain_header())],
+    )?;
+    let cached = scan_hub(second.path(), &hub)?;
+    assert_eq!(
+        only_repository(&cached)?.tool_layout,
+        None,
+        "a cache repository is nobody's category folder"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_lone_shard_queues_with_a_reason_and_is_not_served_as_a_model() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let hub = directory.path().join("hub");
+    fs::create_dir(&hub)?;
+    let shards = llm_shards();
+    let index = br#"{"metadata":{},"weight_map":{"model.layers.0.self_attn.q_proj.weight":"model-00001-of-00003.safetensors","model.layers.1.self_attn.q_proj.weight":"model-00002-of-00003.safetensors","lm_head.weight":"model-00003-of-00003.safetensors"}}"#.to_vec();
+    hf_cache_repo(
+        &hub,
+        "openai",
+        "gpt-oss-120b",
+        &[
+            (
+                "config.json",
+                br#"{"model_type":"gpt_oss","architectures":["GptOssForCausalLM"]}"#.to_vec(),
+            ),
+            ("model.safetensors.index.json", index),
+            ("model-00003-of-00003.safetensors", shards[2].clone()),
+        ],
+    )?;
+    let catalog = scan_hub(directory.path(), &hub)?;
+
+    let rows = search(&catalog, "")?;
+    assert_eq!(rows.total, 1, "the one shard present is the declared set");
+    assert_eq!(rows.rows[0].shard_count, 1);
+    assert_eq!(rows.rows[0].state, State::Triage);
+    let queue = catalog.triage_queue(10)?;
+    assert_eq!(
+        queue.first().map(|item| item.reason.as_str()),
+        Some("1 shard present, incomplete")
+    );
+    assert_eq!(
+        catalog.totals()?.triage_artifacts,
+        queue.len() as u64,
+        "the summary counts what the queue holds"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_weight_map_groups_shards_the_naming_convention_would_miss() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let hub = directory.path().join("hub");

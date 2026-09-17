@@ -171,9 +171,15 @@ it and `SoulsMix` does not.
   projector, name both files in the one line, because neither is usable without the other.
   `repository` is the same line with no file scope, for pulling everything the repository
   holds; it is `null` when the command names no artifact, `null` for a category folder of
-  a tool layout (a loose repository filed under the name of its own source, `comfy/loras`),
-  which is nobody's repository and whose whole-folder pull would be every LoRA on the disk,
-  and `null` when it would repeat the `hf` line word for word.
+  a tool layout, which is nobody's repository and whose whole-folder pull would be every LoRA
+  on the disk, and `null` when it would repeat the `hf` line word for word. A repository is a
+  category folder when loose discovery made it from a category folder of a layout it
+  recognized and stored that layout on the record, `comfy/loras` under a ComfyUI root. A
+  per-model folder of a plain loose source, `bulk/gpt-oss-120b` under a source named `bulk`,
+  is a repository a person can pull whole even though its org is that source's own name, and
+  so is a model folder under a Kohya training root or a root holding a `.gguf`, whose top
+  level folders are models rather than categories: there, only the files dropped directly at
+  the root are a category folder.
   `path` is the path a person walked to the file, which for an hf-cache artifact is the
   snapshot link rather than the blob under `blobs/`.
   A file name is always quoted for the shell. The repository reference and the
@@ -190,7 +196,10 @@ it and `SoulsMix` does not.
 - `GET /api/v1/triage`: artifacts still waiting for a verdict, with `guess` (`role`, `base`,
   `confidence`), `header` (tensor count, key prefixes, hidden dim, dtype) and `reason`, the
   sentence naming why the artifact is queued: `role unclassified`, `role vae at 0.51, below
-  0.85`, or `3 shards present, incomplete`. The count, the prefixes and
+  0.85`, or `3 shards present, incomplete`, which reads `1 shard present, incomplete` for one
+  shard of a set whose index document names fifteen. A verdict answers the role questions and
+  cannot make a set complete, so an incomplete artifact stays in this queue after one, with
+  the incomplete sentence as its reason. The count, the prefixes and
   the dtype are what the sniff measured over the whole file; the hidden dimension is read
   from the at most sixteen tensor samples the stored header keeps, thinned by a stride from
   the sniff's draw rather than taken off its front, not from every tensor the file holds. Inference itself ran over all of them before the row was written.

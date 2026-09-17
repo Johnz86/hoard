@@ -11,7 +11,7 @@ use hoard_core::{
     SubRole, format_size,
 };
 use hoard_index::IndexError;
-use hoard_index::catalog::EntryDetail;
+use hoard_index::catalog::{EntryDetail, RepositoryDetail};
 use hoard_index::config::SourceKind;
 use hoard_index::discover::DEFAULT_REF;
 use hoard_index::row::SearchRow;
@@ -594,10 +594,10 @@ pub fn pull_commands(url: &str, subject: PullSubject<'_>, path: Option<String>) 
     }
 }
 
-/// A loose repository filed under the name of its own source is a category folder of a tool
-/// layout: `comfy/loras` holds every LoRA on the disk and is nobody's repository.
-pub fn is_category_bin(kind: SourceKind, repo: &RepoId, source: &str) -> bool {
-    kind == SourceKind::Loose && repo.org() == Some(source)
+/// A repository loose discovery made from a category folder of a tool layout it recognized:
+/// `comfy/loras` holds every LoRA on the disk and is nobody's repository.
+pub fn is_category_bin(record: &RepositoryDetail) -> bool {
+    record.tool_layout.is_some()
 }
 
 /// The role of the file an artifact of this role is useless without, for the two roles that
@@ -738,6 +738,30 @@ mod tests {
 
     fn repo_of(qualified: &str) -> RepoId {
         RepoId::parse_qualified(qualified).expect("repo parses")
+    }
+
+    fn repository_record(
+        qualified: &str,
+        source: &str,
+        kind: SourceKind,
+        layout: Option<&str>,
+    ) -> RepositoryDetail {
+        RepositoryDetail {
+            id: hoard_core::RepoRowId::new(1),
+            repo: repo_of(qualified),
+            source: source.to_owned(),
+            kind,
+            root_path: "/data/models".to_owned(),
+            git_dir: None,
+            default_ref: DEFAULT_REF.to_owned(),
+            remote: None,
+            tool_layout: layout.map(str::to_owned),
+            node: "workstation".to_owned(),
+            revisions: Vec::new(),
+            refs: Vec::new(),
+            present_files: 1,
+            present_bytes: 1_024,
+        }
     }
 
     fn one_file(path: &str) -> PullArtifact<'_> {
@@ -1313,22 +1337,28 @@ mod tests {
     }
 
     #[test]
-    fn a_loose_repository_under_its_sources_own_name_is_a_bin() {
-        assert!(is_category_bin(
+    fn only_a_category_folder_of_a_recognized_layout_is_a_bin() {
+        assert!(is_category_bin(&repository_record(
+            "models/comfy/loras",
+            "comfy",
             SourceKind::Loose,
-            &repo_of("models/comfy/loras"),
-            "comfy"
-        ));
-        assert!(!is_category_bin(
-            SourceKind::Loose,
-            &repo_of("models/lmstudio-community/Qwen3-VL-8B-Instruct-GGUF"),
-            "lmstudio"
-        ));
-        assert!(!is_category_bin(
+            Some("comfyui")
+        )));
+        assert!(
+            !is_category_bin(&repository_record(
+                "models/bulk/gpt-oss-120b",
+                "bulk",
+                SourceKind::Loose,
+                None
+            )),
+            "a per-model folder of a plain loose source is a repository a person can pull"
+        );
+        assert!(!is_category_bin(&repository_record(
+            "models/Qwen/Qwen3-0.6B",
+            "hub",
             SourceKind::HfCache,
-            &repo_of("models/comfy/loras"),
-            "comfy"
-        ));
+            None
+        )));
     }
 
     #[test]

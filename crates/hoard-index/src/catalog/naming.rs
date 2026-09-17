@@ -173,8 +173,15 @@ pub(super) fn disambiguate_labels(
     member_counts: &[usize],
     anchors: &[&str],
 ) {
-    disambiguate_by(labels, |set| format!(" ({} files)", member_counts[set]));
+    disambiguate_by(labels, |set| file_count(member_counts[set]));
     disambiguate_by(labels, |set| format!(" {}", anchors[set]));
+}
+
+fn file_count(files: usize) -> String {
+    match files {
+        1 => " (1 file)".to_owned(),
+        many => format!(" ({many} files)"),
+    }
 }
 
 /// Appends the suffix to every label more than one set carries, leaving a label already
@@ -426,9 +433,18 @@ mod tests {
             "a set at the root still spells the file its shards are"
         );
 
-        let mut labels = vec!["unet".to_owned(), "unet".to_owned(), "vae".to_owned()];
-        disambiguate_labels(&mut labels, &[2, 8, 3], &["a.safetensors"; 3]);
-        assert_eq!(labels, vec!["unet (2 files)", "unet (8 files)", "vae"]);
+        let mut labels = vec![
+            "unet".to_owned(),
+            "unet".to_owned(),
+            "unet".to_owned(),
+            "vae".to_owned(),
+        ];
+        disambiguate_labels(&mut labels, &[1, 2, 8, 3], &["a.safetensors"; 4]);
+        assert_eq!(
+            labels,
+            vec!["unet (1 file)", "unet (2 files)", "unet (8 files)", "vae"],
+            "the set holding one file of the many it declares says file, not files"
+        );
     }
 
     #[test]

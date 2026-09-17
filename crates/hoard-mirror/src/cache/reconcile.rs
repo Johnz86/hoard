@@ -115,6 +115,7 @@ mod tests {
                 kind: SourceKind::HfCache,
                 root_path: directory.to_path_buf(),
                 git_dir: None,
+                tool_layout: None,
                 revisions: vec![SeedRevision {
                     name: "main".to_owned(),
                     sha: Some(commit()),

@@ -213,9 +213,7 @@ pub async fn pull_command(
             kind: record
                 .as_ref()
                 .map_or(SourceKind::Auto, |record| record.kind),
-            bin: record
-                .as_ref()
-                .is_some_and(|record| is_category_bin(record.kind, &repo, &record.source)),
+            bin: record.as_ref().is_some_and(is_category_bin),
             repo,
             row,
             rows,

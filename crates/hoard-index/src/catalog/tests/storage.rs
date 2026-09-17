@@ -170,6 +170,7 @@ fn an_entry_is_found_by_its_location_alone() -> Result<()> {
         kind: SourceKind::HfCache,
         root_path: "/vault".into(),
         git_dir: None,
+        tool_layout: None,
         revisions: vec![
             revision("main", vec![located("a", 10), located("a/b", 20)]),
             revision("next", vec![located("a", 30)]),
@@ -306,6 +307,7 @@ fn location_keys_separate_repositories_revisions_and_paths() -> Result<()> {
             kind: SourceKind::HfCache,
             root_path: "/vault".into(),
             git_dir: None,
+            tool_layout: None,
             revisions: vec![revision("main", 10), revision("next", 100)],
         })
     };
@@ -495,6 +497,7 @@ fn repository_and_revision_listings_keep_their_order() -> Result<()> {
         kind: SourceKind::HfCache,
         root_path: "/vault".into(),
         git_dir: None,
+        tool_layout: None,
         revisions: (0..2)
             .map(|ordinal| SeedRevision {
                 name: format!("rev{ordinal}"),
@@ -623,8 +626,8 @@ fn overwrite_rows(path: &Path, table: &str, model: u32) -> Result<usize> {
 }
 
 #[test]
-fn format_version_is_thirteen() {
-    assert_eq!(FORMAT_VERSION, 13);
+fn format_version_is_fourteen() {
+    assert_eq!(FORMAT_VERSION, 14);
 }
 
 #[test]

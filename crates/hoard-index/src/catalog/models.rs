@@ -54,6 +54,10 @@ pub(super) struct Repository {
     pub(super) default_ref: String,
     /// The URL a clone's `origin` names, for a repository discovery read one from.
     pub(super) remote: Option<String>,
+    /// The tool whose models directory this repository is a category folder of, as loose
+    /// discovery recognized it. Such a folder holds whatever a person put in it and is
+    /// nobody's repository; everything else carries nothing here.
+    pub(super) tool_layout: Option<String>,
     pub(super) revisions: Vec<Revision>,
     /// The entries of this repository whose bytes are on a node, and the bytes they hold.
     ///
@@ -147,6 +151,15 @@ impl ArtifactRecord {
     /// however confident its inference was.
     pub(super) fn needs_triage(&self, threshold: f32) -> bool {
         self.artifact.needs_triage(threshold) || self.incomplete
+    }
+
+    /// Whether the triage queue still holds this record: it wants a person, and nothing that
+    /// could answer it has. A verdict answers what an artifact is and cannot make a set
+    /// complete, so an incomplete set stays queued whatever was cleared on it; the missing
+    /// files landing, or a rescan dropping a path rejected as noise, is what takes it out.
+    /// The summary count and the entry state a scan writes already read it that way.
+    pub(super) fn is_queued(&self, threshold: f32) -> bool {
+        self.incomplete || (!self.triage_cleared && self.needs_triage(threshold))
     }
 }
 

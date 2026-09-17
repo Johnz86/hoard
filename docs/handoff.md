@@ -3,6 +3,57 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest wave: a partial set is partial, and a category folder is what discovery saw
+
+A set was what held two files rather than what declared two, so `openai/gpt-oss-120b`, an index
+naming fifteen files with one of them present, read as a whole local 4.1 GB `llm` and never
+reached triage. (The names say fourteen and the `weight_map` names
+`model-00000-of-00014.safetensors` through `model-00014-of-00014.safetensors`; the map is what
+a declared total reads. What that download did land sits unfinished under
+`models--openai--gpt-oss-120b/.cache/huggingface/download/`, fourteen `.incomplete` files dated
+10 January, which the walker skips.) `shard.rs` now makes a set from a declared total of two or
+more as soon as one member is present and unclaimed, so that row reads `triage`, `shard_count`
+1 and the queue says `1 shard present, incomplete`; a name or a weight map declaring one file
+declares no set. A declared set also claims its stem, so the files a map left over form no
+phantom second set: `nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4` is one artifact named
+`model.safetensors` where it read `model.safetensors (2 files)`. A shard's own file name yields
+no trigger words, so eight rows lost triggers like `model of`, `data of` and `train of` and
+carry none. Loose discovery stores the tool layout it recognized on the repository
+(`Repository::tool_layout`, `comfyui` for a category folder of a ComfyUI root), and
+`is_category_bin` reads that field instead of comparing a repository's org with its source's
+name: `comfy/loras` still offers no whole-folder pull line, and a per-model folder sitting
+directly under a plain loose source no longer loses one. Only the layouts whose top level
+folders are categories stamp their folders: under a Kohya training root or a folder holding a
+`.gguf`, a top level folder is one model and keeps its pull line, and only the files dropped
+directly at the root are nobody's repository. A verdict cannot make a set complete, so an
+incomplete record stays in the queue however it was cleared, which keeps the queue, the summary
+and the `state:triage` shelf at one number.
+`catalog::FORMAT_VERSION` is 14: the catalog is deleted and rebuilt from disk.
+
+Measured on this workstation's real files, a release build scanning the same three sources
+into a scratch catalog on port 7199, against the user's server on 7099: artifacts 232 to 234,
+the two extra being files the 7099 catalog was scanned before they were on disk; the triage
+total 22 to 22 (gpt-oss-120b joined, and `diffusiongemma-26B-A4B-it-NVFP4` left it through the
+previous wave, which the 7099 process predates); and the triage total, the `triage queue` shelf
+and the length of `/api/v1/triage` all 22. No repository on this disk is a per-model folder
+directly under a plain loose source, so the narrowing of `is_category_bin` is proven by its
+unit tests and by no regression on the fourteen `comfy/*` folders rather than by a row that
+changed. `mistralai/Ministral-3-14B-Instruct-2512`'s `model.safetensors` keeps the trigger
+`mistral-common`: it comes from the card's frontmatter, which outranks the file name, so the
+shard-name guard does not reach it.
+
+Two things this wave named and did not fix. A loadout pin on an incomplete set resolves to
+`PinResolution::Present` and its pull line names the one shard that is there, because
+`api/common.rs::hf_scope` reads `shard_count <= 1` as a single file: the copied command
+re-fetches what the disk already holds instead of the set's `--include` globs. A correct fix
+needs the record's `incomplete` flag carried on `SearchRow`, which is a record and index change
+rather than a spelling one. Trigger words also bleed across a category folder: `naming.rs:72-79`
+keeps one revision-wide card, the shallowest README, and `scan/plan.rs:496` hands
+`plan.context.frontmatter()` to every artifact of the revision, so
+`comfy/text_encoders/ministral-3-3b.safetensors` carries `gemma3, gemma, google` from a
+neighbouring `gemma-3-12b-it-qat-q4_0-unquantized/README.md`. The rule to adopt is
+nearest-directory scoping, exactly as `config_for` and `quant_config_for` already do.
+
 ## Latest wave: read the whole header before naming the base
 
 Every base and role rule matched against a 64-name sample, and the sampler's own keyword list
@@ -51,12 +102,6 @@ written, and the loadout `hf-script` export carries shard globs, `--revision` an
 there is none. `hoard-server`, `web/` and one public function in `hoard_index::shard`;
 nothing stored changed and `catalog::FORMAT_VERSION` stays 12.
 
-`is_category_bin` reads a loose repository whose org is its source's name, which catches a
-per-model folder sitting directly under a plain loose source as well as a real category
-folder; such a repository loses only its whole-repository pull line, and its own file is
-still named. The `whole-header-inference` wave stores the tool layout a source was
-recognized as, and the test becomes exact then.
-
 ## Latest wave: the any bucket is active only when the query names any
 
 The base rail decided a bucket's `active` flag with `Base::matches`, whose `any` wildcard is a
@@ -75,8 +120,7 @@ as a phrase whose last word is a prefix, so `gpt-oss`, `Q4_K_M` and `loxsSoulsMi
 and 1 against this workstation's caches where each answered 0; a `~` token matches every word
 as a prefix in any order. The `hf` pull line of an artifact held outside `main` carries
 `--revision <sha>`, so artifact `a_14`'s copied command downloads its 5 files instead of none.
-Nothing stored changed shape and `catalog::FORMAT_VERSION` stays 12. Left open by the
-2026-09-17 review: the one-shard-of-N model.
+Nothing stored changed shape and `catalog::FORMAT_VERSION` stays 12.
 
 ## Latest wave: a format bump no longer costs a rehash
 

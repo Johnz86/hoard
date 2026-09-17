@@ -704,6 +704,7 @@ fn a_base_bucket_keeps_its_label_only_when_every_segment_agrees() -> Result<()> 
         kind: SourceKind::HfCache,
         root_path: "/vault".into(),
         git_dir: None,
+        tool_layout: None,
         revisions: vec![SeedRevision {
             name: "main".to_owned(),
             sha: None,

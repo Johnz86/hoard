@@ -270,6 +270,7 @@ mod tests {
             git_dir: None,
             default_ref: "main".to_owned(),
             remote: None,
+            tool_layout: None,
             revisions: Vec::new(),
             present_files: files,
             present_bytes: bytes,

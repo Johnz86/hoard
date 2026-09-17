@@ -296,6 +296,7 @@ impl Ingesting<'_, '_> {
             git_dir: None,
             default_ref: crate::discover::DEFAULT_REF.to_owned(),
             remote: None,
+            tool_layout: None,
             revisions: Vec::new(),
             present_files: 0,
             present_bytes: 0,
