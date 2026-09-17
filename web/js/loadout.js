@@ -65,6 +65,8 @@ export function renderDrawer(app) {
             { class: "drawer-empty" },
             "EMPTY LOADOUT",
             el("br"),
+            "a checkpoint and the adapters you use with it",
+            el("br"),
             "select artifacts in the index and press ",
             el("span", { class: "amber", text: "L" })
         );
@@ -79,7 +81,12 @@ export function renderDrawer(app) {
                     el("span", { class: "role-mark" }),
                     el("span", { class: "role-code", text: roleCode(item) })
                 ),
-                el("span", { class: "drawer-name", text: item.name }),
+                el(
+                    "span",
+                    { class: "drawer-name" },
+                    item.prefix ? el("span", { class: "cell-org", text: item.prefix }) : null,
+                    item.name
+                ),
                 el("span", { class: "drawer-rev", text: item.revision || item.rev || "—" }),
                 el("span", { class: "drawer-weight", text: weightLabel(item) }),
                 el("span", {

@@ -21,6 +21,8 @@ use hoard_index::catalog::{
 use hoard_index::config::{HashPolicy, SourceConfig, SourceKind};
 use hoard_index::discover::RefKind;
 
+mod opened;
+
 use crate::api;
 use crate::config::HoardConfig;
 use crate::error::ApiError;
@@ -1001,6 +1003,7 @@ async fn a_pull_command_scopes_hf_to_the_file_and_carries_no_dead_git_line() {
             "git": null,
             "hf": "HF_ENDPOINT=http://hoard.lan:7099 hf download kohya/film-grain-35mm \
                    'film-grain-35mm.safetensors'",
+            "repository": "HF_ENDPOINT=http://hoard.lan:7099 hf download kohya/film-grain-35mm",
             "path": "/mnt/vault/loras/film-grain-35mm.safetensors"
         })
     );
@@ -1258,7 +1261,8 @@ async fn a_repository_files_tab_names_every_kind_and_state() {
             "size_human": "84 B",
             "state": "present",
             "state_label": "PRESENT",
-            "artifact_id": Value::Null
+            "artifact_id": Value::Null,
+            "opened": false
         })
     );
     assert_eq!(rows[1]["kind"], "config");
@@ -1540,7 +1544,7 @@ async fn loadout_items_are_pinned_removed_and_exported() {
         "every interpolated value is quoted for the shell: {script_text}"
     );
     assert!(
-        script_text.contains("hf download 'kohya/film-grain-35mm' 'film-grain-35mm.safetensors'"),
+        script_text.contains("hf download kohya/film-grain-35mm 'film-grain-35mm.safetensors'"),
         "{script_text}"
     );
 

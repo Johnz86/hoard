@@ -9,8 +9,10 @@ export const TABS = ["FILES", "REFS", "CARD", "COMPAT", "USAGE"];
 const AMBER_SHARE = 0.7;
 const FILE_STATE_LABEL = { present: "PRESENT", deduped: "DEDUPED", lfs_ptr: "LFS PTR" };
 
+let revealed = null;
+
 function key(detail) {
-    return `${detail.type}/${detail.org}/${detail.name}@${detail.rev || ""}`;
+    return `${detail.type}/${detail.org}/${detail.name}@${detail.rev || ""}#${detail.aid || ""}`;
 }
 
 async function fetchInto(app, slot, loader) {
@@ -30,28 +32,17 @@ async function fetchInto(app, slot, loader) {
 
 export function loadDetail(app) {
     const detail = app.state.detail;
-    fetchInto(app, "repo", () => api.repo(detail.type, detail.org, detail.name));
+    fetchInto(app, "repo", () => api.repo(detail.type, detail.org, detail.name, detail.aid));
     loadTab(app);
 }
 
 export function loadTab(app) {
     const detail = app.state.detail;
-    const { type, org, name, rev } = detail;
-    if (detail.tab === "FILES") fetchInto(app, "files", () => api.repoFiles(type, org, name, rev));
-    if (detail.tab === "CARD") fetchInto(app, "readme", () => api.repoReadme(type, org, name, rev));
-    if (detail.tab === "COMPAT") fetchInto(app, "compat", () => api.repoCompat(type, org, name, rev));
+    const { type, org, name, rev, aid } = detail;
+    if (detail.tab === "FILES") fetchInto(app, "files", () => api.repoFiles(type, org, name, rev, aid));
+    if (detail.tab === "CARD") fetchInto(app, "readme", () => api.repoReadme(type, org, name, rev, aid));
+    if (detail.tab === "COMPAT") fetchInto(app, "compat", () => api.repoCompat(type, org, name, rev, aid));
     if (detail.tab === "USAGE") fetchInto(app, "usage", () => api.repoUsage(type, org, name));
-}
-
-function currentRef(repo) {
-    const refs = (repo && repo.refs) || [];
-    return refs.find((ref) => ref.current) || refs[0] || null;
-}
-
-function refLabel(ref, fallback) {
-    if (!ref) return fallback ? `refs/heads/${fallback}` : "refs/heads/main";
-    if (String(ref.name).startsWith("refs/")) return ref.name;
-    return `${ref.kind === "tag" ? "refs/tags/" : "refs/heads/"}${ref.name}`;
 }
 
 function header(app, repo) {
@@ -98,12 +89,11 @@ function tabStrip(app) {
 }
 
 function revisionBar(app, repo) {
-    const ref = currentRef(repo);
     return el(
         "div",
         { class: "rev-bar" },
         el("span", { class: "rev-label", text: "REVISION" }),
-        el("span", { class: "rev-chip", text: refLabel(ref, app.state.detail.rev) }),
+        el("span", { class: "rev-chip", text: repo.revision_label || repo.revision || "" }),
         el("span", { class: "rev-meta", text: repo.revision_summary || "" }),
         el("span", {
             class: "rev-switch",
@@ -113,11 +103,21 @@ function revisionBar(app, repo) {
     );
 }
 
+function revealOpened(stamp) {
+    if (revealed === stamp) return;
+    revealed = stamp;
+    requestAnimationFrame(() => {
+        const row = document.querySelector(".file-row.is-opened");
+        if (row) row.scrollIntoView({ block: "center" });
+    });
+}
+
 function filesTab(app) {
     const detail = app.state.detail;
     if (detail.errors.files) return errorPanel(detail.errors.files, () => app.reloadDetailTab());
     if (!detail.files) return loadingPanel("reading the clone…");
     const rows = detail.files.rows || detail.files;
+    revealOpened(key(detail));
     return el(
         "div",
         { class: "files" },
@@ -125,7 +125,10 @@ function filesTab(app) {
             const state = String(file.state || "").toLowerCase();
             return el(
                 "div",
-                { class: "file-row", onClick: () => file.artifact_id && app.openArtifact(file) },
+                {
+                    class: `file-row${file.opened ? " is-opened" : ""}`,
+                    onClick: () => file.artifact_id && app.openArtifact(file)
+                },
                 el("span", { class: `file-path st-file-${state}`, text: file.path }),
                 el("span", { class: "file-kind", text: dash(file.kind) }),
                 el("span", { class: "file-size", text: sizeText(file) }),
@@ -329,6 +332,10 @@ function pullBox(pull) {
         lines.push(el("div", { class: "code-comment", text: "# python, unchanged" }));
     }
     lines.push(el("div", { class: "code-line" }, highlightUrl(pull.hf || "")));
+    if (pull.repository) {
+        lines.push(el("div", { class: "code-comment", text: "# whole repository" }));
+        lines.push(el("div", { class: "code-line" }, highlightUrl(pull.repository)));
+    }
     return el("div", { class: "code-box" }, lines);
 }
 

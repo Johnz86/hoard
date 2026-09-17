@@ -145,17 +145,32 @@ it and `SoulsMix` does not.
   `repo`, `detail`, `size`, `size_human`, `state`, `state_label`, `pull_progress`; `total` is how
   many candidates the rule accepted, which can exceed `rows.len()` when `limit` truncates.
 - `GET /api/v1/artifacts/{id}/pull-command`: `{ "git": null,
-  "hf": "HF_ENDPOINT=http://hoard.lan:7099 hf download org/name file.safetensors",
+  "hf": "HF_ENDPOINT=http://hoard.lan:7099 hf download org/name 'file.safetensors'",
+  "repository": "HF_ENDPOINT=http://hoard.lan:7099 hf download org/name",
   "path": "/srv/..." }`. The `hf` command appends ` --repo-type dataset|space` for a repo of
   that type; models carry no flag. `git` is a `git clone` line only when the repository's
   source is a git clone this node can serve over the git face, and `null` otherwise; `hf`
-  appends the artifact's own path, or the two `--include` globs
-  (`"<stem>-*-of-<total>.<ext>"` and `"<stem>.<ext>.index.json"`) that name a shard set, or
-  nothing at all for the repository-level command the repo page and the generated card print.
+  appends the artifact's own path, or the `--include` globs that name a shard set
+  (`"<stem>-*-of-<total>.<ext>"`, and `"<stem>.<ext>.index.json"` only for a `safetensors` or
+  `bin` set, because no other container ships an index document), or nothing at all for the
+  repository-level command the generated card prints.
   `hf` carries ` --revision <sha>`, or the revision's name when the index holds no sha for it,
   after the repo type and before the file scope, when the artifact is held in a revision other
   than `main`, because a detached snapshot's files are not in the revision the CLI asks for by
   default and the command would download nothing.
+  An LLM held beside exactly one projector in the same repository and revision, and that
+  projector, name both files in the one line, because neither is usable without the other.
+  `repository` is the same line with no file scope, for pulling everything the repository
+  holds; it is `null` when the command names no artifact, `null` for a category folder of
+  a tool layout (a loose repository filed under the name of its own source, `comfy/loras`),
+  which is nobody's repository and whose whole-folder pull would be every LoRA on the disk,
+  and `null` when it would repeat the `hf` line word for word.
+  `path` is the path a person walked to the file, which for an hf-cache artifact is the
+  snapshot link rather than the blob under `blobs/`.
+  A file name is always quoted for the shell. The repository reference and the
+  `HF_ENDPOINT=` value are quoted only when they hold a character outside
+  `[A-Za-z0-9._/:-]`, which a repository named after a directory on disk can, so a line a
+  script carries stays one a person can read.
 - `PUT /api/v1/artifacts/{id}/override { "role", "base", "sub_role" }`, at least one of the
   three set or 400. `DELETE` clears.
 - `GET /api/v1/blobs/{sha256}`: `{ "sha256", "size", "size_human", "path_count",
@@ -181,17 +196,35 @@ it and `SoulsMix` does not.
   opaque row cursor.
 - `GET /api/v1/repos/{type}/{org}/{name}`: header fields (`artifact_id`, `role`,
   `role_code`, `role_full`, `state`, `state_full`, `pull_progress`, `meta`, `revision`,
-  `revision_sha`), `refs` (`name`, `sha`, `when`, `kind`, `current`), `revision_summary`
+  `revision_label`, `revision_sha`), `refs` (`name`, `sha`, `when`, `kind`, `current`),
+  `revision_summary`
   (`14 files · 3 branches · 2 tags`), `facts`, `paths`, `pull` commands, and `rows` (every
   artifact of the repo, in the search row shape). `remote` is the URL a clone's `origin`
   names, or `null` for a repository the mirror, a peer or a bare folder filed.
-- `GET /api/v1/repos/{type}/{org}/{name}/files?revision=`: rows `path`, `kind` (config,
-  weights, single-file, card, git, group), `size`, `state` (present, deduped, lfs_ptr, absent),
-  `artifact_id`.
-- `GET /api/v1/repos/{type}/{org}/{name}/readme?revision=`: `{ "frontmatter": [{ "key",
-  "value" }], "html": "<rendered>", "generated": false, "meta": "4.1 KB · 118 lines",
-  "revision" }`.
-- `GET /api/v1/repos/{type}/{org}/{name}/compat?revision=`: as artifacts compat.
+  `revision` is the shown revision's name and `revision_label` is what the REVISION chip
+  prints: `refs/heads/main` or `refs/tags/v1.0` for a revision a ref points at, and
+  `613bd8d (detached)` for one no ref names. `meta` measures what the header describes: the
+  opened artifact's own bytes, or the shown revision's when no artifact was named. With no
+  `artifact`, the header describes the largest weights file **of the shown revision**.
+- `artifact=<id>` on this route and the three below names the artifact the page was opened
+  on. It
+  replaces the largest weights file as what the header, `facts`, `meta`, `paths`, `pull` and
+  `compat` describe, and when no `revision` is asked for the page opens on the revision that
+  holds it rather than on `main`. An explicit `revision` still wins. An id the repository does
+  not hold, one whose revision this record does not hold (a peer's copy of the same
+  repository is filed under the peer's own source and can carry a commit only that peer has),
+  an unknown one and an unparsable one are ignored rather than refused, so the page
+  opens either way and behaves as it does with no `artifact` at all.
+- `GET /api/v1/repos/{type}/{org}/{name}/files?revision=&artifact=`: rows `path`, `kind`
+  (config, weights, single-file, card, git, group), `size`, `state` (present, deduped,
+  lfs_ptr, absent), `artifact_id`, and `opened`, true on every file the named artifact is
+  made of, which for a shard set is every member. `revision` is the revision the rows come
+  from, which is the opened artifact's own when the request named no revision.
+- `GET /api/v1/repos/{type}/{org}/{name}/readme?revision=&artifact=`: `{ "frontmatter": [{
+  "key", "value" }], "html": "<rendered>", "generated": false, "meta": "4.1 KB · 118 lines",
+  "revision" }`. A generated card describes the opened artifact, and prints its "Pull it"
+  block for every repository but a category folder of a tool layout.
+- `GET /api/v1/repos/{type}/{org}/{name}/compat?revision=&artifact=`: as artifacts compat.
 - `GET /api/v1/repos/{type}/{org}/{name}/usage`: `{ "days": [ { "date", "pulls" } ],
   "pulls": [ { "when", "at", "who", "what", "bytes", "rate_bps" } ], "clients": 3,
   "total": 41 }`. `when` is the relative spelling the design prints, `at` the instant
@@ -220,14 +253,21 @@ rest being counted.
 
 - `GET /api/v1/loadouts`, `GET /api/v1/loadouts/{id}`: document plus resolution per line
   (`present`, `elsewhere` with the node, `missing`) and `apply_preview`
-  (`{ "present": 3, "pulling": 2, "bytes": 1200000000 }`).
+  (`{ "present": 3, "pulling": 2, "bytes": 1200000000 }`). An item carries `prefix`, what the
+  drawer prints dimmed before `name`, in the same spelling a results row uses; it is empty
+  when the pin resolved to nothing.
 - `POST /api/v1/loadouts { "text": "<toml>" }` or the structured form.
 - `POST /api/v1/loadouts/{id}/items { "artifact_id", "weight" }`, `DELETE .../items/{artifact_id}`.
 - `POST /api/v1/loadouts/{id}/validate`: compat violations.
 - `POST /api/v1/loadouts/{id}/apply { "node", "profile" }`: starts a job, answering
   `{ "job_id", "node", "apply_preview" }` with the same `apply_preview` shape as loadout
   detail, resolved before the pull runs.
-- `GET /api/v1/loadouts/{id}/export?format=toml|hf-script|comfy`.
+- `GET /api/v1/loadouts/{id}/export?format=toml|hf-script|comfy`. The `hf-script` writes one
+  `hf download` line per item in the spelling `GET /api/v1/artifacts/{id}/pull-command` gives,
+  without the companion file, so a pinned shard set exports its `--include` globs, a pinned
+  dataset its `--repo-type` and a line pinned outside `main` its `--revision`. A pin whose
+  content resolves in another repository - the same bytes filed twice - exports the pin's own
+  repository and path, never one repository's reference beside another's file.
 
 ## Projection
 

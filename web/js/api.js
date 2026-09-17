@@ -71,13 +71,13 @@ export const artifact = (id) => get(`/artifacts/${segment(id)}`);
 export const artifactCompat = (id, limit) => get(`/artifacts/${segment(id)}/compat`, { limit });
 export const pullCommand = (id) => get(`/artifacts/${segment(id)}/pull-command`);
 
-export const repo = (type, org, name) => get(repoBase(type, org, name));
-export const repoFiles = (type, org, name, revision) =>
-    get(`${repoBase(type, org, name)}/files`, { revision });
-export const repoReadme = (type, org, name, revision) =>
-    get(`${repoBase(type, org, name)}/readme`, { revision });
-export const repoCompat = (type, org, name, revision) =>
-    get(`${repoBase(type, org, name)}/compat`, { revision });
+export const repo = (type, org, name, artifact) => get(repoBase(type, org, name), { artifact });
+export const repoFiles = (type, org, name, revision, artifact) =>
+    get(`${repoBase(type, org, name)}/files`, { revision, artifact });
+export const repoReadme = (type, org, name, revision, artifact) =>
+    get(`${repoBase(type, org, name)}/readme`, { revision, artifact });
+export const repoCompat = (type, org, name, revision, artifact) =>
+    get(`${repoBase(type, org, name)}/compat`, { revision, artifact });
 export const repoUsage = (type, org, name) => get(`${repoBase(type, org, name)}/usage`);
 
 export const shelves = () => get("/shelves");
@@ -86,6 +86,7 @@ export const deleteShelf = (id) => del(`/shelves/${segment(id)}`);
 
 export const loadouts = () => get("/loadouts");
 export const loadout = (id) => get(`/loadouts/${segment(id)}`);
+export const createLoadout = (name) => post("/loadouts", { name });
 export const addLoadoutItem = (id, artifactId, weight) =>
     post(`/loadouts/${segment(id)}/items`, { artifact_id: artifactId, weight: weight ?? null });
 export const removeLoadoutItem = (id, artifactId) =>

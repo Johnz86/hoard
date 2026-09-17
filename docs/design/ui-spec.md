@@ -234,7 +234,10 @@ Right rail (340px, `--panel`): PULL TO THIS MACHINE code box, whose git block
 (`# git, refs preserved`, `git clone http://hoard.lan/org/name`) is shown only for a
 repository this node can serve over the git face, followed by `# or python, unchanged`
 (`# python, unchanged` when no git line precedes it) and
-`HF_ENDPOINT=http://hoard.lan:7099` with the URL in amber; the COPY button copies the first
+`HF_ENDPOINT=http://hoard.lan:7099` with the URL in amber. That line names the artifact the
+page was opened on; a `# whole repository` caption and the repository-level line follow it
+where the repository is one whose whole contents are worth pulling, and a category folder of
+a tool layout shows the one line alone. The COPY button copies the first
 line shown. DERIVED
 FACTS list (same shape as inspector facts, plus `first seen`, `pulls on lan`); PATHS ON
 DISK list (`path · node`, symlinks shown as `laptop · symlink`).
@@ -245,7 +248,9 @@ Right-anchored 520px panel over a scrim, `hoardIn` animation. Header: `loadout` 
 700, name in amber mono (`night-exterior-v3`), CLOSE button. Rows grid
 `52px minmax(0,1fr) 78px 60px 22px`: role, name, rev in `--dim`, weight in `--amb`
 (lora `0.55`, ctrl `0.70`, upsc `2.0×`, others `—`), remove `×`. Empty state:
-`EMPTY LOADOUT / select artifacts in the index and press L`. Footer: terminal box
+`EMPTY LOADOUT / a checkpoint and the adapters you use with it / select artifacts in the
+index and press L`, the middle line saying what a loadout is for. `L` on a node holding no
+loadout creates one named `loadout` and pins into it. Footer: terminal box
 `$ hoard apply night-exterior-v3 --node laptop` with result line in green
 (`→ 3 present, 2 pulling over LAN (1.2 GB/s)` then
 `→ done · 5 artifacts resolved, symlinks written for comfyui`), and an amber

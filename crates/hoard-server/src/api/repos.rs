@@ -16,15 +16,16 @@ use hoard_index::catalog::{
 };
 use hoard_index::catalog::{PullRow, UsageDay};
 use hoard_index::config::SourceKind;
-use hoard_index::discover::RefKind;
+use hoard_index::discover::{DEFAULT_REF, RefKind};
 use hoard_index::row::SearchRow;
 use hoard_index::shard::parse_shard_name;
 use hoard_index::sniff::parse_readme;
 
+use crate::api::artifacts::artifact_id;
 use crate::api::common::{
-    DEFAULT_LIMIT, EntryView, Fact, MIDDOT, PullCommands, RowView, blocking, clamp_limit,
-    decode_row_cursor, encode_row_cursor, entry_views, facts, pull_commands, relative_time,
-    repo_id, shown_path, state_label,
+    DEFAULT_LIMIT, EntryView, Fact, MIDDOT, PullArtifact, PullCommands, PullSubject, RowView,
+    blocking, clamp_limit, companion_of, decode_row_cursor, encode_row_cursor, entry_views, facts,
+    is_category_bin, pull_commands, relative_time, repo_id, shown_path, state_label,
 };
 use crate::api::compat::{CompatView, compat_for};
 use crate::error::{ApiError, ApiResult};
@@ -46,20 +47,66 @@ pub struct ListParams {
     pub limit: Option<u32>,
 }
 
+/// What a repository request names beside the repository itself: the revision to open, and
+/// the artifact the caller opened the page on.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RevisionParams {
     pub revision: Option<String>,
+    pub artifact: Option<String>,
 }
 
 impl RevisionParams {
-    fn wanted(&self) -> String {
+    fn named(&self) -> Option<&str> {
         self.revision
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or("main")
-            .to_owned()
     }
+
+    fn wanted(&self) -> String {
+        self.named().unwrap_or(DEFAULT_REF).to_owned()
+    }
+
+    fn opened(&self) -> Option<ArtifactId> {
+        self.artifact
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|raw| artifact_id(raw).ok())
+    }
+}
+
+/// What a request resolved to: the artifact it opened the page on, when the id names one
+/// this repository holds, and the revision the page reads.
+struct Opened {
+    row: Option<SearchRow>,
+    revision: String,
+}
+
+/// An artifact of another repository, one whose revision this record does not hold, an
+/// unknown id and an unparsable one are all ignored rather than refused, because the
+/// repository page has to open either way. A row is filed against the node holding it, so a
+/// peer's copy carries this repository's name and a revision only that peer has.
+fn opened_for(
+    catalog: &Catalog,
+    record: &RepositoryDetail,
+    params: &RevisionParams,
+) -> Result<Opened, IndexError> {
+    let row = params
+        .opened()
+        .map(|id| catalog.artifact_row(id))
+        .transpose()?
+        .flatten()
+        .filter(|row| row.repo == record.repo.qualified())
+        .filter(|row| catalog.resolve_revision(record, &row.revision).is_some());
+    Ok(Opened {
+        revision: params
+            .named()
+            .map(str::to_owned)
+            .or_else(|| row.as_ref().map(|row| row.revision.clone()))
+            .unwrap_or_else(|| params.wanted()),
+        row,
+    })
 }
 
 /// One line of the repositories listing.
@@ -119,6 +166,9 @@ pub struct RepoView {
     pub pull_progress: Option<f32>,
     pub meta: String,
     pub revision: String,
+    /// What the REVISION chip prints: the full spelling of the ref pointing at the shown
+    /// revision, and `613bd8d (detached)` for a revision no ref names.
+    pub revision_label: String,
     pub revision_sha: Option<CommitSha>,
     pub revision_summary: String,
     pub refs: Vec<RefView>,
@@ -138,6 +188,8 @@ pub struct FileRow {
     pub state: FileState,
     pub state_label: &'static str,
     pub artifact_id: Option<ArtifactId>,
+    /// Whether this file is one the artifact the page was opened on is made of.
+    pub opened: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -255,7 +307,6 @@ pub async fn detail(
     Query(params): Query<RevisionParams>,
 ) -> ApiResult<Json<RepoView>> {
     let repo = repo_id(&repo_type, &org, &name)?;
-    let wanted = params.wanted();
     let host = state.node_name().to_owned();
     let public = public_host(state.public_url());
     let now = Timestamp::now();
@@ -266,7 +317,7 @@ pub async fn detail(
             &catalog,
             &Header {
                 repo,
-                wanted,
+                params,
                 host,
                 public,
             },
@@ -278,11 +329,11 @@ pub async fn detail(
     Ok(Json(view))
 }
 
-/// What the header needs that the catalog does not hold: which repository and revision the
-/// route named, this node's name and the host a served badge prints.
+/// What the header needs that the catalog does not hold: which repository the route named,
+/// what the request asked to see, this node's name and the host a served badge prints.
 struct Header {
     repo: RepoId,
-    wanted: String,
+    params: RevisionParams,
     host: String,
     public: String,
 }
@@ -294,10 +345,18 @@ fn describe(
     now: Timestamp,
 ) -> Result<RepoView, IndexError> {
     let record = require_repository(catalog, &header.repo)?;
-    let revision = require_revision(catalog, &record, &header.wanted)?;
+    let opened = opened_for(catalog, &record, &header.params)?;
+    let revision = require_revision(catalog, &record, &opened.revision)?;
     let rows = catalog.repository_rows(record.id, REPO_ARTIFACTS)?;
-    let primary = pick_primary(&rows);
     let entries = catalog.revision_entries(record.id, revision.ordinal, Dedupe::Ignore)?;
+    let primary = opened
+        .row
+        .as_ref()
+        .or_else(|| pick_primary(rows.iter().filter(|row| holds(&entries, row))));
+    let size = match opened.row.as_ref() {
+        Some(row) => row.size,
+        None => entries.iter().map(|entry| entry.size).sum(),
+    };
     let refs = ref_views(&record, &revision, now);
     let paths = match primary {
         Some(row) => entry_views(&catalog.entries_of(row.artifact_id)?, &header.host),
@@ -322,14 +381,27 @@ fn describe(
             Some(&header.public),
         ),
         pull_progress: primary.and_then(|row| row.pull_progress),
-        meta: meta_line(primary, &entries, now),
+        meta: meta_line(primary, size, now),
         revision: revision_name(&refs, &revision),
+        revision_label: revision_label(&refs, &revision),
         revision_sha: revision.sha,
         revision_summary: revision_summary(&revision, entries.len(), &refs),
         facts: repo_facts(catalog, primary, now)?,
         refs,
         paths,
-        pull: pull_commands(url, &header.repo, record.kind, None, path),
+        pull: pull_commands(
+            url,
+            PullSubject {
+                repo: &header.repo,
+                kind: record.kind,
+                bin: is_category_bin(record.kind, &record.repo, &record.source),
+                artifact: opened.row.as_ref().map(|row| PullArtifact {
+                    companion: companion_of(row, &rows).map(|row| row.path.as_str()),
+                    ..PullArtifact::from(row)
+                }),
+            },
+            path,
+        ),
         rows: rows.iter().map(RowView::from).collect(),
     })
 }
@@ -340,21 +412,25 @@ pub async fn files(
     Query(params): Query<RevisionParams>,
 ) -> ApiResult<Json<FilesView>> {
     let repo = repo_id(&repo_type, &org, &name)?;
-    let wanted = params.wanted();
     let catalog = Arc::clone(state.catalog());
     let view = blocking(move || {
         let record = require_repository(&catalog, &repo)?;
-        let revision = require_revision(&catalog, &record, &wanted)?;
+        let opened = opened_for(&catalog, &record, &params)?;
+        let revision = require_revision(&catalog, &record, &opened.revision)?;
         let entries = catalog.revision_entries(record.id, revision.ordinal, Dedupe::Resolve)?;
         let single = entries
             .iter()
             .filter(|entry| entry.artifact_id.is_some())
             .count()
             == 1;
-        let mut rows: Vec<FileRow> = entries.iter().map(|item| file_row(item, single)).collect();
+        let shown = opened.row.as_ref().map(|row| row.artifact_id);
+        let mut rows: Vec<FileRow> = entries
+            .iter()
+            .map(|item| file_row(item, single, shown))
+            .collect();
         rows.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(FilesView {
-            revision: wanted,
+            revision: opened.revision,
             rows,
         })
     })
@@ -362,7 +438,7 @@ pub async fn files(
     Ok(Json(view))
 }
 
-fn file_row(item: &EntryDetail, single: bool) -> FileRow {
+fn file_row(item: &EntryDetail, single: bool, opened: Option<ArtifactId>) -> FileRow {
     let state = file_state(item.present, item.lfs_pointer, item.deduped);
     FileRow {
         kind: file_kind(&item.rel_path, item.artifact_id.is_some(), single),
@@ -370,6 +446,7 @@ fn file_row(item: &EntryDetail, single: bool) -> FileRow {
         size_human: format_size(item.size),
         state,
         state_label: state.label(),
+        opened: item.artifact_id.is_some() && item.artifact_id == opened,
         artifact_id: item.artifact_id,
         path: item.rel_path.clone(),
     }
@@ -381,13 +458,12 @@ pub async fn readme(
     Query(params): Query<RevisionParams>,
 ) -> ApiResult<Json<ReadmeView>> {
     let repo = repo_id(&repo_type, &org, &name)?;
-    let wanted = params.wanted();
     let probe = repo.clone();
-    let revision = wanted.clone();
     let catalog = Arc::clone(state.catalog());
-    let (path, fallback, kind) = blocking(move || {
+    let card = blocking(move || {
         let record = require_repository(&catalog, &probe)?;
-        let resolved = require_revision(&catalog, &record, &revision)?;
+        let opened = opened_for(&catalog, &record, &params)?;
+        let resolved = require_revision(&catalog, &record, &opened.revision)?;
         let entries = catalog.revision_entries(record.id, resolved.ordinal, Dedupe::Ignore)?;
         let path = entries
             .iter()
@@ -395,18 +471,30 @@ pub async fn readme(
             .and_then(|entry| entry.abs_path.clone())
             .map(PathBuf::from);
         let rows = catalog.repository_rows(record.id, REPO_ARTIFACTS)?;
-        Ok((path, pick_primary(&rows).cloned(), record.kind))
+        Ok(Card {
+            path,
+            primary: opened.row.or_else(|| pick_primary(&rows).cloned()),
+            kind: record.kind,
+            bin: is_category_bin(record.kind, &record.repo, &record.source),
+            revision: opened.revision,
+        })
     })
     .await?;
 
-    let source = match path {
-        Some(path) => read_card(&path).await,
+    let source = match &card.path {
+        Some(path) => read_card(path).await,
         None => None,
     };
     let (text, generated) = match source {
         Some(text) => (text, false),
         None => (
-            generated_card(state.public_url(), &repo, kind, fallback.as_ref()),
+            generated_card(
+                state.public_url(),
+                &repo,
+                card.kind,
+                card.bin,
+                card.primary.as_ref(),
+            ),
             true,
         ),
     };
@@ -426,8 +514,18 @@ pub async fn readme(
             format_size(document.bytes),
             document.lines
         ),
-        revision: wanted,
+        revision: card.revision,
     }))
+}
+
+/// What the CARD tab reads on its blocking thread: the card on disk when there is one, the
+/// artifact a generated card describes, and what a pull line for this repository looks like.
+struct Card {
+    path: Option<PathBuf>,
+    primary: Option<SearchRow>,
+    kind: SourceKind,
+    bin: bool,
+    revision: String,
 }
 
 pub async fn compat(
@@ -436,14 +534,17 @@ pub async fn compat(
     Query(params): Query<RevisionParams>,
 ) -> ApiResult<Json<CompatView>> {
     let repo = repo_id(&repo_type, &org, &name)?;
-    let wanted = params.wanted();
     let now = Timestamp::now();
     let catalog = Arc::clone(state.catalog());
     let view = blocking(move || {
         let record = require_repository(&catalog, &repo)?;
-        let resolved = require_revision(&catalog, &record, &wanted)?;
+        let opened = opened_for(&catalog, &record, &params)?;
+        let resolved = require_revision(&catalog, &record, &opened.revision)?;
         let rows = rows_in_revision(&catalog, &record, resolved.ordinal)?;
-        let row = pick_primary(&rows)
+        let row = opened
+            .row
+            .as_ref()
+            .or_else(|| pick_primary(&rows))
             .ok_or_else(|| IndexError::not_found("artifact", record.repo.qualified()))?;
         compat_for(&catalog, row, DEFAULT_LIMIT, now)
     })
@@ -487,12 +588,20 @@ fn pull_view(pull: PullRow, now: Timestamp) -> PullView {
     }
 }
 
-/// The artifact the header describes: the largest weights file, else the largest artifact.
-fn pick_primary(rows: &[SearchRow]) -> Option<&SearchRow> {
-    rows.iter()
-        .filter(|row| row.format.holds_tensors())
-        .max_by_key(|row| row.size)
-        .or_else(|| rows.iter().max_by_key(|row| row.size))
+/// The artifact the header describes when a request named none: the largest weights file,
+/// else the largest artifact, of whatever rows the caller offers.
+fn pick_primary<'a>(rows: impl IntoIterator<Item = &'a SearchRow>) -> Option<&'a SearchRow> {
+    rows.into_iter()
+        .max_by_key(|row| (row.format.holds_tensors(), row.size))
+}
+
+/// Whether a revision's files include the artifact a row stands for. A repository's
+/// artifacts are shared across its revisions, so this is what decides which of them answer
+/// for the revision a request named.
+fn holds(entries: &[EntryDetail], row: &SearchRow) -> bool {
+    entries
+        .iter()
+        .any(|entry| entry.artifact_id == Some(row.artifact_id))
 }
 
 fn require_repository(catalog: &Catalog, repo: &RepoId) -> Result<RepositoryDetail, IndexError> {
@@ -548,6 +657,21 @@ fn revision_name(refs: &[RefView], revision: &RevisionDetail) -> String {
         .unwrap_or_else(|| short_sha(revision.sha))
 }
 
+/// The REVISION chip: a ref pointing at the shown revision, spelled in full, and otherwise
+/// the revision's own short sha marked as what it is.
+fn revision_label(refs: &[RefView], revision: &RevisionDetail) -> String {
+    let Some(reference) = refs.iter().find(|reference| reference.current) else {
+        return format!("{} (detached)", short_sha(revision.sha));
+    };
+    if reference.name.starts_with("refs/") {
+        return reference.name.clone();
+    }
+    match reference.kind {
+        RefKind::Branch => format!("refs/heads/{}", reference.name),
+        RefKind::Tag => format!("refs/tags/{}", reference.name),
+    }
+}
+
 /// `462c3cb \u{b7} 14 files \u{b7} 3 branches \u{b7} 2 tags`, the line under the revision chip.
 fn revision_summary(revision: &RevisionDetail, files: usize, refs: &[RefView]) -> String {
     let branches = refs
@@ -561,9 +685,10 @@ fn revision_summary(revision: &RevisionDetail, files: usize, refs: &[RefView]) -
     )
 }
 
-/// `path \u{b7} size \u{b7} last used 2h ago`, the header's third line.
-fn meta_line(primary: Option<&SearchRow>, entries: &[EntryDetail], now: Timestamp) -> String {
-    let size: u64 = entries.iter().map(|entry| entry.size).sum();
+/// `path \u{b7} size \u{b7} last used 2h ago`, the header's third line. `size` is what the
+/// header describes: the opened artifact's own bytes, or the revision's when it describes
+/// the revision.
+fn meta_line(primary: Option<&SearchRow>, size: u64, now: Timestamp) -> String {
     let mut parts = Vec::with_capacity(3);
     if let Some(path) = primary.and_then(shown_path) {
         parts.push(path);
@@ -607,11 +732,7 @@ fn rows_in_revision(
 ) -> Result<Vec<SearchRow>, IndexError> {
     let entries = catalog.revision_entries(record.id, revision, Dedupe::Ignore)?;
     let mut rows = catalog.repository_rows(record.id, REPO_ARTIFACTS)?;
-    rows.retain(|row| {
-        entries
-            .iter()
-            .any(|entry| entry.artifact_id == Some(row.artifact_id))
-    });
+    rows.retain(|row| holds(&entries, row));
     Ok(rows)
 }
 
@@ -665,14 +786,15 @@ async fn read_card(path: &std::path::Path) -> Option<String> {
 }
 
 /// The card hoard writes when upstream never shipped one: what the index knows, and how to
-/// pull the repository it describes.
+/// pull the repository it describes. A category folder of a tool layout is nobody's
+/// repository, so it is offered no line that would pull every file in it.
 fn generated_card(
     url: &str,
     repo: &RepoId,
     kind: SourceKind,
+    bin: bool,
     primary: Option<&SearchRow>,
 ) -> String {
-    let commands = pull_commands(url, repo, kind, None, None);
     let mut text = format!(
         "# {}\n\nNo upstream card was recovered for this repository. This page is generated \
          from hoard's index record.\n\n## What we know\n\n",
@@ -694,6 +816,19 @@ fn generated_card(
         }
         None => text.push_str("- nothing has been classified in this repository yet\n"),
     }
+    if bin {
+        return text;
+    }
+    let commands = pull_commands(
+        url,
+        PullSubject {
+            repo,
+            kind,
+            bin,
+            artifact: None,
+        },
+        None,
+    );
     text.push_str("\n## Pull it\n\n```\n");
     if let Some(git) = commands.git.as_deref() {
         text.push_str(git);

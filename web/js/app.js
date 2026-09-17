@@ -51,6 +51,7 @@ const state = {
     jobs: null,
     jobsError: null,
     loadoutId: null,
+    loadoutCreating: null,
     loadout: null,
     loadoutError: null,
     loadoutApplied: false,
@@ -196,10 +197,10 @@ function readHash() {
             state.detail.type === detail.type &&
             state.detail.org === detail.org &&
             state.detail.name === detail.name &&
-            state.detail.rev === detail.rev;
+            state.detail.rev === detail.rev &&
+            (state.detail.aid || null) === (detail.aid || null);
         if (same) {
             state.detail.tab = detail.tab;
-            state.detail.aid = detail.aid || state.detail.aid;
         } else {
             state.detail = detail;
         }
@@ -425,8 +426,16 @@ async function addToLoadout(row) {
         return;
     }
     if (!state.loadoutId) {
-        toast("no loadout on this node");
-        return;
+        try {
+            state.loadoutCreating = state.loadoutCreating || api.createLoadout("loadout");
+            const created = await state.loadoutCreating;
+            state.loadoutId = created.id;
+        } catch (error) {
+            toast(`cannot start a loadout · ${error.message}`);
+            return;
+        } finally {
+            state.loadoutCreating = null;
+        }
     }
     const pinned = loadoutItems(app).some((item) => item.artifact_id === row.artifact_id);
     if (pinned) {

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use axum::http::HeaderMap;
@@ -15,7 +16,7 @@ use hoard_index::config::SourceKind;
 use hoard_index::discover::DEFAULT_REF;
 use hoard_index::row::SearchRow;
 use hoard_index::search::{SortKey, SortSpec};
-use hoard_index::shard::parse_shard_name;
+use hoard_index::shard::{index_document_name, parse_shard_name};
 use hoard_mirror::git::is_clonable;
 
 use crate::error::{ApiError, ApiResult};
@@ -35,6 +36,9 @@ const BLOB_NAME_CHARS: usize = 12;
 /// here rather than published across the crate boundary, because a view crate wanting one
 /// word of a layout is not a reason for a discovery module to export it.
 const BLOBS_DIR: &str = "blobs";
+/// The bytes beside the alphanumerics a shell reads as themselves, so a value made only of
+/// them needs no quotes.
+const BARE_WORD_BYTES: [u8; 5] = [b'.', b'_', b'/', b':', b'-'];
 
 const SECONDS_PER_MINUTE: i64 = 60;
 const SECONDS_PER_HOUR: i64 = 60 * SECONDS_PER_MINUTE;
@@ -505,22 +509,36 @@ fn plural(count: i64, unit: &str) -> String {
 
 /// The ways to fetch a repository from this node, as the PULL TO THIS MACHINE box and the
 /// `Y` yank both print them. `git` is absent for a source this node cannot serve over the
-/// git face.
+/// git face, and `repository` is the line for everything the repository holds, beside the
+/// `hf` line for the artifact that was opened.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PullCommands {
     pub git: Option<String>,
     pub hf: String,
+    pub repository: Option<String>,
     pub path: Option<String>,
 }
 
 /// The one artifact a pull command names, when it names one rather than the repository.
 /// `revision` is what `--revision` has to say, and is absent for an artifact held in the
-/// revision `hf download` asks for unprompted.
+/// revision `hf download` asks for unprompted. `companion` is the file that is useless
+/// without this one, and comes down with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullArtifact<'a> {
     pub path: &'a str,
     pub shard_count: u32,
     pub revision: Option<String>,
+    pub companion: Option<&'a str>,
+}
+
+/// What a pull command is written for: the repository, the source it was filed from and the
+/// artifact the caller opened, when it opened one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullSubject<'a> {
+    pub repo: &'a RepoId,
+    pub kind: SourceKind,
+    pub bin: bool,
+    pub artifact: Option<PullArtifact<'a>>,
 }
 
 impl<'a> From<&'a SearchRow> for PullArtifact<'a> {
@@ -532,46 +550,102 @@ impl<'a> From<&'a SearchRow> for PullArtifact<'a> {
                 row.revision_sha
                     .map_or_else(|| row.revision.clone(), CommitSha::to_hex)
             }),
+            companion: None,
         }
     }
 }
 
-pub fn pull_commands(
-    url: &str,
-    repo: &RepoId,
-    kind: SourceKind,
-    artifact: Option<PullArtifact<'_>>,
-    path: Option<String>,
-) -> PullCommands {
-    let url = url.trim_end_matches('/');
-    let reference = repo.reference();
+/// Everything after `hf download`: the reference, the repository type of a non-model, the
+/// revision when it is not the default one, and the files the artifact is.
+pub fn hf_arguments(repo: &RepoId, artifact: Option<&PullArtifact<'_>>) -> String {
+    let reference = shell_word(&repo.reference()).into_owned();
     let repo_type = match repo.repo_type() {
         RepoType::Models => String::new(),
         other => format!(" --repo-type {}", other.singular()),
     };
     let revision = artifact
-        .as_ref()
         .and_then(|artifact| artifact.revision.as_deref())
         .map_or_else(String::new, |revision| {
             format!(" --revision {}", shell_quoted(revision))
         });
-    let scope = artifact.map_or_else(String::new, |artifact| {
-        hf_scope(artifact.path, artifact.shard_count)
-    });
+    let scope = artifact.map_or_else(String::new, hf_scope);
+    format!("{reference}{repo_type}{revision}{scope}")
+}
+
+pub fn pull_commands(url: &str, subject: PullSubject<'_>, path: Option<String>) -> PullCommands {
+    let url = url.trim_end_matches('/');
+    let endpoint = shell_word(url);
+    let line = |artifact: Option<&PullArtifact<'_>>| {
+        format!(
+            "HF_ENDPOINT={endpoint} hf download {}",
+            hf_arguments(subject.repo, artifact)
+        )
+    };
+    let hf = line(subject.artifact.as_ref());
+    let repository = (subject.artifact.is_some() && !subject.bin)
+        .then(|| line(None))
+        .filter(|repository| repository != &hf);
     PullCommands {
-        git: is_clonable(kind).then(|| format!("git clone {url}/{reference}")),
-        hf: format!("HF_ENDPOINT={url} hf download {reference}{repo_type}{revision}{scope}"),
+        git: is_clonable(subject.kind)
+            .then(|| format!("git clone {url}/{}", subject.repo.reference())),
+        hf,
+        repository,
         path,
     }
 }
 
-fn hf_scope(path: &str, shard_count: u32) -> String {
-    if shard_count <= 1 {
-        return format!(" {}", shell_quoted(path));
+/// A loose repository filed under the name of its own source is a category folder of a tool
+/// layout: `comfy/loras` holds every LoRA on the disk and is nobody's repository.
+pub fn is_category_bin(kind: SourceKind, repo: &RepoId, source: &str) -> bool {
+    kind == SourceKind::Loose && repo.org() == Some(source)
+}
+
+/// The role of the file an artifact of this role is useless without, for the two roles that
+/// have one. A caller reads it to know whether a repository's rows are worth loading at all.
+pub fn companion_role(role: Role) -> Option<Role> {
+    match role {
+        Role::Llm => Some(Role::Proj),
+        Role::Proj => Some(Role::Llm),
+        Role::Lora
+        | Role::Ckpt
+        | Role::Ctrl
+        | Role::Upsc
+        | Role::Vae
+        | Role::Emb
+        | Role::Ds
+        | Role::Unk => None,
     }
-    let (directory, file) = match path.rsplit_once('/') {
+}
+
+/// The file the opened one is useless without: the projector of an LLM, or the LLM of a
+/// projector, when the repository's revision holds exactly one of them.
+pub fn companion_of<'a>(opened: &SearchRow, rows: &'a [SearchRow]) -> Option<&'a SearchRow> {
+    let wanted = companion_role(opened.role)?;
+    let mut candidates = rows.iter().filter(|row| {
+        row.role == wanted
+            && row.repo == opened.repo
+            && row.revision == opened.revision
+            && row.shard_count == 1
+            && row.artifact_id != opened.artifact_id
+    });
+    let only = candidates.next()?;
+    candidates.next().is_none().then_some(only)
+}
+
+fn hf_scope(artifact: &PullArtifact<'_>) -> String {
+    if artifact.shard_count <= 1 {
+        return match artifact.companion {
+            Some(companion) => format!(
+                " {} {}",
+                shell_quoted(artifact.path),
+                shell_quoted(companion)
+            ),
+            None => format!(" {}", shell_quoted(artifact.path)),
+        };
+    }
+    let (directory, file) = match artifact.path.rsplit_once('/') {
         Some((dir, file)) => (format!("{dir}/"), file),
-        None => (String::new(), path),
+        None => (String::new(), artifact.path),
     };
     let Some(shard) = parse_shard_name(file) else {
         return String::new();
@@ -587,12 +661,32 @@ fn hf_scope(path: &str, shard_count: u32) -> String {
         "{directory}{}-*-of-{total_and_dot}{}",
         shard.stem, shard.extension
     );
-    let index = format!("{directory}{}.{}.index.json", shard.stem, shard.extension);
-    format!(
-        " --include {} --include {}",
-        shell_quoted(&weights),
-        shell_quoted(&index)
-    )
+    let mut scope = format!(" --include {}", shell_quoted(&weights));
+    if let Some(index) = index_document_name(shard.stem, shard.extension) {
+        scope.push_str(&format!(
+            " --include {}",
+            shell_quoted(&format!("{directory}{index}"))
+        ));
+    }
+    if let Some(companion) = artifact.companion {
+        scope.push_str(&format!(" --include {}", shell_quoted(companion)));
+    }
+    scope
+}
+
+/// A value as a shell script may carry it: bare when every byte of it is one a shell reads
+/// as itself, and quoted otherwise. A repository reference and a node's public URL are
+/// usually bare words, and a loose repository named after a directory holding a space or a
+/// quote is not.
+pub(crate) fn shell_word(value: &str) -> Cow<'_, str> {
+    let bare = !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || BARE_WORD_BYTES.contains(&byte));
+    match bare {
+        true => Cow::Borrowed(value),
+        false => Cow::Owned(shell_quoted(value)),
+    }
 }
 
 /// Quotes a value for a POSIX shell: wrapped in single quotes, with every embedded single
@@ -640,6 +734,41 @@ mod tests {
             revision_sha: sha,
             ..RowFacts::default()
         })
+    }
+
+    fn repo_of(qualified: &str) -> RepoId {
+        RepoId::parse_qualified(qualified).expect("repo parses")
+    }
+
+    fn one_file(path: &str) -> PullArtifact<'_> {
+        PullArtifact {
+            path,
+            shard_count: 1,
+            revision: None,
+            companion: None,
+        }
+    }
+
+    fn subject<'a>(
+        repo: &'a RepoId,
+        kind: SourceKind,
+        artifact: Option<PullArtifact<'a>>,
+    ) -> PullSubject<'a> {
+        PullSubject {
+            repo,
+            kind,
+            bin: false,
+            artifact,
+        }
+    }
+
+    fn gguf_row(id: i64, role: Role, path: &str) -> SearchRow {
+        let mut row = row("main", None);
+        row.artifact_id = ArtifactId::new(id);
+        row.role = role;
+        row.path = path.to_owned();
+        row.repo = "models/lmstudio-community/Qwen3-VL-8B-Instruct-GGUF".to_owned();
+        row
     }
 
     #[test]
@@ -755,16 +884,14 @@ mod tests {
 
     #[test]
     fn a_single_file_artifact_scopes_the_hf_line_to_its_path() {
-        let repo = RepoId::parse_qualified("models/comfy/loras").expect("repo parses");
+        let repo = repo_of("models/comfy/loras");
         let commands = pull_commands(
             "http://127.0.0.1:7099",
-            &repo,
-            SourceKind::Loose,
-            Some(PullArtifact {
-                path: "Flux_2-Turbo-LoRA_comfyui.safetensors",
-                shard_count: 1,
-                revision: None,
-            }),
+            subject(
+                &repo,
+                SourceKind::Loose,
+                Some(one_file("Flux_2-Turbo-LoRA_comfyui.safetensors")),
+            ),
             None,
         );
         assert_eq!(
@@ -776,17 +903,19 @@ mod tests {
 
     #[test]
     fn a_shard_set_scopes_the_hf_line_to_two_include_globs() {
-        let repo = RepoId::parse_qualified("models/mistralai/Ministral-3-14B-Instruct-2512")
-            .expect("repo parses");
+        let repo = repo_of("models/mistralai/Ministral-3-14B-Instruct-2512");
         let commands = pull_commands(
             "http://127.0.0.1:7099",
-            &repo,
-            SourceKind::HfCache,
-            Some(PullArtifact {
-                path: "model-00001-of-00010.safetensors",
-                shard_count: 10,
-                revision: None,
-            }),
+            subject(
+                &repo,
+                SourceKind::HfCache,
+                Some(PullArtifact {
+                    path: "model-00001-of-00010.safetensors",
+                    shard_count: 10,
+                    revision: None,
+                    companion: None,
+                }),
+            ),
             None,
         );
         assert_eq!(
@@ -799,16 +928,19 @@ mod tests {
 
     #[test]
     fn a_shard_set_inside_a_subdirectory_keeps_its_directory_in_both_globs() {
-        let repo = RepoId::parse_qualified("models/org/checkpoint").expect("repo parses");
+        let repo = repo_of("models/org/checkpoint");
         let commands = pull_commands(
             "http://127.0.0.1:7099",
-            &repo,
-            SourceKind::HfCache,
-            Some(PullArtifact {
-                path: "unet/diffusion_pytorch_model-00001-of-00002.safetensors",
-                shard_count: 2,
-                revision: None,
-            }),
+            subject(
+                &repo,
+                SourceKind::HfCache,
+                Some(PullArtifact {
+                    path: "unet/diffusion_pytorch_model-00001-of-00002.safetensors",
+                    shard_count: 2,
+                    revision: None,
+                    companion: None,
+                }),
+            ),
             None,
         );
         assert_eq!(
@@ -821,16 +953,19 @@ mod tests {
 
     #[test]
     fn a_shard_set_without_five_digit_padding_keeps_its_own_width() {
-        let repo = RepoId::parse_qualified("models/org/checkpoint").expect("repo parses");
+        let repo = repo_of("models/org/checkpoint");
         let commands = pull_commands(
             "http://127.0.0.1:7099",
-            &repo,
-            SourceKind::HfCache,
-            Some(PullArtifact {
-                path: "model-1-of-2.safetensors",
-                shard_count: 2,
-                revision: None,
-            }),
+            subject(
+                &repo,
+                SourceKind::HfCache,
+                Some(PullArtifact {
+                    path: "model-1-of-2.safetensors",
+                    shard_count: 2,
+                    revision: None,
+                    companion: None,
+                }),
+            ),
             None,
         );
         assert_eq!(
@@ -843,36 +978,70 @@ mod tests {
 
     #[test]
     fn a_set_grouped_without_shard_names_falls_back_to_the_repository_command() {
-        let repo = RepoId::parse_qualified("models/org/checkpoint").expect("repo parses");
+        let repo = repo_of("models/org/checkpoint");
         let commands = pull_commands(
             "http://127.0.0.1:7099",
-            &repo,
-            SourceKind::HfCache,
-            Some(PullArtifact {
-                path: "model.safetensors",
-                shard_count: 4,
-                revision: None,
-            }),
+            subject(
+                &repo,
+                SourceKind::HfCache,
+                Some(PullArtifact {
+                    path: "model.safetensors",
+                    shard_count: 4,
+                    revision: None,
+                    companion: None,
+                }),
+            ),
             None,
         );
         assert_eq!(
             commands.hf,
             "HF_ENDPOINT=http://127.0.0.1:7099 hf download org/checkpoint"
         );
+        assert_eq!(
+            commands.repository, None,
+            "a line that already names the whole repository is not printed twice"
+        );
+    }
+
+    #[test]
+    fn a_reference_with_a_space_or_a_quote_is_quoted() {
+        let spaced = RepoId::parse_ref(RepoType::Models, "comfy/My LoRAs").expect("repo parses");
+        assert_eq!(
+            pull_commands(
+                "http://127.0.0.1:7099",
+                subject(&spaced, SourceKind::Loose, Some(one_file("a.safetensors"))),
+                None,
+            )
+            .hf,
+            "HF_ENDPOINT=http://127.0.0.1:7099 hf download 'comfy/My LoRAs' 'a.safetensors'"
+        );
+        let hostile =
+            RepoId::parse_ref(RepoType::Models, "comfy/it's $(rm -rf ~)").expect("repo parses");
+        assert_eq!(
+            hf_arguments(&hostile, None),
+            "'comfy/it'\\''s $(rm -rf ~)'",
+            "a directory name a shell would read as code survives as text"
+        );
+    }
+
+    #[test]
+    fn a_plain_reference_stays_bare() {
+        assert_eq!(shell_word("kohya/film-grain-35mm"), "kohya/film-grain-35mm");
+        assert_eq!(shell_word("http://hoard.lan:7099"), "http://hoard.lan:7099");
+        assert_eq!(shell_word("a b"), "'a b'");
+        assert_eq!(shell_word(""), "''");
     }
 
     #[test]
     fn a_path_carrying_a_space_is_shell_quoted() {
-        let repo = RepoId::parse_qualified("models/org/name").expect("repo parses");
+        let repo = repo_of("models/org/name");
         let commands = pull_commands(
             "http://127.0.0.1:7099",
-            &repo,
-            SourceKind::HfCache,
-            Some(PullArtifact {
-                path: "a checkpoint.safetensors",
-                shard_count: 1,
-                revision: None,
-            }),
+            subject(
+                &repo,
+                SourceKind::HfCache,
+                Some(one_file("a checkpoint.safetensors")),
+            ),
             None,
         );
         assert_eq!(
@@ -886,13 +1055,7 @@ mod tests {
         let repo = RepoId::parse_ref(RepoType::Datasets, "squad").expect("repo parses");
         let commands = pull_commands(
             "http://hoard.lan:7099",
-            &repo,
-            SourceKind::HfCache,
-            Some(PullArtifact {
-                path: "train.parquet",
-                shard_count: 1,
-                revision: None,
-            }),
+            subject(&repo, SourceKind::HfCache, Some(one_file("train.parquet"))),
             None,
         );
         assert_eq!(
@@ -903,17 +1066,19 @@ mod tests {
 
     #[test]
     fn an_artifact_outside_main_names_its_revision_before_the_file_scope() {
-        let repo = RepoId::parse_qualified("models/mistralai/Ministral-3-14B-Instruct-2512")
-            .expect("repo parses");
+        let repo = repo_of("models/mistralai/Ministral-3-14B-Instruct-2512");
         let commands = pull_commands(
             "http://127.0.0.1:7099",
-            &repo,
-            SourceKind::HfCache,
-            Some(PullArtifact {
-                path: "model-00001-of-00004.safetensors",
-                shard_count: 4,
-                revision: Some(DETACHED_SHA.to_owned()),
-            }),
+            subject(
+                &repo,
+                SourceKind::HfCache,
+                Some(PullArtifact {
+                    path: "model-00001-of-00004.safetensors",
+                    shard_count: 4,
+                    revision: Some(DETACHED_SHA.to_owned()),
+                    companion: None,
+                }),
+            ),
             None,
         );
         assert_eq!(
@@ -930,13 +1095,16 @@ mod tests {
         let repo = RepoId::parse_ref(RepoType::Datasets, "squad").expect("repo parses");
         let commands = pull_commands(
             "http://hoard.lan:7099",
-            &repo,
-            SourceKind::HfCache,
-            Some(PullArtifact {
-                path: "train.parquet",
-                shard_count: 1,
-                revision: Some("refs/pr/1".to_owned()),
-            }),
+            subject(
+                &repo,
+                SourceKind::HfCache,
+                Some(PullArtifact {
+                    path: "train.parquet",
+                    shard_count: 1,
+                    revision: Some("refs/pr/1".to_owned()),
+                    companion: None,
+                }),
+            ),
             None,
         );
         assert_eq!(
@@ -965,17 +1133,19 @@ mod tests {
 
     #[test]
     fn git_answers_only_for_a_clonable_repository() {
-        let repo = RepoId::parse_qualified("models/org/name").expect("repo parses");
-        let clonable = pull_commands("http://hoard.lan:7099", &repo, SourceKind::Git, None, None);
+        let repo = repo_of("models/org/name");
+        let clonable = pull_commands(
+            "http://hoard.lan:7099",
+            subject(&repo, SourceKind::Git, None),
+            None,
+        );
         assert_eq!(
             clonable.git.as_deref(),
             Some("git clone http://hoard.lan:7099/org/name")
         );
         let cached = pull_commands(
             "http://hoard.lan:7099",
-            &repo,
-            SourceKind::HfCache,
-            None,
+            subject(&repo, SourceKind::HfCache, None),
             None,
         );
         assert_eq!(cached.git, None);
@@ -983,18 +1153,182 @@ mod tests {
 
     #[test]
     fn no_artifact_names_the_repository_command() {
-        let repo = RepoId::parse_qualified("models/org/name").expect("repo parses");
+        let repo = repo_of("models/org/name");
         let commands = pull_commands(
             "http://hoard.lan:7099",
-            &repo,
-            SourceKind::HfCache,
-            None,
+            subject(&repo, SourceKind::HfCache, None),
             None,
         );
         assert_eq!(
             commands.hf,
             "HF_ENDPOINT=http://hoard.lan:7099 hf download org/name"
         );
+    }
+
+    #[test]
+    fn the_repository_line_rides_beside_an_artifacts_line() {
+        let repo = repo_of("models/mistralai/Ministral-3-14B-Instruct-2512");
+        let commands = pull_commands(
+            "http://hoard.lan:7099",
+            subject(&repo, SourceKind::HfCache, Some(one_file("config.json"))),
+            None,
+        );
+        assert_eq!(
+            commands.hf,
+            "HF_ENDPOINT=http://hoard.lan:7099 hf download \
+             mistralai/Ministral-3-14B-Instruct-2512 'config.json'"
+        );
+        assert_eq!(
+            commands.repository.as_deref(),
+            Some(
+                "HF_ENDPOINT=http://hoard.lan:7099 hf download \
+                 mistralai/Ministral-3-14B-Instruct-2512"
+            )
+        );
+    }
+
+    #[test]
+    fn a_category_bin_offers_no_repository_line() {
+        let repo = repo_of("models/comfy/loras");
+        let commands = pull_commands(
+            "http://hoard.lan:7099",
+            PullSubject {
+                repo: &repo,
+                kind: SourceKind::Loose,
+                bin: true,
+                artifact: Some(one_file("zit/Z-Detail-Slider.safetensors")),
+            },
+            None,
+        );
+        assert_eq!(
+            commands.hf,
+            "HF_ENDPOINT=http://hoard.lan:7099 hf download comfy/loras \
+             'zit/Z-Detail-Slider.safetensors'"
+        );
+        assert_eq!(commands.repository, None);
+    }
+
+    #[test]
+    fn a_bare_repository_has_no_second_line() {
+        let repo = repo_of("models/org/name");
+        let commands = pull_commands(
+            "http://hoard.lan:7099",
+            subject(&repo, SourceKind::HfCache, None),
+            None,
+        );
+        assert_eq!(commands.repository, None);
+    }
+
+    #[test]
+    fn an_llm_and_its_one_projector_come_in_one_line() {
+        let repo = repo_of("models/lmstudio-community/Qwen3-VL-8B-Instruct-GGUF");
+        let llm = gguf_row(1, Role::Llm, "Qwen3-VL-8B-Instruct-Q8_0.gguf");
+        let projector = gguf_row(2, Role::Proj, "mmproj-Qwen3-VL-8B-Instruct-F16.gguf");
+        let rows = vec![llm.clone(), projector];
+        let mut artifact = PullArtifact::from(&llm);
+        artifact.companion = companion_of(&llm, &rows).map(|row| row.path.as_str());
+        let commands = pull_commands(
+            "http://hoard.lan:7099",
+            subject(&repo, SourceKind::HfCache, Some(artifact)),
+            None,
+        );
+        assert_eq!(
+            commands.hf,
+            "HF_ENDPOINT=http://hoard.lan:7099 hf download \
+             lmstudio-community/Qwen3-VL-8B-Instruct-GGUF 'Qwen3-VL-8B-Instruct-Q8_0.gguf' \
+             'mmproj-Qwen3-VL-8B-Instruct-F16.gguf'"
+        );
+    }
+
+    #[test]
+    fn a_shard_set_takes_its_companion_as_an_include() {
+        let repo = repo_of("models/org/vision");
+        let commands = pull_commands(
+            "http://hoard.lan:7099",
+            subject(
+                &repo,
+                SourceKind::HfCache,
+                Some(PullArtifact {
+                    path: "model-00001-of-00002.safetensors",
+                    shard_count: 2,
+                    revision: None,
+                    companion: Some("mmproj.gguf"),
+                }),
+            ),
+            None,
+        );
+        assert_eq!(
+            commands.hf,
+            "HF_ENDPOINT=http://hoard.lan:7099 hf download org/vision \
+             --include 'model-*-of-00002.safetensors' \
+             --include 'model.safetensors.index.json' \
+             --include 'mmproj.gguf'"
+        );
+    }
+
+    #[test]
+    fn a_gguf_set_names_no_index_document() {
+        let repo = repo_of("models/nvidia/nemotron-gguf");
+        let commands = pull_commands(
+            "http://hoard.lan:7099",
+            subject(
+                &repo,
+                SourceKind::HfCache,
+                Some(PullArtifact {
+                    path: "Nemotron-Q8_0-00001-of-00003.gguf",
+                    shard_count: 3,
+                    revision: None,
+                    companion: None,
+                }),
+            ),
+            None,
+        );
+        assert_eq!(
+            commands.hf,
+            "HF_ENDPOINT=http://hoard.lan:7099 hf download nvidia/nemotron-gguf \
+             --include 'Nemotron-Q8_0-*-of-00003.gguf'"
+        );
+    }
+
+    #[test]
+    fn two_projectors_beside_one_llm_name_no_companion() {
+        let llm = gguf_row(1, Role::Llm, "Qwen3-VL-8B-Instruct-Q8_0.gguf");
+        let first = gguf_row(2, Role::Proj, "mmproj-Qwen3-VL-8B-Instruct-F16.gguf");
+        let second = gguf_row(3, Role::Proj, "mmproj-Qwen3-VL-8B-Instruct-Q8_0.gguf");
+        assert_eq!(
+            companion_of(&llm, &[llm.clone(), first.clone(), second]).map(|row| row.path.clone()),
+            None
+        );
+        assert_eq!(
+            companion_of(&first, &[llm, first.clone()]).map(|row| row.path.clone()),
+            Some("Qwen3-VL-8B-Instruct-Q8_0.gguf".to_owned()),
+            "a projector names the one model it belongs to"
+        );
+        let lora = row("main", None);
+        assert_eq!(
+            companion_of(&lora, &[lora.clone(), first]).map(|row| row.path.clone()),
+            None,
+            "nothing comes down beside a lora"
+        );
+    }
+
+    #[test]
+    fn a_loose_repository_under_its_sources_own_name_is_a_bin() {
+        assert!(is_category_bin(
+            SourceKind::Loose,
+            &repo_of("models/comfy/loras"),
+            "comfy"
+        ));
+        assert!(!is_category_bin(
+            SourceKind::Loose,
+            &repo_of("models/lmstudio-community/Qwen3-VL-8B-Instruct-GGUF"),
+            "lmstudio"
+        ));
+        assert!(!is_category_bin(
+            SourceKind::HfCache,
+            &repo_of("models/comfy/loras"),
+            "comfy"
+        ));
     }
 
     #[test]

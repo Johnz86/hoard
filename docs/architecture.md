@@ -188,7 +188,8 @@ hoard/
           context.rs         sort keys, compat targets, the context a query compiles against
           facets.rs          per-dimension counts excluding own key, disk pressure
           brands.rs          the brand a base root belongs to, for the rail's grouping alone
-        shard.rs             groups a model split across files into one artifact
+        shard.rs             groups a model split across files into one artifact, and names
+                             the index document a set of that container ships
         triage.rs            queue, confirm, reject, noise list
         watch.rs             notify-driven rescan requests for the scan lane
       tests/scale.rs         ignored harness: 100k and 1M synthetic entries
@@ -246,6 +247,8 @@ hoard/
 
 End-to-end tests live beside the code they cover, in `tests.rs` modules under
 `crates/hoard-server/src/{api,hub,git}/`, driven by the `fixtures` feature of `hoard-index`.
+A `tests.rs` that has grown enough takes child modules beside it that reach its helpers
+through `super::`: `api/tests/opened.rs` covers the repository routes of an opened artifact.
 
 Dependency direction is strict: `hoard-core` <- `hoard-index` <- `hoard-mirror` <-
 `hoard-net` <- `hoard-server` <- `hoard`. No crate below `hoard-server` knows about axum.

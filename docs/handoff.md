@@ -3,6 +3,28 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest wave: the page describes the artifact that was opened
+
+A repository page described the largest weights file of `main` whatever the index row opened
+it: `Z-Detail-Slider.safetensors` (21.3 MB) showed the facts of a 7.6 GB LoRA beside it and
+copied `hf download comfy/loras`, which is 38 files and 30.9 GB. The four repository routes
+now take `artifact=<id>`, and the header, `facts`, `meta`, `paths`, `pull` and `compat`
+describe that row, on the revision holding it unless a `revision` is asked for; FILES marks
+the files it is made of. `PullCommands` gained `repository`, the whole-repository line, absent
+for a category folder of a tool layout, whose generated card also stops offering one. One
+writer, `api/common.rs::hf_arguments`, spells everything after `hf download`, so an LLM and its
+single projector come in one line, a `gguf` set asks for no `.index.json` that was never
+written, and the loadout `hf-script` export carries shard globs, `--revision` and
+`--repo-type`. `L` creates a loadout named `loadout` on first use instead of toasting that
+there is none. `hoard-server`, `web/` and one public function in `hoard_index::shard`;
+nothing stored changed and `catalog::FORMAT_VERSION` stays 12.
+
+`is_category_bin` reads a loose repository whose org is its source's name, which catches a
+per-model folder sitting directly under a plain loose source as well as a real category
+folder; such a repository loses only its whole-repository pull line, and its own file is
+still named. The `whole-header-inference` wave stores the tool layout a source was
+recognized as, and the test becomes exact then.
+
 ## Latest wave: the any bucket is active only when the query names any
 
 The base rail decided a bucket's `active` flag with `Base::matches`, whose `any` wildcard is a
@@ -22,11 +44,7 @@ and 1 against this workstation's caches where each answered 0; a `~` token match
 as a prefix in any order. The `hf` pull line of an artifact held outside `main` carries
 `--revision <sha>`, so artifact `a_14`'s copied command downloads its 5 files instead of none.
 Nothing stored changed shape and `catalog::FORMAT_VERSION` stays 12. Left open by the
-2026-09-17 review: the repo page's folder-level PULL box, the one-shard-of-N model, and base
-identification. Left open with them, the loadout `hf-script` export
-(`api/loadouts.rs::hf_script`) still writes its own `hf download` line, with no `--revision`
-and naming one shard of a set; the wave that opens an artifact moves it onto `pull_commands`
-rather than fixing the line twice.
+2026-09-17 review: the one-shard-of-N model and base identification.
 
 ## Latest wave: a format bump no longer costs a rehash
 

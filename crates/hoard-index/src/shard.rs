@@ -20,6 +20,10 @@ const SHARD_EXTENSIONS: [&str; 5] = ["safetensors", "bin", "pth", "gguf", "parqu
 
 const INDEX_SUFFIX: &str = ".index.json";
 
+/// The containers a set of which is declared by an index document beside its pieces. A
+/// `gguf` split and a `parquet` set carry none.
+const INDEXED_EXTENSIONS: [&str; 2] = ["safetensors", "bin"];
+
 /// What separates a shard's own number from the size of the set it belongs to.
 const SHARD_SEPARATOR: &str = "-of-";
 
@@ -123,6 +127,16 @@ pub fn is_shardable(file_name: &str) -> bool {
 /// True for the document that names the pieces of a model rather than holding any.
 pub fn is_index_document(file_name: &str) -> bool {
     file_name.len() > INDEX_SUFFIX.len() && file_name.ends_with(INDEX_SUFFIX)
+}
+
+/// The name of the document that declares a set's pieces, for the containers a producer
+/// writes one beside. Absent for every other container, so nothing asks for a file that was
+/// never written.
+pub fn index_document_name(stem: &str, extension: &str) -> Option<String> {
+    INDEXED_EXTENSIONS
+        .iter()
+        .any(|known| extension.eq_ignore_ascii_case(known))
+        .then(|| format!("{stem}.{extension}{INDEX_SUFFIX}"))
 }
 
 /// True for any file grouping considers: a container a model splits across, or the index
@@ -419,6 +433,22 @@ mod tests {
         assert!(parse_shard_name("model.safetensors").is_none());
         assert!(parse_shard_name("-00001-of-00002.gguf").is_none());
         assert!(parse_shard_name("notes-1-of-2.txt").is_none());
+    }
+
+    #[test]
+    fn only_a_container_that_ships_an_index_document_names_one() {
+        assert_eq!(
+            index_document_name("model", "safetensors").as_deref(),
+            Some("model.safetensors.index.json")
+        );
+        assert_eq!(
+            index_document_name("pytorch_model", "BIN").as_deref(),
+            Some("pytorch_model.BIN.index.json"),
+            "a container is named however the file on disk spells it"
+        );
+        assert_eq!(index_document_name("Nemotron-Q8_0", "gguf"), None);
+        assert_eq!(index_document_name("train", "parquet"), None);
+        assert_eq!(index_document_name("model", "pth"), None);
     }
 
     #[test]

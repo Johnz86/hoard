@@ -13,14 +13,17 @@ use hoard_index::config::SourceKind;
 use hoard_index::row::SearchRow;
 
 use crate::api::common::{
-    EntryView, Fact, PLUGS_INTO_LIMIT, PullArtifact, PullCommands, RowView, authorize, blocking,
-    clamp_limit, entry_views, facts, pull_commands,
+    EntryView, Fact, PLUGS_INTO_LIMIT, PullArtifact, PullCommands, PullSubject, RowView, authorize,
+    blocking, clamp_limit, companion_of, companion_role, entry_views, facts, is_category_bin,
+    pull_commands, shown_path,
 };
 use crate::api::compat::{CompatRowView, CompatView, compat_for};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 const PULLS_LABEL: &str = "pulls on lan";
+/// How many of a repository's artifacts a pull command reads to find a companion.
+const REPO_ARTIFACTS: u32 = 64;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct LimitParams {
@@ -198,23 +201,50 @@ pub async fn pull_command(
 ) -> ApiResult<Json<PullCommands>> {
     let id = artifact_id(&id)?;
     let catalog = Arc::clone(state.catalog());
-    let (row, repo, kind) = blocking(move || {
+    let subject = blocking(move || {
         let row = require_row(&catalog, id)?;
         let repo = RepoId::parse_qualified(&row.repo)?;
-        let kind = catalog
-            .repository(&repo)?
-            .map_or(SourceKind::Auto, |record| record.kind);
-        Ok((row, repo, kind))
+        let record = catalog.repository(&repo)?;
+        let rows = match (&record, companion_role(row.role)) {
+            (Some(record), Some(_)) => catalog.repository_rows(record.id, REPO_ARTIFACTS)?,
+            (Some(_), None) | (None, _) => Vec::new(),
+        };
+        Ok(PullTarget {
+            kind: record
+                .as_ref()
+                .map_or(SourceKind::Auto, |record| record.kind),
+            bin: record
+                .as_ref()
+                .is_some_and(|record| is_category_bin(record.kind, &repo, &record.source)),
+            repo,
+            row,
+            rows,
+        })
     })
     .await?;
-    let path = row.abs_path.clone().or_else(|| Some(row.path.clone()));
+    let mut artifact = PullArtifact::from(&subject.row);
+    artifact.companion = companion_of(&subject.row, &subject.rows).map(|row| row.path.as_str());
+    let path = shown_path(&subject.row).or_else(|| Some(subject.row.path.clone()));
     Ok(Json(pull_commands(
         state.public_url(),
-        &repo,
-        kind,
-        Some(PullArtifact::from(&row)),
+        PullSubject {
+            repo: &subject.repo,
+            kind: subject.kind,
+            bin: subject.bin,
+            artifact: Some(artifact),
+        },
         path,
     )))
+}
+
+/// What a pull command needs from the catalog: the artifact, the repository holding it, and
+/// that repository's other artifacts, to see whether one of them comes down with it.
+struct PullTarget {
+    row: SearchRow,
+    repo: RepoId,
+    kind: SourceKind,
+    bin: bool,
+    rows: Vec<SearchRow>,
 }
 
 pub async fn put_override(

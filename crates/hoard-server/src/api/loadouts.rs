@@ -18,7 +18,9 @@ use hoard_net::identity::NodeIdentity;
 use hoard_net::{PullRequest, Puller, PullerConfig};
 
 use crate::api::artifacts::artifact_id;
-use crate::api::common::{authorize, blocking, shell_quoted};
+use crate::api::common::{
+    PullArtifact, authorize, blocking, hf_arguments, row_prefix, shell_quoted,
+};
 use crate::api::link::{self, Profile};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -37,6 +39,9 @@ pub struct LoadoutItem {
     pub role_code: String,
     pub artifact_id: Option<ArtifactId>,
     pub name: String,
+    /// What the drawer prints dimmed before the name, as a results row prints it: the
+    /// repository the line names, and empty when the pin resolved to nothing.
+    pub prefix: String,
     pub repo: String,
     pub path: String,
     pub revision: Option<String>,
@@ -46,6 +51,8 @@ pub struct LoadoutItem {
     pub size_human: String,
     pub state: Option<ArtifactState>,
     pub resolution: PinResolution,
+    #[serde(skip)]
+    hf_arguments: String,
 }
 
 /// What applying the loadout to a node would do.
@@ -749,7 +756,22 @@ fn item_of(
     };
     let row = held.or(elsewhere).or_else(|| candidates.first());
     let size = row.map_or(0, |row| row.size);
+    let of_this_repo = row.filter(|row| row.repo == pin.repo.qualified());
+    let artifact = match of_this_repo {
+        Some(row) => PullArtifact::from(row),
+        None => PullArtifact {
+            path: &pin.path,
+            shard_count: 1,
+            revision: pin.sha.map(|sha| sha.to_hex()),
+            companion: None,
+        },
+    };
+    let arguments = hf_arguments(&pin.repo, Some(&artifact));
     Ok(LoadoutItem {
+        hf_arguments: arguments,
+        prefix: row.map_or_else(String::new, |_| {
+            row_prefix(&pin.repo.qualified(), pin.display_name())
+        }),
         slot,
         role: row.map_or(slot.role(), |row| row.role),
         role_code: row.map_or(slot.role(), |row| row.role).code().to_owned(),
@@ -807,16 +829,7 @@ fn hf_script(view: &LoadoutView, public: &str) -> String {
         shell_quoted(public)
     );
     for item in &view.items {
-        let reference = item
-            .repo
-            .split_once('/')
-            .map(|(_, rest)| rest.to_owned())
-            .unwrap_or_else(|| item.repo.clone());
-        text.push_str(&format!(
-            "hf download {} {}\n",
-            shell_quoted(&reference),
-            shell_quoted(&item.path)
-        ));
+        text.push_str(&format!("hf download {}\n", item.hf_arguments));
     }
     text
 }
