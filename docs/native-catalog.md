@@ -201,7 +201,7 @@ nothing here restates it.
 The whole thing is recreatable from disk plus peers. redb takes an exclusive lock, so one
 process may open a catalog at a time; `hoard doctor` reports it when a second one tries.
 
-`<data_dir>/` holds two more files beside `native/`, and they are beside it rather than inside
+`<data_dir>/` holds four more files beside `native/`, and they are beside it rather than inside
 it on purpose: `open_or_scan` answers a format mismatch with `remove_dir_all` of
 `<data_dir>/native` alone, so what sits next to that directory survives a rebuild.
 
@@ -228,10 +228,26 @@ it on purpose: `open_or_scan` answers a format mismatch with `remove_dir_all` of
   holds redb's lock on is neither, and is reported as `CatalogBusy` rather than unlinked from
   under its holder.
 
-The memo grows monotonically: one row per distinct `(inode, mtime, size)` ever seen, with no
-eviction, and it is not counted by `Catalog::storage` or `hoard doctor`, which report the
-catalog directory alone. Deleting `digests.redb` by hand at any time is safe and costs only
-the re-reads a later pass then pays.
+- `civitai.redb`, the lookup's memo: one row per sha256 a lookup pass has ever asked a listing
+  service about, keyed by the 32 bytes of that hash and valued by when it was asked and what
+  came back. An answer of "asked, and unknown" is a row too, so a hash the service does not
+  know is asked about again only after `RETRY_UNKNOWN_DAYS`, 30. The catalog opens it on first
+  use and holds it open for its own lifetime, because redb takes one exclusive lock per file;
+  `lookup_candidates` asks it through one read transaction for a whole listing rather than
+  opening one per artifact it considers.
+- `civitai.version`, that memo's own format, written and read exactly as `digests.version` is
+  and for the same reason: what a third party said about a file's bytes and the shape of a
+  catalog record are unrelated facts. A memo of another version, or one whose redb file is
+  corrupt, is deleted and started again empty; one another handle holds is reported as
+  `CatalogBusy`.
+
+Both memos grow monotonically, with no eviction, and neither is counted by `Catalog::storage`
+or `hoard doctor`, which report the catalog directory alone. Deleting either by hand at any
+time is safe: `digests.redb` costs the re-reads a later pass then pays, and `civitai.redb`
+costs one request per hashed diffusion artifact the next time the lookup is switched on. A
+`FORMAT_VERSION` rebuild re-infers every artifact from disk, after which the hashing pass
+restores the digests from the one memo and the lookup restores its refinements from the other,
+without reading a file or opening a socket.
 
 On the fixture of `a_rebuilt_catalog_recalls_digests_the_memo_already_knows`, three files of
 2,359,296 bytes in all: the first pass reports `HashProgress.bytes_done` of 2,359,296, and a
@@ -330,6 +346,11 @@ the catalog at `<data_dir>/native`.
 - `hashing.rs` sha256 and git blob sha1 per file, content identities, merges.
 - `hash_memo.rs` the `<data_dir>/digests.redb` sidecar: a digest against the inode, mtime and
   size that earned it, and its own version stamp.
+- `lookup_memo.rs` the `<data_dir>/civitai.redb` sidecar: what a listing service answered
+  about one sha256 and when it was asked, and its own version stamp.
+- `lookup.rs` the artifacts a lookup pass may ask about and the writer that applies an answer:
+  it refines the stored base, records one `lookup` evidence row whatever it decided, and moves
+  the same counters, change log and search refresh a verdict does.
 - `ingest.rs` a file the mirror fetched, filed as a served entry.
 - `nodes.rs` this machine and every peer it knows.
 - `digest.rs` the rows this node offers and the rows a peer advertises.
@@ -491,6 +512,14 @@ Every writer of an entry commits through `scan::Counters`:
   published. The sequence continues past both the highest key the log holds and
   `Manifest.search_seq`.
 - `Counters::save(transaction)` flushes whatever shift is left and writes the allocator back.
+
+`Catalog::apply_lookups` is the newest writer of an artifact record and takes the same path a
+verdict does: one transaction for a batch, `touch` before the record is written, the artifacts
+whose base moved pushed onto `pending` and logged, `settle_summary`, then one `refresh_search`
+for the batch and only when something moved. It writes no entry, so it moves no derived count.
+An answer that refines nothing still writes the artifact's cold `ArtifactDetail` row with one
+`lookup` evidence, which is how the same hash is never asked about twice; that row is not in
+the search document, so it is not logged and does not refresh the index.
 
 A rescan recognises a stored row by where it is filed. `repository_stamps` keys the map it hands
 the walk by a hash of the location - the repository id, the revision ordinal and the relative

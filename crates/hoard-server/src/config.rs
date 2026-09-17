@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use hoard_index::config::IndexConfig;
 use hoard_mirror::config::MirrorConfig;
+use hoard_mirror::lookup::LookupConfig;
 
 use crate::error::ApiError;
 
@@ -124,6 +125,8 @@ pub struct HoardConfig {
     pub index: IndexConfig,
     #[serde(default)]
     pub mirror: MirrorConfig,
+    #[serde(default)]
+    pub lookup: LookupConfig,
 }
 
 impl HoardConfig {
@@ -234,6 +237,28 @@ mod tests {
     #[test]
     fn nothing_outside_the_data_directory_is_writable_by_default() {
         assert!(HoardConfig::default().server.projection_roots.is_empty());
+    }
+
+    #[test]
+    fn the_lookup_is_off_until_a_section_asks_for_it() {
+        let absent = HoardConfig::parse("[server]\n").expect("config parses");
+        assert!(
+            !absent.lookup.civitai,
+            "a config with no lookup section sends nothing anywhere"
+        );
+        assert_eq!(absent.lookup.civitai_url, "https://civitai.com");
+
+        let asked = HoardConfig::parse("[lookup]\ncivitai = true\n").expect("config parses");
+        assert!(asked.lookup.civitai);
+        assert_eq!(
+            asked.lookup.civitai_url, "https://civitai.com",
+            "the url a switched-on lookup uses is still the default one"
+        );
+
+        let elsewhere =
+            HoardConfig::parse("[lookup]\ncivitai_url = \"http://127.0.0.1:9\"\n").expect("parses");
+        assert!(!elsewhere.lookup.civitai);
+        assert_eq!(elsewhere.lookup.civitai_url, "http://127.0.0.1:9");
     }
 
     #[test]

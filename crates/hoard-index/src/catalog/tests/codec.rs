@@ -36,6 +36,7 @@ fn compact_records_round_trip_without_changing_public_views() -> Result<()> {
         EvidenceSource::FolderHint,
         EvidenceSource::Filename,
         EvidenceSource::Header,
+        EvidenceSource::Lookup,
         EvidenceSource::User,
     ]
     .into_iter()
@@ -51,7 +52,8 @@ fn compact_records_round_trip_without_changing_public_views() -> Result<()> {
             | EvidenceSource::Frontmatter
             | EvidenceSource::FolderHint
             | EvidenceSource::Filename
-            | EvidenceSource::Header => Some("read from the header".to_owned()),
+            | EvidenceSource::Header
+            | EvidenceSource::Lookup => Some("read from the header".to_owned()),
         },
         confidence: 0.5,
     })

@@ -3,6 +3,67 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest wave: ask Civitai what a file is, once, when the owner says so
+
+A header proves an architecture and often no more: `oneObsession_v24.safetensors` reads `sdxl`
+because nothing in its name, its folder or its tensors says `Illustrious`. With
+`[lookup] civitai = true` a background worker now asks civitai.com by sha256 what each hashed
+checkpoint, LoRA, ControlNet, VAE, embedding and upscaler on this node is - one request per
+hash, one more every thirty days while the service does not know that hash, and at most one a
+second - and refines the stored base with the answer. An answer that extends the architecture
+hoard already proved refines it (`sdxl` to `sdxl illustrious`, which `base:sdxl` still finds),
+one for an artifact whose header proved nothing names it at the lookup's own confidence of
+0.7, one naming another architecture loses to what hoard has, and a user's verdict is never
+overwritten: an artifact whose base a verdict settled is not a candidate at all, so it can
+never take a place in a window it could do nothing with. Every answer leaves one `lookup`
+evidence row saying what was listed and what it did, which is also what stops the same hash
+being asked about twice. Answers live in `<data_dir>/civitai.redb` beside the digest memo, with
+their own version stamp, so a catalog rebuilt after a format change restores every refinement
+without a socket. `catalog::FORMAT_VERSION` is 15: the catalog is deleted and rebuilt from disk.
+
+The switch is off by default and is ignored while `[mirror] offline = true`. Nothing but the
+sha256 leaves the machine: no path, no file name, no `Authorization` header, no query string,
+which `only_the_hash_leaves_the_machine` pins against wiremock. The lookup's client follows no
+redirect, so a 3xx is a status that answers nothing rather than a way for the hash to reach a
+host the configuration never named (`a_redirect_is_not_followed`), and it makes one attempt per
+hash per pass, so a service that is rate limiting is asked once and the pass ends rather than
+three times over. A stop reaches the worker inside the request it is waiting on, so shutting a
+node down does not wait out a hung connection. To turn it on, add `[lookup]` / `civitai = true`
+to `hoard.toml` and restart `serve`; the JOBS tab then shows a `lookup` job with subject
+`civitai` for each pass of up to 256 hashes.
+
+Expect compat lists to move the first time a pass lands, in both directions. Compat is a
+two-way prefix test, so refining ONE side can end a match the two had before: a LoRA refined
+from `sdxl` to `sdxl illustrious` no longer resolves against a host filed `sdxl pony`, though
+both still answer `base:sdxl`. That is intended - a pony host and an illustrious LoRA are a
+worse pairing than the bare architecture suggested - but it is a visible change to a list a
+person may have learned.
+
+The number that says the problem exists was measured by hand on 2026-09-17: of the 85 hashed
+ComfyUI checkpoints and LoRAs on this disk, Civitai knows 72 (37 of 48 checkpoints, 35 of 37
+LoRAs), and where hoard already has a base the listing refines the same architecture every
+time and never contradicts it. No live run is part of this wave: turning the switch on sends
+this machine's file hashes to a third party, and that is the owner's to do. The check that was
+run is a release build with the switch absent and `[mirror] offline = true`, scanning the three
+real sources into a scratch catalog on port 7199: the catalog stamps format 15, `/api/v1/jobs`
+holds one `scan` job and no `lookup`, no `civitai.redb` was created, and artifacts 234,
+triage 22, `base:sdxl` 5, `base:sdxlpony` 1 and `base:sdxlillustrious` 1 are the previous
+wave's numbers unchanged.
+
+One question for the performance reviewer. `Catalog::lookup_candidates` is a primary scan that
+exits at the window, and it asks the memo through one read transaction for the whole listing,
+but it still reads one cold `ArtifactDetail` row per hashed diffusion artifact it considers,
+because the `lookup` evidence on that row is what says the artifact has been answered. In the
+steady state, where every artifact has been answered, that is one LZ4 decode per diffusion
+artifact every fifteen minutes, and at a million artifacts it is the only part of this wave
+that does not obviously hold. The cheap fix is a flag on `ArtifactRecord` rather than a read
+of the detail, which is a record shape change and so a wave of its own.
+
+Two follow-ups this wave named and did not build. The inspector does not show Civitai's model
+name and version, though the evidence detail carries both. Trigger words are not taken from
+`trainedWords`, which is the other half of what a listing knows and what the TRIGGER column is
+usually empty for.
+
 ## Latest wave: a partial set is partial, and a category folder is what discovery saw
 
 A set was what held two files rather than what declared two, so `openai/gpt-oss-120b`, an index

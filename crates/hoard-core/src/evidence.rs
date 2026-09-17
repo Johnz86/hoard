@@ -14,6 +14,7 @@ pub enum EvidenceSource {
     FolderHint,
     Filename,
     Header,
+    Lookup,
     User,
 }
 
@@ -27,6 +28,7 @@ impl EvidenceSource {
             EvidenceSource::FolderHint => "folder_hint",
             EvidenceSource::Filename => "filename",
             EvidenceSource::Header => "header",
+            EvidenceSource::Lookup => "lookup",
             EvidenceSource::User => "user",
         }
     }
@@ -39,6 +41,7 @@ impl EvidenceSource {
             EvidenceSource::Metadata => 0.9,
             EvidenceSource::Config => 0.85,
             EvidenceSource::Header => 0.8,
+            EvidenceSource::Lookup => 0.7,
             EvidenceSource::Frontmatter => 0.6,
             EvidenceSource::Filename => 0.4,
             EvidenceSource::FolderHint => 0.35,
@@ -98,5 +101,34 @@ mod tests {
             Some("lora_unet_ prefix on 264 tensors")
         );
         assert!(EvidenceSource::Tensor.weight() > EvidenceSource::FolderHint.weight());
+    }
+
+    #[test]
+    fn a_lookup_is_spelled_once_and_weighed_between_a_header_and_a_card() {
+        let every = [
+            EvidenceSource::Tensor,
+            EvidenceSource::Config,
+            EvidenceSource::Metadata,
+            EvidenceSource::Frontmatter,
+            EvidenceSource::FolderHint,
+            EvidenceSource::Filename,
+            EvidenceSource::Header,
+            EvidenceSource::Lookup,
+            EvidenceSource::User,
+        ];
+        let mut spellings: Vec<&str> = every.iter().map(|source| source.as_str()).collect();
+        spellings.sort_unstable();
+        spellings.dedup();
+        assert_eq!(spellings.len(), every.len(), "two sources share a spelling");
+
+        assert_eq!(EvidenceSource::Lookup.as_str(), "lookup");
+        assert!(
+            EvidenceSource::Lookup.weight() < EvidenceSource::Header.weight(),
+            "a third party's label loses to what the bytes themselves proved"
+        );
+        assert!(
+            EvidenceSource::Lookup.weight() > EvidenceSource::Frontmatter.weight(),
+            "a label for these exact bytes beats a card written about a repository"
+        );
     }
 }

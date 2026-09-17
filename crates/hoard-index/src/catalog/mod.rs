@@ -5,6 +5,8 @@ mod hashing;
 mod ingest;
 mod jobs;
 mod loadouts;
+mod lookup;
+mod lookup_memo;
 mod models;
 mod naming;
 mod nodes;
@@ -22,7 +24,7 @@ mod userdata;
 mod verdict;
 
 use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use native_db::{Builder, Database, Models};
 use redb::{MultimapTableHandle, ReadableTableMetadata, TableHandle};
@@ -39,6 +41,8 @@ pub use self::hashing::{HashProgress, HashReport, Stop, content_key};
 pub use self::ingest::{IngestRecord, MIRROR_SOURCE, ServedFile};
 pub use self::jobs::{JobProgress, JobRecord, JobState};
 pub use self::loadouts::LoadoutRecord;
+pub use self::lookup::LookupCandidate;
+pub use self::lookup_memo::{Listed, LookupAnswer};
 pub use self::models::LOCAL_NODE;
 pub use self::nodes::{NodeRecord, PEER_SOURCE};
 pub use self::pulls::{PULL_SOURCE, PullMark, PullSlot, PulledFile};
@@ -56,7 +60,7 @@ pub use self::verdict::OverrideRecord;
 
 /// The one shape this build reads and writes. A catalog whose `FORMAT` stamp names another,
 /// or that carries no stamp, is rebuilt from disk rather than converted.
-pub const FORMAT_VERSION: u32 = 14;
+pub const FORMAT_VERSION: u32 = 15;
 
 const FORMAT_FILE: &str = "FORMAT";
 
@@ -130,6 +134,7 @@ pub struct Catalog {
     directory: PathBuf,
     search_cache: RwLock<Option<OpenIndex>>,
     search_lane: parking_lot::Mutex<()>,
+    lookup_memo: parking_lot::Mutex<Option<Arc<self::lookup_memo::LookupMemo>>>,
 }
 
 /// The Tantivy index a catalog is currently serving, kept open so a query does not pay for
@@ -188,6 +193,7 @@ impl Catalog {
             directory: directory.to_path_buf(),
             search_cache: RwLock::new(None),
             search_lane: parking_lot::Mutex::new(()),
+            lookup_memo: parking_lot::Mutex::new(None),
         };
         let manifest = catalog.manifest()?;
         Ok((catalog, manifest))

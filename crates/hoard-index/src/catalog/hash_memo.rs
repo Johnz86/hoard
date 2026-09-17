@@ -118,7 +118,7 @@ impl HashMemo {
     }
 }
 
-fn memo_builder() -> Builder {
+pub(super) fn memo_builder() -> Builder {
     let mut builder = Builder::new();
     builder.set_cache_size(MEMO_CACHE_BYTES);
     builder
@@ -132,7 +132,7 @@ fn stamp_key(stamp: FileStamp) -> u128 {
     xxhash_rust::xxh3::xxh3_128(&key)
 }
 
-fn stamped_version(path: &Path) -> Option<u32> {
+pub(super) fn stamped_version(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|text| text.trim_end().parse().ok())

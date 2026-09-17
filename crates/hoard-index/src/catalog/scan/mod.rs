@@ -171,6 +171,7 @@ impl Catalog {
                     directory,
                     search_cache: std::sync::RwLock::new(None),
                     search_lane: parking_lot::Mutex::new(()),
+                    lookup_memo: parking_lot::Mutex::new(None),
                 };
                 Ok(catalog)
             }

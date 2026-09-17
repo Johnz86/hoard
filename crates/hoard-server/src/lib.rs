@@ -80,6 +80,34 @@ pub fn start_eviction(state: &AppState) -> Option<hoard_mirror::cache::EvictionH
     ))
 }
 
+/// Starts the lookup that asks a listing service by sha256 what each hashed diffusion
+/// artifact is, or nothing at all.
+///
+/// Nothing is started unless `[lookup] civitai = true`, and nothing is started while the
+/// mirror is offline, whatever that switch says: offline means this node opens no socket.
+///
+/// The lookup gets a client of its own rather than the mirror's, and one that follows no
+/// redirect: its URL carries the content hash of a file on this machine, and a 3xx would
+/// otherwise send that hash on to whatever host the answer named.
+pub fn start_lookup(state: &AppState) -> Option<hoard_mirror::lookup::LookupHandle> {
+    let config = state.config();
+    if !config.lookup.civitai || state.offline() {
+        return None;
+    }
+    let client = match hoard_mirror::upstream::UpstreamClient::direct(state.offline()) {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(%error, "the lookup has no client; nothing is asked");
+            return None;
+        }
+    };
+    Some(hoard_mirror::lookup::spawn_lookup(
+        std::sync::Arc::clone(state.catalog()),
+        client,
+        config.lookup.clone(),
+    ))
+}
+
 /// Starts watching every configured source, so a file added while this node serves is
 /// searchable without a manual scan.
 ///
@@ -458,6 +486,42 @@ mod tests {
             .list_jobs(Some(JobState::Running))
             .expect("jobs read back");
         assert!(running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_lookup_is_off_by_default() {
+        let (_dir, state) = state();
+        assert!(
+            start_lookup(&state).is_none(),
+            "nothing is sent anywhere until the owner says so"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_offline_mirror_starts_no_lookup_even_when_asked() {
+        let mut config = HoardConfig {
+            lookup: hoard_mirror::lookup::LookupConfig {
+                civitai: true,
+                civitai_url: "http://127.0.0.1:1".to_owned(),
+            },
+            ..HoardConfig::default()
+        };
+        config.mirror.offline = true;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let catalog = crate::testing::empty_catalog(dir.path(), "test");
+        let offline = AppState::new(config.clone(), catalog).expect("state builds");
+
+        assert!(
+            start_lookup(&offline).is_none(),
+            "offline means no socket, whatever the switch says"
+        );
+
+        config.mirror.offline = false;
+        let second = tempfile::tempdir().expect("temp dir");
+        let catalog = crate::testing::empty_catalog(second.path(), "test");
+        let online = AppState::new(config, catalog).expect("state builds");
+        let handle = start_lookup(&online).expect("a switched-on lookup runs");
+        handle.shutdown().await;
     }
 
     #[tokio::test]

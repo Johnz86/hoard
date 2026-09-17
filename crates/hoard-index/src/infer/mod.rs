@@ -7,6 +7,7 @@
 
 mod base;
 mod families;
+pub mod lookup;
 mod lora;
 mod precision;
 mod role;

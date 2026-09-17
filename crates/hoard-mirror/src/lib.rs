@@ -11,6 +11,7 @@ pub mod error;
 pub mod git;
 pub mod ingest;
 pub mod local;
+pub mod lookup;
 pub mod model;
 pub mod resolve;
 pub mod upstream;

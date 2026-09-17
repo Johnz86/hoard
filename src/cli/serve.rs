@@ -31,6 +31,7 @@ pub async fn run(context: Context, bind: Option<String>) -> Result<()> {
 
     let gossip = hoard_server::start_gossip(&state).await;
     let eviction = hoard_server::start_eviction(&state);
+    let lookup = hoard_server::start_lookup(&state);
     hoard_server::start_watcher(&state).await;
     tracing::info!(node = %node, %address, url = %public, offline, "hoard is serving");
     hoard_server::serve(listener, state, shutdown())
@@ -41,6 +42,9 @@ pub async fn run(context: Context, bind: Option<String>) -> Result<()> {
     }
     if let Some(eviction) = eviction {
         eviction.shutdown().await;
+    }
+    if let Some(lookup) = lookup {
+        lookup.shutdown().await;
     }
     tracing::info!("hoard has stopped");
     Ok(())

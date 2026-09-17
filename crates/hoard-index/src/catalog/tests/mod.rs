@@ -4,6 +4,7 @@ mod collapse;
 mod counts;
 mod hashing;
 mod index;
+mod lookup;
 mod mirror;
 mod naming;
 mod paging;

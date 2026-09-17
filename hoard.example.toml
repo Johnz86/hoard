@@ -70,3 +70,12 @@ allow = true
 [[mirror.cache]]
 repo = "*/*"
 allow = true
+
+# Ask civitai.com by sha256 what each hashed checkpoint, LoRA, ControlNet, VAE, embedding
+# and upscaler on this node is, to refine the base a header could only half name.
+# The sha256 is all that is sent: no path, no file name, no token, and no redirect followed.
+# One request per file, and one more every thirty days while civitai.com does not know it;
+# the answer is remembered so a rebuilt catalog asks nothing again.
+# Nothing is asked while [mirror] offline = true, and nothing is asked without this switch.
+[lookup]
+# civitai = true

@@ -138,6 +138,7 @@ hoard/
           rules.rs           key prefix and shape signature tables, the marker vocabulary
           families.rs        a family by the exact keys ComfyUI detects it by, a LoRA by module
           role.rs  base.rs  lora.rs  precision.rs  trigger.rs
+          lookup.rs          what a listing service's baseModel does to a stored base, no IO
         hash/                fingerprint, sha256, git blob sha1
         catalog/             the native_db + Tantivy catalog: the index
           mod.rs             Catalog open/status/integrity, format version, storage report
@@ -168,6 +169,7 @@ hoard/
           query.rs           the grammar compiled against the Tantivy index
           read.rs            inspector, repository screens, triage queue, sources
           verdict.rs         a user's override of what an artifact is
+          lookup.rs          the artifacts a lookup may ask about and the writer of an answer
           seed.rs            synthetic records for tests, behind `fixtures`
           userdata.rs        shelves, settings, the noise list, projections
           usage.rs           the served-response log and per-artifact use counts
@@ -175,13 +177,14 @@ hoard/
           jobs.rs            scan, apply and pull job rows
           hashing.rs         sha256 and git blob sha1 per file, content identities, merges
           hash_memo.rs       <data_dir>/digests.redb: a digest against the stamp that earned it
+          lookup_memo.rs     <data_dir>/civitai.redb: what a lookup was told about one sha256
           ingest.rs          a file the mirror fetched, filed as a served entry
           nodes.rs           this machine and every peer it knows
           digest.rs          the rows this node offers and the rows a peer advertises
           pulls.rs           a pull in flight and the file it lands
           tests/             shared fixtures in mod.rs; scan, revisions, storage, codec, reads,
                              mirror, counts, rescan, index, paging, collapse, usage, hashing,
-                             recovery, brands, naming, text
+                             recovery, brands, naming, text, lookup
         row.rs               SearchRow, FacetBucket, DiskPressure: what a search answers with
         time.rs              reading and writing the instants the catalog stores
         search/
@@ -217,6 +220,7 @@ hoard/
         git/
           smart_http.rs      info/refs and upload-pack via the git binary
           lfs_batch.rs       LFS batch API pointing at resolve
+        lookup.rs            the civitai by-hash worker, its config and its job
         resolve.rs           revision -> sha, local first
         ingest.rs            completed cache entries into the index
         usage.rs             served-request log and the sink that batches it

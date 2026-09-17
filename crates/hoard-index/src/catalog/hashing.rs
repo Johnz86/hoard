@@ -369,7 +369,7 @@ impl Catalog {
         Ok(())
     }
 
-    fn memo_directory(&self) -> &Path {
+    pub(super) fn memo_directory(&self) -> &Path {
         self.directory.parent().unwrap_or(&self.directory)
     }
 

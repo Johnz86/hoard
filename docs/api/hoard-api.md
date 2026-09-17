@@ -320,10 +320,34 @@ no `dir` at all and always uses the configured root.
   merged into, and that queued scan takes the stronger of the two hash policies, `"now"`
   over `"later"` over `"never"`. A node shutting down runs what the lane still holds before
   it exits.
-- `GET /api/v1/jobs?state=`: scans, hash runs, pulls, applies with `phase`, `progress`
-  (0..1), `bytes`, `total`, `rate_bps`, `started`, `finished`, `error`. A scan's hashing
-  phase reports `total` as the bytes it was owed when the pass opened. `GET /api/v1/jobs/{id}`,
+- `GET /api/v1/jobs?state=`: scans, hash runs, pulls, applies and lookups with `phase`,
+  `progress` (0..1), `bytes`, `total`, `rate_bps`, `started`, `finished`, `error`. A scan's
+  hashing phase reports `total` as the bytes it was owed when the pass opened. A job of kind
+  `lookup` has subject `civitai` and reports how many hashes of its window it has asked about
+  out of how many that window holds; it is failed with the reason when the service rate limits
+  it and cancelled when the node stops mid-pass. `GET /api/v1/jobs/{id}`,
   `POST /api/v1/jobs/{id}/cancel`.
+
+## The lookup
+
+`[lookup] civitai = true` in `hoard.toml` lets a background worker ask civitai.com by sha256
+what each hashed checkpoint, LoRA, ControlNet, VAE, embedding and upscaler on this node is,
+`GET https://civitai.com/api/v1/model-versions/by-hash/<sha256>`: one request per hash, one
+more every thirty days while the service does not know that hash, and at most one request a
+second. The sha256 is the whole request: no path, no file name, no `Authorization` header, no
+query string, one attempt per hash per pass, and no redirect followed, so a 3xx answers
+nothing rather than carrying the hash on to another host. The switch is off by default and is
+ignored while `[mirror] offline = true`, so an offline node opens no socket whatever the
+switch says.
+
+An answer naming a base hoard knows refines the stored one, `sdxl` becoming
+`sdxl illustrious`, and names one when hoard proved nothing; an answer naming another
+architecture loses to what hoard already has, and a user's verdict is never overwritten - an
+artifact a verdict has settled the base of is never asked about at all. Every answer leaves
+one evidence row on the artifact with source `lookup`, field `base` and a detail sentence
+saying what was listed and what it did, which `GET /api/v1/artifacts/{id}` returns beside the
+tensor and header evidence. Answers are remembered in `<data_dir>/civitai.redb`, so a catalog
+rebuilt after a format change restores them without asking again.
 
 ## Nodes and peers
 

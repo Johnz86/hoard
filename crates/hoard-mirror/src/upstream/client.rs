@@ -245,13 +245,26 @@ pub struct UpstreamClient {
 impl UpstreamClient {
     /// Builds the client. `offline` makes every request fail before a socket is opened.
     pub fn new(offline: bool) -> Result<Self> {
+        Self::built(offline, redirect_policy())
+    }
+
+    /// A client that follows no redirect at all: a 3xx comes back as a status rather than
+    /// sending the request on to whatever host the answer names.
+    ///
+    /// It is what a caller uses when the URL itself is the thing that must not travel, such
+    /// as the lookup, whose path carries a content hash of a file on this machine.
+    pub fn direct(offline: bool) -> Result<Self> {
+        Self::built(offline, Policy::none())
+    }
+
+    fn built(offline: bool, redirect: Policy) -> Result<Self> {
         let http = Client::builder()
             .user_agent(USER_AGENT)
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_TIMEOUT)
             .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
-            .redirect(redirect_policy())
+            .redirect(redirect)
             .no_gzip()
             .build()?;
         Ok(Self {

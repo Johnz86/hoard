@@ -541,7 +541,7 @@ impl Catalog {
     /// record. The index is a cache of the records and can lag them: a verdict clears a
     /// record without moving its entry, and a rescan settles a record before a refresh
     /// republishes the document. Every page row is therefore measured against its own record
-    /// by [`ArtifactRecord::is_queued`], and the query narrows what has to be read rather
+    /// by `ArtifactRecord::is_queued`, and the query narrows what has to be read rather
     /// than deciding what belongs. A catalog with no search directory answers the same rows
     /// from the records themselves rather than erroring.
     pub fn triage_queue(&self, limit: u32) -> Result<Vec<TriageItem>> {
