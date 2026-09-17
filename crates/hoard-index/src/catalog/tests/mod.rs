@@ -15,6 +15,7 @@ mod rescan;
 mod revisions;
 mod scan;
 mod storage;
+mod text;
 mod usage;
 
 use std::cmp::Reverse;

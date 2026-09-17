@@ -845,30 +845,17 @@ fn loadout_id(raw: &str) -> ApiResult<LoadoutId> {
 #[cfg(test)]
 mod tests {
     use hoard_core::{CommitSha, NodeId, RepoType, Sha256};
-    use serde_json::json;
     use tempfile::TempDir;
 
     use super::*;
+    use crate::testing::{RowFacts, search_row};
 
-    /// One `search_row` as the peer holding it would be reported, built through the shape
-    /// the API already serializes so the test cannot drift from the view.
     fn row(node: &str, sha256: Option<Sha256>) -> SearchRow {
-        serde_json::from_value(json!({
-            "artifact_id": 1, "blob_id": 1,
-            "blob_sha256": sha256.map(Sha256::to_hex),
-            "role": "lora", "sub_role": null, "role_confidence": 0.98,
-            "org": "kohya", "name": "film-grain", "base": "sdxl", "base_label": "SDXL 1.0",
-            "format": "safetensors", "precision": "fp16", "quant": null,
-            "size": 239_075_328u64, "rank": 32, "alpha": 16.0, "params": null, "context": null,
-            "revision": "main", "revision_sha": CommitSha::from_bytes([3u8; 20]).to_hex(),
-            "node": node, "layout": "loras", "state": "remote",
-            "pull_progress": null, "trigger": null,
-            "path": "loras/film-grain.safetensors", "abs_path": null,
-            "path_count": 1, "dupe": false, "triage": false, "last_used": null,
-            "repo": "models/kohya/film-grain", "repo_id": 1, "entry_id": 1,
-            "source": null, "is_symlink": false, "lfs_pointer": false
-        }))
-        .expect("a search row parses")
+        search_row(RowFacts {
+            node,
+            blob_sha256: sha256,
+            ..RowFacts::default()
+        })
     }
 
     /// A catalog knowing only this node and one peer, reachable or not.

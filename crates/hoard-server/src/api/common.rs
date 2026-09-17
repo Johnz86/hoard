@@ -12,6 +12,7 @@ use hoard_core::{
 use hoard_index::IndexError;
 use hoard_index::catalog::EntryDetail;
 use hoard_index::config::SourceKind;
+use hoard_index::discover::DEFAULT_REF;
 use hoard_index::row::SearchRow;
 use hoard_index::search::{SortKey, SortSpec};
 use hoard_index::shard::parse_shard_name;
@@ -513,10 +514,13 @@ pub struct PullCommands {
 }
 
 /// The one artifact a pull command names, when it names one rather than the repository.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `revision` is what `--revision` has to say, and is absent for an artifact held in the
+/// revision `hf download` asks for unprompted.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullArtifact<'a> {
     pub path: &'a str,
     pub shard_count: u32,
+    pub revision: Option<String>,
 }
 
 impl<'a> From<&'a SearchRow> for PullArtifact<'a> {
@@ -524,6 +528,10 @@ impl<'a> From<&'a SearchRow> for PullArtifact<'a> {
         Self {
             path: &row.path,
             shard_count: row.shard_count,
+            revision: (row.revision != DEFAULT_REF).then(|| {
+                row.revision_sha
+                    .map_or_else(|| row.revision.clone(), CommitSha::to_hex)
+            }),
         }
     }
 }
@@ -541,12 +549,18 @@ pub fn pull_commands(
         RepoType::Models => String::new(),
         other => format!(" --repo-type {}", other.singular()),
     };
+    let revision = artifact
+        .as_ref()
+        .and_then(|artifact| artifact.revision.as_deref())
+        .map_or_else(String::new, |revision| {
+            format!(" --revision {}", shell_quoted(revision))
+        });
     let scope = artifact.map_or_else(String::new, |artifact| {
         hf_scope(artifact.path, artifact.shard_count)
     });
     PullCommands {
         git: is_clonable(kind).then(|| format!("git clone {url}/{reference}")),
-        hf: format!("HF_ENDPOINT={url} hf download {reference}{repo_type}{scope}"),
+        hf: format!("HF_ENDPOINT={url} hf download {reference}{repo_type}{revision}{scope}"),
         path,
     }
 }
@@ -612,9 +626,20 @@ pub fn repo_id(repo_type: &str, org: &str, name: &str) -> ApiResult<RepoId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{RowFacts, search_row};
+
+    const DETACHED_SHA: &str = "613bd8d0a8d026c4f5d5b57c3929a62788f048b4";
 
     fn now() -> Timestamp {
         "2026-09-04T09:10:00Z".parse().expect("timestamp parses")
+    }
+
+    fn row(revision: &str, sha: Option<CommitSha>) -> SearchRow {
+        search_row(RowFacts {
+            revision,
+            revision_sha: sha,
+            ..RowFacts::default()
+        })
     }
 
     #[test]
@@ -738,6 +763,7 @@ mod tests {
             Some(PullArtifact {
                 path: "Flux_2-Turbo-LoRA_comfyui.safetensors",
                 shard_count: 1,
+                revision: None,
             }),
             None,
         );
@@ -759,6 +785,7 @@ mod tests {
             Some(PullArtifact {
                 path: "model-00001-of-00010.safetensors",
                 shard_count: 10,
+                revision: None,
             }),
             None,
         );
@@ -780,6 +807,7 @@ mod tests {
             Some(PullArtifact {
                 path: "unet/diffusion_pytorch_model-00001-of-00002.safetensors",
                 shard_count: 2,
+                revision: None,
             }),
             None,
         );
@@ -801,6 +829,7 @@ mod tests {
             Some(PullArtifact {
                 path: "model-1-of-2.safetensors",
                 shard_count: 2,
+                revision: None,
             }),
             None,
         );
@@ -822,6 +851,7 @@ mod tests {
             Some(PullArtifact {
                 path: "model.safetensors",
                 shard_count: 4,
+                revision: None,
             }),
             None,
         );
@@ -841,6 +871,7 @@ mod tests {
             Some(PullArtifact {
                 path: "a checkpoint.safetensors",
                 shard_count: 1,
+                revision: None,
             }),
             None,
         );
@@ -860,12 +891,75 @@ mod tests {
             Some(PullArtifact {
                 path: "train.parquet",
                 shard_count: 1,
+                revision: None,
             }),
             None,
         );
         assert_eq!(
             commands.hf,
             "HF_ENDPOINT=http://hoard.lan:7099 hf download squad --repo-type dataset 'train.parquet'"
+        );
+    }
+
+    #[test]
+    fn an_artifact_outside_main_names_its_revision_before_the_file_scope() {
+        let repo = RepoId::parse_qualified("models/mistralai/Ministral-3-14B-Instruct-2512")
+            .expect("repo parses");
+        let commands = pull_commands(
+            "http://127.0.0.1:7099",
+            &repo,
+            SourceKind::HfCache,
+            Some(PullArtifact {
+                path: "model-00001-of-00004.safetensors",
+                shard_count: 4,
+                revision: Some(DETACHED_SHA.to_owned()),
+            }),
+            None,
+        );
+        assert_eq!(
+            commands.hf,
+            "HF_ENDPOINT=http://127.0.0.1:7099 hf download mistralai/Ministral-3-14B-Instruct-2512 \
+             --revision '613bd8d0a8d026c4f5d5b57c3929a62788f048b4' \
+             --include 'model-*-of-00004.safetensors' \
+             --include 'model.safetensors.index.json'"
+        );
+    }
+
+    #[test]
+    fn a_dataset_outside_main_carries_both_flags_in_order() {
+        let repo = RepoId::parse_ref(RepoType::Datasets, "squad").expect("repo parses");
+        let commands = pull_commands(
+            "http://hoard.lan:7099",
+            &repo,
+            SourceKind::HfCache,
+            Some(PullArtifact {
+                path: "train.parquet",
+                shard_count: 1,
+                revision: Some("refs/pr/1".to_owned()),
+            }),
+            None,
+        );
+        assert_eq!(
+            commands.hf,
+            "HF_ENDPOINT=http://hoard.lan:7099 hf download squad --repo-type dataset \
+             --revision 'refs/pr/1' 'train.parquet'"
+        );
+    }
+
+    #[test]
+    fn a_row_on_main_asks_for_no_revision_and_a_detached_row_asks_for_its_sha() {
+        let sha = CommitSha::from_bytes([
+            0x61, 0x3b, 0xd8, 0xd0, 0xa8, 0xd0, 0x26, 0xc4, 0xf5, 0xd5, 0xb5, 0x7c, 0x39, 0x29,
+            0xa6, 0x27, 0x88, 0xf0, 0x48, 0xb4,
+        ]);
+        assert_eq!(PullArtifact::from(&row("main", Some(sha))).revision, None);
+        assert_eq!(
+            PullArtifact::from(&row("613bd8d", Some(sha))).revision,
+            Some(DETACHED_SHA.to_owned())
+        );
+        assert_eq!(
+            PullArtifact::from(&row("pr-1", None)).revision,
+            Some("pr-1".to_owned())
         );
     }
 

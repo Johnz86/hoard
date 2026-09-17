@@ -291,7 +291,7 @@ Leading `~` forces fuzzy matching over everything indexed. Comma inside a value 
 | `size:<400mb` / `size:>10gb` | comparison with kb/mb/gb/tb units, default mb |
 | `used:>30d` | last access age (proposal) |
 | `trigger:"phrase"` | exact phrase in trigger words or model card (proposal) |
-| free text | substring over org, name, base, trigger words, role, node; `~` for fuzzy |
+| free text | word-prefix match over name, org, base, trigger words, tensor keys and the card; `~` for fuzzy |
 
 Facets compute their counts with their own key removed from the query so a click never
 produces zero. Shelves in the prototype: `triage queue` = `role:?`, `sdxl · lora · small` =

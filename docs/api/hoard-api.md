@@ -113,6 +113,19 @@ brings the row back. A skipped row still counts as a position walked, so `next_c
 offered exactly as it would have been had the row been assembled and paging never stops
 short. The server logs the window at `debug`; nothing in the response names it.
 
+A token carrying no `key:` is free text, and it is matched against the words the index holds:
+the value is cut where the index cuts a name, at every non-alphanumeric character, and those
+pieces have to appear consecutively and in that order with the last one matched as a prefix,
+so `gpt-oss`, `Q4_K_M` and `Qwen3-VL-8B` each find the file whose name they were pasted from.
+Words separated by a space are each required, in any order, and a `~` in front of a token
+relaxes it to every word matched as a prefix in any order. A value of one word is matched
+without any cap, while in a value of several words the last word expands to at most 1024 index
+terms in dictionary order, so a very short last word on a very large catalog can miss a row it
+names; typing one more letter narrows the expansion back under the cap. The limit this leaves
+is that a run from the middle of an unbroken word does not match: the index holds
+`loxsSoulsMixPerfectDoll_v30` as `loxssoulsmixperfectdoll` and `v30`, so `loxsSoulsMix` finds
+it and `SoulsMix` does not.
+
 `GET /api/v1/search/parse?q=` returns only `query`, for the token strip while typing.
 
 ## Artifacts and blobs
@@ -136,6 +149,10 @@ short. The server logs the window at `debug`; nothing in the response names it.
   appends the artifact's own path, or the two `--include` globs
   (`"<stem>-*-of-<total>.<ext>"` and `"<stem>.<ext>.index.json"`) that name a shard set, or
   nothing at all for the repository-level command the repo page and the generated card print.
+  `hf` carries ` --revision <sha>`, or the revision's name when the index holds no sha for it,
+  after the repo type and before the file scope, when the artifact is held in a revision other
+  than `main`, because a detached snapshot's files are not in the revision the CLI asks for by
+  default and the command would download nothing.
 - `PUT /api/v1/artifacts/{id}/override { "role", "base", "sub_role" }`, at least one of the
   three set or 400. `DELETE` clears.
 - `GET /api/v1/blobs/{sha256}`: `{ "sha256", "size", "size_human", "path_count",

@@ -3,6 +3,20 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest wave: a name finds its file, and a pull names the revision holding it
+
+Free text now runs through the analyzer the `text` field is indexed with and matches its words
+as a phrase whose last word is a prefix, so `gpt-oss`, `Q4_K_M` and `loxsSoulsMix` answer 1, 6
+and 1 against this workstation's caches where each answered 0; a `~` token matches every word
+as a prefix in any order. The `hf` pull line of an artifact held outside `main` carries
+`--revision <sha>`, so artifact `a_14`'s copied command downloads its 5 files instead of none.
+Nothing stored changed shape and `catalog::FORMAT_VERSION` stays 12. Left open by the
+2026-09-17 review: the repo page's folder-level PULL box, the `any` highlight on the base
+rail, the one-shard-of-N model, and base identification. Left open with them, the loadout
+`hf-script` export (`api/loadouts.rs::hf_script`) still writes its own `hf download` line,
+with no `--revision` and naming one shard of a set; the wave that opens an artifact moves it
+onto `pull_commands` rather than fixing the line twice.
+
 ## Latest wave: a format bump no longer costs a rehash
 
 A hashing pass now recalls a file's sha256 and git blob sha1 from `<data_dir>/digests.redb`,

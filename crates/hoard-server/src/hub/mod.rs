@@ -26,13 +26,14 @@ use axum::routing::{get, post};
 use hoard_core::{RepoId, RepoType, clean_repo_path};
 use hoard_index::IndexError;
 use hoard_index::catalog::Catalog;
+use hoard_index::discover::DEFAULT_REF;
 use hoard_mirror::upstream::Authorization;
 
 use crate::error::{HubError, HubResult};
 use crate::state::AppState;
 
 /// The revision every route without one means.
-pub(crate) const DEFAULT_REVISION: &str = "main";
+pub(crate) const DEFAULT_REVISION: &str = DEFAULT_REF;
 
 /// The leading path segments of a repo reference, named the same way in every router so
 /// the Hub face and the git face can be merged into one application.

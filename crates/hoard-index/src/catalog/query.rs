@@ -1,4 +1,5 @@
 use std::ops::Bound;
+use std::sync::OnceLock;
 
 use hoard_core::Role;
 use jiff::Span;
@@ -7,6 +8,9 @@ use tantivy::query::{
     AllQuery, BooleanQuery, EmptyQuery, Occur, PhrasePrefixQuery, Query, RangeQuery, TermQuery,
 };
 use tantivy::schema::{Field, IndexRecordOption};
+use tantivy::tokenizer::{
+    LowerCaser, SimpleTokenizer, TextAnalyzer, TokenStream, TokenizerManager,
+};
 
 use crate::error::{IndexError, Result};
 use crate::search::context::{HOURS_PER_DAY, MAX_SHELF_DEPTH};
@@ -20,6 +24,10 @@ use super::search::{
 
 const ANY_BASE: &str = "any";
 const LOCAL_NODE_ALIASES: [&str; 4] = ["self", "me", "local", "here"];
+const TEXT_ANALYZER: &str = "default";
+const PREFIX_EXPANSIONS: u32 = 1024;
+
+static TEXT_TOKENIZER: OnceLock<TextAnalyzer> = OnceLock::new();
 
 /// The schema a query binds to and everything the query text does not carry: the shelves,
 /// the local node alias and the resolved `compat:` target.
@@ -371,31 +379,68 @@ fn cutoff_second(context: &CompileContext, days: i64) -> Result<i64> {
     Ok(cutoff.as_second())
 }
 
-/// Free text: every word has to appear. A fuzzy token also accepts the words as prefixes.
+/// Free text: a value is cut into the words the index cut the stored names into, and those
+/// words have to appear at the distances apart the value spells, the last one as a prefix.
+/// Every value of the token is required, and a fuzzy token drops the order and the distances
+/// and matches every word as a prefix.
 fn text_filter(token: &Token, field: Field) -> Box<dyn Query> {
-    let words = all_of(
-        token
-            .values
-            .iter()
-            .map(|value| term(field, &value.to_ascii_lowercase()))
-            .collect(),
-    );
-    if !token.fuzzy {
-        return words;
-    }
-    let prefixes = all_of(
+    let mut analyzer = text_analyzer();
+    all_of(
         token
             .values
             .iter()
             .map(|value| {
-                Box::new(PhrasePrefixQuery::new(vec![Term::from_field_text(
-                    field,
-                    &value.to_ascii_lowercase(),
-                )])) as Box<dyn Query>
+                let words = analyzed_words(&mut analyzer, value);
+                match (token.fuzzy, words.as_slice()) {
+                    (_, []) => Box::new(EmptyQuery) as Box<dyn Query>,
+                    (true, all) => all_of(
+                        all.iter()
+                            .map(|(_, word)| starts_with(field, word))
+                            .collect(),
+                    ),
+                    (false, [(_, word)]) => starts_with(field, word),
+                    (false, all) => phrase_prefix(field, all),
+                }
             })
             .collect(),
+    )
+}
+
+fn text_analyzer() -> TextAnalyzer {
+    TEXT_TOKENIZER
+        .get_or_init(|| {
+            TokenizerManager::default()
+                .get(TEXT_ANALYZER)
+                .unwrap_or_else(|| {
+                    TextAnalyzer::builder(SimpleTokenizer::default())
+                        .filter(LowerCaser)
+                        .build()
+                })
+        })
+        .clone()
+}
+
+/// Every word of `value` with the position the analyzer gave it. A token the index refuses
+/// to hold still takes its position, so the positions travel with the words rather than
+/// being counted back from zero.
+fn analyzed_words(analyzer: &mut TextAnalyzer, value: &str) -> Vec<(usize, String)> {
+    let mut words = Vec::new();
+    let mut stream = analyzer.token_stream(value);
+    while let Some(token) = stream.next() {
+        words.push((token.position, token.text.clone()));
+    }
+    words
+}
+
+fn phrase_prefix(field: Field, words: &[(usize, String)]) -> Box<dyn Query> {
+    let mut phrase = PhrasePrefixQuery::new_with_offset(
+        words
+            .iter()
+            .map(|(position, word)| (*position, Term::from_field_text(field, word)))
+            .collect(),
     );
-    any_of(vec![words, prefixes])
+    phrase.set_max_expansions(PREFIX_EXPANSIONS);
+    Box::new(phrase)
 }
 
 fn compat_filter(token: &Token, fields: &QueryFields<'_>) -> Result<Box<dyn Query>> {

@@ -179,7 +179,7 @@ hoard/
           pulls.rs           a pull in flight and the file it lands
           tests/             shared fixtures in mod.rs; scan, revisions, storage, codec, reads,
                              mirror, counts, rescan, index, paging, collapse, usage, hashing,
-                             recovery, brands, naming
+                             recovery, brands, naming, text
         row.rs               SearchRow, FacetBucket, DiskPressure: what a search answers with
         time.rs              reading and writing the instants the catalog stores
         search/
