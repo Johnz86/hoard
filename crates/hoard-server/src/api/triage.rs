@@ -169,7 +169,12 @@ pub async fn reject(
         }
         Ok(entries
             .into_iter()
-            .map(|entry| entry.abs_path.unwrap_or(entry.rel_path))
+            .map(|entry| {
+                entry
+                    .walked_path
+                    .or(entry.abs_path)
+                    .unwrap_or(entry.rel_path)
+            })
             .collect::<Vec<_>>())
     })
     .await?;

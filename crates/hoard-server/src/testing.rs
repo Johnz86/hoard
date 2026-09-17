@@ -3,10 +3,12 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use hoard_core::{CommitSha, Sha256};
+use hoard_core::{ArtifactId, CommitSha, RepoId, Role, Sha256};
 use hoard_index::catalog::Catalog;
-use hoard_index::config::IndexConfig;
+use hoard_index::config::{IndexConfig, SourceKind};
 use hoard_index::row::SearchRow;
+
+use crate::api::common::{PullArtifact, PullSubject};
 
 /// A native catalog with no configured sources, answering under `node`, for the test worlds
 /// that only need the server state to be holding one.
@@ -58,4 +60,36 @@ pub(crate) fn search_row(facts: RowFacts<'_>) -> SearchRow {
         "source": null, "is_symlink": false, "lfs_pointer": false
     }))
     .expect("a search row parses")
+}
+
+/// One of the GGUF rows of a repository holding an LLM and the projector beside it.
+pub(crate) fn gguf_row(id: i64, role: Role, path: &str) -> SearchRow {
+    SearchRow {
+        artifact_id: ArtifactId::new(id),
+        role,
+        path: path.to_owned(),
+        repo: "models/lmstudio-community/Qwen3-VL-8B-Instruct-GGUF".to_owned(),
+        ..search_row(RowFacts {
+            revision_sha: None,
+            ..RowFacts::default()
+        })
+    }
+}
+
+pub(crate) fn repo_of(qualified: &str) -> RepoId {
+    RepoId::parse_qualified(qualified).expect("repo parses")
+}
+
+/// What a pull command is written for, with the repository-level flag a test never varies.
+pub(crate) fn subject<'a>(
+    repo: &'a RepoId,
+    kind: SourceKind,
+    artifact: Option<PullArtifact<'a>>,
+) -> PullSubject<'a> {
+    PullSubject {
+        repo,
+        kind,
+        bin: false,
+        artifact,
+    }
 }

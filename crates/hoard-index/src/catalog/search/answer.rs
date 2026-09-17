@@ -527,6 +527,7 @@ pub(in crate::catalog) fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
         quant: inferred.quant.clone(),
         size: artifact.group_bytes.unwrap_or(inferred.size),
         shard_count: artifact.shard_count.unwrap_or(1),
+        incomplete: artifact.incomplete,
         rank: inferred.rank,
         alpha: inferred.alpha,
         params: inferred.params,

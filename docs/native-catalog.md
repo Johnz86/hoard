@@ -443,11 +443,16 @@ the catalog at `<data_dir>/native`.
   repository, a git clone and every mirror, pull or peer repository carry nothing, and the
   server's category-folder test is that one field rather than a comparison of an org with a
   source name.
-- A verdict cannot make a set complete. `ArtifactRecord::is_queued` is what the triage queue
-  reads: an incomplete record is queued whatever `triage_cleared` says, so confirming a role
-  on one leaves it in the queue with the incomplete reason and the queue, the summary's
-  `triage_artifacts` and the `state:triage` shelf stay one number. Landing the missing files,
-  or a rescan dropping a path rejected as noise, is what takes it out.
+- A verdict cannot make a set complete, and a rejection ends everything.
+  `ArtifactRecord::is_queued` is what the triage queue reads and
+  `ArtifactRecord::needs_triage` is what the summary and the entry state a scan writes read;
+  both begin at the stored `rejected` flag. An incomplete record is queued whatever
+  `triage_cleared` says, so confirming a role on one leaves it in the queue with the
+  incomplete reason and the queue, the summary's `triage_artifacts` and the `state:triage`
+  shelf stay one number. `Catalog::clear_triage` sets `rejected` and rewrites the artifact's
+  `triage` entries as `local` in the same transaction, so a rejection moves all three
+  together. Landing the missing files, a rejection, or a rescan dropping a path rejected as
+  noise, is what takes an artifact out.
 - An unreadable file keeps its path and is recorded as an absent entry with no artifact; a
   git-lfs pointer stub is absent with the pointer's size and hash; a fetched LFS weight is an
   ordinary artifact.

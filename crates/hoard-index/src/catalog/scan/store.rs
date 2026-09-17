@@ -188,6 +188,7 @@ fn store_artifact(
     );
     if let Some(stored) = &stored {
         record.triage_cleared = stored.triage_cleared;
+        record.rejected = stored.rejected;
         if !names_better(&record, stored) {
             record.name = stored.name.clone();
             record.org = stored.org.clone();
@@ -379,6 +380,7 @@ pub(in crate::catalog) fn record_of(facts: RecordFacts<'_>) -> (ArtifactRecord, 
         incomplete,
         named_by_repo,
         triage_cleared: false,
+        rejected: false,
         first_seen: first_seen.unwrap_or_else(|| jiff::Timestamp::now().to_string()),
     };
     let detail = ArtifactDetail::new(id, tensors, inference.evidence.clone());
@@ -434,6 +436,7 @@ mod tests {
             named_by_repo,
             shard_count: None,
             triage_cleared: false,
+            rejected: false,
             first_seen: "2026-01-01T00:00:00Z".to_owned(),
         }
     }

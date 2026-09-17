@@ -533,6 +533,10 @@ async fn plan_of(state: &AppState, id: LoadoutId) -> ApiResult<Vec<PlannedLine>>
     Ok(plan)
 }
 
+fn holds_whole(row: &SearchRow, node: &str) -> bool {
+    row.node == node && row.state.has_bytes() && !row.incomplete
+}
+
 fn plan_line(
     catalog: &Catalog,
     pin: &LoadoutPin,
@@ -541,7 +545,7 @@ fn plan_line(
 ) -> Result<PlannedLine, IndexError> {
     let held = candidates
         .iter()
-        .find(|row| row.node == local && row.state.has_bytes() && row.abs_path.is_some());
+        .find(|row| holds_whole(row, local) && row.abs_path.is_some());
     let elsewhere = candidates
         .iter()
         .find(|row| row.node != local && row.blob_sha256.is_some());
@@ -741,9 +745,7 @@ fn item_of(
     node_name: &str,
 ) -> Result<LoadoutItem, IndexError> {
     let candidates = catalog.resolve_pin(pin)?;
-    let held = candidates
-        .iter()
-        .find(|row| row.node == node_name && row.state.has_bytes());
+    let held = candidates.iter().find(|row| holds_whole(row, node_name));
     let elsewhere = candidates
         .iter()
         .find(|row| row.node != node_name && row.blob_sha256.is_some());
@@ -761,7 +763,7 @@ fn item_of(
         Some(row) => PullArtifact::from(row),
         None => PullArtifact {
             path: &pin.path,
-            shard_count: 1,
+            set: false,
             revision: pin.sha.map(|sha| sha.to_hex()),
             companion: None,
         },
@@ -943,5 +945,62 @@ mod tests {
             .expect("resolution runs")
             .is_none()
         );
+    }
+
+    #[test]
+    fn an_incomplete_set_is_not_held() {
+        let local = SearchRow {
+            state: ArtifactState::Local,
+            ..row("workstation", None)
+        };
+        let short = SearchRow {
+            state: ArtifactState::Triage,
+            incomplete: true,
+            ..row("workstation", None)
+        };
+
+        assert!(holds_whole(&local, "workstation"));
+        assert!(
+            !holds_whole(&short, "workstation"),
+            "one shard of a declared set is not the file the pin names"
+        );
+        assert!(!holds_whole(&local, "laptop"), "another node holds it");
+        assert!(!holds_whole(&row("workstation", None), "workstation"));
+    }
+
+    #[test]
+    fn a_pin_on_an_incomplete_set_is_planned_as_nowhere() {
+        let dir = TempDir::new().expect("temp dir");
+        let catalog = catalog_with_peer(&dir, Some("http://laptop.lan:7099"));
+        let held = SearchRow {
+            state: ArtifactState::Local,
+            abs_path: Some("/vault/loras/film-grain.safetensors".to_owned()),
+            ..row("workstation", None)
+        };
+        let short = SearchRow {
+            state: ArtifactState::Triage,
+            incomplete: true,
+            ..held.clone()
+        };
+        let pin = LoadoutPin::new(
+            RepoId::new(RepoType::Models, Some("kohya".to_owned()), "film-grain"),
+            "loras/film-grain.safetensors",
+        );
+
+        let short_line = plan_line(&catalog, &pin, &[short], "workstation").expect("a plan runs");
+        let held_line = plan_line(&catalog, &pin, &[held], "workstation").expect("a plan runs");
+
+        match short_line.source {
+            LineSource::Nowhere => (),
+            LineSource::Held(path) => panic!("an incomplete set was linked from {path}"),
+            LineSource::Peer(_) => panic!("an incomplete set was planned as a peer pull"),
+        }
+        match held_line.source {
+            LineSource::Held(path) => {
+                assert_eq!(path, "/vault/loras/film-grain.safetensors");
+            }
+            LineSource::Nowhere => panic!("a whole local file was planned as nowhere"),
+            LineSource::Peer(_) => panic!("a whole local file was planned as a peer pull"),
+        }
     }
 }

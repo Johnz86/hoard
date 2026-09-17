@@ -3,6 +3,59 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest wave: say a partial set is partial on its row, pull the set, let a rejection end it
+
+Four things an incomplete set got wrong, and one flag each. A row now carries `incomplete`
+(`hoard_index::row::SearchRow`), filled from the record in
+`catalog/search/answer.rs::assemble_row`, the one place a row is built: the field is read off
+`ArtifactRecord` rather than out of a Tantivy document, so no search document and no
+`FORMAT_VERSION` changed for it, and `hoard-server`'s `api/common.rs::RowView` re-exports it.
+`SearchRow::is_set` is the question the pull line actually asks - more than one file present,
+or fewer present than declared - and `PullArtifact::set` replaces the `shard_count` that
+`api/common.rs::hf_scope` was misreading as "is this one file": `openai/gpt-oss-120b`'s line
+is now the set's two `--include` globs instead of the one shard the disk holds, and
+`companion_of` no longer offers a lone shard as anybody's companion. `api/loadouts.rs`
+resolves "held" through one predicate, `holds_whole`, used by both `item_of` and `plan_line`,
+so a pin on an incomplete set resolves `missing` or `elsewhere` and apply stops linking 1 of
+15 shards; `PinResolution` gained no variant, because the drawer prints no per-item
+resolution and what apply does is already right for `missing`. Finally `ArtifactRecord` gained
+a stored `rejected` flag that `needs_triage` reads first, so the queue (`is_queued`), the
+summary (`scan/counters.rs::SummaryPart::of`) and the entry state a scan writes
+(`scan/store.rs`) all follow one predicate; `catalog/verdict.rs::clear_triage` sets it and, in
+the same transaction, moves the artifact's `triage` entries to `local` through `DerivedShift`
+and `log_changes`. `api/triage.rs::reject` records `walked_path` before `abs_path`, so a
+rejected hf-cache file writes the `snapshots/` path the walker tests rather than the blob it
+never visits. `catalog::FORMAT_VERSION` is 16: the catalog is deleted and rebuilt from disk.
+
+Measured on this workstation's real files at `c5070a9`, a release build scanning the same
+three sources into a scratch catalog on port 7199 with `[mirror] offline = true` and no
+`[lookup]`: `repo:openai/gpt-oss-120b` answers one row with `incomplete` true, `shard_count`
+1, state `triage`; its pull line is
+`HF_ENDPOINT=http://127.0.0.1:7199 hf download openai/gpt-oss-120b --include 'model-*-of-00014.safetensors' --include 'model.safetensors.index.json'`;
+the queue, `/api/v1/stats` `triage` and the `state:triage` total read 23, 23 and 23 before the
+rejection and 22, 22 and 22 after it; the rejection answered one noise path, the
+`snapshots/b5c939de.../model-00007-of-00014.safetensors` link and no `blobs/` path; the row
+afterwards is `local` and still `incomplete`; the catalog stamps format 16.
+
+Two tests changed their assertions. `the_queue_holds_every_state_triage_row_the_set_is_still_short`
+lost its closing `clear_triage` step, which asserted that clearing cannot take an incomplete
+set out of the queue: that is now exactly what a rejection does, and the confirm half of the
+claim stays pinned by `a_verdict_on_an_incomplete_set_leaves_it_queued_and_the_three_counts_equal`.
+`format_version_is_fifteen` became `format_version_is_sixteen`.
+
+Left open. `DELETE /api/v1/triage/noise/{id}` does not clear `rejected` on a record no scan
+has swept yet, so un-noising a path does not put the artifact back in the queue until it is
+re-stored; the same was already true of `triage_cleared`. A confirm on an ordinary artifact
+still leaves its entries `triage` until a rescan, so the `state:triage` shelf can read one
+above the queue after a confirm. Neither `ingest.rs` (the file the mirror fetched, around
+:384) nor `pulls.rs` (the file a peer pull lands, around :400) ever clears `incomplete` on an
+existing record: neither writer stores or re-reads the declared total, so a set completed
+through the mirror or through a peer stays `incomplete: true` until a rescan re-derives it.
+That staleness predates this wave; what is new is its consequence, because a loadout pin on
+such a set now keeps resolving as not held and its pull line stays the set's globs until that
+rescan runs. The inspector prints no `incomplete` fact. F19 (trigger words across a category
+folder) and F21 (the facet rail) are untouched.
+
 ## Latest wave: ask Civitai what a file is, once, when the owner says so
 
 A header proves an architecture and often no more: `oneObsession_v24.safetensors` reads `sdxl`

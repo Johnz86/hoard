@@ -670,6 +670,27 @@ async fn a_walked_path_names_the_snapshot_and_not_the_blob() {
 }
 
 #[tokio::test]
+async fn rejecting_a_cached_file_records_the_snapshot_path() {
+    let opened = opened();
+
+    let body = post(
+        &opened.world.state,
+        &format!("/api/v1/triage/{}/reject", opened.cached),
+        json!({}),
+    )
+    .await;
+
+    assert_eq!(
+        body["noise"],
+        json!([format!(
+            "{CACHE_ROOT}/snapshots/{}/model.safetensors",
+            CACHED_REVISION.to_hex()
+        )]),
+        "a rejection records the path the walker tests"
+    );
+}
+
+#[tokio::test]
 async fn a_pull_command_names_a_model_and_the_projector_it_needs() {
     let opened = opened();
     let body = get(

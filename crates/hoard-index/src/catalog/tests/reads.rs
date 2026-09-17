@@ -578,7 +578,7 @@ fn the_triage_queue_pages_in_artifact_order() -> Result<()> {
             .map(|item| item.row.artifact_id.get())
             .collect::<Vec<_>>(),
         queued_ids[1..].to_vec(),
-        "a cleared record leaves the queue even though its entry keeps its state"
+        "a rejected record leaves the queue and its entry is settled with it"
     );
     Ok(())
 }
@@ -645,7 +645,7 @@ fn the_triage_queue_answers_from_the_catalog_when_no_index_exists() -> Result<()
 
 /// A repository holding two of the three shards it declares: classified with confidence, and
 /// queued only because the set is not all there.
-fn partial_shard_catalog(directory: &Path) -> Result<Catalog> {
+pub(super) fn partial_shard_catalog(directory: &Path) -> Result<Catalog> {
     let hub = directory.join("hub");
     fs::create_dir(&hub)?;
     let shards = llm_shards();
@@ -661,8 +661,9 @@ fn partial_shard_catalog(directory: &Path) -> Result<Catalog> {
     scan_hub(directory, &hub)
 }
 
-/// A repository holding one of the three shards its index document declares.
-fn lone_shard_catalog(directory: &Path) -> Result<Catalog> {
+/// The cache tree of a repository holding one of the three shards its index document
+/// declares, answering with the hub root a scan is pointed at.
+pub(super) fn lone_shard_tree(directory: &Path) -> Result<PathBuf> {
     let hub = directory.join("hub");
     fs::create_dir(&hub)?;
     let shards = llm_shards();
@@ -680,6 +681,12 @@ fn lone_shard_catalog(directory: &Path) -> Result<Catalog> {
             ("model-00003-of-00003.safetensors", shards[2].clone()),
         ],
     )?;
+    Ok(hub)
+}
+
+/// A repository holding one of the three shards its index document declares.
+pub(super) fn lone_shard_catalog(directory: &Path) -> Result<Catalog> {
+    let hub = lone_shard_tree(directory)?;
     scan_hub(directory, &hub)
 }
 
@@ -694,12 +701,6 @@ fn the_queue_holds_every_state_triage_row_the_set_is_still_short() -> Result<()>
     assert!(
         item.row.role_confidence >= 0.85,
         "above the threshold, so the missing shard is the only thing queueing it"
-    );
-    catalog.clear_triage(item.row.artifact_id)?;
-    assert_eq!(
-        catalog.triage_queue(10)?.len(),
-        1,
-        "clearing answers what an artifact is and cannot make a set complete"
     );
     Ok(())
 }

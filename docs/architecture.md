@@ -184,7 +184,7 @@ hoard/
           pulls.rs           a pull in flight and the file it lands
           tests/             shared fixtures in mod.rs; scan, revisions, storage, codec, reads,
                              mirror, counts, rescan, index, paging, collapse, usage, hashing,
-                             recovery, brands, naming, text, lookup
+                             recovery, brands, naming, text, lookup, rejection
         row.rs               SearchRow, FacetBucket, DiskPressure: what a search answers with
         time.rs              reading and writing the instants the catalog stores
         search/
@@ -241,7 +241,7 @@ hoard/
         git/                 git smart HTTP and LFS routes (mod.rs)
         api/                 /api/v1: search.rs compat.rs artifacts.rs repos.rs shelves.rs
                              loadouts.rs triage.rs jobs.rs nodes.rs link.rs system.rs
-                             common.rs
+                             common.rs common_tests.rs
         ui/                  embedded web/ and index.html fallback
   web/
     index.html

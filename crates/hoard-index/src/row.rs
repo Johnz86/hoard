@@ -29,6 +29,10 @@ pub struct SearchRow {
     /// How many files the artifact is split across; one for a model that is a single file.
     #[serde(default = "single_shard")]
     pub shard_count: u32,
+    /// True when the set this artifact stands for holds fewer files than it declares.
+    /// `shard_count` then counts the files present, which can be one.
+    #[serde(default)]
+    pub incomplete: bool,
     pub rank: Option<u32>,
     pub alpha: Option<f32>,
     pub params: Option<u64>,
@@ -60,6 +64,14 @@ pub struct SearchRow {
     pub source: Option<String>,
     pub is_symlink: bool,
     pub lfs_pointer: bool,
+}
+
+impl SearchRow {
+    /// Whether the artifact is a shard set, whole or not: more than one file present, or
+    /// fewer present than declared. A set is pulled by its globs; a single file by its path.
+    pub fn is_set(&self) -> bool {
+        self.shard_count > 1 || self.incomplete
+    }
 }
 
 fn single_shard() -> u32 {

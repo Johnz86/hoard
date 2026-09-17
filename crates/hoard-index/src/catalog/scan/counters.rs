@@ -426,6 +426,7 @@ mod tests {
             incomplete: false,
             named_by_repo: false,
             triage_cleared: false,
+            rejected: false,
             first_seen: "2026-01-01T00:00:00Z".to_owned(),
         }
     }

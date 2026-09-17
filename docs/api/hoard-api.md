@@ -37,7 +37,8 @@ parquet arrow jsonl csv readme config unknown`.
     "params": null, "context": null, "quant": null, "revision": "main", "revision_sha": "462c3cb...",
     "node": "workstation", "layout": "loras", "state": "served", "pull_progress": null,
     "trigger": "film grain, 35mm, halation", "path": "/mnt/vault/loras/film-grain-35mm.safetensors",
-    "path_count": 2, "shard_count": 1, "last_used": "2026-09-04T09:10:00Z" } ],
+    "path_count": 2, "shard_count": 1, "incomplete": false,
+    "last_used": "2026-09-04T09:10:00Z" } ],
   "next_cursor": "...", "total": 212, "nodes": 3, "summary": "212 ARTIFACTS · 3 NODES",
   "sort": "name", "dir": "asc"
 }
@@ -117,6 +118,10 @@ model, not forty unclassifiable rows. `path_count` stays per file, because dedup
 and serving are per file. In a facet bucket, `token` is what a click toggles in the query
 and `query` is the whole query that selects exactly that bucket.
 
+A row also carries `incomplete`, true when the set found fewer files than its own names or
+its index document declare. `shard_count` is then the number of files present, which is one
+for a lone shard, and `size` is what is on disk rather than what the whole set would weigh.
+
 A page can hold fewer rows than `limit`, and the rows of every page together fewer than
 `total`. The index is answered from even while a rescan has logged changes no refresh has
 applied, so a row whose entry that rescan replaced is skipped rather than the whole request
@@ -167,6 +172,9 @@ it and `SoulsMix` does not.
   after the repo type and before the file scope, when the artifact is held in a revision other
   than `main`, because a detached snapshot's files are not in the revision the CLI asks for by
   default and the command would download nothing.
+  An incomplete set is scoped by the set's two `--include` globs and not by the one shard the
+  disk already holds, because that line is the one that completes the download through this
+  node; a lone shard of a set is therefore nobody's companion.
   An LLM held beside exactly one projector in the same repository and revision, and that
   projector, name both files in the one line, because neither is usable without the other.
   `repository` is the same line with no file scope, for pulling everything the repository
@@ -205,7 +213,11 @@ it and `SoulsMix` does not.
   the sniff's draw rather than taken off its front, not from every tensor the file holds. Inference itself ran over all of them before the row was written.
 - `POST /api/v1/triage/{id}/confirm { "role", "base", "sub_role" }`: assigns and leaves
   triage; `sub_role` is optional.
-- `POST /api/v1/triage/{id}/reject`: records the path as noise; later scans skip it.
+- `POST /api/v1/triage/{id}/reject`: records the path a scan walks as noise, which for an
+  hf-cache file is the snapshot link rather than the blob, so later scans skip it. The
+  rejection is stored on the artifact and settles its paths in the same transaction, so the
+  artifact leaves this queue, the `state:triage` shelf and the stats triage total at once. An
+  incomplete set leaves the queue this way or by its missing files landing, and no other.
 - `GET /api/v1/triage/noise` and `DELETE /api/v1/triage/noise/{id}`.
 
 ## Repos and README
@@ -273,7 +285,9 @@ rest being counted.
   (`present`, `elsewhere` with the node, `missing`) and `apply_preview`
   (`{ "present": 3, "pulling": 2, "bytes": 1200000000 }`). An item carries `prefix`, what the
   drawer prints dimmed before `name`, in the same spelling a results row uses; it is empty
-  when the pin resolved to nothing.
+  when the pin resolved to nothing. A pin whose only local row is an incomplete set resolves
+  `missing`, or `elsewhere` when a peer holds a hashed copy, and never `present`: one shard of
+  fifteen cannot satisfy the line, so apply pulls it rather than linking it.
 - `POST /api/v1/loadouts { "text": "<toml>" }` or the structured form.
 - `POST /api/v1/loadouts/{id}/items { "artifact_id", "weight" }`, `DELETE .../items/{artifact_id}`.
 - `POST /api/v1/loadouts/{id}/validate`: compat violations.

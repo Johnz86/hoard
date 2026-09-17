@@ -12,6 +12,7 @@ mod reads;
 /// Interrupting a stage at a chosen commit and comparing what the next run completes to
 /// against a run nothing interrupted.
 mod recovery;
+mod rejection;
 mod rescan;
 mod revisions;
 mod scan;
@@ -625,13 +626,7 @@ fn llm_shards() -> Vec<Vec<u8>> {
 }
 
 fn scan_hub(directory: &Path, hub: &Path) -> Result<Catalog> {
-    let config = IndexConfig {
-        sources: vec![SourceConfig {
-            kind: SourceKind::HfCache,
-            ..source(hub, "hub")
-        }],
-        ..IndexConfig::default()
-    };
+    let config = hub_config(hub);
     let catalog = Catalog::scan_sources(
         &directory.join("native"),
         "n",

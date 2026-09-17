@@ -512,6 +512,7 @@ impl Applying<'_, '_> {
             group_bytes: None,
             shard_count: None,
             triage_cleared: false,
+            rejected: false,
             first_seen: jiff::Timestamp::now().to_string(),
         })?;
         Ok((id, true))

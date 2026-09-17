@@ -211,6 +211,8 @@ pub struct RowView {
     pub path_count: u32,
     /// How many files the model spans; 1 unless it is sharded.
     pub shard_count: u32,
+    /// True when the set holds fewer files than it declares.
+    pub incomplete: bool,
     pub last_used: Option<Timestamp>,
     pub repo: String,
     pub repo_type: RepoType,
@@ -268,6 +270,7 @@ impl From<&SearchRow> for RowView {
             path: shown_path(row).unwrap_or_else(|| row.path.clone()),
             path_count: row.path_count,
             shard_count: row.shard_count,
+            incomplete: row.incomplete,
             last_used: row.last_used,
             repo: row.repo.clone(),
             repo_type: repo_type_of(&row.repo),
@@ -526,7 +529,9 @@ pub struct PullCommands {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullArtifact<'a> {
     pub path: &'a str,
-    pub shard_count: u32,
+    /// Whether the artifact is a shard set, whole or not. A set is named by its globs and
+    /// its index document, a single file by its path.
+    pub set: bool,
     pub revision: Option<String>,
     pub companion: Option<&'a str>,
 }
@@ -545,7 +550,7 @@ impl<'a> From<&'a SearchRow> for PullArtifact<'a> {
     fn from(row: &'a SearchRow) -> Self {
         Self {
             path: &row.path,
-            shard_count: row.shard_count,
+            set: row.is_set(),
             revision: (row.revision != DEFAULT_REF).then(|| {
                 row.revision_sha
                     .map_or_else(|| row.revision.clone(), CommitSha::to_hex)
@@ -625,7 +630,7 @@ pub fn companion_of<'a>(opened: &SearchRow, rows: &'a [SearchRow]) -> Option<&'a
         row.role == wanted
             && row.repo == opened.repo
             && row.revision == opened.revision
-            && row.shard_count == 1
+            && !row.is_set()
             && row.artifact_id != opened.artifact_id
     });
     let only = candidates.next()?;
@@ -633,7 +638,7 @@ pub fn companion_of<'a>(opened: &SearchRow, rows: &'a [SearchRow]) -> Option<&'a
 }
 
 fn hf_scope(artifact: &PullArtifact<'_>) -> String {
-    if artifact.shard_count <= 1 {
+    if !artifact.set {
         return match artifact.companion {
             Some(companion) => format!(
                 " {} {}",
@@ -720,7 +725,7 @@ pub fn repo_id(repo_type: &str, org: &str, name: &str) -> ApiResult<RepoId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{RowFacts, search_row};
+    use crate::testing::{RowFacts, gguf_row, repo_of, search_row, subject};
 
     const DETACHED_SHA: &str = "613bd8d0a8d026c4f5d5b57c3929a62788f048b4";
 
@@ -734,10 +739,6 @@ mod tests {
             revision_sha: sha,
             ..RowFacts::default()
         })
-    }
-
-    fn repo_of(qualified: &str) -> RepoId {
-        RepoId::parse_qualified(qualified).expect("repo parses")
     }
 
     fn repository_record(
@@ -767,32 +768,10 @@ mod tests {
     fn one_file(path: &str) -> PullArtifact<'_> {
         PullArtifact {
             path,
-            shard_count: 1,
+            set: false,
             revision: None,
             companion: None,
         }
-    }
-
-    fn subject<'a>(
-        repo: &'a RepoId,
-        kind: SourceKind,
-        artifact: Option<PullArtifact<'a>>,
-    ) -> PullSubject<'a> {
-        PullSubject {
-            repo,
-            kind,
-            bin: false,
-            artifact,
-        }
-    }
-
-    fn gguf_row(id: i64, role: Role, path: &str) -> SearchRow {
-        let mut row = row("main", None);
-        row.artifact_id = ArtifactId::new(id);
-        row.role = role;
-        row.path = path.to_owned();
-        row.repo = "models/lmstudio-community/Qwen3-VL-8B-Instruct-GGUF".to_owned();
-        row
     }
 
     #[test]
@@ -935,7 +914,7 @@ mod tests {
                 SourceKind::HfCache,
                 Some(PullArtifact {
                     path: "model-00001-of-00010.safetensors",
-                    shard_count: 10,
+                    set: true,
                     revision: None,
                     companion: None,
                 }),
@@ -960,7 +939,7 @@ mod tests {
                 SourceKind::HfCache,
                 Some(PullArtifact {
                     path: "unet/diffusion_pytorch_model-00001-of-00002.safetensors",
-                    shard_count: 2,
+                    set: true,
                     revision: None,
                     companion: None,
                 }),
@@ -985,7 +964,7 @@ mod tests {
                 SourceKind::HfCache,
                 Some(PullArtifact {
                     path: "model-1-of-2.safetensors",
-                    shard_count: 2,
+                    set: true,
                     revision: None,
                     companion: None,
                 }),
@@ -1010,7 +989,7 @@ mod tests {
                 SourceKind::HfCache,
                 Some(PullArtifact {
                     path: "model.safetensors",
-                    shard_count: 4,
+                    set: true,
                     revision: None,
                     companion: None,
                 }),
@@ -1098,7 +1077,7 @@ mod tests {
                 SourceKind::HfCache,
                 Some(PullArtifact {
                     path: "model-00001-of-00004.safetensors",
-                    shard_count: 4,
+                    set: true,
                     revision: Some(DETACHED_SHA.to_owned()),
                     companion: None,
                 }),
@@ -1124,7 +1103,7 @@ mod tests {
                 SourceKind::HfCache,
                 Some(PullArtifact {
                     path: "train.parquet",
-                    shard_count: 1,
+                    set: false,
                     revision: Some("refs/pr/1".to_owned()),
                     companion: None,
                 }),
@@ -1274,7 +1253,7 @@ mod tests {
                 SourceKind::HfCache,
                 Some(PullArtifact {
                     path: "model-00001-of-00002.safetensors",
-                    shard_count: 2,
+                    set: true,
                     revision: None,
                     companion: Some("mmproj.gguf"),
                 }),
@@ -1300,7 +1279,7 @@ mod tests {
                 SourceKind::HfCache,
                 Some(PullArtifact {
                     path: "Nemotron-Q8_0-00001-of-00003.gguf",
-                    shard_count: 3,
+                    set: true,
                     revision: None,
                     companion: None,
                 }),

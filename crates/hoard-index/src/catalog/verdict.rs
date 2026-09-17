@@ -1,13 +1,13 @@
 use serde::Serialize;
 
-use hoard_core::{ArtifactId, Base, Role, SubRole};
+use hoard_core::{ArtifactId, Base, Role, State, SubRole};
 
 use crate::error::{IndexError, Result};
 use crate::triage::check_verdict;
 
 use super::Catalog;
-use super::models::{ArtifactRecord, Override};
-use super::scan::{Counters, log_changes};
+use super::models::{ArtifactRecord, Entry, Override};
+use super::scan::{Counters, log_changes, paths_of_artifact};
 
 /// A user's verdict on one artifact, as the routes that record and read it see it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -95,16 +95,42 @@ impl Catalog {
 
     /// Takes the artifact out of the triage queue without a verdict, which is what a
     /// rejection leaves behind.
+    ///
+    /// The record is marked rejected and every path it still holds is settled from `triage`
+    /// to `local` in the same transaction, so the queue, the `state:triage` shelf and the
+    /// stats total drop together rather than one of them at a time. An incomplete set leaves
+    /// the queue this way or by its missing files landing, and no other.
     pub fn clear_triage(&self, id: ArtifactId) -> Result<()> {
         let mut counters = Counters::load(&self.database, self.stored_triage()?)?;
         let transaction = self.database.rw_transaction()?;
         let mut record = require_record(&transaction, id)?;
         counters.touch(&transaction, id.get())?;
         record.triage_cleared = true;
+        record.rejected = true;
         transaction.upsert(record)?;
+        for entry in paths_of_artifact(&transaction, id.get())? {
+            if !entry.triage && entry.state != State::Triage {
+                continue;
+            }
+            counters.derived.removed(&entry);
+            let settled = Entry {
+                state: match entry.state {
+                    State::Triage => State::Local,
+                    State::Local
+                    | State::Served
+                    | State::Stale
+                    | State::Pulling
+                    | State::Remote => entry.state,
+                },
+                triage: false,
+                ..entry
+            };
+            counters.derived.added(&settled);
+            transaction.upsert(settled)?;
+        }
         counters.pending.push(id.get());
         log_changes(&transaction, &mut counters)?;
-        counters.settle_summary(&transaction)?;
+        counters.save(&transaction)?;
         transaction.commit()?;
         self.refresh_search(|_| {})?;
         Ok(())

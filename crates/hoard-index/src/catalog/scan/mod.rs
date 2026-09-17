@@ -33,7 +33,9 @@ pub(super) use self::store::{
     RecordFacts, collapse_key, preference, preferred_entry, record_of, settle_repositories,
     tensor_keys,
 };
-pub(super) use self::sweep::{log_revision_artifacts, recount_artifact, sweep_artifact};
+pub(super) use self::sweep::{
+    log_revision_artifacts, paths_of_artifact, recount_artifact, sweep_artifact,
+};
 pub(super) use self::walk::location_hash;
 #[cfg(test)]
 pub(super) use self::walk::stamp_moved;

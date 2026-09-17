@@ -141,6 +141,9 @@ pub(super) struct ArtifactRecord {
     pub(super) named_by_repo: bool,
     pub(super) shard_count: Option<u32>,
     pub(super) triage_cleared: bool,
+    /// True once the owner rejected this artifact from triage: it wants nobody and counts in
+    /// no triage total, whatever else is true of it.
+    pub(super) rejected: bool,
     pub(super) first_seen: String,
 }
 
@@ -148,18 +151,20 @@ impl ArtifactRecord {
     /// Whether this record still wants a person, for every reader of the queue, the entry
     /// state a scan writes and the summary count. A set that found fewer files than it
     /// declares cannot be served whatever its header says, so an incomplete set queues
-    /// however confident its inference was.
+    /// however confident its inference was; a rejection is the one answer that ends that,
+    /// because it says the files are not wanted rather than that they are all here.
     pub(super) fn needs_triage(&self, threshold: f32) -> bool {
-        self.artifact.needs_triage(threshold) || self.incomplete
+        !self.rejected && (self.artifact.needs_triage(threshold) || self.incomplete)
     }
 
     /// Whether the triage queue still holds this record: it wants a person, and nothing that
     /// could answer it has. A verdict answers what an artifact is and cannot make a set
     /// complete, so an incomplete set stays queued whatever was cleared on it; the missing
-    /// files landing, or a rescan dropping a path rejected as noise, is what takes it out.
-    /// The summary count and the entry state a scan writes already read it that way.
+    /// files landing, a rejection, or a rescan dropping a path rejected as noise, is what
+    /// takes it out. The summary count and the entry state a scan writes read the same
+    /// predicate, so all three move together.
     pub(super) fn is_queued(&self, threshold: f32) -> bool {
-        self.incomplete || (!self.triage_cleared && self.needs_triage(threshold))
+        self.needs_triage(threshold) && (self.incomplete || !self.triage_cleared)
     }
 }
 

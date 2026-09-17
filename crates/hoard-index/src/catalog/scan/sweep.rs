@@ -279,7 +279,10 @@ pub(in crate::catalog) fn log_revision_artifacts(
 }
 
 /// Every path pointing at one artifact, which is the bound on recounting what it holds.
-fn paths_of_artifact(transaction: &RwTransaction<'_>, id: i64) -> Result<Vec<Entry>> {
+pub(in crate::catalog) fn paths_of_artifact(
+    transaction: &RwTransaction<'_>,
+    id: i64,
+) -> Result<Vec<Entry>> {
     Ok(transaction
         .scan()
         .secondary::<Entry>(EntryKey::artifact_id)?

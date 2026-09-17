@@ -339,6 +339,7 @@ impl Seeding<'_, '_> {
             shard_count: seed.shard_count,
             incomplete: false,
             triage_cleared: false,
+            rejected: false,
             first_seen: SEEDED_AT.to_owned(),
         })?;
         self.by_identity.insert(seed.identity, id);
