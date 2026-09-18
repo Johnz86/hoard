@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use hoard_core::{
     ArtifactId, JobId, Loadout, LoadoutId, LoadoutPin, LoadoutSlot, LoadoutViolation,
-    PinResolution, RepoId, Role, State as ArtifactState, format_size,
+    PinResolution, RepoId, Role, State as ArtifactState, format_size, free_loadout_name,
+    loadout_stem, numbered_loadout_name,
 };
 use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, JobProgress, LoadoutRecord, NewProjection};
@@ -30,6 +31,8 @@ const APPLY_KIND: &str = "apply";
 const FACTOR_SLOT: LoadoutSlot = LoadoutSlot::Upscaler;
 /// The tool layout an apply writes when none is named.
 const DEFAULT_PROFILE: Profile = Profile::ComfyUi;
+/// What a pin's notice names as the revision when the row carries none.
+const UNREVISIONED: &str = "content hash";
 
 /// One line of the loadout drawer, with whether the target node can satisfy it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -110,12 +113,30 @@ pub struct ExportView {
     pub text: String,
 }
 
-/// A new loadout, given either as the document text or as the document itself.
+/// An empty request object, which is how a caller asks the server to number the loadout.
+/// Unknown keys are refused so a misspelled or mistyped field is not read as "number it".
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoBody {}
+
+/// A new loadout: the document text, the document itself, or nothing but an optional name,
+/// in which case the server numbers it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum CreateBody {
     Text { text: String },
     Document(Box<Loadout>),
+    Unnamed(NoBody),
+}
+
+/// What `POST /api/v1/loadouts/{id}/items` does when the line is a host and the loadout
+/// already has one: replace it, or start a new loadout named after the file and pin there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostPolicy {
+    #[default]
+    Replace,
+    Branch,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -123,6 +144,46 @@ pub struct ItemBody {
     pub artifact_id: String,
     #[serde(default)]
     pub weight: Option<f32>,
+    #[serde(default)]
+    pub on_second_host: HostPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RenameBody {
+    pub name: String,
+}
+
+/// The line a pin displaced: the slot it sat in and the name it showed.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Replaced {
+    pub slot: LoadoutSlot,
+    pub name: String,
+}
+
+/// The answer to a pin: the loadout the line now sits in, which is a new one when the
+/// policy branched, what the line displaced, and the one line the drawer's toast prints.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PinnedView {
+    #[serde(flatten)]
+    pub loadout: LoadoutView,
+    pub replaced: Option<Replaced>,
+    pub notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DeletedLoadout {
+    pub id: LoadoutId,
+    pub deleted: bool,
+}
+
+/// One pin as the blocking side reads it: which loadout, which artifact, at what weight,
+/// what to do about a second host, and the node the answer is resolved against.
+struct Pinning {
+    id: LoadoutId,
+    artifact: ArtifactId,
+    weight: Option<f32>,
+    policy: HostPolicy,
+    node_name: String,
 }
 
 /// What an apply names: the node whose disk is written and the tool layout to write.
@@ -180,18 +241,63 @@ pub async fn create(
     let document = match body {
         CreateBody::Text { text } => Loadout::parse(&text).map_err(ApiError::from)?,
         CreateBody::Document(document) => *document,
+        CreateBody::Unnamed(NoBody {}) => Loadout::default(),
     };
-    if document.name.trim().is_empty() {
-        return Err(ApiError::bad_request("a loadout needs a name"));
-    }
     let node_name = state.node_name().to_owned();
     let catalog = Arc::clone(state.catalog());
-    let view = blocking(move || {
-        let id = catalog.upsert_loadout(&document)?;
+    let view = blocking_or_conflict(move || {
+        let mut document = document;
+        if document.name.trim().is_empty() {
+            document.name = numbered_loadout_name(
+                catalog
+                    .list_loadouts()?
+                    .iter()
+                    .map(|record| record.name.as_str()),
+            );
+        }
+        let id = catalog.create_loadout(&document)?;
         view_of(&catalog, id, &node_name)
     })
     .await?;
     Ok(Json(view))
+}
+
+pub async fn rename(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<RenameBody>,
+) -> ApiResult<Json<LoadoutView>> {
+    authorize(&state, &headers)?;
+    let id = loadout_id(&id)?;
+    let name = body.name.trim().to_owned();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("a loadout needs a name"));
+    }
+    let node_name = state.node_name().to_owned();
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking_or_conflict(move || {
+        let record = catalog.rename_loadout(id, &name)?;
+        view_of(&catalog, record.id, &node_name)
+    })
+    .await?;
+    Ok(Json(view))
+}
+
+pub async fn delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<DeletedLoadout>> {
+    authorize(&state, &headers)?;
+    let id = loadout_id(&id)?;
+    let catalog = Arc::clone(state.catalog());
+    let deleted = blocking(move || {
+        stored(&catalog, id)?;
+        catalog.delete_loadout(id)
+    })
+    .await?;
+    Ok(Json(DeletedLoadout { id, deleted }))
 }
 
 pub async fn add_item(
@@ -199,27 +305,17 @@ pub async fn add_item(
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(body): Json<ItemBody>,
-) -> ApiResult<Json<LoadoutView>> {
+) -> ApiResult<Json<PinnedView>> {
     authorize(&state, &headers)?;
-    let id = loadout_id(&id)?;
-    let artifact = artifact_id(&body.artifact_id)?;
-    let weight = body.weight;
-    let node_name = state.node_name().to_owned();
+    let pinning = Pinning {
+        id: loadout_id(&id)?,
+        artifact: artifact_id(&body.artifact_id)?,
+        weight: body.weight,
+        policy: body.on_second_host,
+        node_name: state.node_name().to_owned(),
+    };
     let catalog = Arc::clone(state.catalog());
-    let view = tokio::task::spawn_blocking(move || {
-        let row = require_catalog_row(&catalog, artifact)?;
-        let mut document = stored(&catalog, id)?.parse()?;
-        let slot = LoadoutSlot::for_role(row.role).ok_or_else(|| {
-            IndexError::Query(format!("role {} cannot be pinned in a loadout", row.role))
-        })?;
-        document.remove_path(&row.path);
-        document.add(row.role, pin_for(&row, slot, weight)?)?;
-        catalog.update_loadout(id, &document.to_toml()?)?;
-        view_of(&catalog, id, &node_name)
-    })
-    .await
-    .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(unpinnable)?;
+    let view = blocking_or_conflict(move || pin_into(&catalog, pinning)).await?;
     Ok(Json(view))
 }
 
@@ -236,7 +332,8 @@ pub async fn remove_item(
     let view = blocking(move || {
         let row = require_catalog_row(&catalog, artifact)?;
         let mut document = stored(&catalog, id)?.parse()?;
-        if document.remove_path(&row.path) == 0 {
+        let repo = RepoId::parse_qualified(&row.repo)?;
+        if document.remove_line(&repo, &row.path) == 0 {
             return Err(IndexError::not_found("loadout line", row.path.clone()));
         }
         catalog.update_loadout(id, &document.to_toml()?)?;
@@ -798,12 +895,7 @@ fn item_of(
 
 /// The pin an artifact becomes: hashed identity first so the same document resolves on any
 /// node, with the repository and path as the fallback.
-fn pin_for(
-    row: &SearchRow,
-    slot: LoadoutSlot,
-    weight: Option<f32>,
-) -> Result<LoadoutPin, IndexError> {
-    let repo = RepoId::parse_qualified(&row.repo)?;
+fn pin_for(row: &SearchRow, repo: RepoId, slot: LoadoutSlot, weight: Option<f32>) -> LoadoutPin {
     let mut pin = LoadoutPin::new(repo, row.path.clone());
     pin.sha = row.revision_sha;
     pin.sha256 = row.blob_sha256;
@@ -813,11 +905,111 @@ fn pin_for(
         FACTOR_SLOT => pin.factor = weight,
         _ => pin.weight = weight,
     }
-    Ok(pin)
+    pin
 }
 
-/// A role with nowhere to sit in a tool layout is a conflict with the loadout's shape.
-fn unpinnable(error: IndexError) -> ApiError {
+/// Pins one row into a loadout, answering what the line displaced or which loadout it
+/// started. A line the loadout already holds is answered without a write.
+fn pin_into(catalog: &Catalog, pinning: Pinning) -> Result<PinnedView, IndexError> {
+    let row = require_catalog_row(catalog, pinning.artifact)?;
+    let mut document = stored(catalog, pinning.id)?.parse()?;
+    let slot = LoadoutSlot::for_role(row.role).ok_or_else(|| {
+        IndexError::Query(format!("role {} cannot be pinned in a loadout", row.role))
+    })?;
+    let repo = RepoId::parse_qualified(&row.repo)?;
+    if document.holds_line(&repo, &row.path) {
+        let notice = format!("{} is already in {}", row.name, document.name);
+        return Ok(PinnedView {
+            loadout: view_of(catalog, pinning.id, &pinning.node_name)?,
+            replaced: None,
+            notice,
+        });
+    }
+    let pin = pin_for(&row, repo, slot, pinning.weight);
+    let branching = match pinning.policy {
+        HostPolicy::Branch => slot == LoadoutSlot::Host && document.host.is_some(),
+        HostPolicy::Replace => false,
+    };
+    if branching {
+        return branch_into(catalog, &row, pin, &pinning.node_name);
+    }
+    let placed = document.add(row.role, pin)?;
+    catalog.update_loadout(pinning.id, &document.to_toml()?)?;
+    let replaced = placed.replaced.map(|old| Replaced {
+        slot: placed.slot,
+        name: old.display_name().to_owned(),
+    });
+    let notice = match &replaced {
+        Some(old) => format!(
+            "replaced {} {} with {}",
+            slot_noun(placed.slot),
+            old.name,
+            row.name
+        ),
+        None => format!("+ {} pinned at {}", row.name, revision_label(&row)),
+    };
+    Ok(PinnedView {
+        loadout: view_of(catalog, pinning.id, &pinning.node_name)?,
+        replaced,
+        notice,
+    })
+}
+
+/// Starts a loadout named after the file whose pin would have displaced a host, and pins
+/// the file there rather than over the host the caller already had.
+fn branch_into(
+    catalog: &Catalog,
+    row: &SearchRow,
+    pin: LoadoutPin,
+    node_name: &str,
+) -> Result<PinnedView, IndexError> {
+    let taken = catalog.list_loadouts()?;
+    let name = free_loadout_name(
+        taken.iter().map(|record| record.name.as_str()),
+        loadout_stem(&row.name),
+    );
+    let mut started = Loadout::new(name);
+    started.add(row.role, pin)?;
+    let id = catalog.create_loadout(&started)?;
+    let notice = format!(
+        "new loadout {:?}: {} pinned",
+        started.name,
+        slot_noun(LoadoutSlot::Host)
+    );
+    Ok(PinnedView {
+        loadout: view_of(catalog, id, node_name)?,
+        replaced: None,
+        notice,
+    })
+}
+
+/// The word a notice calls a slot: `checkpoint`, `vae`, `upscaler`.
+fn slot_noun(slot: LoadoutSlot) -> String {
+    slot.role().label().to_ascii_lowercase()
+}
+
+fn revision_label(row: &SearchRow) -> &str {
+    match row.revision.is_empty() {
+        true => UNREVISIONED,
+        false => &row.revision,
+    }
+}
+
+/// Blocking catalog work whose refusals are conflicts rather than server errors.
+async fn blocking_or_conflict<T, W>(work: W) -> ApiResult<T>
+where
+    T: Send + 'static,
+    W: FnOnce() -> Result<T, IndexError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .map_err(loadout_conflict)
+}
+
+/// A role with nowhere to sit in a tool layout, and a name another loadout already holds,
+/// are conflicts with the loadout's shape rather than server errors.
+fn loadout_conflict(error: IndexError) -> ApiError {
     match error {
         IndexError::Query(message) if message.contains("cannot be pinned") => {
             ApiError::conflict(message)

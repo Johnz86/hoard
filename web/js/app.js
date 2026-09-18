@@ -52,6 +52,8 @@ const state = {
     jobsError: null,
     loadoutId: null,
     loadoutCreating: null,
+    loadouts: null,
+    loadoutDeleting: null,
     loadout: null,
     loadoutError: null,
     loadoutApplied: false,
@@ -97,6 +99,11 @@ const app = {
     openArtifact,
     addToLoadout,
     removeFromLoadout,
+    switchLoadout,
+    newLoadout,
+    renameLoadout,
+    armDelete,
+    deleteLoadout,
     yank,
     copyCommand,
     openDrawer,
@@ -413,11 +420,7 @@ async function openArtifact(item) {
 
 function detailArtifact() {
     const detail = state.detail;
-    return {
-        artifact_id: detail.aid || (detail.repo && detail.repo.artifact_id),
-        name: detail.name,
-        revision: detail.rev
-    };
+    return { artifact_id: detail.aid || (detail.repo && detail.repo.artifact_id) };
 }
 
 async function addToLoadout(row) {
@@ -427,9 +430,10 @@ async function addToLoadout(row) {
     }
     if (!state.loadoutId) {
         try {
-            state.loadoutCreating = state.loadoutCreating || api.createLoadout("loadout");
+            state.loadoutCreating = state.loadoutCreating || api.createLoadout(null);
             const created = await state.loadoutCreating;
             state.loadoutId = created.id;
+            updateSettings({ loadoutId: created.id });
         } catch (error) {
             toast(`cannot start a loadout · ${error.message}`);
             return;
@@ -437,19 +441,69 @@ async function addToLoadout(row) {
             state.loadoutCreating = null;
         }
     }
-    const pinned = loadoutItems(app).some((item) => item.artifact_id === row.artifact_id);
-    if (pinned) {
-        toast(`${row.name} is already in the loadout`);
-        return;
-    }
     try {
-        await api.addLoadoutItem(state.loadoutId, row.artifact_id, null);
+        const answer = await api.addLoadoutItem(state.loadoutId, row.artifact_id);
+        state.loadoutId = answer.id;
+        updateSettings({ loadoutId: answer.id });
         state.loadoutApplied = false;
-        toast(`+ ${row.name} pinned at ${row.revision || "content hash"}`);
+        toast(answer.notice);
         await loadLoadout(app);
     } catch (error) {
         toast(`pin failed · ${error.message}`);
     }
+}
+
+function switchLoadout(id) {
+    if (!id) return;
+    state.loadoutId = id;
+    state.loadoutDeleting = null;
+    state.loadout = null;
+    updateSettings({ loadoutId: id });
+    loadLoadout(app);
+}
+
+async function newLoadout(name) {
+    try {
+        const created = await api.createLoadout(name || null);
+        toast(`new loadout "${created.name}"`);
+        switchLoadout(created.id);
+    } catch (error) {
+        toast(`cannot start a loadout · ${error.message}`);
+    }
+}
+
+async function renameLoadout(name) {
+    if (!state.loadoutId) return;
+    try {
+        const view = await api.renameLoadout(state.loadoutId, name);
+        toast(`renamed to ${view.name}`);
+    } catch (error) {
+        toast(`rename failed · ${error.message}`);
+    }
+    await loadLoadout(app);
+}
+
+function armDelete(id) {
+    state.loadoutDeleting = id;
+    render();
+}
+
+async function deleteLoadout(id) {
+    if (state.loadoutDeleting !== id) return;
+    const row = (state.loadouts || []).find((entry) => entry.id === id);
+    try {
+        await api.deleteLoadout(id);
+        toast(`removed loadout ${row ? row.name : id}`);
+    } catch (error) {
+        toast(`remove failed · ${error.message}`);
+    }
+    state.loadoutDeleting = null;
+    if (id === state.loadoutId) {
+        state.loadoutId = null;
+        state.loadout = null;
+        updateSettings({ loadoutId: null });
+    }
+    await loadLoadout(app);
 }
 
 async function removeFromLoadout(item) {
@@ -487,6 +541,7 @@ function openDrawer() {
 
 function closeDrawer() {
     state.drawerOpen = false;
+    state.loadoutDeleting = null;
     render();
 }
 

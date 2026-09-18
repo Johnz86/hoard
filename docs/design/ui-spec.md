@@ -245,20 +245,33 @@ DISK list (`path · node`, symlinks shown as `laptop · symlink`).
 ## Loadout drawer
 
 Right-anchored 520px panel over a scrim, `hoardIn` animation. Header: `loadout` 19px sans
-700, name in amber mono (`night-exterior-v3`), CLOSE button. Rows grid
+700, then the current loadout's name in an amber mono field, borderless until it is focused,
+and `none` as a plain amber slug when the node holds no loadout; CLOSE button. Enter in that
+field, or leaving it, sends the name as typed and the server refuses a blank one. Rows grid
 `52px minmax(0,1fr) 78px 60px 22px`: role, name, rev in `--dim`, weight in `--amb`
-(lora `0.55`, ctrl `0.70`, upsc `2.0×`, others `—`), remove `×`. Empty state:
-`EMPTY LOADOUT / a checkpoint and the adapters you use with it / select artifacts in the
-index and press L`, the middle line saying what a loadout is for. `L` on a node holding no
-loadout creates one named `loadout` and pins into it. Footer: terminal box
+(lora `0.55`, ctrl `0.70`, upsc `2.0×`, others `—`), remove `×`. Below the rows a `LOADOUTS`
+block lists every loadout on the node in a grid `minmax(0,1fr) 64px 72px`: the name (amber on
+the current one, click switches to it), `n items` dimmed, and `DELETE`, which reads `CONFIRM`
+in amber after one click and removes the loadout on the second. Below that a NEW form: a
+field placeheld `name, or blank for loadout-N` and a NEW button; Enter in the field does the
+same. Empty states: `EMPTY LOADOUT <name> / a checkpoint and the adapters you use with it /
+select artifacts in the index and press L, or start another with NEW below` when a loadout is
+current, and `NO LOADOUT YET / a checkpoint and the adapters you use with it / press L on a
+row to start one, or NEW below` when none is; the middle line says what a loadout is for.
+`L` with no loadout creates `loadout-1` and pins into it; `L` on a checkpoint while the
+current loadout has one starts a loadout named after the file and pins it there. The current
+loadout is remembered in the settings record. Footer: terminal box
 `$ hoard apply night-exterior-v3 --node laptop` with result line in green
 (`→ 3 present, 2 pulling over LAN (1.2 GB/s)` then
 `→ done · 5 artifacts resolved, symlinks written for comfyui`), and an amber
 `APPLY TO LAPTOP` button.
 
 Toast: bottom center, `--panel2` fill, 3px amber left border, mono 12px, 2.4 s, used for
-`+ name pinned at v3`, `copied: git clone ...`, `served name → http://hoard.lan/org/name`,
-`checked out ...`, `applied to laptop · symlinks written for comfyui`.
+`+ name pinned at v3`, `replaced vae X with Y`, `new loadout "X": checkpoint pinned`,
+`new loadout "X"`, `renamed to X`, `removed loadout X`, `copied: git clone ...`,
+`served name → http://hoard.lan/org/name`, `checked out ...`,
+`applied to laptop · symlinks written for comfyui`. Every pin toast is the server's own
+`notice`, so the drawer decides nothing about what a pin did.
 
 ## Keyboard map
 
@@ -266,11 +279,16 @@ Global: `Esc` blurs the search field, else closes the drawer, else leaves detail
 `/` focuses search (prevent default). Keys are ignored while typing in an input.
 
 Index: `j`/`↓` and `k`/`↑` move the cursor (clamped), `Enter` opens, `Space` toggles
-selection, `L` adds cursor row to the loadout, `Y` yanks the pull command, `?` shows the key
-sheet (proposal footer).
+selection, `L` pins the cursor row into the current loadout and a second checkpoint starts a
+loadout named after it, `Y` yanks the pull command, `?` shows the key sheet (proposal
+footer).
 
-Detail: `[` and `]` cycle FILES, REFS, CARD, COMPAT, USAGE; `L` adds the repo to the
-loadout; `Esc` returns to the index.
+Detail: `[` and `]` cycle FILES, REFS, CARD, COMPAT, USAGE; `L` pins the opened file into
+the current loadout; `Esc` returns to the index.
+
+Drawer: the header name field renames on Enter or blur; NEW starts a loadout named as typed
+or `loadout-N`; a loadout row switches on click; DELETE arms, CONFIRM removes; the row's `×`
+removes a line.
 
 Mouse: row click sets cursor, double-click opens, facet click toggles its token in the
 query, shelf click replaces the query, column header click sorts, tab click switches.

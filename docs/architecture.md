@@ -187,7 +187,8 @@ hoard/
           pulls.rs           a pull in flight and the file it lands
           tests/             shared fixtures in mod.rs; scan, revisions, storage, codec, reads,
                              mirror, counts, rescan, index, paging, collapse, usage, hashing,
-                             recovery, brands, cards, naming, text, lookup, rejection
+                             recovery, brands, cards, naming, text, lookup, rejection,
+                             loadouts
         row.rs               SearchRow, FacetBucket, DiskPressure: what a search answers with
         time.rs              reading and writing the instants the catalog stores
         search/
@@ -257,7 +258,8 @@ hoard/
 End-to-end tests live beside the code they cover, in `tests.rs` modules under
 `crates/hoard-server/src/{api,hub,git}/`, driven by the `fixtures` feature of `hoard-index`.
 A `tests.rs` that has grown enough takes child modules beside it that reach its helpers
-through `super::`: `api/tests/opened.rs` covers the repository routes of an opened artifact.
+through `super::`: `api/tests/opened.rs` covers the repository routes of an opened artifact
+and `api/tests/loadouts.rs` the loadout routes that name, number, rename and delete one.
 
 Dependency direction is strict: `hoard-core` <- `hoard-index` <- `hoard-mirror` <-
 `hoard-net` <- `hoard-server` <- `hoard`. No crate below `hoard-server` knows about axum.

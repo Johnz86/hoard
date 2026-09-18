@@ -1,7 +1,7 @@
 use jiff::Timestamp;
 use serde::Serialize;
 
-use hoard_core::{Loadout, LoadoutId, LoadoutPin};
+use hoard_core::{HoardError, Loadout, LoadoutId, LoadoutPin};
 
 use crate::error::{IndexError, Result};
 use crate::row::SearchRow;
@@ -48,7 +48,61 @@ impl Sequenced for LoadoutDoc {
     }
 }
 
+fn name_taken(name: &str) -> IndexError {
+    IndexError::Domain(HoardError::InvalidLoadout(format!(
+        "a loadout named {name:?} already exists"
+    )))
+}
+
 impl Catalog {
+    /// Stores a new loadout under the name its document carries. A name another loadout
+    /// already holds is refused with [`HoardError::InvalidLoadout`], never merged.
+    pub fn create_loadout(&self, loadout: &Loadout) -> Result<LoadoutId> {
+        let document = loadout.to_toml()?;
+        let at = timestamp_text(now());
+        let transaction = self.database.rw_transaction()?;
+        let taken: Option<LoadoutDoc> = transaction
+            .get()
+            .secondary(LoadoutDocKey::name, loadout.name.as_str())?;
+        if taken.is_some() {
+            return Err(name_taken(&loadout.name));
+        }
+        let id = next_id::<LoadoutDoc>(&transaction)?;
+        transaction.insert(LoadoutDoc {
+            id,
+            name: loadout.name.clone(),
+            document,
+            created_at: at.clone(),
+            updated_at: at,
+        })?;
+        transaction.commit()?;
+        Ok(LoadoutId::new(id))
+    }
+
+    /// Gives one loadout a new name, inside its document as well as on its row. A name
+    /// another loadout holds is refused with [`HoardError::InvalidLoadout`]; the loadout's
+    /// own current name is accepted and changes nothing but the update time.
+    pub fn rename_loadout(&self, id: LoadoutId, name: &str) -> Result<LoadoutRecord> {
+        let transaction = self.database.rw_transaction()?;
+        let stored: Option<LoadoutDoc> = transaction.get().primary(id.get())?;
+        let stored = stored.ok_or_else(|| IndexError::not_found("loadout", id.to_string()))?;
+        let taken: Option<LoadoutDoc> = transaction.get().secondary(LoadoutDocKey::name, name)?;
+        if taken.is_some_and(|other| other.id != stored.id) {
+            return Err(name_taken(name));
+        }
+        let mut document = Loadout::parse(&stored.document)?;
+        document.name = name.to_owned();
+        let renamed = LoadoutDoc {
+            name: name.to_owned(),
+            document: document.to_toml()?,
+            updated_at: timestamp_text(now()),
+            ..stored
+        };
+        transaction.upsert(renamed.clone())?;
+        transaction.commit()?;
+        LoadoutRecord::try_from(renamed)
+    }
+
     /// Stores a loadout under the name its document carries, keeping the id and creation
     /// time a loadout of that name already had.
     pub fn upsert_loadout(&self, loadout: &Loadout) -> Result<LoadoutId> {

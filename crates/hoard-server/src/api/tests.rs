@@ -21,6 +21,7 @@ use hoard_index::catalog::{
 use hoard_index::config::{HashPolicy, SourceConfig, SourceKind};
 use hoard_index::discover::RefKind;
 
+mod loadouts;
 mod opened;
 
 use crate::api;

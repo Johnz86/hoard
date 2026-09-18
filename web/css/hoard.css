@@ -1704,6 +1704,62 @@ input.field:focus {
 
 .drawer-x:hover { color: var(--red); }
 
+input.field.drawer-rename {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+    color: var(--amb);
+    background: transparent;
+    border-color: transparent;
+    padding: 4px 6px;
+}
+
+input.field.drawer-rename:focus {
+    border-color: var(--rule);
+    background: var(--bg);
+}
+
+.drawer-list { padding-top: 18px; }
+
+.drawer-list-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 64px 72px;
+    gap: 10px;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px dashed var(--rule);
+    font-family: var(--mono);
+    font-size: 12.5px;
+}
+
+.drawer-list-row .link {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.drawer-list-row.is-current .link { color: var(--amb); }
+
+.drawer-list-row .row-x,
+.drawer-confirm {
+    text-align: right;
+    cursor: pointer;
+}
+
+.drawer-confirm { color: var(--amb); }
+
+.drawer-new {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding-top: 14px;
+}
+
+.drawer-new .field {
+    flex: 1;
+    min-width: 0;
+}
+
 .drawer-empty {
     padding: 40px 0;
     text-align: center;

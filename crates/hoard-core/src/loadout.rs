@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -6,6 +7,9 @@ use crate::compat::{CompatSubject, compatible};
 use crate::error::HoardError;
 use crate::id::{CommitSha, RepoId, Sha256};
 use crate::role::{Base, Role};
+
+/// The stem a loadout takes when it is named after a file.
+pub const DEFAULT_LOADOUT_STEM: &str = "loadout";
 
 /// One pinned artifact inside a loadout. Pinned by content hash first and by
 /// repo plus commit plus path second, so the same document resolves on any node.
@@ -193,30 +197,53 @@ impl Loadout {
 
     /// Adds a pin to the slot its role implies. Datasets and unclassified artifacts are
     /// refused because no tool layout has a place for them.
-    pub fn add(&mut self, role: Role, pin: LoadoutPin) -> Result<LoadoutSlot, HoardError> {
+    pub fn add(&mut self, role: Role, pin: LoadoutPin) -> Result<Placed, HoardError> {
         let slot = LoadoutSlot::for_role(role).ok_or_else(|| {
             HoardError::InvalidLoadout(format!("role {role} cannot be pinned in a loadout"))
         })?;
-        match slot {
-            LoadoutSlot::Host => self.host = Some(pin),
-            LoadoutSlot::Adapter => self.adapters.push(pin),
-            LoadoutSlot::Controlnet => self.controlnets.push(pin),
-            LoadoutSlot::Vae => self.vae = Some(pin),
-            LoadoutSlot::Upscaler => self.upscaler = Some(pin),
-            LoadoutSlot::Embedding => self.embeddings.push(pin),
-        }
-        Ok(slot)
+        let replaced = match slot {
+            LoadoutSlot::Host => self.host.replace(pin),
+            LoadoutSlot::Vae => self.vae.replace(pin),
+            LoadoutSlot::Upscaler => self.upscaler.replace(pin),
+            LoadoutSlot::Adapter => {
+                self.adapters.push(pin);
+                None
+            }
+            LoadoutSlot::Controlnet => {
+                self.controlnets.push(pin);
+                None
+            }
+            LoadoutSlot::Embedding => {
+                self.embeddings.push(pin);
+                None
+            }
+        };
+        Ok(Placed { slot, replaced })
     }
 
-    /// Drops every pin matching the path, returning how many were removed.
-    pub fn remove_path(&mut self, path: &str) -> usize {
+    /// Whether this repository's file is already pinned, in any slot. A line is identified
+    /// by its repository and path together, so the same file name under two repositories is
+    /// two lines.
+    pub fn holds_line(&self, repo: &RepoId, path: &str) -> bool {
+        self.host
+            .iter()
+            .chain(self.adapters.iter())
+            .chain(self.controlnets.iter())
+            .chain(self.vae.iter())
+            .chain(self.upscaler.iter())
+            .chain(self.embeddings.iter())
+            .any(|pin| is_line(pin, repo, path))
+    }
+
+    /// Drops every pin of this repository's file, returning how many were removed.
+    pub fn remove_line(&mut self, repo: &RepoId, path: &str) -> usize {
         let before = self.len();
-        self.host.take_if(|pin| pin.path == path);
-        self.vae.take_if(|pin| pin.path == path);
-        self.upscaler.take_if(|pin| pin.path == path);
-        self.adapters.retain(|pin| pin.path != path);
-        self.controlnets.retain(|pin| pin.path != path);
-        self.embeddings.retain(|pin| pin.path != path);
+        self.host.take_if(|pin| is_line(pin, repo, path));
+        self.vae.take_if(|pin| is_line(pin, repo, path));
+        self.upscaler.take_if(|pin| is_line(pin, repo, path));
+        self.adapters.retain(|pin| !is_line(pin, repo, path));
+        self.controlnets.retain(|pin| !is_line(pin, repo, path));
+        self.embeddings.retain(|pin| !is_line(pin, repo, path));
         before - self.len()
     }
 
@@ -256,6 +283,60 @@ impl Loadout {
     }
 }
 
+fn is_line(pin: &LoadoutPin, repo: &RepoId, path: &str) -> bool {
+    pin.repo == *repo && pin.path == path
+}
+
+/// Where a pin landed and what it displaced. `replaced` is `Some` only for a host, VAE or
+/// upscaler line that was occupied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Placed {
+    pub slot: LoadoutSlot,
+    pub replaced: Option<LoadoutPin>,
+}
+
+/// A file name without its extension, where an extension is a final dot followed by one or
+/// more ASCII letters and nothing else: `cyberrealisticPony_v160.safetensors` gives
+/// `cyberrealisticPony_v160`, `sdxl-base-1.0` and `Meta-Llama-3.1-8B` are unchanged.
+pub fn loadout_stem(name: &str) -> &str {
+    match name.rsplit_once('.') {
+        Some((stem, extension))
+            if !stem.is_empty()
+                && !extension.is_empty()
+                && extension.bytes().all(|byte| byte.is_ascii_alphabetic()) =>
+        {
+            stem
+        }
+        Some(_) | None => name,
+    }
+}
+
+/// `stem` when no taken name equals it, else `stem-2`, `stem-3`, ... at the first free one.
+pub fn free_loadout_name<'a>(taken: impl Iterator<Item = &'a str>, stem: &str) -> String {
+    let taken: BTreeSet<&str> = taken.collect();
+    if taken.contains(stem) {
+        first_free_number(&taken, stem, 2)
+    } else {
+        stem.to_owned()
+    }
+}
+
+/// `loadout-1`, `loadout-2`, ... at the first one no taken name equals.
+pub fn numbered_loadout_name<'a>(taken: impl Iterator<Item = &'a str>) -> String {
+    first_free_number(&taken.collect(), DEFAULT_LOADOUT_STEM, 1)
+}
+
+fn first_free_number(taken: &BTreeSet<&str>, stem: &str, from: usize) -> String {
+    let mut number = from;
+    loop {
+        let candidate = format!("{stem}-{number}");
+        if !taken.contains(candidate.as_str()) {
+            return candidate;
+        }
+        number += 1;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoadoutViolation {
     pub path: String,
@@ -276,9 +357,12 @@ mod tests {
     use super::*;
     use crate::id::RepoType;
 
+    fn repo(name: &str) -> RepoId {
+        RepoId::new(RepoType::Models, Some("org".to_owned()), name)
+    }
+
     fn pin(name: &str, base: &str) -> LoadoutPin {
-        let repo = RepoId::new(RepoType::Models, Some("org".to_owned()), name);
-        let mut pin = LoadoutPin::new(repo, format!("{name}.safetensors"));
+        let mut pin = LoadoutPin::new(repo(name), format!("{name}.safetensors"));
         pin.base = Some(Base::new(base));
         pin
     }
@@ -311,19 +395,130 @@ mod tests {
         assert_eq!(
             loadout
                 .add(Role::Lora, pin("a", "sdxl"))
-                .expect("lora pins"),
+                .expect("lora pins")
+                .slot,
             LoadoutSlot::Adapter
         );
         assert_eq!(
             loadout
                 .add(Role::Ckpt, pin("b", "sdxl"))
-                .expect("ckpt pins"),
+                .expect("ckpt pins")
+                .slot,
             LoadoutSlot::Host
         );
         assert!(loadout.add(Role::Ds, pin("c", "sdxl")).is_err());
         assert!(loadout.add(Role::Unk, pin("d", "sdxl")).is_err());
-        assert_eq!(loadout.remove_path("a.safetensors"), 1);
+        assert_eq!(loadout.remove_line(&repo("a"), "a.safetensors"), 1);
         assert_eq!(loadout.len(), 1);
+    }
+
+    #[test]
+    fn a_second_host_vae_or_upscaler_comes_back_as_replaced() {
+        let mut loadout = Loadout::new("l");
+        let first_host = pin("a", "sdxl");
+        assert_eq!(
+            loadout
+                .add(Role::Ckpt, first_host.clone())
+                .expect("first ckpt pins")
+                .replaced,
+            None
+        );
+        let second = loadout
+            .add(Role::Ckpt, pin("b", "sdxl"))
+            .expect("second ckpt pins");
+        assert_eq!(second.slot, LoadoutSlot::Host);
+        assert_eq!(second.replaced, Some(first_host));
+        assert_eq!(
+            loadout.host.as_ref().map(|host| host.path.as_str()),
+            Some("b.safetensors")
+        );
+
+        let first_vae = pin("c", "sdxl");
+        loadout
+            .add(Role::Vae, first_vae.clone())
+            .expect("first vae pins");
+        let second_vae = loadout
+            .add(Role::Vae, pin("d", "sdxl"))
+            .expect("second vae pins");
+        assert_eq!(second_vae.slot, LoadoutSlot::Vae);
+        assert_eq!(second_vae.replaced, Some(first_vae));
+
+        let first_upscaler = pin("e", "any");
+        loadout
+            .add(Role::Upsc, first_upscaler.clone())
+            .expect("first upscaler pins");
+        let second_upscaler = loadout
+            .add(Role::Upsc, pin("f", "any"))
+            .expect("second upscaler pins");
+        assert_eq!(second_upscaler.slot, LoadoutSlot::Upscaler);
+        assert_eq!(second_upscaler.replaced, Some(first_upscaler));
+
+        assert_eq!(
+            loadout
+                .add(Role::Lora, pin("g", "sdxl"))
+                .expect("first lora pins")
+                .replaced,
+            None
+        );
+        assert_eq!(
+            loadout
+                .add(Role::Lora, pin("h", "sdxl"))
+                .expect("second lora pins")
+                .replaced,
+            None
+        );
+        assert_eq!(loadout.adapters.len(), 2);
+
+        assert!(loadout.holds_line(&repo("d"), "d.safetensors"));
+        assert!(!loadout.holds_line(&repo("c"), "c.safetensors"));
+    }
+
+    #[test]
+    fn a_line_is_identified_by_its_repository_and_path() {
+        let mut loadout = Loadout::new("l");
+        let first = LoadoutPin::new(repo("one"), "model.safetensors");
+        let second = LoadoutPin::new(repo("two"), "model.safetensors");
+        loadout
+            .add(Role::Lora, first.clone())
+            .expect("the first lora pins");
+        loadout
+            .add(Role::Lora, second.clone())
+            .expect("the second lora pins");
+        assert_eq!(loadout.len(), 2);
+
+        assert!(loadout.holds_line(&repo("one"), "model.safetensors"));
+        assert!(loadout.holds_line(&repo("two"), "model.safetensors"));
+        assert!(!loadout.holds_line(&repo("three"), "model.safetensors"));
+        assert!(!loadout.holds_line(&repo("one"), "other.safetensors"));
+
+        assert_eq!(loadout.remove_line(&repo("one"), "model.safetensors"), 1);
+        assert_eq!(loadout.len(), 1);
+        assert_eq!(loadout.adapters, vec![second]);
+    }
+
+    #[test]
+    fn a_loadout_stem_drops_only_a_letter_extension() {
+        assert_eq!(
+            loadout_stem("cyberrealisticPony_v160.safetensors"),
+            "cyberrealisticPony_v160"
+        );
+        assert_eq!(loadout_stem("model.v2.ckpt"), "model.v2");
+        assert_eq!(loadout_stem("sdxl-base-1.0"), "sdxl-base-1.0");
+        assert_eq!(loadout_stem("Meta-Llama-3.1-8B"), "Meta-Llama-3.1-8B");
+        assert_eq!(loadout_stem("llama-3-8b"), "llama-3-8b");
+        assert_eq!(loadout_stem("trailing."), "trailing.");
+        assert_eq!(loadout_stem(".hidden"), ".hidden");
+    }
+
+    #[test]
+    fn a_free_name_counts_past_every_taken_one() {
+        let taken = ["night", "night-2"];
+        assert_eq!(free_loadout_name(taken.iter().copied(), "night"), "night-3");
+        assert_eq!(free_loadout_name(taken.iter().copied(), "day"), "day");
+
+        let numbered = ["loadout-1", "loadout-3"];
+        assert_eq!(numbered_loadout_name(numbered.iter().copied()), "loadout-2");
+        assert_eq!(numbered_loadout_name(std::iter::empty()), "loadout-1");
     }
 
     #[test]

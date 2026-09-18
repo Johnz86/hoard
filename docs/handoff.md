@@ -3,6 +3,87 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest wave: several named loadouts
+
+A node now holds any number of loadouts and no pin replaces a line silently. No stored record
+changed shape, so `catalog::FORMAT_VERSION` stays 19: `LoadoutDoc` already keyed on a unique
+name and already had a remove path, and the wave is rules in core, two catalog writers, three
+route changes and the drawer.
+
+The core rules. `hoard-core::loadout::Loadout::add` answers `Placed { slot, replaced }`, its
+host, VAE and upscaler arms using `Option::replace` so the displaced pin comes back, and
+`Loadout::holds_path` answers "already pinned" without a write. `loadout_stem` drops a final
+dot followed only by ASCII letters, so `cyberrealisticPony_v160.safetensors` names a loadout
+`cyberrealisticPony_v160` while `sdxl-base-1.0` and `Meta-Llama-3.1-8B` are unchanged;
+`free_loadout_name` counts `-2`, `-3` past every taken name and `numbered_loadout_name` hands
+out `loadout-1`, `loadout-2`.
+
+The catalog. `catalog/loadouts.rs::create_loadout` reads the unique `name` secondary key
+inside its own `rw_transaction` and refuses a taken name with
+`IndexError::Domain(HoardError::InvalidLoadout)` rather than merging, then `insert`s;
+`rename_loadout` refuses a name another row holds, rewrites the name inside the document as
+well as on the row, and accepts the loadout's own current name. `upsert_loadout` is untouched
+because `hoard loadout import` replaces by name on purpose.
+
+The routes. `POST /api/v1/loadouts` takes `{}` or a blank name and numbers it;
+`PUT /api/v1/loadouts/{id}` renames; `DELETE /api/v1/loadouts/{id}` answers
+`{ "id", "deleted" }`; a taken name is 409 on every one of them.
+`POST .../items` takes `on_second_host: "replace" | "branch"` and answers `PinnedView`: the
+loadout view of whichever loadout holds the line, `replaced` and the `notice` the drawer
+prints. `api/loadouts.rs::pin_into` answers a path the loadout already holds without a write,
+branches a second host into a loadout named after the file, and otherwise adds and reports
+what it displaced. `unpinnable` became `loadout_conflict` and the shared
+`blocking_or_conflict` carries the three writers that must answer 409.
+
+The drawer. `web/js/loadout.js::loadLoadout` lists every loadout, adopts the one the settings
+record remembers or the first one, and falls back without an error when the stored id is
+gone; `renderDrawer` prints the header name field, the LOADOUTS list with `n items`, DELETE
+then CONFIRM, and the NEW form. `web/js/app.js` gained `switchLoadout`, `newLoadout`,
+`renameLoadout`, `armDelete` and `deleteLoadout`, and `addToLoadout` now prints the server's
+`notice` and follows the id the server answers. The JS decides nothing: the "already in the
+loadout" check and the `revision` and `name` the repo page used to pass are gone, which is
+why the repo page's toast names the file rather than the repository.
+
+Live readings, taken at `940bee8` on a scratch catalog of the owner's disk at
+`127.0.0.1:7199`, offline, with no lookup: (1) `POST /loadouts {}` answered `loadout-1`; (2)
+`+ anima_context_detailer_base10.safetensors pinned at main`; (3) the checkpoint landed
+beside it as `["host", "adapter"]`; (4) a second checkpoint with `branch` answered a new id
+`ld_2` named `animaOfficial_preview2`, one item, notice
+`new loadout "animaOfficial_preview2": checkpoint pinned`, and `loadout-1` still held its 2
+items; (5) a second LoRA into the new loadout made 2 items there; (6) the listing read
+`[{"animaOfficial_preview2", 2}, {"loadout-1", 2}]`; (7) `PUT` renamed it to `night-test`,
+which the document carries too; (8) two VAEs exist on this disk, and the second answered
+`replaced vae ae.safetensors with flux2-vae.safetensor` with
+`replaced: {"slot": "vae", "name": "ae.safetensors"}`; (9) `DELETE` answered
+`{"id": "ld_1", "deleted": true}` and left one row. In the browser at 1720x1000, `L` on a LoRA
+gave `LOADOUT 1`, a checkpoint `LOADOUT 2`, a second checkpoint the branch toast and
+`LOADOUT 1`; the drawer listed both loadouts with their counts, switching repainted the items
+and the count, a rename in the header survived a reload, DELETE read CONFIRM before it
+removed, and the last delete left `NO LOADOUT YET / a checkpoint and the adapters you use with
+it / press L on a row to start one, or NEW below`. On a repository page whose heading reads
+`comfy/diffusion_models`, `+ LOADOUT` toasted
+`+ anima_aestheticV11.safetensors pinned at main`.
+
+A line is identified by its repository and path together: `Loadout::holds_line` and
+`Loadout::remove_line` take a `RepoId` beside the path, so the same file name under two
+repositories is two lines, both pin, and a remove takes only the line the named artifact sits
+in. `CreateBody::Unnamed` carries a `deny_unknown_fields` `NoBody`, so a mistyped or
+misspelled create body is refused rather than read as "number it". The drawer sends the name
+field as typed and lets the server refuse a blank one.
+
+One test changed an assertion: `adding_routes_by_role_and_refuses_datasets` reads `.slot` off
+the `Placed` that `add` now answers, and its `remove_path` call became `remove_line` with the
+pin's repository. Nothing else was rewritten.
+
+What is left: an apply resolves its loadout by id at plan time, so deleting a loadout while
+its apply runs fails the job at that read; `hoard loadout import` still replaces a same-named
+loadout, which its clap help now says; the drawer has no weight editor and no key for
+switching loadouts; the free-name numbering in `create` and `branch_into` reads
+`list_loadouts` in one transaction and creates in another, so two concurrent creates make the
+loser a 409 rather than the next number, which one owner driving one UI does not hit and which
+no retry loop pays for today; and `armDelete` re-renders the drawer, so a half-typed NEW name
+or rename is lost when DELETE is armed.
+
 ## Latest wave: a card by whole words, a stored declared total, one triage predicate
 
 Five things the walk of 2026-09-18 found wrong on the owner's own catalog, and the record

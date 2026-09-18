@@ -325,8 +325,32 @@ rest being counted.
   when the pin resolved to nothing. A pin whose only local row is an incomplete set resolves
   `missing`, or `elsewhere` when a peer holds a hashed copy, and never `present`: one shard of
   fifteen cannot satisfy the line, so apply pulls it rather than linking it.
-- `POST /api/v1/loadouts { "text": "<toml>" }` or the structured form.
-- `POST /api/v1/loadouts/{id}/items { "artifact_id", "weight" }`, `DELETE .../items/{artifact_id}`.
+- `POST /api/v1/loadouts { "text": "<toml>" }`, the structured document, or `{}` or a blank
+  `name`, which takes the next free `loadout-N`. A name another loadout already holds is 409
+  `Conflict` on every route, never merged, with the message
+  `invalid loadout: a loadout named "night" already exists`.
+- `PUT /api/v1/loadouts/{id} { "name" }` renames one loadout, inside its document as well as
+  on its row, answering the loadout view. A blank name is 400, a taken name 409, an unknown
+  id 404; the loadout's own current name is accepted and changes nothing.
+- `DELETE /api/v1/loadouts/{id}` answers `{ "id", "deleted" }`; an unknown id is 404. An
+  apply already running against that loadout fails at its next read of it, because a job row
+  names the loadout only in its subject.
+- `POST /api/v1/loadouts/{id}/items { "artifact_id", "weight", "on_second_host" }`,
+  `DELETE .../items/{artifact_id}`. `on_second_host` is `replace` (the default) or `branch`:
+  `branch` on a line that would displace a host starts a new loadout named after the file,
+  by its name without a letter extension, numbered `-2`, `-3` when that name is taken, and
+  pins the line there instead. The answer is the loadout view of whichever loadout now holds
+  the line, plus `replaced` - `{ "slot", "name" }` for a host, VAE or upscaler line that was
+  occupied, otherwise `null` - and `notice`, the one line the drawer prints:
+  `+ sdxl-base-1.0 pinned at v3`, `replaced vae old-vae with sdxl-vae`,
+  `new loadout "cyberrealisticPony_v160": checkpoint pinned`, or
+  `sdxl-vae is already in night` for a line the loadout already holds, which writes nothing.
+  A weight change is `DELETE` then `POST`, because a re-pinned line is answered rather than
+  rewritten. A line is identified by its repository and path together, so the same file name
+  under two repositories is two lines: both pin, and `DELETE .../items/{artifact_id}` removes
+  only the line whose repository the named artifact sits in.
+- `hoard loadout import` is the one path that replaces by name: reading a document whose name
+  a loadout already holds overwrites that loadout, where every route above refuses with 409.
 - `POST /api/v1/loadouts/{id}/validate`: compat violations.
 - `POST /api/v1/loadouts/{id}/apply { "node", "profile" }`: starts a job, answering
   `{ "job_id", "node", "apply_preview" }` with the same `apply_preview` shape as loadout

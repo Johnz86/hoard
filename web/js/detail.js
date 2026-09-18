@@ -68,7 +68,7 @@ function header(app, repo) {
             class: "btn",
             type: "button",
             text: "+ LOADOUT",
-            onClick: () => app.addToLoadout({ artifact_id: detail.aid || repo.artifact_id, name: detail.name })
+            onClick: () => app.addToLoadout({ artifact_id: detail.aid || repo.artifact_id })
         })
     );
 }

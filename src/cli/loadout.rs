@@ -17,7 +17,7 @@ pub enum LoadoutCommand {
     Resolve { name: String },
     /// Write a loadout out as TOML.
     Export { name: String },
-    /// Read a TOML document into this node's index.
+    /// Read a TOML document into this node's index, replacing a loadout of the same name.
     Import { file: PathBuf },
     /// Check the compatibility rules without changing anything.
     Validate { file: PathBuf },

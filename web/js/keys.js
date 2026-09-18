@@ -12,13 +12,20 @@ const SHEET = [
         ["K  ↑", "move the cursor up"],
         ["↵", "open the repo under the cursor"],
         ["SPC", "toggle selection"],
-        ["L", "add to the loadout"],
+        ["L", "pin into the current loadout; a second checkpoint starts a loadout named after it"],
         ["Y", "yank the pull command"]
     ]],
     ["DETAIL", [
         ["[  ]", "cycle FILES / REFS / CARD / COMPAT / USAGE"],
-        ["L", "add this repo to the loadout"],
+        ["L", "pin the opened file into the current loadout"],
         ["ESC", "back to the index"]
+    ]],
+    ["LOADOUT DRAWER", [
+        ["LOADOUT n", "open the drawer on the current loadout"],
+        ["NAME", "edit the name in the header; Enter or leaving the field renames"],
+        ["NEW", "start an empty loadout, named as typed or loadout-N"],
+        ["LIST", "click a loadout to switch; DELETE then CONFIRM removes it"],
+        ["×", "remove the line"]
     ]]
 ];
 

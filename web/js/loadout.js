@@ -1,21 +1,18 @@
 import * as api from "./api.js";
 import { el, errorPanel, fmtRate, loadingPanel, mount, toast } from "./dom.js";
 import { roleClass, roleCode } from "./table.js";
+import { settings, updateSettings } from "./theme.js";
 
 export async function loadLoadout(app) {
     try {
-        if (!app.state.loadoutId) {
-            const list = await api.loadouts();
-            const first = (Array.isArray(list) ? list : list.loadouts || [])[0];
-            if (!first) {
-                app.state.loadout = { items: [], name: "loadout" };
-                app.state.loadoutError = null;
-                app.render();
-                return;
-            }
-            app.state.loadoutId = first.id;
-        }
-        app.state.loadout = await api.loadout(app.state.loadoutId);
+        const list = await api.loadouts();
+        const rows = Array.isArray(list) ? list : list.loadouts || [];
+        app.state.loadouts = rows;
+        const wanted = app.state.loadoutId || settings.loadoutId;
+        const current = rows.find((row) => row.id === wanted) || rows[0] || null;
+        app.state.loadoutId = current ? current.id : null;
+        updateSettings({ loadoutId: app.state.loadoutId });
+        app.state.loadout = current ? await api.loadout(current.id) : null;
         app.state.loadoutError = null;
     } catch (error) {
         app.state.loadoutError = error;
@@ -45,6 +42,125 @@ function applyLine(app, items) {
     return `→ ${preview.present ?? 0} present, ${preview.pulling ?? 0} pulling over LAN${rate}`;
 }
 
+function emptyState(name) {
+    return el(
+        "div",
+        { class: "drawer-empty" },
+        name ? "EMPTY LOADOUT " : "NO LOADOUT YET",
+        name ? el("span", { class: "amber", text: name }) : null,
+        el("br"),
+        "a checkpoint and the adapters you use with it",
+        el("br"),
+        name ? "select artifacts in the index and press " : "press ",
+        el("span", { class: "amber", text: "L" }),
+        name ? ", or start another with " : " on a row to start one, or ",
+        el("span", { class: "amber", text: "NEW" }),
+        " below"
+    );
+}
+
+function itemRows(app, items) {
+    return items.map((item) =>
+        el(
+            "div",
+            { class: `drawer-row ${roleClass(item.role)}` },
+            el(
+                "span",
+                { class: "cell-role" },
+                el("span", { class: "role-mark" }),
+                el("span", { class: "role-code", text: roleCode(item) })
+            ),
+            el(
+                "span",
+                { class: "drawer-name" },
+                item.prefix ? el("span", { class: "cell-org", text: item.prefix }) : null,
+                item.name
+            ),
+            el("span", { class: "drawer-rev", text: item.revision || item.rev || "—" }),
+            el("span", { class: "drawer-weight", text: weightLabel(item) }),
+            el("span", {
+                class: "drawer-x",
+                text: "×",
+                title: "remove",
+                onClick: () => app.removeFromLoadout(item)
+            })
+        )
+    );
+}
+
+function pinnedBlock(app, items) {
+    if (app.state.loadoutError) return errorPanel(app.state.loadoutError, () => loadLoadout(app));
+    if (!app.state.loadouts) return loadingPanel("reading loadouts…");
+    if (!app.state.loadoutId) return emptyState(null);
+    if (!app.state.loadout) return loadingPanel("reading loadout…");
+    if (!items.length) return emptyState(app.state.loadout.name);
+    return itemRows(app, items);
+}
+
+function listBlock(app) {
+    const rows = app.state.loadouts || [];
+    if (!rows.length) return null;
+    return el(
+        "div",
+        { class: "drawer-list" },
+        el("div", { class: "rail-title", text: "LOADOUTS" }),
+        rows.map((row) => {
+            const armed = app.state.loadoutDeleting === row.id;
+            const current = row.id === app.state.loadoutId ? " is-current" : "";
+            return el(
+                "div",
+                { class: `drawer-list-row${current}` },
+                el("span", {
+                    class: "link",
+                    text: row.name,
+                    onClick: () => app.switchLoadout(row.id)
+                }),
+                el("span", { class: "mono-dim", text: `${row.items} items` }),
+                el("span", {
+                    class: armed ? "drawer-confirm" : "row-x",
+                    text: armed ? "CONFIRM" : "DELETE",
+                    onClick: () => (armed ? app.deleteLoadout(row.id) : app.armDelete(row.id))
+                })
+            );
+        })
+    );
+}
+
+function newForm(app) {
+    const field = el("input", {
+        class: "field",
+        type: "text",
+        placeholder: "name, or blank for loadout-N",
+        spellcheck: "false",
+        onKeyDown: (event) => {
+            if (event.key === "Enter") app.newLoadout(field.value);
+        }
+    });
+    return el(
+        "div",
+        { class: "drawer-new" },
+        field,
+        el("button", {
+            class: "btn",
+            type: "button",
+            text: "NEW",
+            onClick: () => app.newLoadout(field.value)
+        })
+    );
+}
+
+function nameField(app) {
+    const doc = app.state.loadout;
+    if (!doc) return el("span", { class: "drawer-slug", text: "none" });
+    return el("input", {
+        class: "field drawer-rename",
+        type: "text",
+        value: doc.name,
+        spellcheck: "false",
+        onChange: (event) => app.renameLoadout(event.target.value)
+    });
+}
+
 export function renderDrawer(app) {
     const root = document.getElementById("drawer-root");
     if (!app.state.drawerOpen) {
@@ -53,51 +169,8 @@ export function renderDrawer(app) {
     }
     const doc = app.state.loadout;
     const items = loadoutItems(app);
-    const name = (doc && (doc.name || (doc.document && doc.document.name))) || "loadout";
+    const name = (doc && doc.name) || "none";
     const node = app.selfNodeName();
-
-    let body;
-    if (app.state.loadoutError) body = errorPanel(app.state.loadoutError, () => loadLoadout(app));
-    else if (!doc) body = loadingPanel("reading loadout…");
-    else if (!items.length) {
-        body = el(
-            "div",
-            { class: "drawer-empty" },
-            "EMPTY LOADOUT",
-            el("br"),
-            "a checkpoint and the adapters you use with it",
-            el("br"),
-            "select artifacts in the index and press ",
-            el("span", { class: "amber", text: "L" })
-        );
-    } else {
-        body = items.map((item) =>
-            el(
-                "div",
-                { class: `drawer-row ${roleClass(item.role)}` },
-                el(
-                    "span",
-                    { class: "cell-role" },
-                    el("span", { class: "role-mark" }),
-                    el("span", { class: "role-code", text: roleCode(item) })
-                ),
-                el(
-                    "span",
-                    { class: "drawer-name" },
-                    item.prefix ? el("span", { class: "cell-org", text: item.prefix }) : null,
-                    item.name
-                ),
-                el("span", { class: "drawer-rev", text: item.revision || item.rev || "—" }),
-                el("span", { class: "drawer-weight", text: weightLabel(item) }),
-                el("span", {
-                    class: "drawer-x",
-                    text: "×",
-                    title: "remove",
-                    onClick: () => app.removeFromLoadout(item)
-                })
-            )
-        );
-    }
 
     mount(
         root,
@@ -111,7 +184,7 @@ export function renderDrawer(app) {
                     "div",
                     { class: "drawer-head" },
                     el("span", { class: "drawer-title", text: "loadout" }),
-                    el("span", { class: "drawer-slug", text: name }),
+                    nameField(app),
                     el("button", {
                         class: "btn btn-close",
                         type: "button",
@@ -119,7 +192,13 @@ export function renderDrawer(app) {
                         onClick: () => app.closeDrawer()
                     })
                 ),
-                el("div", { class: "drawer-body" }, body),
+                el(
+                    "div",
+                    { class: "drawer-body" },
+                    pinnedBlock(app, items),
+                    listBlock(app),
+                    newForm(app)
+                ),
                 el(
                     "div",
                     { class: "drawer-foot" },
@@ -133,6 +212,7 @@ export function renderDrawer(app) {
                         class: "btn btn-primary btn-wide",
                         type: "button",
                         text: `APPLY TO ${node.toUpperCase()}`,
+                        disabled: !doc,
                         onClick: () => applyNow(app, node)
                     })
                 )

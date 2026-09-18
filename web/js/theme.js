@@ -5,7 +5,8 @@ const DEFAULTS = {
     theme: "system",
     density: "Condensed",
     roleColorMode: "Color-coded",
-    showInspector: true
+    showInspector: true,
+    loadoutId: null
 };
 
 function read() {

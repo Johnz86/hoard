@@ -78,7 +78,12 @@ pub fn routes() -> Router<AppState> {
             "/api/v1/loadouts",
             get(loadouts::list).post(loadouts::create),
         )
-        .route("/api/v1/loadouts/{id}", get(loadouts::detail))
+        .route(
+            "/api/v1/loadouts/{id}",
+            get(loadouts::detail)
+                .put(loadouts::rename)
+                .delete(loadouts::delete),
+        )
         .route("/api/v1/loadouts/{id}/items", post(loadouts::add_item))
         .route(
             "/api/v1/loadouts/{id}/items/{artifact_id}",

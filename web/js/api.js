@@ -86,9 +86,15 @@ export const deleteShelf = (id) => del(`/shelves/${segment(id)}`);
 
 export const loadouts = () => get("/loadouts");
 export const loadout = (id) => get(`/loadouts/${segment(id)}`);
-export const createLoadout = (name) => post("/loadouts", { name });
-export const addLoadoutItem = (id, artifactId, weight) =>
-    post(`/loadouts/${segment(id)}/items`, { artifact_id: artifactId, weight: weight ?? null });
+export const createLoadout = (name) => post("/loadouts", name ? { name } : {});
+export const renameLoadout = (id, name) => put(`/loadouts/${segment(id)}`, { name });
+export const deleteLoadout = (id) => del(`/loadouts/${segment(id)}`);
+export const addLoadoutItem = (id, artifactId) =>
+    post(`/loadouts/${segment(id)}/items`, {
+        artifact_id: artifactId,
+        weight: null,
+        on_second_host: "branch"
+    });
 export const removeLoadoutItem = (id, artifactId) =>
     del(`/loadouts/${segment(id)}/items/${segment(artifactId)}`);
 export const applyLoadout = (id, node, profile) =>
