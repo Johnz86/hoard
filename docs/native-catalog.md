@@ -449,14 +449,21 @@ the catalog at `<data_dir>/native`.
   source name.
 - A verdict cannot make a set complete, and a rejection ends everything.
   `ArtifactRecord::is_queued` is what the triage queue reads and
-  `ArtifactRecord::needs_triage` is what the summary and the entry state a scan writes read;
-  both begin at the stored `rejected` flag. An incomplete record is queued whatever
-  `triage_cleared` says, so confirming a role on one leaves it in the queue with the
-  incomplete reason and the queue, the summary's `triage_artifacts` and the `state:triage`
-  shelf stay one number. `Catalog::clear_triage` sets `rejected` and rewrites the artifact's
-  `triage` entries as `local` in the same transaction, so a rejection moves all three
-  together. Landing the missing files, a rejection, or a rescan dropping a path rejected as
-  noise, is what takes an artifact out.
+  `ArtifactRecord::needs_triage` is what the summary, the entry state a scan writes and a
+  verdict settling an artifact's paths all read; both begin at the stored `rejected` flag. An
+  incomplete record is queued whatever `triage_cleared` says, so confirming a role on one
+  leaves it in the queue with the incomplete reason and the queue, the summary's
+  `triage_artifacts` and the `state:triage` shelf stay one number. `Catalog::record_verdict`
+  is the one verdict path, used by both `put_override` and `clear_triage`: it writes what the
+  verdict says on the record, decides `needs_triage` once off the record it is about to store
+  and, when the record no longer needs triage, moves every `triage` path of the artifact to
+  `local` through `leave_triage`, `DerivedShift` and `log_changes` in the same transaction.
+  Gating on that predicate rather than on `is_queued` is what keeps a verdict and the next
+  scan of the same file in agreement: a confirm that settles the role settles the paths
+  exactly as a rejection does, while an incomplete set, or a verdict that leaves the role
+  unsettled, keeps its `triage` paths, which is what `scan/store.rs::entry_state` would write
+  for them anyway. Landing the missing files, a rejection, or a rescan dropping a path
+  rejected as noise, is what takes an artifact out.
 - An unreadable file keeps its path and is recorded as an absent entry with no artifact; a
   git-lfs pointer stub is absent with the pointer's size and hash; a fetched LFS weight is an
   ordinary artifact.

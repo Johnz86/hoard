@@ -538,11 +538,11 @@ impl Catalog {
     ///
     /// The queue is a `state:triage` page of the search index in artifact id order, so a
     /// catalog holding a million settled artifacts pays for the page rather than for every
-    /// record. The index is a cache of the records and can lag them: a verdict clears a
-    /// record without moving its entry, and a rescan settles a record before a refresh
-    /// republishes the document. Every page row is therefore measured against its own record
-    /// by `ArtifactRecord::is_queued`, and the query narrows what has to be read rather
-    /// than deciding what belongs. A catalog with no search directory answers the same rows
+    /// record. The index is a cache of the records and can lag them: a record written
+    /// directly leaves the published document behind it, and a rescan settles a record
+    /// before a refresh republishes it. Every page row is therefore measured against its
+    /// own record by `ArtifactRecord::is_queued`, and the query narrows what has to be read
+    /// rather than deciding what belongs. A catalog with no search directory answers the same rows
     /// from the records themselves rather than erroring.
     pub fn triage_queue(&self, limit: u32) -> Result<Vec<TriageItem>> {
         let threshold = self.stored_triage()?;

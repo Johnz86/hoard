@@ -207,12 +207,19 @@ fn the_summary_is_exact_after_incremental_passes() -> Result<()> {
     catalog.put_override(queued, Some(Role::Lora), None, None)?;
     exact("an override")?;
     assert_eq!(
+        search(&catalog, "state:triage")?.total,
+        catalog.triage_queue(50)?.len() as u64,
+        "a verdict settles the shelf with the queue"
+    );
+    assert_eq!(
         catalog.totals()?.triage_artifacts,
         before_verdict.triage_artifacts - 1,
         "a verdict takes the artifact out of the triage total"
     );
     assert!(catalog.clear_override(queued)?);
     exact("a cleared override")?;
+    catalog.clear_triage(queued)?;
+    exact("a rejection after a verdict")?;
 
     let laptop = catalog.upsert_peer(&NodeId::new("laptop-1")?, "laptop", None)?;
     let pass = catalog.begin_pass(laptop.id)?;

@@ -31,13 +31,23 @@ impl From<Override> for OverrideRecord {
     }
 }
 
+#[derive(Debug)]
+enum Verdict {
+    Confirmed(Override),
+    Rejected,
+}
+
 impl Catalog {
     /// Records a user's verdict, rewrites the artifact's role, sub-role and base, clears
     /// triage, and logs the artifact for the search index. Refreshes the index.
     ///
-    /// A verdict settles a role at full confidence, which takes the artifact out of the
-    /// triage total, so the record is measured before and after and the totals moved by the
-    /// difference.
+    /// A verdict that names a role settles it at full confidence, which takes the artifact
+    /// out of the triage total, so the record is measured before and after and the totals
+    /// moved by the difference. Every path the artifact holds is then settled from `triage`
+    /// to `local` in the same transaction, as a rejection settles them. A record that still
+    /// needs triage afterwards, an incomplete set, or a verdict that leaves the role unsettled
+    /// (no role, or `unk`), keeps its paths in `triage`, which is what the next scan of those
+    /// files would write.
     ///
     /// A role and a sub-role that disagree are refused rather than stored; see
     /// [`crate::triage::check_verdict`].
@@ -56,20 +66,7 @@ impl Catalog {
             base,
             decided_at: jiff::Timestamp::now().to_string(),
         };
-        let mut counters = Counters::load(&self.database, self.stored_triage()?)?;
-        let transaction = self.database.rw_transaction()?;
-        let mut record = require_record(&transaction, id)?;
-        counters.touch(&transaction, id.get())?;
-        apply_override(&mut record, &verdict);
-        record.triage_cleared = true;
-        transaction.upsert(record)?;
-        transaction.upsert(verdict)?;
-        counters.pending.push(id.get());
-        log_changes(&transaction, &mut counters)?;
-        counters.settle_summary(&transaction)?;
-        transaction.commit()?;
-        self.refresh_search(|_| {})?;
-        Ok(())
+        self.record_verdict(id, Verdict::Confirmed(verdict))
     }
 
     /// Forgets the verdict; the artifact keeps what the verdict wrote until a rescan
@@ -101,32 +98,27 @@ impl Catalog {
     /// stats total drop together rather than one of them at a time. An incomplete set leaves
     /// the queue this way or by its missing files landing, and no other.
     pub fn clear_triage(&self, id: ArtifactId) -> Result<()> {
-        let mut counters = Counters::load(&self.database, self.stored_triage()?)?;
+        self.record_verdict(id, Verdict::Rejected)
+    }
+
+    fn record_verdict(&self, id: ArtifactId, verdict: Verdict) -> Result<()> {
+        let threshold = self.stored_triage()?;
+        let mut counters = Counters::load(&self.database, threshold)?;
         let transaction = self.database.rw_transaction()?;
         let mut record = require_record(&transaction, id)?;
         counters.touch(&transaction, id.get())?;
+        match &verdict {
+            Verdict::Confirmed(over) => apply_override(&mut record, over),
+            Verdict::Rejected => record.rejected = true,
+        }
         record.triage_cleared = true;
-        record.rejected = true;
+        let settled = !record.needs_triage(threshold);
         transaction.upsert(record)?;
-        for entry in paths_of_artifact(&transaction, id.get())? {
-            if !entry.triage && entry.state != State::Triage {
-                continue;
-            }
-            counters.derived.removed(&entry);
-            let settled = Entry {
-                state: match entry.state {
-                    State::Triage => State::Local,
-                    State::Local
-                    | State::Served
-                    | State::Stale
-                    | State::Pulling
-                    | State::Remote => entry.state,
-                },
-                triage: false,
-                ..entry
-            };
-            counters.derived.added(&settled);
-            transaction.upsert(settled)?;
+        if let Verdict::Confirmed(over) = verdict {
+            transaction.upsert(over)?;
+        }
+        if settled {
+            leave_triage(&transaction, &mut counters, id.get())?;
         }
         counters.pending.push(id.get());
         log_changes(&transaction, &mut counters)?;
@@ -135,6 +127,32 @@ impl Catalog {
         self.refresh_search(|_| {})?;
         Ok(())
     }
+}
+
+fn leave_triage(
+    transaction: &native_db::transaction::RwTransaction<'_>,
+    counters: &mut Counters,
+    id: i64,
+) -> Result<()> {
+    for entry in paths_of_artifact(transaction, id)? {
+        if !entry.triage && entry.state != State::Triage {
+            continue;
+        }
+        counters.derived.removed(&entry);
+        let settled = Entry {
+            state: match entry.state {
+                State::Triage => State::Local,
+                State::Local | State::Served | State::Stale | State::Pulling | State::Remote => {
+                    entry.state
+                }
+            },
+            triage: false,
+            ..entry
+        };
+        counters.derived.added(&settled);
+        transaction.upsert(settled)?;
+    }
+    Ok(())
 }
 
 fn require_record(

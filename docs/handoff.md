@@ -3,6 +3,74 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest wave: a confirm settles the paths it clears
+
+A confirm wrote the role at full confidence and set `triage_cleared`, which took the artifact
+out of the queue and out of the summary's `triage_artifacts`, but it never touched an entry,
+so every path it had stayed in state `triage` until a rescan and the `state:triage` shelf read
+one above the queue after every confirm. `catalog/verdict.rs` now has one verdict path,
+`Catalog::record_verdict`, that both `put_override` and `clear_triage` call with a private
+`Verdict` value: it loads `Counters` once, opens one transaction, touches the record, writes
+what the verdict says on it, decides `needs_triage` once off the record it is about to store
+and, when the record no longer needs triage, moves every `triage` path of the artifact to
+`local` through the private `leave_triage` - the loop `clear_triage` already had, moved and
+shared - with `DerivedShift` around each entry and `log_changes` and `counters.save` closing
+the transaction. `put_override` kept only its `check_verdict` call and the `Override` value it
+builds; neither verdict opens a transaction of its own any more. An incomplete set stays
+queued through a confirm, so `leave_triage` never runs for it and its paths stay `triage`,
+which is what `a_confirm_on_an_incomplete_set_moves_no_path` pins. A peer's row keeps its
+state: `State::Triage` is written only for a path whose bytes are on this node, so the move
+touches no other node's row, a `triage` flag such a row carried is cleared without its state
+changing, and `Node.filed` is unmoved on both nodes because the move is on one node and
+`DerivedShift` nets it to zero.
+
+`catalog::FORMAT_VERSION` stays 17. No record changed shape: `ArtifactRecord`, `Entry`,
+`Override` and `Noise` keep every field and the wave only changes which values a verdict
+writes into fields that already exist. A catalog stamped 17 is therefore read identically
+before and after, which also means a confirm made before this wave keeps its stale `triage`
+entries until those files change or the catalog is rebuilt.
+
+Measured on this workstation's real files at `d393c09`, a release build scanning the same
+three sources into a fresh scratch catalog on port 7199 with `[mirror] offline = true`,
+`[index] hash_policy = "never"` and `watch = false`, no `[lookup]` and
+`[node] discovery = "none"`. The three numbers are the `/api/v1/triage?limit=500` length, the
+`/api/v1/stats` `triage` field and the `/api/v1/search?q=state:triage` total, read after each
+verdict. Before any verdict: 23, 23, 23. After confirming `a_12`,
+`models/hexgrad/Kokoro-82M` `Kokoro-82M`, an ordinary queued artifact guessed `unk`, as a
+lora: 22, 22, 22 - where before this wave the shelf stayed at 23 until a rescan. After
+confirming `a_18`, `models/openai/gpt-oss-120b` `gpt-oss-120b`, the incomplete set, as an llm:
+22, 22, 22, unmoved, because a verdict cannot make a set complete and the set stays queued
+with its paths in `triage`. After rejecting `a_19`,
+`models/speechbrain/spkrec-ecapa-voxceleb` `classifier.ckpt`, which answered one noise path:
+21, 21, 21. `hoard doctor` on the same catalog afterwards exits 0 and reports
+`ok   catalog   format 17, generation 1`. The gate moved from `is_queued` to `needs_triage`
+after that run, on review; the readings stand, because a confirm naming a role, a confirm on
+an incomplete set and a rejection take the same branch under either predicate, and the case
+where they differ, a verdict that names no role, is pinned by
+`a_verdict_that_leaves_the_role_unsettled_keeps_its_path_in_triage` rather than measured.
+
+Left open. `DELETE /api/v1/triage/noise/{id}` still does not clear `rejected` on the record,
+so un-noising a path does not put the artifact back in the queue until a scan re-stores it. It
+is not fixable at this format version: a `Noise` row holds a path and nothing leads from a
+path back to a record. `Repository` indexes only its identity key, not `root_path`, and
+`Entry` indexes `artifact_id`, `content` and its location, never an absolute path, so tying
+the row to its artifact today means a primary scan of every repository to find the root that
+prefixes the path, which is unbounded at a million repositories. The fix is a field or an
+index - `artifact_id` on `Noise`, or a secondary key on `Repository.root_path` - and so a
+`FORMAT_VERSION` bump, to be taken with the next one. Separately, a verdict that leaves the
+role unsettled - `PUT /api/v1/artifacts/{id}/override` with a base and no role, or a confirm
+whose role is `unk`, both of which the routes accept - sets `triage_cleared` without
+settling anything, so `needs_triage` stays true while `is_queued` goes false. The move is
+gated on `needs_triage`, the predicate the scan (`scan/store.rs::entry_state`) and the summary
+(`scan/counters.rs::SummaryPart::of`) write from, so the paths stay `triage`: the summary and
+the shelf count the artifact while the queue does not, exactly as before this wave, and a
+rescan of the same file cannot flip it back. `is_queued` differs from `needs_triage` only by
+`triage_cleared` on a record that is not incomplete, which is why every other verdict sees the
+two agree. The same summary-against-shelf split shows on an artifact whose only path was
+retired: `SummaryPart::of` counts a record that needs triage whether or not any entry holds
+it, so the summary total can stand above a queue and a shelf that agree with each other. F21
+(the facet rail) is untouched.
+
 ## Latest wave: let a card describe only the files at or below its own directory
 
 A revision kept one frontmatter, the shallowest `README.md`'s, and handed it to every artifact
@@ -97,9 +165,8 @@ claim stays pinned by `a_verdict_on_an_incomplete_set_leaves_it_queued_and_the_t
 
 Left open. `DELETE /api/v1/triage/noise/{id}` does not clear `rejected` on a record no scan
 has swept yet, so un-noising a path does not put the artifact back in the queue until it is
-re-stored; the same was already true of `triage_cleared`. A confirm on an ordinary artifact
-still leaves its entries `triage` until a rescan, so the `state:triage` shelf can read one
-above the queue after a confirm. Neither `ingest.rs` (the file the mirror fetched, around
+re-stored; the same was already true of `triage_cleared`. Still open after the verdict-states
+wave; see above. Neither `ingest.rs` (the file the mirror fetched, around
 :384) nor `pulls.rs` (the file a peer pull lands, around :400) ever clears `incomplete` on an
 existing record: neither writer stores or re-reads the declared total, so a set completed
 through the mirror or through a peer stays `incomplete: true` until a rescan re-derives it.

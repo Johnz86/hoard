@@ -211,14 +211,20 @@ it and `SoulsMix` does not.
   the dtype are what the sniff measured over the whole file; the hidden dimension is read
   from the at most sixteen tensor samples the stored header keeps, thinned by a stride from
   the sniff's draw rather than taken off its front, not from every tensor the file holds. Inference itself ran over all of them before the row was written.
-- `POST /api/v1/triage/{id}/confirm { "role", "base", "sub_role" }`: assigns and leaves
-  triage; `sub_role` is optional.
+- `POST /api/v1/triage/{id}/confirm { "role", "base", "sub_role" }`: assigns the role, the
+  sub-role and the base and, when the role it assigns settles the record, settles the
+  artifact's paths from `triage` to `local` in the same transaction a rejection uses, so the
+  queue, the `state:triage` shelf and the stats triage total drop together. A record that
+  still needs triage after the verdict, an incomplete set or one whose role is left `unk`,
+  stays with its paths in `triage`. `sub_role` is optional.
 - `POST /api/v1/triage/{id}/reject`: records the path a scan walks as noise, which for an
   hf-cache file is the snapshot link rather than the blob, so later scans skip it. The
   rejection is stored on the artifact and settles its paths in the same transaction, so the
   artifact leaves this queue, the `state:triage` shelf and the stats triage total at once. An
   incomplete set leaves the queue this way or by its missing files landing, and no other.
-- `GET /api/v1/triage/noise` and `DELETE /api/v1/triage/noise/{id}`.
+- `GET /api/v1/triage/noise` and `DELETE /api/v1/triage/noise/{id}`. The delete removes the
+  row so the next scan walks the path again; it does not clear `rejected` on the record, so
+  the artifact returns to the queue only when a scan re-stores it.
 
 ## Repos and README
 

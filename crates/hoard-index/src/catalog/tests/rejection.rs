@@ -32,6 +32,53 @@ fn stored_record(catalog: &Catalog, id: ArtifactId) -> Result<ArtifactRecord> {
         .ok_or_else(|| IndexError::Catalog("the artifact record is gone".into()))
 }
 
+fn filed_by_node(catalog: &Catalog) -> Result<BTreeMap<i64, u64>> {
+    let snapshot = catalog.database.r_transaction()?;
+    let mut filed = BTreeMap::new();
+    for node in snapshot.scan().primary::<Node>()?.all()? {
+        let node: Node = node?;
+        filed.insert(node.id, node.filed);
+    }
+    Ok(filed)
+}
+
+fn mystery_catalog(directory: &Path) -> Result<Catalog> {
+    let config = IndexConfig {
+        data_dir: directory.join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    Catalog::open_or_scan(&config, "workstation", |_, _| {})
+}
+
+fn queued_seed(identity: u128, name: &str, rel_path: &str) -> SeedEntry {
+    SeedEntry {
+        state: State::Triage,
+        ..seeded_entry(
+            rel_path,
+            2_048,
+            Some(seeded_artifact(
+                identity,
+                name,
+                None,
+                Artifact {
+                    role: Role::Unk,
+                    role_confidence: 0.2,
+                    ..seeded_facts()
+                },
+            )),
+        )
+    }
+}
+
+fn seeded_id(written: &[(u128, ArtifactId)], identity: u128) -> Result<ArtifactId> {
+    written
+        .iter()
+        .find(|(seeded, _)| *seeded == identity)
+        .map(|(_, id)| *id)
+        .ok_or_else(|| IndexError::Catalog("the seeded artifact is missing".into()))
+}
+
 fn only_artifact(catalog: &Catalog) -> Result<ArtifactId> {
     let queue = catalog.triage_queue(10)?;
     queue
@@ -125,32 +172,11 @@ fn a_rejection_takes_an_incomplete_set_out_of_the_queue_the_shelf_and_the_total(
 #[test]
 fn a_rejection_takes_an_ordinary_artifact_out_of_all_three() -> Result<()> {
     let directory = tempfile::tempdir()?;
-    let config = IndexConfig {
-        data_dir: directory.path().join("data"),
-        sources: Vec::new(),
-        ..IndexConfig::default()
-    };
-    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let catalog = mystery_catalog(directory.path())?;
     catalog.seed(&[seeded_revision(
         seeded_repo("misc/mystery", RepoType::Models),
         0x77,
-        vec![SeedEntry {
-            state: State::Triage,
-            ..seeded_entry(
-                "mystery.safetensors",
-                2_048,
-                Some(seeded_artifact(
-                    0x77,
-                    "mystery",
-                    None,
-                    Artifact {
-                        role: Role::Unk,
-                        role_confidence: 0.2,
-                        ..seeded_facts()
-                    },
-                )),
-            )
-        }],
+        vec![queued_seed(0x77, "mystery", "mystery.safetensors")],
     )])?;
     catalog.rebuild_search(|_| {})?;
     let id = only_artifact(&catalog)?;
@@ -159,6 +185,211 @@ fn a_rejection_takes_an_ordinary_artifact_out_of_all_three() -> Result<()> {
     catalog.clear_triage(id)?;
 
     assert_eq!(three_counts(&catalog)?, (0, 0, 0));
+    Ok(())
+}
+
+#[test]
+fn a_confirm_takes_an_ordinary_artifact_out_of_all_three() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = mystery_catalog(directory.path())?;
+    catalog.seed(&[seeded_revision(
+        seeded_repo("misc/mystery", RepoType::Models),
+        0x77,
+        vec![queued_seed(0x77, "mystery", "mystery.safetensors")],
+    )])?;
+    catalog.rebuild_search(|_| {})?;
+    let id = only_artifact(&catalog)?;
+    assert_eq!(three_counts(&catalog)?, (1, 1, 1));
+
+    catalog.put_override(id, Some(Role::Lora), None, None)?;
+
+    assert_eq!(
+        three_counts(&catalog)?,
+        (0, 0, 0),
+        "a confirm settles the queue, the stats total and the shelf together"
+    );
+    let row = catalog
+        .artifact_row(id)?
+        .ok_or_else(|| IndexError::Catalog("the confirmed row is gone".into()))?;
+    assert_eq!(row.state, State::Local, "its path is settled, not queued");
+    assert!(!row.triage);
+    assert_eq!(row.role, Role::Lora);
+    let record = stored_record(&catalog, id)?;
+    assert!(record.triage_cleared);
+    assert!(!record.rejected, "a confirm is not a rejection");
+    assert!(catalog.artifact_override(id)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn a_verdict_that_leaves_the_role_unsettled_keeps_its_path_in_triage() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = mystery_catalog(directory.path())?;
+    catalog.seed(&[seeded_revision(
+        seeded_repo("misc/mystery", RepoType::Models),
+        0x77,
+        vec![queued_seed(0x77, "mystery", "mystery.safetensors")],
+    )])?;
+    catalog.rebuild_search(|_| {})?;
+    let id = only_artifact(&catalog)?;
+    assert_eq!(three_counts(&catalog)?, (1, 1, 1));
+
+    catalog.put_override(id, None, None, Some(Base::new("sdxl")))?;
+
+    assert_eq!(
+        three_counts(&catalog)?,
+        (0, 1, 1),
+        "the queue drops a cleared record; the summary and the shelf still count it"
+    );
+    let row = catalog
+        .artifact_row(id)?
+        .ok_or_else(|| IndexError::Catalog("the base-only row is gone".into()))?;
+    assert_eq!(
+        row.state,
+        State::Triage,
+        "the next scan of the file writes the same state, so the verdict leaves it"
+    );
+    assert!(row.triage);
+    assert_eq!(row.base, Base::new("sdxl"));
+    let record = stored_record(&catalog, id)?;
+    assert!(record.triage_cleared);
+    assert!(!record.rejected);
+    assert_eq!(catalog.totals()?, catalog.count_summary()?);
+    Ok(())
+}
+
+#[test]
+fn a_confirm_on_an_incomplete_set_moves_no_path() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = lone_shard_catalog(directory.path())?;
+    let id = only_artifact(&catalog)?;
+    assert_eq!(three_counts(&catalog)?, (1, 1, 1));
+
+    catalog.put_override(id, Some(Role::Llm), None, None)?;
+
+    assert_eq!(
+        three_counts(&catalog)?,
+        (1, 1, 1),
+        "a verdict cannot make a set complete, so it stays queued"
+    );
+    let row = catalog
+        .artifact_row(id)?
+        .ok_or_else(|| IndexError::Catalog("the confirmed row is gone".into()))?;
+    assert_eq!(row.state, State::Triage, "its path waits with the set");
+    assert!(row.triage);
+    assert!(row.incomplete);
+    let record = stored_record(&catalog, id)?;
+    assert!(record.triage_cleared);
+    assert!(!record.rejected);
+    Ok(())
+}
+
+#[test]
+fn a_confirm_then_a_rejection_and_the_reverse_end_at_the_same_state() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = mystery_catalog(directory.path())?;
+    let written = catalog.seed(&[seeded_revision(
+        seeded_repo("misc/mystery", RepoType::Models),
+        0x77,
+        vec![
+            queued_seed(0x77, "mystery-a", "mystery-a.safetensors"),
+            queued_seed(0x78, "mystery-b", "mystery-b.safetensors"),
+        ],
+    )])?;
+    catalog.rebuild_search(|_| {})?;
+    let first = seeded_id(&written, 0x77)?;
+    let second = seeded_id(&written, 0x78)?;
+    assert_eq!(three_counts(&catalog)?, (2, 2, 2));
+
+    catalog.put_override(first, Some(Role::Lora), None, None)?;
+    assert_eq!(
+        three_counts(&catalog)?,
+        (1, 1, 1),
+        "the confirmed artifact leaves all three and the other waits"
+    );
+    catalog.clear_triage(first)?;
+    assert_eq!(
+        three_counts(&catalog)?,
+        (1, 1, 1),
+        "rejecting what was already settled moves nothing"
+    );
+    catalog.clear_triage(second)?;
+    assert_eq!(three_counts(&catalog)?, (0, 0, 0));
+    catalog.put_override(second, Some(Role::Lora), None, None)?;
+    assert_eq!(
+        three_counts(&catalog)?,
+        (0, 0, 0),
+        "confirming what was already rejected moves nothing"
+    );
+
+    for id in [first, second] {
+        let row = catalog
+            .artifact_row(id)?
+            .ok_or_else(|| IndexError::Catalog("the settled row is gone".into()))?;
+        assert_eq!(row.state, State::Local);
+        assert!(!row.triage);
+        assert_eq!(row.role, Role::Lora);
+        let record = stored_record(&catalog, id)?;
+        assert!(record.rejected);
+        assert!(record.triage_cleared);
+    }
+    assert_eq!(catalog.totals()?, catalog.count_summary()?);
+    Ok(())
+}
+
+#[test]
+fn a_verdict_settles_no_path_another_node_holds() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = mystery_catalog(directory.path())?;
+    let attic = catalog.upsert_peer(&NodeId::new("attic-node")?, "attic", None)?;
+    let held = queued_seed(0x79, "mystery", "mystery.safetensors");
+    let artifact = held.artifact.clone();
+    catalog.seed(&[
+        seeded_revision(
+            seeded_repo("misc/mystery", RepoType::Models),
+            0x79,
+            vec![held],
+        ),
+        seeded_revision(
+            seeded_repo("attic/mystery", RepoType::Models),
+            0x79,
+            vec![SeedEntry {
+                node: attic.id,
+                state: State::Remote,
+                abs_path: None,
+                ..seeded_entry("mystery.safetensors", 2_048, artifact)
+            }],
+        ),
+    ])?;
+    catalog.rebuild_search(|_| {})?;
+    let id = only_artifact(&catalog)?;
+    let before = filed_by_node(&catalog)?;
+
+    catalog.put_override(id, Some(Role::Lora), None, None)?;
+
+    assert_eq!(three_counts(&catalog)?, (0, 0, 0));
+    let entries = catalog.entries_of(id)?;
+    assert_eq!(entries.len(), 2, "both paths still point at the artifact");
+    let here = entries
+        .iter()
+        .find(|entry| entry.node == "workstation")
+        .ok_or_else(|| IndexError::Catalog("this node holds no path".into()))?;
+    assert_eq!(here.state, State::Local, "the path we hold is settled");
+    let there = entries
+        .iter()
+        .find(|entry| entry.node == "attic")
+        .ok_or_else(|| IndexError::Catalog("the peer holds no path".into()))?;
+    assert_eq!(
+        there.state,
+        State::Remote,
+        "a peer's row keeps the state the peer advertised"
+    );
+    assert_eq!(
+        filed_by_node(&catalog)?,
+        before,
+        "settling a path files it on the same node"
+    );
+    assert_eq!(catalog.totals()?, catalog.count_summary()?);
     Ok(())
 }
 
