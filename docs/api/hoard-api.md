@@ -77,7 +77,7 @@ SDXL and `base:pony` finds the Pony ones alone, never the files known only as `s
 architecture is a compatibility question and not a question about which family a file belongs
 to: a Pony adapter fits a Pony host or a plain SDXL one, and never an Illustrious one.
 
-`facets.base` is counted over at most 32 buckets. A bucket's `count` is the prefix-rule count
+`facets.base` is counted over at most 48 buckets. A bucket's `count` is the prefix-rule count
 plus one term for every lineage of that architecture, which is exactly what `base:<value>`
 answers and so exactly how many artifacts the query the bucket opens returns; a family bucket
 counts the versions under it and an architecture bucket counts its lineages. The 32 are the largest by that count among the most populous bases by

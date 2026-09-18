@@ -15,7 +15,7 @@ pub(super) const BASE_DIMENSION: usize = 2;
 /// How many base buckets the rail carries. The tally orders them, the prefix rule then
 /// counts each one with a query of its own, so this bounds the searches a query pays for
 /// the rail by a constant rather than by how many bases the catalog holds.
-pub(super) const BASE_RAIL: usize = 32;
+pub(super) const BASE_RAIL: usize = 48;
 pub(super) const NODE_DIMENSION: usize = 5;
 /// The six facet dimensions, named as the columns a collapsed hit carries them in.
 pub(super) const FACET_COLUMNS: [&str; FACET_DIMENSIONS.len()] =

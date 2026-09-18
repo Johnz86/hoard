@@ -1392,8 +1392,8 @@ fn base_rail_fixture() -> Result<(TempDir, Catalog, usize)> {
         ("sdxl".to_owned(), 2),
         ("sd".to_owned(), 1),
     ];
-    populations.extend((0..27).map(|index| (format!("base-{index:02}"), 2)));
-    populations.extend((27..40).map(|index| (format!("base-{index:02}"), 1)));
+    populations.extend((0..43).map(|index| (format!("base-{index:02}"), 2)));
+    populations.extend((43..60).map(|index| (format!("base-{index:02}"), 1)));
     let mut entries = Vec::new();
     let mut identity = 0x4000_u128;
     for (base, held) in &populations {
@@ -1436,7 +1436,7 @@ fn the_base_rail_holds_at_most_the_capped_buckets_and_counts_them_by_prefix() ->
     );
     assert_eq!(
         page.facets.base.len(),
-        32,
+        48,
         "the rail is capped: {:?}",
         page.facets.base
     );
@@ -1451,7 +1451,7 @@ fn the_base_rail_holds_at_most_the_capped_buckets_and_counts_them_by_prefix() ->
         .into_iter()
         .map(str::to_owned)
         .collect();
-    expected.extend((0..27).map(|index| Base::new(format!("base-{index:02}")).as_str().to_owned()));
+    expected.extend((0..43).map(|index| Base::new(format!("base-{index:02}")).as_str().to_owned()));
     expected.sort_unstable();
     assert_eq!(
         shown, expected,
@@ -1490,7 +1490,7 @@ fn the_base_rail_holds_at_most_the_capped_buckets_and_counts_them_by_prefix() ->
         "the bucket counts the query it opens"
     );
     assert_eq!(
-        search(&catalog, "base:base35")?.total,
+        search(&catalog, "base:base55")?.total,
         1,
         "a base the rail does not show still answers its own query"
     );
@@ -1530,7 +1530,7 @@ fn a_total_counts_what_the_page_path_counts_without_answering_a_page() -> Result
         seeded as u64,
         "the empty query counts every artifact, over more bases than the rail can show"
     );
-    for raw in ["base:sd", "base:base35", "role:lora", "role:ds", "size:>1"] {
+    for raw in ["base:sd", "base:base55", "role:lora", "role:ds", "size:>1"] {
         totals_agree(&catalog, raw)?;
     }
     let (_mirrored, collapsing) = paging_fixture(40)?;
@@ -1549,9 +1549,9 @@ fn a_total_counts_what_the_page_path_counts_without_answering_a_page() -> Result
 fn the_base_rail_reports_how_many_bases_it_could_not_show() -> Result<()> {
     let (_directory, catalog, _seeded) = base_rail_fixture()?;
     let page = search(&catalog, "")?;
-    assert_eq!(page.facets.base.len(), 32, "the rail is capped");
+    assert_eq!(page.facets.base.len(), 48, "the rail is capped");
     assert_eq!(
-        page.facets.base_total, 46,
+        page.facets.base_total, 66,
         "every distinct base is counted before the cap"
     );
     assert!(
@@ -1560,7 +1560,7 @@ fn the_base_rail_reports_how_many_bases_it_could_not_show() -> Result<()> {
     );
     assert_eq!(
         search(&catalog, "base:sd")?.facets.base_total,
-        46,
+        66,
         "the total is counted over the set the base key does not narrow, like the buckets"
     );
     assert_eq!(

@@ -791,7 +791,7 @@ accumulates, and slower than what it replaced.
 `Catalog::query` answers a whole index screen: the page in any of the ten sort orders, the
 distinct artifact and node totals, and the six facet dimensions. Each dimension is counted
 over the query with its own key excluded, so clicking a bucket never collapses the rail it
-was clicked in. The `base` rail is at most 32 buckets, each counted by running its own query,
+was clicked in. The `base` rail is at most 48 buckets, each counted by running its own query,
 because the prefix rule that groups base labels cannot be answered from the tally. The
 candidates are the most populous bases by exact term plus every family root among the rest
 that one of them extends, since a root carried by few artifacts but prefixing many is a

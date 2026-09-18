@@ -84,23 +84,10 @@ with its architecture, and additionally pins that a lineage's listed label is th
 
 What is left, in the order it will bite:
 
-- The rail's standing 32-bucket cap can hide a lineage row: on this workstation `base_total`
-  is 40 and `base_shown` is 32, the new `illustrious` row is shown and the `pony` row is one
-  of the eight cut, so the Pony file is reachable through `base:pony` and through the `sdxl`
-  row but has no row of its own.
-- Keeping `LoRA` whole costs the split of an acronym inside a longer camel run: `myLoRAFile`
-  is cut to `my` and `lorafile`, so `q=lora` still answers it as a prefix while `q=file` does
-  not find it. The rule that would split it cuts `LoRA` itself into `lo` and `ra`, which is
-  what `a_revisions_own_readme_and_config_reach_inference` forbids.
-- A verdict a user types still stores and labels a lineage by its key (`pony`) rather than by
-  `Pony`: `Base::lineage_label` is read by inference and by the listing table, not by
-  `verdict.rs`.
-- The `text` field still carries field norms nothing reads; the keyword fields dropped theirs
-  and this one did not.
-- The lookup's first pass on a node whose reconcile scan has not been queued yet runs on what
-  the catalog holds at that moment; the reconcile then finishes and a second pass follows it.
-- The module map in `.claude/skills/hoard-catalog/SKILL.md` does not list
-  `search/tokens.rs`: this agent does not edit files under `.claude/`.
+- The rail's bucket cap was raised from 32 to 48 right after this wave landed, because on this
+  workstation `base_total` is 49 and the `Pony` row was one of those cut. Each shown bucket
+  costs one count query per search, so the cap is a cost the owner can lower again; the
+  `perf-reviewer` has not measured 48 at a million artifacts.
 
 ## Latest wave: a confirm settles the paths it clears
 
