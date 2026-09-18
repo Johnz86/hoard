@@ -155,7 +155,8 @@ hoard/
           scan/sweep.rs      the artifact sweep and every retirement
           scan/sources.rs    the source rows, their scanned counts, configuration validation
           scan/revisions.rs  discovered revisions merged with the stored ones
-          naming.rs          the config and card a revision carries, artifact names, file hashes
+          naming.rs          the configs and cards a revision carries, each scoped to its own
+                             directory, artifact names, file hashes
           search/mod.rs      QueryRequest, QueryPage, RefreshReport, the re-exports
           search/schema.rs   Fields, the keyword and column constants, the entry document
           search/build.rs    the rebuild, the metered writer, per-entry documents, publish
@@ -184,7 +185,7 @@ hoard/
           pulls.rs           a pull in flight and the file it lands
           tests/             shared fixtures in mod.rs; scan, revisions, storage, codec, reads,
                              mirror, counts, rescan, index, paging, collapse, usage, hashing,
-                             recovery, brands, naming, text, lookup, rejection
+                             recovery, brands, cards, naming, text, lookup, rejection
         row.rs               SearchRow, FacetBucket, DiskPressure: what a search answers with
         time.rs              reading and writing the instants the catalog stores
         search/

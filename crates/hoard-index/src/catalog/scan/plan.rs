@@ -493,7 +493,7 @@ fn prepare_entry<'a>(
                     .or_else(|| plan.context.config_for(&entry.rel_path));
             }
             input.quant_config = plan.context.quant_config_for(&entry.rel_path);
-            input.frontmatter = plan.context.frontmatter();
+            input.frontmatter = plan.context.frontmatter_for(&entry.rel_path);
             Ok(ArtifactDraft {
                 identity: identity(entry, &presence)?,
                 inference: infer::infer(&input),

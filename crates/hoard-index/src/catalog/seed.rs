@@ -14,7 +14,7 @@ use crate::error::{IndexError, Result};
 use super::Catalog;
 use super::hashing::content_key;
 use super::models::{
-    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, Entry, Manifest, Ref, Repository,
+    ArtifactDetail, ArtifactRecord, ArtifactRecordKey, CardText, Entry, Manifest, Ref, Repository,
     RepositoryKey, Revision, SearchText, Source, Summary, placement_in, repository_key,
     store_revision_card,
 };
@@ -258,7 +258,15 @@ impl Seeding<'_, '_> {
             None => None,
         };
         if let Some(card) = seed.artifact.as_ref().and_then(|seed| seed.card.as_deref()) {
-            store_revision_card(self.transaction, repo_id, revision, card)?;
+            store_revision_card(
+                self.transaction,
+                repo_id,
+                revision,
+                CardText {
+                    directory: "",
+                    body: card,
+                },
+            )?;
         }
         let triage = seed.state == State::Triage
             || seed

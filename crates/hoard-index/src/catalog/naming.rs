@@ -11,8 +11,10 @@ use crate::config::SourceKind;
 use crate::discover::DiscoveredEntry;
 use crate::error::Result;
 use crate::hash;
-use crate::shard::{ShardSet, directory_of, file_name};
+use crate::shard::{ShardSet, covers, directory_of, file_name};
 use crate::sniff::{self, SniffResult};
+
+use super::models::CardText;
 
 /// The ceiling on a `*.index.json` read for its `weight_map`. A forty shard model names a
 /// few hundred kilobytes of tensors; anything larger is not one of these documents.
@@ -20,6 +22,9 @@ pub(super) const INDEX_DOCUMENT_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The sidecar a quantized repository states its scheme in, beside its model config.
 const QUANT_CONFIG: &str = "hf_quant_config.json";
+
+/// The lower-cased file name a card is read from.
+const CARD_NAME: &str = "readme.md";
 
 /// A cache blob is content addressed, so the file the entry points at carries no name and
 /// no format was ever decided for it. The document is read as the JSON it is.
@@ -40,13 +45,13 @@ pub(super) fn index_document(
 pub(super) struct InferenceContext {
     configs: Vec<(String, serde_json::Value)>,
     quant_configs: Vec<(String, serde_json::Value)>,
-    frontmatter: Option<Vec<(String, String)>>,
-    card: Option<String>,
+    frontmatters: Vec<(String, Vec<(String, String)>)>,
+    card: Option<(String, String)>,
 }
 
 impl InferenceContext {
-    /// The shallowest README and every model config of a revision, keyed by the directory
-    /// each config governs.
+    /// The shallowest README of a revision as its card, and every model config and every
+    /// card that states frontmatter, keyed by the directory each of them governs.
     pub(super) fn from_results<'a>(
         results: impl Iterator<Item = (&'a str, &'a SniffResult)>,
     ) -> Self {
@@ -70,12 +75,18 @@ impl InferenceContext {
                     .push((directory_of(rel_path).to_owned(), config.clone()));
             }
             if let Some(readme) = &result.readme
-                && name == "readme.md"
-                && depth < card_depth
+                && name == CARD_NAME
             {
-                card_depth = depth;
-                context.frontmatter = Some(readme.frontmatter.clone());
-                context.card = Some(readme.body.clone());
+                if !readme.frontmatter.is_empty() {
+                    context.frontmatters.push((
+                        directory_of(rel_path).to_owned(),
+                        readme.frontmatter.clone(),
+                    ));
+                }
+                if depth < card_depth {
+                    card_depth = depth;
+                    context.card = Some((directory_of(rel_path).to_owned(), readme.body.clone()));
+                }
             }
         }
         context
@@ -85,14 +96,23 @@ impl InferenceContext {
             .quant_configs
             .sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
         context
+            .frontmatters
+            .sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
+        context
     }
 
-    pub(super) fn frontmatter(&self) -> Option<&[(String, String)]> {
-        self.frontmatter.as_deref()
+    /// The frontmatter that describes a file is the nearest card's at or above its own
+    /// directory, never simply the shallowest in the revision: a `README.md` inside one
+    /// folder must not state the trigger words of unrelated weights beside it. A card that
+    /// states no frontmatter says nothing about any file, so it shadows no card above it.
+    pub(super) fn frontmatter_for(&self, rel_path: &str) -> Option<&[(String, String)]> {
+        nearest(&self.frontmatters, rel_path).map(Vec::as_slice)
     }
 
-    pub(super) fn card(&self) -> Option<&str> {
-        self.card.as_deref()
+    pub(super) fn card(&self) -> Option<CardText<'_>> {
+        self.card
+            .as_ref()
+            .map(|(directory, body)| CardText { directory, body })
     }
 
     /// The config that describes a file is the nearest one at or above its own directory,
@@ -110,24 +130,12 @@ impl InferenceContext {
     }
 }
 
-fn nearest<'a>(
-    documents: &'a [(String, serde_json::Value)],
-    rel_path: &str,
-) -> Option<&'a serde_json::Value> {
+fn nearest<'a, T>(documents: &'a [(String, T)], rel_path: &str) -> Option<&'a T> {
     let directory = directory_of(rel_path);
     documents
         .iter()
         .find(|(prefix, _)| covers(prefix, directory))
         .map(|(_, document)| document)
-}
-
-/// True when a config living in `prefix` governs a file in `directory`.
-fn covers(prefix: &str, directory: &str) -> bool {
-    prefix.is_empty()
-        || directory == prefix
-        || directory
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The documents that describe a model itself. The quantization sidecar is deliberately not
@@ -269,6 +277,88 @@ mod tests {
         }
     }
 
+    fn card(text: &str) -> SniffResult {
+        SniffResult {
+            format: hoard_core::ArtifactFormat::Readme,
+            tensors: None,
+            readme: Some(sniff::parse_readme(text)),
+            config: None,
+            size: text.len() as u64,
+            lfs_pointer: None,
+        }
+    }
+
+    fn tagged(tag: &str) -> String {
+        format!("---\ntags:\n- {tag}\n---\nA card.\n")
+    }
+
+    #[test]
+    fn a_card_describes_only_the_files_at_or_below_its_own_directory() {
+        let inner = card(&tagged("gemma3"));
+        let context =
+            InferenceContext::from_results([("encoders/gemma/README.md", &inner)].into_iter());
+
+        assert_eq!(
+            context.frontmatter_for("encoders/gemma/model.safetensors"),
+            Some(&[("tags".to_owned(), "[\"gemma3\"]".to_owned())][..]),
+            "the card describes the weights in its own directory"
+        );
+        assert_eq!(
+            context.frontmatter_for("encoders/gemma/deeper/x.safetensors"),
+            context.frontmatter_for("encoders/gemma/model.safetensors"),
+            "and everything below it"
+        );
+        assert_eq!(
+            context.frontmatter_for("encoders/ministral.safetensors"),
+            None,
+            "a file above the card reads no frontmatter from it"
+        );
+        assert_eq!(
+            context.frontmatter_for("encoders/gemma-other/x.safetensors"),
+            None,
+            "a shared name prefix is not a parent directory"
+        );
+        assert_eq!(
+            context.frontmatter_for("loras/x.safetensors"),
+            None,
+            "and neither does a file beside it"
+        );
+    }
+
+    #[test]
+    fn the_nearest_card_wins_and_a_card_without_frontmatter_shadows_nothing() {
+        let deepest = card("A card with no frontmatter at all.\n");
+        let inner = card(&tagged("inner"));
+        let root = card(&tagged("root"));
+        let context = InferenceContext::from_results(
+            [
+                ("a/b/README.md", &deepest),
+                ("a/README.md", &inner),
+                ("README.md", &root),
+            ]
+            .into_iter(),
+        );
+        let tag = |rel_path: &str| {
+            context
+                .frontmatter_for(rel_path)
+                .and_then(|pairs| pairs.first())
+                .map(|(_, value)| value.clone())
+        };
+
+        assert_eq!(tag("x.safetensors").as_deref(), Some("[\"root\"]"));
+        assert_eq!(tag("a/x.safetensors").as_deref(), Some("[\"inner\"]"));
+        assert_eq!(
+            tag("a/b/x.safetensors").as_deref(),
+            Some("[\"inner\"]"),
+            "a card that states no frontmatter does not shadow the card above it"
+        );
+        assert_eq!(
+            tag("c/x.safetensors").as_deref(),
+            Some("[\"root\"]"),
+            "a sibling directory falls back to the card at the root"
+        );
+    }
+
     #[test]
     fn a_quantization_sidecar_never_shadows_the_model_config_beside_it() {
         let model = document(serde_json::json!({"architectures": ["Qwen3ForCausalLM"]}));
@@ -300,7 +390,7 @@ mod tests {
                 (String::new(), serde_json::json!({"model_type": "root"})),
             ],
             quant_configs: Vec::new(),
-            frontmatter: None,
+            frontmatters: Vec::new(),
             card: None,
         };
 

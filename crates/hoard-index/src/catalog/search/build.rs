@@ -216,12 +216,13 @@ pub(super) struct Indexing<'a, 'db> {
     pub(super) fields: &'a Fields,
     pub(super) names: &'a NodeNames,
     pub(super) repository: Option<(i64, Repository)>,
-    pub(super) card: Option<((i64, u32), String)>,
+    pub(super) card: Option<((i64, u32), Option<RevisionText>)>,
     pub(super) source_kind: Option<(String, Option<SourceKind>)>,
 }
 
 impl Indexing<'_, '_> {
-    /// The repository one entry sits in, the card of the revision it sits at, and the kind
+    /// The repository one entry sits in, the card text this entry carries, which is the card
+    /// of the revision it sits at only when that card covers its own directory, and the kind
     /// of the source that repository belongs to.
     fn resolve(&mut self, entry: &Entry) -> Result<(&Repository, &str, Option<SourceKind>)> {
         self.load_repository(entry.repo_id)?;
@@ -233,7 +234,10 @@ impl Indexing<'_, '_> {
             .map(|(_, kind)| *kind)
             .ok_or_else(|| IndexError::Catalog("resolution cache went empty".into()))?;
         let repository = self.repository.as_ref().map(|(_, repository)| repository);
-        let card = self.card.as_ref().map(|(_, card)| card.as_str());
+        let card = self.card.as_ref().map(|(_, text)| {
+            text.as_ref()
+                .map_or("", |text| text.text_for(&entry.rel_path))
+        });
         repository
             .zip(card)
             .map(|(repository, card)| (repository, card, kind))
@@ -277,7 +281,7 @@ impl Indexing<'_, '_> {
                 .snapshot
                 .get()
                 .primary(LocationKey::revision(repo_id, revision))?;
-            self.card = Some((slot, text.map(|text| text.card).unwrap_or_default()));
+            self.card = Some((slot, text));
         }
         Ok(())
     }

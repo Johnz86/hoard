@@ -163,6 +163,7 @@ fn a_changed_card_reindexes_the_revision_and_an_unchanged_one_writes_nothing() -
     let transaction = catalog.database.rw_transaction()?;
     transaction.upsert(models::RevisionText {
         key: LocationKey::revision(repo_id, revision),
+        directory: String::new(),
         card: sentinel.to_owned(),
     })?;
     transaction.commit()?;

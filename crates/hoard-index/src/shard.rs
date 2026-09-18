@@ -408,6 +408,16 @@ pub(crate) fn directory_of(rel_path: &str) -> &str {
         .map_or("", |(directory, _)| directory)
 }
 
+/// True when a document living in `prefix` governs a file in `directory`: the revision root
+/// governs everything, and otherwise only the directory itself and those below it.
+pub(crate) fn covers(prefix: &str, directory: &str) -> bool {
+    prefix.is_empty()
+        || directory == prefix
+        || directory
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 fn join_path(directory: &str, name: &str) -> String {
     match directory.is_empty() {
         true => name.to_owned(),

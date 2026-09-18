@@ -1,4 +1,5 @@
 mod brands;
+mod cards;
 mod codec;
 mod collapse;
 mod counts;
@@ -193,6 +194,44 @@ fn hf_cache_repo(root: &Path, org: &str, name: &str, files: &[(&str, Vec<u8>)]) 
 /// The body of a card, with a word nothing else in a fixture uses.
 fn card_body(word: &str) -> Vec<u8> {
     format!("---\nlicense: mit\n---\nTrained on {word} photographs.\n").into_bytes()
+}
+
+/// Files one pulled file into a slot, sniffed and inferred the way the pull queue does, and
+/// answers the artifact it was filed under.
+fn pull_into(
+    catalog: &Catalog,
+    slot: PullSlot,
+    root: &Path,
+    rel_path: &str,
+    bytes: &[u8],
+    sha: u8,
+) -> Result<ArtifactId> {
+    let destination = root.join(rel_path);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&destination, bytes)?;
+    let sniff = crate::sniff::sniff_path(&destination)?;
+    let name = crate::shard::file_name(rel_path);
+    let mut input = crate::infer::InferInput::new(sniff.format, &destination, name, sniff.size);
+    if let Some(tensors) = &sniff.tensors {
+        input = input.with_tensors(tensors);
+    }
+    let inference = crate::infer::infer(&input);
+    catalog
+        .file_pulled(&PulledFile {
+            slot,
+            rel_path,
+            abs_path: &destination,
+            sha256: Sha256::from_bytes([sha; 32]),
+            git_sha1: None,
+            sniff: &sniff,
+            inference: &inference,
+            served: true,
+            triage: false,
+        })?
+        .artifact
+        .ok_or_else(|| IndexError::Catalog(format!("{rel_path} was filed under no artifact")))
 }
 
 /// The card one revision of the catalog holds, read straight from the record.

@@ -290,12 +290,15 @@ relative path's own bytes. The first 8 bytes are exactly one repository and the 
 exactly one revision, so a repository listing and a revision listing are both one prefix
 scan of that index and `Entry` needs no repository index of its own.
 
-`RevisionText` holds one revision's card, keyed by the same 12 bytes an entry's location
-starts with, so the card an artifact's documents are indexed from is one point lookup by
-`(repo_id, revision)` and one repository's cards are an 8 byte prefix scan. Every artifact of
-a revision reads that one row rather than carrying a copy; a build reads it once per run of
-entries that share a revision. A card that changes marks every artifact of its revision for
-indexing, because nothing else about those artifacts moved.
+`RevisionText` holds one revision's card and the directory that card sits in, keyed by the
+same 12 bytes an entry's location starts with, so the card an artifact's documents are indexed
+from is one point lookup by `(repo_id, revision)` and one repository's cards are an 8 byte
+prefix scan. Every artifact of a revision reads that one row rather than carrying a copy; a
+build reads it once per run of entries that share a revision. A document carries the card text
+only when the card covers the entry it is written from, which `RevisionText::text_for` decides
+from the stored directory: a `README.md` inside one folder does not describe the weights above
+it or beside it. A card whose text or whose directory changes marks every artifact of its
+revision for indexing, because nothing else about those artifacts moved.
 
 `ArtifactDetail` keeps at most sixteen of the up to sixty-four tensor samples the sniff draws
 for inference, thinned by a stride so the triage queue's hidden dimension is read from a
@@ -324,7 +327,8 @@ the catalog at `<data_dir>/native`.
 - `scan/sweep.rs` the artifact sweep and every retirement of a revision, a source or a row.
 - `scan/sources.rs` the source rows, their scanned counts and the configuration validation.
 - `scan/revisions.rs` the revisions discovery found merged with the revisions the catalog holds.
-- `naming.rs` the config and card a revision carries, artifact names, per-file hashes.
+- `naming.rs` the configs and cards a revision carries, each scoped to the directory it sits
+  in, artifact names, per-file hashes.
 - `search/mod.rs` `QueryRequest`, `QueryPage`, `RefreshReport` and what the catalog imports.
 - `search/schema.rs` `Fields`, the keyword and column constants, the document one entry writes.
 - `search/build.rs` the rebuild, the metered writer, per-entry documents, the directory publish.
@@ -790,8 +794,9 @@ rail do not grow with the number of bases the catalog holds. A collapsed query c
 bucket by folding the artifact id alone, with no tallies and no row.
 
 Free text indexes names, organizations, bases, triggers, tensor key prefixes and the body of
-the shallowest README in each revision. Tantivy uses one writer thread with a 32 MiB indexing
-budget; nothing larger than a unit is held in memory or in an open transaction.
+the shallowest README in each revision, into the entries that README's directory covers.
+Tantivy uses one writer thread with a 32 MiB indexing budget; nothing larger than a unit is
+held in memory or in an open transaction.
 
 ## Running it
 

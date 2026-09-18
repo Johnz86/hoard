@@ -13,8 +13,8 @@ use super::Catalog;
 use super::hashing::content_key;
 use super::ingest::IngestRecord;
 use super::models::{
-    ArtifactRecord, ArtifactRecordKey, Entry, EntryKey, LOCAL_NODE, LocationKey, Placement,
-    Repository, RepositoryKey, Revision, SearchText, Source, entry_at, placement_in,
+    ArtifactRecord, ArtifactRecordKey, CardText, Entry, EntryKey, LOCAL_NODE, LocationKey,
+    Placement, Repository, RepositoryKey, Revision, SearchText, Source, entry_at, placement_in,
     repository_key, store_revision_card,
 };
 use super::scan::{
@@ -134,7 +134,10 @@ impl Catalog {
                 &transaction,
                 file.slot.repo.get(),
                 file.slot.revision,
-                &readme.body,
+                CardText {
+                    directory: crate::shard::directory_of(file.rel_path),
+                    body: &readme.body,
+                },
             )?
         {
             log_revision_artifacts(

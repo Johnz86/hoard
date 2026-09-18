@@ -3,6 +3,58 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest wave: let a card describe only the files at or below its own directory
+
+A revision kept one frontmatter, the shallowest `README.md`'s, and handed it to every artifact
+of the revision, so the one README inside
+`comfy/text_encoders/gemma-3-12b-it-qat-q4_0-unquantized` gave 18 unrelated encoders the
+trigger words `gemma3, gemma, google` and made `q=gemma` find them.
+`catalog/naming.rs::InferenceContext` now keeps one frontmatter per README that states any,
+keyed by the directory the README sits in, and answers `frontmatter_for(rel_path)` from the
+nearest one at or above that file's own directory, through the same `nearest` / `covers` pair
+that already resolves `config_for` and `quant_config_for`; `nearest` became generic over the
+document type so all three lookups share it. `catalog/scan/plan.rs::prepare_entry` is its one
+caller. A README that states no frontmatter is not listed, so it shadows no card above it.
+The stored card is still one per revision, the shallowest, but `models::RevisionText` now
+carries the `directory` that card sits in and `RevisionText::text_for` is the one place the
+scope of the indexed card is decided: `catalog/search/build.rs::Indexing::resolve` holds the
+row rather than its text in its one-element cache and hands a document the card only when the
+card covers that entry. Every writer of the record passes
+`models::CardText { directory, body }`: the scan from `InferenceContext::card()`, a pull from
+the pulled file's own directory, a seed from the revision root, and `move_revision_card`
+carries the directory with the body. A card that moves to another folder keeping its words
+answers `true` and has its revision's artifacts logged, because it now describes other files.
+`catalog::FORMAT_VERSION` is 17: the catalog is deleted and rebuilt from disk.
+
+Measured on this workstation's real files at `ab79f89`, a release build scanning the same
+three sources into a fresh scratch catalog on port 7199 with `[mirror] offline = true` and no
+`[lookup]`, against the same run at `cd24004`: exactly 1 row carries the trigger
+`gemma3, gemma, google`,
+`comfy/text_encoders/gemma-3-12b-it-qat-q4_0-unquantized/model.safetensors`, where 19 did
+before; `q=gemma` answers 17 rows where it answered 32, and none of
+`ministral-3-3b.safetensors`, `mistral_3_small_flux2_bf16.safetensors`,
+`byt5_small_glyphxl_fp16.safetensors`, `clip_l.safetensors`,
+`umt5_xxl_fp8_e4m3fn_scaled.safetensors` or any `qwen*` file of that folder is among them,
+while the three `gemma*` files at the folder's root stay on the strength of their own names.
+Exactly 18 rows changed trigger, all of them in `comfy/text_encoders`, each falling back to
+its own file name; no hf-cache and no lmstudio row moved. Artifacts 239, triage 23 (the queue,
+`/api/v1/stats` and the `state:triage` total all 23), `base:sdxl` 5, `base:sdxlpony` 1 and
+`base:sdxlillustrious` 1 are unchanged; the catalog stamps format 17.
+
+One test changed its assertion: `format_version_is_sixteen` became
+`format_version_is_seventeen`. The new `catalog/tests/cards.rs` holds the scope tests, and
+`pull_into` moved from `tests/mirror.rs` to `tests/mod.rs` unchanged so both files can use it.
+
+Left open. The stored and indexed card is still the ONE shallowest `README.md` of a revision,
+so a file under a deeper or sibling README that the shallowest does not cover reads that
+README's frontmatter for inference but carries no card text in search. A README that changes
+does not re-infer the unchanged weights it describes until those files change or the catalog
+is rebuilt, because `scan/walk.rs::decide_unit` prepares only changed entries; that predates
+this wave. Two `README.md` pulled at the same depth into one revision take the card in turn
+(`pulls.rs::is_revision_card` refuses only a shallower one), so the last pulled wins and now
+sets the card's directory too, where a scan keeps the first it saw at the minimum depth; that
+also predates this wave. F21 (the facet rail) is untouched.
+
 ## Latest wave: say a partial set is partial on its row, pull the set, let a rejection end it
 
 Four things an incomplete set got wrong, and one flag each. A row now carries `incomplete`
@@ -166,7 +218,8 @@ keeps one revision-wide card, the shallowest README, and `scan/plan.rs:496` hand
 `plan.context.frontmatter()` to every artifact of the revision, so
 `comfy/text_encoders/ministral-3-3b.safetensors` carries `gemma3, gemma, google` from a
 neighbouring `gemma-3-12b-it-qat-q4_0-unquantized/README.md`. The rule to adopt is
-nearest-directory scoping, exactly as `config_for` and `quant_config_for` already do.
+nearest-directory scoping, exactly as `config_for` and `quant_config_for` already do; the
+card-scope wave above adopted it.
 
 ## Latest wave: read the whole header before naming the base
 

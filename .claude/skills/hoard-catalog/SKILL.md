@@ -34,7 +34,8 @@ One line per file in `crates/hoard-index/src/catalog/`:
 - `scan/sweep.rs` the artifact sweep and every retirement of a revision, a source or a row.
 - `scan/sources.rs` the source rows, their scanned counts and the configuration validation.
 - `scan/revisions.rs` the revisions discovery found merged with the revisions the catalog holds.
-- `naming.rs` the config and card a revision carries, artifact names, per-file hashes.
+- `naming.rs` the configs and cards a revision carries, each scoped to the directory it sits
+  in, artifact names, per-file hashes.
 - `search/mod.rs` `QueryRequest`, `QueryPage`, `RefreshReport` and what the catalog imports.
 - `search/schema.rs` `Fields`, the keyword and column constants, the document one entry writes.
 - `search/build.rs` the rebuild, the metered writer, per-entry documents, the directory publish.
@@ -61,7 +62,7 @@ One line per file in `crates/hoard-index/src/catalog/`:
 - `pulls.rs` a pull in flight and the file it lands.
 - `tests/` the catalog's own tests: shared fixtures in `mod.rs`, then `scan`, `revisions`,
   `storage`, `codec`, `reads`, `mirror`, `counts`, `rescan`, `index`, `paging`, `collapse`,
-  `usage`, `hashing` and `recovery`.
+  `usage`, `hashing`, `cards` and `recovery`.
 
 ## The write path
 

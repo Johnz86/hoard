@@ -11,6 +11,7 @@ use hoard_core::{
 
 use crate::config::{SourceConfig, SourceKind};
 use crate::discover::RefKind;
+use crate::shard::{covers, directory_of};
 
 use super::jobs::JobState;
 
@@ -421,8 +422,9 @@ pub(super) struct SearchText {
     pub(super) keys: String,
 }
 
-/// The card of one revision, stored once however many artifacts the revision holds and
-/// indexed into every one of their documents.
+/// The card of one revision, stored once however many artifacts the revision holds, with the
+/// directory the card sits in: a document carries the card only when the card covers the
+/// entry it was written from.
 ///
 /// The key is [`LocationKey::revision`], the same 12 bytes an entry's location starts with,
 /// so one revision is a point lookup and one repository's cards are an 8 byte prefix scan.
@@ -432,29 +434,52 @@ pub(super) struct SearchText {
 pub(super) struct RevisionText {
     #[primary_key]
     pub(super) key: LocationKey,
+    pub(super) directory: String,
     pub(super) card: String,
 }
 
-/// Stores the card of one revision, writing only when the text is not the one already
-/// there: a rescan that reaches a revision whose card did not change leaves the row alone,
-/// and a revision that lost its card loses its row. Answers whether the row moved, which is
-/// what tells the caller the revision's artifacts have to be indexed again.
+impl RevisionText {
+    /// The card text one file carries into its document: the body when the card sits at or
+    /// above the file's own directory, and nothing when it sits below it or beside it.
+    pub(super) fn text_for(&self, rel_path: &str) -> &str {
+        match covers(&self.directory, directory_of(rel_path)) {
+            true => &self.card,
+            false => "",
+        }
+    }
+}
+
+/// A card as its writer holds it: the body, and the directory inside the revision it was
+/// read from, which is what decides the files it describes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct CardText<'a> {
+    pub(super) directory: &'a str,
+    pub(super) body: &'a str,
+}
+
+/// Stores the card of one revision, writing only when the text or the directory is not the
+/// one already there: a rescan that reaches a revision whose card did not change leaves
+/// the row alone, and a revision that lost its card loses its row. Answers whether the row
+/// moved, which is what tells the caller the revision's artifacts have to be indexed again.
+/// A card that moved to another folder keeping its words moved, because it now describes
+/// other files.
 pub(super) fn store_revision_card(
     transaction: &native_db::transaction::RwTransaction<'_>,
     repo_id: i64,
     revision: u32,
-    card: &str,
+    card: CardText<'_>,
 ) -> super::Result<bool> {
     let key = LocationKey::revision(repo_id, revision);
     let stored: Option<RevisionText> = transaction.get().primary(key.clone())?;
-    match (stored, card.is_empty()) {
+    match (stored, card.body.is_empty()) {
         (Some(stored), true) => {
             transaction.remove(stored)?;
             Ok(true)
         }
-        (Some(stored), false) if stored.card != card => {
+        (Some(stored), false) if stored.card != card.body || stored.directory != card.directory => {
             transaction.upsert(RevisionText {
-                card: card.to_owned(),
+                directory: card.directory.to_owned(),
+                card: card.body.to_owned(),
                 ..stored
             })?;
             Ok(true)
@@ -463,7 +488,8 @@ pub(super) fn store_revision_card(
         (None, false) => {
             transaction.insert(RevisionText {
                 key,
-                card: card.to_owned(),
+                directory: card.directory.to_owned(),
+                card: card.body.to_owned(),
             })?;
             Ok(true)
         }
@@ -491,10 +517,21 @@ pub(super) fn move_revision_card(
     let held: Option<RevisionText> = transaction
         .get()
         .primary(LocationKey::revision(repo_id, to))?;
-    let carried = held.is_none().then(|| stored.card.clone());
+    let carried = held
+        .is_none()
+        .then(|| (stored.directory.clone(), stored.card.clone()));
     transaction.remove(stored)?;
     match carried {
-        Some(card) => store_revision_card(transaction, repo_id, to, &card).map(|_| ()),
+        Some((directory, card)) => store_revision_card(
+            transaction,
+            repo_id,
+            to,
+            CardText {
+                directory: &directory,
+                body: &card,
+            },
+        )
+        .map(|_| ()),
         None => Ok(()),
     }
 }
