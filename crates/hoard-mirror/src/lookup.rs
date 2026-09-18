@@ -3,7 +3,10 @@
 //!
 //! Off unless `[lookup] civitai = true`, and never while the mirror is offline. Nothing about
 //! a file but its content hash leaves this machine: no path, no name, no token, and no
-//! redirect followed, so the hash reaches the host the configuration names and no other.
+//! redirect followed, so the hash reaches the host the configuration names and no other. A
+//! pass runs only while no scan is running or queued, again as soon as one has finished, and
+//! otherwise every quarter of an hour: a scan is what restores the hashes a rebuilt catalog
+//! is asked about, so asking before one has run asks about nothing.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,11 +14,12 @@ use std::time::Duration;
 use hoard_core::Sha256;
 use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, JobProgress, Listed, LookupAnswer};
+use hoard_index::coordinate::Coordinator;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 use url::Url;
 
 use crate::error::{MirrorError, Result};
@@ -35,6 +39,9 @@ const BY_HASH_PATH: &str = "api/v1/model-versions/by-hash";
 /// How long between passes. A pass asks about what the previous one did not reach and about
 /// files that landed since, so this is a trickle rather than a schedule to meet.
 const PASS_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// How often the worker looks at the scan lane while it waits for it, and between passes.
+const SCAN_WAIT: Duration = Duration::from_secs(10);
 
 /// The least time between two requests, so one node is never a burst.
 const REQUEST_GAP: Duration = Duration::from_secs(1);
@@ -119,18 +126,21 @@ impl LookupHandle {
     }
 }
 
-/// Runs the first pass at once and then one every quarter of an hour; a failed pass is logged
-/// and the loop continues.
+/// Runs a pass when the node starts and no scan is running or queued, again as soon as a
+/// scan has finished, and otherwise every quarter of an hour; a failed pass is logged and the
+/// loop continues.
 pub fn spawn_lookup(
     catalog: Arc<Catalog>,
     client: UpstreamClient,
     config: LookupConfig,
+    scans: Arc<Coordinator>,
 ) -> LookupHandle {
     let (stop, mut stopped) = watch::channel(false);
     let lookup = Lookup::new(catalog, client, config.civitai_url, stopped.clone());
     let task = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(PASS_INTERVAL);
+        let mut ticker = tokio::time::interval(SCAN_WAIT);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut cadence = Cadence::new(scans.finished(), Instant::now());
         loop {
             tokio::select! {
                 changed = stopped.changed() => {
@@ -138,12 +148,48 @@ pub fn spawn_lookup(
                         break;
                     }
                 }
-                _ = ticker.tick() => pass_once(&lookup).await,
+                _ = ticker.tick() => {
+                    if cadence.ready(scans.busy(), scans.finished(), Instant::now()) {
+                        let before = scans.finished();
+                        pass_once(&lookup).await;
+                        cadence.passed(before, Instant::now());
+                    }
+                }
             }
         }
         tracing::debug!("the lookup stopped");
     });
     LookupHandle { stop, task }
+}
+
+/// When a pass runs: never while a scan runs or waits, as soon as one has finished since the
+/// last pass, and otherwise every [`PASS_INTERVAL`].
+#[derive(Debug)]
+struct Cadence {
+    seen: u64,
+    due: Instant,
+}
+
+impl Cadence {
+    fn new(finished: u64, now: Instant) -> Self {
+        Self {
+            seen: finished,
+            due: now,
+        }
+    }
+
+    /// Whether this look at the lane starts a pass.
+    fn ready(&self, busy: bool, finished: u64, now: Instant) -> bool {
+        !busy && (finished != self.seen || now >= self.due)
+    }
+
+    /// Records that a pass ran, so the next waits for a scan to finish or the interval.
+    /// `finished` is the count read before the pass, so a scan that started and ended while
+    /// the pass ran is one the next look still sees.
+    fn passed(&mut self, finished: u64, now: Instant) {
+        self.seen = finished;
+        self.due = now + PASS_INTERVAL;
+    }
 }
 
 async fn pass_once(lookup: &Lookup) {
@@ -480,6 +526,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
 
     use hoard_core::{
@@ -488,7 +535,8 @@ mod tests {
     use hoard_index::catalog::{
         JobState, LOCAL_NODE, SeedArtifact, SeedEntry, SeedRepository, SeedRevision, content_key,
     };
-    use hoard_index::config::{IndexConfig, SourceKind};
+    use hoard_index::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
+    use hoard_index::coordinate::{Origin, ScanRequest};
     use tempfile::TempDir;
     use wiremock::matchers::{method, path as path_matcher};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -551,11 +599,18 @@ mod tests {
             |_, _| {},
         )
         .expect("catalog opens");
+        seed_repo(&catalog, directory, "checkpoints", files);
+        catalog.rebuild_search(|_| {}).expect("the index builds");
+        Arc::new(catalog)
+    }
+
+    /// One repository of hashed checkpoints written into a catalog that is already open.
+    fn seed_repo(catalog: &Catalog, directory: &Path, repo: &str, files: &[(Sha256, &str, &str)]) {
         let entries: Vec<SeedEntry> = files
             .iter()
             .map(|(sha256, name, base)| SeedEntry {
                 node: LOCAL_NODE,
-                rel_path: format!("checkpoints/{name}.safetensors"),
+                rel_path: format!("{repo}/{name}.safetensors"),
                 abs_path: None,
                 size: 4096,
                 state: State::Local,
@@ -567,7 +622,7 @@ mod tests {
             .collect();
         catalog
             .seed(&[SeedRepository {
-                repo: RepoId::new(RepoType::Models, None, "checkpoints"),
+                repo: RepoId::new(RepoType::Models, None, repo),
                 source: "files".to_owned(),
                 kind: SourceKind::Loose,
                 root_path: directory.join("files"),
@@ -584,8 +639,6 @@ mod tests {
                 }],
             }])
             .expect("the catalog is seeded");
-        catalog.rebuild_search(|_| {}).expect("the index builds");
-        Arc::new(catalog)
     }
 
     /// The worker exactly as `spawn_lookup` builds it: the same client, the same one attempt
@@ -630,6 +683,196 @@ mod tests {
         server.received_requests().await.unwrap_or_default()
     }
 
+    /// A lane over the catalog the worker reads, with nothing queued on it.
+    fn idle_lane(directory: &Path, catalog: &Arc<Catalog>) -> Arc<Coordinator> {
+        Arc::new(Coordinator::new(
+            Arc::clone(catalog),
+            IndexConfig {
+                data_dir: directory.join("data"),
+                sources: Vec::new(),
+                ..IndexConfig::default()
+            },
+        ))
+    }
+
+    async fn asked(server: &MockServer, count: usize, looks: usize) -> Vec<wiremock::Request> {
+        for _ in 0..looks {
+            let seen = requests(server).await;
+            if seen.len() >= count {
+                return seen;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        requests(server).await
+    }
+
+    /// A synthetic LoRA header, written by the test and never a real weight file.
+    fn lora_header() -> Vec<u8> {
+        let header = concat!(
+            r#"{"__metadata__":{"ss_network_dim":"16","ss_network_alpha":"8"},"#,
+            r#""lora_unet_down_blocks_0_attn.lora_down.weight":"#,
+            r#"{"dtype":"F16","shape":[16,768],"data_offsets":[0,24576]},"#,
+            r#""lora_unet_down_blocks_0_attn.lora_up.weight":"#,
+            r#"{"dtype":"F16","shape":[768,16],"data_offsets":[24576,49152]}}"#
+        );
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes
+    }
+
+    /// A lane over one source holding one synthetic LoRA, hashing what it finds, and the
+    /// catalog it writes into, which starts empty as a rebuilt one does.
+    fn lane_over_a_source(directory: &Path) -> (Arc<Catalog>, Arc<Coordinator>) {
+        let files = directory.join("files");
+        fs::create_dir_all(files.join("loras")).expect("the source directory");
+        fs::write(
+            files.join("loras").join("one-obsession.safetensors"),
+            lora_header(),
+        )
+        .expect("the fixture is written");
+        let data_dir = directory.join("data");
+        let catalog = Arc::new(
+            Catalog::open_or_scan(
+                &IndexConfig {
+                    data_dir: data_dir.clone(),
+                    sources: Vec::new(),
+                    ..IndexConfig::default()
+                },
+                "node-a",
+                |_, _| {},
+            )
+            .expect("catalog opens"),
+        );
+        let scans = Arc::new(Coordinator::new(
+            Arc::clone(&catalog),
+            IndexConfig {
+                data_dir,
+                hash_policy: HashPolicy::Now,
+                sources: vec![SourceConfig {
+                    name: "files".to_owned(),
+                    path: files,
+                    kind: SourceKind::Loose,
+                    include: Vec::new(),
+                    exclude: Vec::new(),
+                    follow_symlinks: false,
+                    repo_per_folder: false,
+                }],
+                ..IndexConfig::default()
+            },
+        ));
+        (catalog, scans)
+    }
+
+    #[tokio::test]
+    async fn the_worker_passes_again_after_the_lane_finishes_a_scan() {
+        let directory = TempDir::new().expect("temp dir");
+        let (catalog, scans) = lane_over_a_source(directory.path());
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(ILLUSTRIOUS, "application/json"))
+            .mount(&server)
+            .await;
+        let handle = spawn_lookup(
+            Arc::clone(&catalog),
+            lookup_client(),
+            LookupConfig {
+                civitai: true,
+                civitai_url: server.uri(),
+            },
+            Arc::clone(&scans),
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            requests(&server).await.is_empty(),
+            "a catalog holding no hash asks about nothing"
+        );
+
+        scans
+            .request(ScanRequest {
+                sources: None,
+                hash: HashPolicy::Now,
+                origin: Origin::Manual,
+            })
+            .await
+            .expect("the lane takes the request");
+        for _ in 0..600 {
+            if !scans.busy() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let sent = asked(&server, 1, 150).await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "a finished scan starts a pass rather than the quarter hour"
+        );
+        let hash: Sha256 = sent[0]
+            .url
+            .path()
+            .strip_prefix(&format!("/{BY_HASH_PATH}/"))
+            .expect("the pass asks on the by-hash route")
+            .parse()
+            .expect("the route carries a sha256");
+        let refined = Base::new("illustrious");
+        let mut stored = base_of(&catalog, &hash);
+        for _ in 0..200 {
+            if stored == refined {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stored = base_of(&catalog, &hash);
+        }
+        assert_eq!(
+            stored, refined,
+            "the pass asked about the hash the scan produced and applied the answer"
+        );
+
+        handle.shutdown().await;
+        scans.shutdown().await.expect("the lane stops");
+    }
+
+    #[test]
+    fn the_first_look_on_an_idle_lane_starts_a_pass() {
+        let start = Instant::now();
+        assert!(Cadence::new(0, start).ready(false, 0, start));
+    }
+
+    #[test]
+    fn no_pass_starts_while_a_scan_runs_or_waits() {
+        let start = Instant::now();
+        let cadence = Cadence::new(0, start);
+        assert!(!cadence.ready(true, 0, start));
+        assert!(!cadence.ready(true, 1, start + PASS_INTERVAL));
+    }
+
+    #[test]
+    fn a_pass_starts_as_soon_as_a_scan_has_finished() {
+        let start = Instant::now();
+        let mut cadence = Cadence::new(0, start);
+        cadence.passed(0, start);
+        assert!(!cadence.ready(false, 0, start + SCAN_WAIT));
+        assert!(cadence.ready(false, 1, start + SCAN_WAIT));
+    }
+
+    #[test]
+    fn a_scan_that_ends_during_a_pass_starts_the_next_one() {
+        let start = Instant::now();
+        let mut cadence = Cadence::new(0, start);
+        cadence.passed(0, start);
+        assert!(cadence.ready(false, 1, start + SCAN_WAIT));
+    }
+
+    #[test]
+    fn a_pass_starts_at_the_interval_when_no_scan_ran() {
+        let start = Instant::now();
+        let mut cadence = Cadence::new(3, start);
+        cadence.passed(3, start);
+        assert!(!cadence.ready(false, 3, start + PASS_INTERVAL - SCAN_WAIT));
+        assert!(cadence.ready(false, 3, start + PASS_INTERVAL));
+    }
+
     #[tokio::test]
     async fn a_known_hash_is_asked_once_and_refines_the_base() {
         let directory = TempDir::new().expect("temp dir");
@@ -647,7 +890,7 @@ mod tests {
 
         assert_eq!(first.asked, 1);
         assert_eq!(first.applied, 1);
-        assert_eq!(base_of(&catalog, &hash), Base::new("sdxlillustrious"));
+        assert_eq!(base_of(&catalog, &hash), Base::new("illustrious"));
         assert_eq!(requests(&server).await.len(), 1);
         assert_eq!(
             only_job(&catalog).state,
@@ -754,7 +997,7 @@ mod tests {
             requests(&server).await.is_empty(),
             "what a rebuilt catalog forgot is restored without a socket"
         );
-        assert_eq!(base_of(&catalog, &hash), Base::new("sdxlillustrious"));
+        assert_eq!(base_of(&catalog, &hash), Base::new("illustrious"));
     }
 
     #[tokio::test]
@@ -883,6 +1126,7 @@ mod tests {
             )
             .mount(&server)
             .await;
+        let scans = idle_lane(directory.path(), &catalog);
         let handle = spawn_lookup(
             Arc::clone(&catalog),
             lookup_client(),
@@ -890,6 +1134,7 @@ mod tests {
                 civitai: true,
                 civitai_url: server.uri(),
             },
+            Arc::clone(&scans),
         );
         for _ in 0..200 {
             if !requests(&server).await.is_empty() {

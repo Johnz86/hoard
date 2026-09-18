@@ -10,25 +10,45 @@ fn named_fixture() -> Result<(TempDir, Catalog)> {
     ])
 }
 
-fn scanned_names(names: &[&str]) -> Result<(TempDir, Catalog)> {
-    let directory = tempfile::tempdir()?;
-    let input = directory.path().join("files");
+fn named_and_cased_fixture() -> Result<(TempDir, Catalog)> {
+    scanned_names(&[
+        "gpt-oss-style_v2.safetensors",
+        "Qwen3-VL-8B-Instruct-Q4_K_M.safetensors",
+        "loxsSoulsMixPerfectDoll_v30.safetensors",
+        "cyberrealisticPony_v160.safetensors",
+        "oneObsession_v24.safetensors",
+    ])
+}
+
+fn scanned_config(root: &Path, names: &[&str]) -> Result<IndexConfig> {
+    let input = root.join("files");
     fs::create_dir_all(input.join("loras"))?;
     for name in names {
         fs::write(input.join("loras").join(name), lora_header())?;
     }
-    let config = IndexConfig {
+    Ok(IndexConfig {
+        data_dir: root.to_path_buf(),
         sources: vec![source(&input, "files")],
         ..IndexConfig::default()
-    };
+    })
+}
+
+fn scanned_into(config: &IndexConfig) -> Result<Catalog> {
     let catalog = Catalog::scan_sources(
-        &directory.path().join("native"),
+        &config.native_path(),
         "n",
-        &config,
+        config,
         HashPolicy::Never,
         |_, _| {},
     )?;
     catalog.rebuild_search(|_| {})?;
+    Ok(catalog)
+}
+
+fn scanned_names(names: &[&str]) -> Result<(TempDir, Catalog)> {
+    let directory = tempfile::tempdir()?;
+    let config = scanned_config(directory.path(), names)?;
+    let catalog = scanned_into(&config)?;
     Ok((directory, catalog))
 }
 
@@ -89,4 +109,42 @@ fn a_word_too_long_for_the_index_leaves_a_gap_the_phrase_steps_over() -> Result<
 fn punctuation_alone_matches_nothing_and_a_missing_word_still_excludes() -> Result<()> {
     let (_directory, catalog) = named_fixture()?;
     totals(&catalog, &[("...", 0), ("gpt-oss nothere", 0)])
+}
+
+#[test]
+fn a_word_inside_a_camel_cased_name_is_found() -> Result<()> {
+    let (_directory, catalog) = named_and_cased_fixture()?;
+    totals(
+        &catalog,
+        &[
+            ("pony", 1),
+            ("Pony", 1),
+            ("souls", 1),
+            ("obsession", 1),
+            ("doll", 1),
+            ("ponytail", 0),
+            ("8B", 1),
+            ("120", 0),
+            ("Qwen3-VL-8B", 1),
+            ("Q4_K_M", 1),
+            ("loxsSoulsMix", 1),
+        ],
+    )
+}
+
+#[test]
+fn the_query_is_cut_by_the_index_it_runs_against() -> Result<()> {
+    let (_directory, catalog) = named_and_cased_fixture()?;
+    totals(&catalog, &[("vl-8b", 1), ("vl8b", 1)])
+}
+
+#[test]
+fn an_index_opened_from_disk_registers_the_word_tokenizer() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = scanned_config(directory.path(), &["cyberrealisticPony_v160.safetensors"])?;
+    let catalog = scanned_into(&config)?;
+    drop(catalog);
+
+    let reopened = Catalog::open_or_scan(&config, "n", |_, _| {})?;
+    totals(&reopened, &[("pony", 1), ("cyberrealistic", 1)])
 }

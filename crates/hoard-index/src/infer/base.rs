@@ -3,7 +3,7 @@ use hoard_core::{Base, Evidence, EvidenceSource, Role, TensorSample, TensorSumma
 use super::families::{ADAPTER_RULES, FAMILY_RULES, txt_norm_family};
 use super::rules::{
     self, BASE_ALIASES, BASE_RULES, BaseRule, CROSS_ATTENTION_DIMS, CROSS_ATTENTION_KEYS,
-    FIRST_CONVOLUTION_KEYS, KeyMatch, LINEAGES, PROJECTION_KEYS, PROJECTOR_ARCHITECTURE,
+    FIRST_CONVOLUTION_KEYS, KeyMatch, PROJECTION_KEYS, PROJECTOR_ARCHITECTURE,
     PROJECTOR_DESCRIPTORS, PROJECTOR_SHAPES, UNET_BODY_KEYS,
 };
 use super::{Accumulator, InferInput};
@@ -98,7 +98,8 @@ pub(crate) fn infer_base(input: &InferInput<'_>, role: Role) -> BaseVerdict {
         .filter(|(candidate, _, _)| *candidate == base)
         .reduce(|best, next| if next.2 > best.2 { next } else { best })
         .map(|(_, label, _)| label)
-        .filter(|label| Base::new(label) == base);
+        .filter(|label| Base::new(label) == base)
+        .or_else(|| base.lineage_label().map(str::to_owned));
 
     let mut evidence = bases.into_evidence();
     let (base, label) = match lineage_refinement(input, &base) {
@@ -130,7 +131,7 @@ pub(crate) fn infer_base(input: &InferInput<'_>, role: Role) -> BaseVerdict {
 /// The lineage a proven architecture is refined by, named by the file itself or by the one
 /// folder it sits in. A lineage token never names an architecture of its own.
 fn lineage_refinement(input: &InferInput<'_>, base: &Base) -> Option<(&'static str, Evidence)> {
-    LINEAGES
+    Base::LINEAGES
         .iter()
         .filter(|(_, architecture, _)| *base == Base::new(architecture))
         .find_map(|(token, architecture, label)| {
@@ -705,25 +706,28 @@ mod tests {
             (
                 "/models/checkpoints/pony/x.safetensors",
                 "x.safetensors",
-                "sdxl pony",
+                "pony",
+                "Pony",
             ),
             (
                 "/models/checkpoints/cyberrealisticPony_v160.safetensors",
                 "cyberrealisticPony_v160.safetensors",
-                "sdxl pony",
+                "pony",
+                "Pony",
             ),
             (
                 "/models/checkpoints/Illustrious/y.safetensors",
                 "y.safetensors",
-                "sdxl illustrious",
+                "illustrious",
+                "Illustrious",
             ),
         ];
-        for (path, name, label) in claims {
+        for (path, name, lineage, label) in claims {
             let verdict = infer_base(
                 &input(Path::new(path), name).with_tensors(&header),
                 Role::Ckpt,
             );
-            assert_eq!(verdict.base, Base::new(label), "{path}");
+            assert_eq!(verdict.base, Base::new(lineage), "{path}");
             assert_eq!(verdict.label.as_deref(), Some(label), "{path}");
             assert!(verdict.base.matches(&Base::new("sdxl")), "{path}");
             assert!(verdict.confidence >= rules::TENSOR_SHAPE, "{path}");
@@ -806,7 +810,12 @@ mod tests {
             &input(path, "style.safetensors").with_tensors(&summary),
             Role::Lora,
         );
-        assert_eq!(verdict.base, Base::new("sdxlpony"));
+        assert_eq!(verdict.base, Base::new("pony"));
+        assert_eq!(
+            verdict.label.as_deref(),
+            Some("Pony"),
+            "a metadata spelling of a lineage prints the lineage's own label"
+        );
     }
 
     #[test]

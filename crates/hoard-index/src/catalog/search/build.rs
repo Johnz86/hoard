@@ -72,6 +72,7 @@ impl Catalog {
     ) -> Result<u64> {
         let (schema, fields) = Fields::build();
         let index = Index::create_in_dir(directory, schema)?;
+        super::tokens::register(&index);
         let writer = index.writer_with_num_threads(1, WRITER_BUDGET)?;
         let mut metered = Metered::new(writer, budget);
         let snapshot = self.database.r_transaction()?;

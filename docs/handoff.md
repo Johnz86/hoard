@@ -3,6 +3,105 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest wave: a word inside a name, a lineage by its name, a lookup after hashing
+
+Three things that made the search bar and the BASE column read wrong, and one that made the
+Civitai worker ask before there was anything to ask about.
+
+`crates/hoard-index/src/catalog/search/tokens.rs` is hoard's own tokenizer. It cuts at every
+character that is neither a letter nor a digit, at every step between a letter and a digit,
+and before an uppercase letter that follows a lowercase one unless another uppercase follows
+it, so `cyberrealisticPony_v160` is `cyberrealistic`, `Pony`, `v`, `160`, `PONYTAIL` stays
+one word and `LoRA` stays one word. `text_analyzer()` wraps it in the default analyzer's own
+filters, `RemoveLongFilter(40)` then `LowerCaser`, and `register(index)` puts it on an index
+under the name `hoard_words`, which `search/schema.rs` writes into the `text` field's
+indexing options. Every index the catalog creates or opens registers it before it makes a
+writer: `search/build.rs`, `search/refresh.rs` and the in-memory `one_segment` of
+`search/mod.rs`, which is the whole list
+`grep -rn "Index::create_in_dir\|Index::open_in_dir\|Index::create_in_ram"` returns. The
+query side no longer reaches for `TokenizerManager::default()`: `QueryFields` carries a
+`text: TextAnalyzer` taken from the open index with `index.tokenizer_for_field(fields.text)`,
+at the three sites that build it (`search/answer.rs` twice, `search/inspect.rs` once), so
+index and query cut identically or the query fails loudly. `trigger_text` keeps the `default`
+analyzer, because `trigger:` is a whole-value term match. One fact the plan had missed went
+with it: the grammar lowercased a free-text token's `values` before the analyzer saw them,
+which destroyed exactly the case steps the tokenizer cuts on, so `search/grammar.rs`'s
+`text_token` now keeps the case the user typed and leaves `normalized` lowercased as it was.
+
+A lineage is stored under its own key. `hoard_core::Base::LINEAGES` is the one table naming
+`pony`, `illustrious` and `noobai` beside the architecture each runs on and the label it
+prints (`Pony`, `Illustrious`, `NoobAI`), and `Base::architecture`, `Base::lineage_label` and
+`Base::lineages_under` are how everything else reads it. `Base::matches` gained the two
+clauses that make a lineage select its architecture and be selected by it, and never a
+sibling. `query.rs::base_filter` adds one term per lineage of the architecture asked for, so
+`base:sdxl` still answers a Pony file and its rail bucket still counts what a click on it
+answers; `base_compat` adds the same terms plus the prefixes of the lineage's architecture,
+so a Pony host accepts a plain SDXL adapter. `infer/rules.rs` lost its own `LINEAGES` and its
+three `BASE_ALIASES` rows now map a lineage to itself; `infer/base.rs` reads the core table
+and falls back to the lineage's label when a metadata spelling named it; `infer/lookup.rs`
+keys its lineage rows on the lineage and spells every label the way Civitai writes it
+(`Illustrious`, `Flux.2 Klein 4B`, `ZImageTurbo`), and `refine` compares architectures as
+well as keys.
+
+The Civitai worker no longer runs on a timer alone. `Coordinator::finished()` counts scans the
+lane ran to their end (`Lane.finished: AtomicU64`, incremented in `run_lane` after
+`lane.run(item)`), and `hoard-mirror`'s `Cadence` reads it beside `Coordinator::busy()`: a
+pass runs only while no scan is running or queued, again as soon as one has finished, and
+otherwise every fifteen minutes; the worker looks every ten seconds. `spawn_lookup` takes the
+coordinator and `hoard_server::start_lookup` hands it over. That is what makes the first pass
+on a rebuilt catalog ask about the hashes the startup scan restored rather than about the few
+that survived it.
+
+`catalog::FORMAT_VERSION` is 18: the catalog is deleted and rebuilt from disk. The schema of
+the `text` field changed and so did the stored spelling of every lineage, so a catalog stamped
+17 holds terms cut the old way and bases spelled the old way.
+
+Measured at `77ef442` against a baseline at `5af2c4d`, both a release build of the wave
+worktree scanning this workstation's three sources into a fresh scratch catalog on port 7199
+with `[mirror] offline = true`, `[index] hash_policy = "never"` and `watch = false`, no
+`[lookup]` and `[node] discovery = "none"`. `artifacts` 240 and `triage` 23 in both columns.
+`q=` totals, baseline then after: `pony` 0 then 1, `obsession` 0 then 1, `souls` 0 then 1,
+`illustrious` 0 then 1, `cyberrealistic` 1 then 1, `gpt-oss` 1 then 1, `Q4_K_M` 6 then 6,
+`loxsSoulsMix` 1 then 1, `Qwen3-VL-8B` 3 then 4. The one that moved where nothing was expected
+to move is the last: the fourth row is `qwen3vl_8b_fp8_scaled.safetensors`, which the coarser
+cut left as `qwen3vl` plus `8b` and no query spelling could reach. `base:sdxl` 5 then 5,
+`base:sdxlpony` 1 then 0, `base:sdxlillustrious` 1 then 0, `base:pony` 0 then 1, `base:Pony`
+0 then 1, `base:illustrious` 0 then 1. The BASE column of `cyberrealisticPony_v160` reads
+`sdxl pony` then `Pony`, and of `loxsSoulsMixPerfectDoll_v30` `sdxl illustrious` then
+`Illustrious`. The compat list of `cyberrealisticPony_v160` is the same 42 names in both
+columns. `hoard doctor` prints `format 17` then `format 18`.
+
+Tests whose assertions changed, and why. `format_version_is_seventeen` became
+`format_version_is_eighteen`, because the format moved. Every assertion naming `sdxlpony`,
+`sdxlillustrious` or the labels `sdxl pony` and `sdxl illustrious` - in `infer/base.rs`,
+`infer/lookup.rs`, `sniff/mod.rs`, `catalog/tests/lookup.rs`, `catalog/tests/brands.rs` and
+`hoard-mirror`'s `lookup.rs` - was asserting the suffix spelling this wave removes, and now
+names the lineage and its label.
+`every_listed_base_extends_an_architecture_and_is_spelled_by_its_label` now asks that a listed
+base's architecture extends one hoard's rules name, because a lineage key no longer starts
+with its architecture, and additionally pins that a lineage's listed label is the label
+`Base::LINEAGES` gives it.
+
+What is left, in the order it will bite:
+
+- The rail's standing 32-bucket cap can hide a lineage row: on this workstation `base_total`
+  is 40 and `base_shown` is 32, the new `illustrious` row is shown and the `pony` row is one
+  of the eight cut, so the Pony file is reachable through `base:pony` and through the `sdxl`
+  row but has no row of its own.
+- Keeping `LoRA` whole costs the split of an acronym inside a longer camel run: `myLoRAFile`
+  is cut to `my` and `lorafile`, so `q=lora` still answers it as a prefix while `q=file` does
+  not find it. The rule that would split it cuts `LoRA` itself into `lo` and `ra`, which is
+  what `a_revisions_own_readme_and_config_reach_inference` forbids.
+- A verdict a user types still stores and labels a lineage by its key (`pony`) rather than by
+  `Pony`: `Base::lineage_label` is read by inference and by the listing table, not by
+  `verdict.rs`.
+- The `text` field still carries field norms nothing reads; the keyword fields dropped theirs
+  and this one did not.
+- The lookup's first pass on a node whose reconcile scan has not been queued yet runs on what
+  the catalog holds at that moment; the reconcile then finishes and a second pass follows it.
+- The module map in `.claude/skills/hoard-catalog/SKILL.md` does not list
+  `search/tokens.rs`: this agent does not edit files under `.claude/`.
+
 ## Latest wave: a confirm settles the paths it clears
 
 A confirm wrote the role at full confidence and set `triage_cleared`, which took the artifact

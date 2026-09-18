@@ -6,6 +6,7 @@ use tantivy::schema::{
 use crate::catalog::models::SearchText;
 
 use super::answer::EntryFacts;
+use super::tokens::WORD_TOKENIZER;
 
 pub(super) const BASE_LABEL_COLUMN: &str = "base_label";
 /// The column `used:` filters on and `sort=used` orders by, as epoch seconds.
@@ -78,6 +79,16 @@ pub(in crate::catalog) struct Fields {
     keywords: [Field; KEYWORD_FIELDS.len()],
 }
 
+/// `TEXT` with the tokenizer renamed: positions stay, because the free-text path is a
+/// phrase prefix query, and nothing is stored.
+fn text_options() -> TextOptions {
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(WORD_TOKENIZER)
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+    )
+}
+
 /// One whole value as one term, with no field norms.
 ///
 /// Field norms are read by relevance scoring alone, and nothing here ranks by score: both
@@ -111,7 +122,7 @@ impl Fields {
             entry: schema.add_i64_field("entry_id", FAST),
             preference: schema.add_i64_field("preference", FAST),
             size: schema.add_u64_field("size", FAST | INDEXED),
-            text: schema.add_text_field("text", TEXT),
+            text: schema.add_text_field("text", text_options()),
             name: schema.add_text_field("name", column_only.clone()),
             base_label: schema.add_text_field(BASE_LABEL_COLUMN, column_only),
             revision_sha: schema.add_text_field("revision_sha", filter.clone()),

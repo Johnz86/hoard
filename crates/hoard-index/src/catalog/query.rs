@@ -1,16 +1,13 @@
 use std::ops::Bound;
-use std::sync::OnceLock;
 
-use hoard_core::Role;
+use hoard_core::{Base, Role};
 use jiff::Span;
 use tantivy::Term;
 use tantivy::query::{
     AllQuery, BooleanQuery, EmptyQuery, Occur, PhrasePrefixQuery, Query, RangeQuery, TermQuery,
 };
 use tantivy::schema::{Field, IndexRecordOption};
-use tantivy::tokenizer::{
-    LowerCaser, SimpleTokenizer, TextAnalyzer, TokenStream, TokenizerManager,
-};
+use tantivy::tokenizer::{TextAnalyzer, TokenStream};
 
 use crate::error::{IndexError, Result};
 use crate::search::context::{HOURS_PER_DAY, MAX_SHELF_DEPTH};
@@ -24,16 +21,15 @@ use super::search::{
 
 const ANY_BASE: &str = "any";
 const LOCAL_NODE_ALIASES: [&str; 4] = ["self", "me", "local", "here"];
-const TEXT_ANALYZER: &str = "default";
 const PREFIX_EXPANSIONS: u32 = 1024;
 
-static TEXT_TOKENIZER: OnceLock<TextAnalyzer> = OnceLock::new();
-
 /// The schema a query binds to and everything the query text does not carry: the shelves,
-/// the local node alias and the resolved `compat:` target.
+/// the local node alias, the resolved `compat:` target and the analyzer the index this query
+/// runs against cut its `text` field with, so a value is cut into the words the index holds.
 pub(super) struct QueryFields<'a> {
     pub(super) fields: &'a Fields,
     pub(super) context: &'a CompileContext,
+    pub(super) text: TextAnalyzer,
 }
 
 /// Whether answering this query needs one document per entry collapsed to its artifact, or
@@ -204,7 +200,7 @@ fn clause(token: &Token, fields: &QueryFields<'_>, depth: usize) -> Result<Box<d
         TokenKind::Used => used_filter(token, schema.last_used, fields.context),
         TokenKind::Compat => compat_filter(token, fields),
         TokenKind::Shelf => shelf_filter(token, fields, depth),
-        TokenKind::Text => Ok(text_filter(token, schema.text)),
+        TokenKind::Text => Ok(text_filter(token, schema.text, &fields.text)),
     }
 }
 
@@ -255,25 +251,43 @@ fn base_matches(field: Field, value: &str) -> Vec<Box<dyn Query>> {
     parts
 }
 
-/// `base:` as a filter: the family asked for and the families under it, one way only.
+/// Every lineage of the architecture `value` names, each stored under its own key, which is
+/// what keeps `base:sdxl` and `compat:` a Pony file's answer.
+fn lineage_terms(field: Field, value: &str) -> Vec<Box<dyn Query>> {
+    Base::lineages_under(value)
+        .map(|lineage| term(field, lineage))
+        .collect()
+}
+
+/// `base:` as a filter: the family asked for, the families under it and every lineage that
+/// runs on it, one way only.
 ///
-/// `base:sdxl` answers every lineage stored as a suffix of it, and `base:sdxlpony` answers
-/// the Pony ones alone rather than every plain `sdxl` file as well. The other direction is a
-/// compatibility notion, and `compat:` keeps it.
+/// `base:sdxl` answers every lineage of SDXL, and `base:pony` answers the Pony ones alone
+/// rather than every plain `sdxl` file as well. The other direction is a compatibility
+/// notion, and `compat:` keeps it.
 ///
 /// `any` states that an artifact works with every architecture, which is a claim about
 /// compatibility rather than about belonging to a family, so an `any` artifact answers no
 /// family's query. It still answers `base:any`, which is the query the facet rail's own
 /// `any` bucket opens.
 pub(super) fn base_filter(schema: &Fields, value: &str) -> Box<dyn Query> {
-    starts_with(schema.keyword(BASE_FIELD), value)
+    let field = schema.keyword(BASE_FIELD);
+    let mut parts = vec![starts_with(field, value)];
+    parts.extend(lineage_terms(field, value));
+    any_of(parts)
 }
 
-/// `compat:` resolves against the same families, and here `any` does belong: an upscaler
+/// `compat:` resolves against the same families both ways, so a Pony host accepts a plain
+/// SDXL adapter and an SDXL host accepts a Pony one. Here `any` does belong: an upscaler
 /// that declares it really does plug into a host of any architecture.
 fn base_compat(schema: &Fields, value: &str) -> Box<dyn Query> {
     let field = schema.keyword(BASE_FIELD);
     let mut parts = base_matches(field, value);
+    parts.extend(lineage_terms(field, value));
+    let architecture = Base::new(value);
+    if architecture.architecture() != value {
+        parts.extend(is_prefix_of(field, architecture.architecture()));
+    }
     parts.push(term(field, ANY_BASE));
     any_of(parts)
 }
@@ -387,8 +401,8 @@ fn cutoff_second(context: &CompileContext, days: i64) -> Result<i64> {
 /// words have to appear at the distances apart the value spells, the last one as a prefix.
 /// Every value of the token is required, and a fuzzy token drops the order and the distances
 /// and matches every word as a prefix.
-fn text_filter(token: &Token, field: Field) -> Box<dyn Query> {
-    let mut analyzer = text_analyzer();
+fn text_filter(token: &Token, field: Field, analyzer: &TextAnalyzer) -> Box<dyn Query> {
+    let mut analyzer = analyzer.clone();
     all_of(
         token
             .values
@@ -408,20 +422,6 @@ fn text_filter(token: &Token, field: Field) -> Box<dyn Query> {
             })
             .collect(),
     )
-}
-
-fn text_analyzer() -> TextAnalyzer {
-    TEXT_TOKENIZER
-        .get_or_init(|| {
-            TokenizerManager::default()
-                .get(TEXT_ANALYZER)
-                .unwrap_or_else(|| {
-                    TextAnalyzer::builder(SimpleTokenizer::default())
-                        .filter(LowerCaser)
-                        .build()
-                })
-        })
-        .clone()
 }
 
 /// Every word of `value` with the position the analyzer gave it. A token the index refuses
@@ -542,20 +542,21 @@ mod tests {
     fn repo(reference: &str) -> RepoId {
         RepoId::parse_qualified(reference).expect("a repository reference")
     }
+    use crate::catalog::search::text_analyzer;
     use crate::search::{CompatTarget, CompileContext, parse};
+
+    fn bound<'a>(fields: &'a Fields, context: &'a CompileContext) -> QueryFields<'a> {
+        QueryFields {
+            fields,
+            context,
+            text: text_analyzer(),
+        }
+    }
 
     fn compiled(raw: &str) -> String {
         let (_, fields) = Fields::build();
         let context = CompileContext::new("2026-09-04T00:00:00Z".parse().expect("clock"));
-        let query = compile(
-            &parse(raw).tokens,
-            None,
-            &QueryFields {
-                fields: &fields,
-                context: &context,
-            },
-        )
-        .expect("compiles");
+        let query = compile(&parse(raw).tokens, None, &bound(&fields, &context)).expect("compiles");
         format!("{query:?}")
     }
 
@@ -627,10 +628,7 @@ mod tests {
         let result = compile(
             &parse("compat:sdxl").tokens,
             None,
-            &QueryFields {
-                fields: &fields,
-                context: &context,
-            },
+            &bound(&fields, &context),
         );
         assert!(matches!(result, Err(IndexError::Query(_))));
     }
@@ -642,15 +640,7 @@ mod tests {
             .with_local_node("workstation");
         let rendered = format!(
             "{:?}",
-            compile(
-                &parse("node:self").tokens,
-                None,
-                &QueryFields {
-                    fields: &fields,
-                    context: &context,
-                },
-            )
-            .expect("compiles")
+            compile(&parse("node:self").tokens, None, &bound(&fields, &context)).expect("compiles")
         );
         assert!(rendered.contains("workstation"));
         assert!(!rendered.contains("self"));
@@ -670,10 +660,7 @@ mod tests {
             compile(
                 &parse("compat:sdxl-base-1.0").tokens,
                 None,
-                &QueryFields {
-                    fields: &fields,
-                    context: &context,
-                },
+                &bound(&fields, &context),
             )
             .expect("compiles")
         );
@@ -704,10 +691,7 @@ mod tests {
             compile(
                 &parse("compat:mmproj-gemma-4").tokens,
                 None,
-                &QueryFields {
-                    fields: &fields,
-                    context: &context,
-                },
+                &bound(&fields, &context),
             )
             .expect("compiles")
         );
@@ -745,15 +729,48 @@ mod tests {
     }
 
     #[test]
+    fn a_base_filter_names_the_lineages_of_the_architecture_it_asks_for() {
+        let (_, fields) = Fields::build();
+        let architecture = format!("{:?}", base_filter(&fields, "sdxl"));
+        for lineage in ["pony", "illustrious", "noobai"] {
+            assert!(
+                architecture.contains(lineage),
+                "base:sdxl answers its {lineage} files: {architecture}"
+            );
+        }
+        let lineage = format!("{:?}", base_filter(&fields, "pony"));
+        assert!(lineage.contains("pony"));
+        assert!(
+            !lineage.contains("sdxl") && !lineage.contains("illustrious"),
+            "base:pony answers the Pony files alone: {lineage}"
+        );
+        let other = format!("{:?}", base_filter(&fields, "flux"));
+        for absent in ["pony", "illustrious", "noobai"] {
+            assert!(!other.contains(absent), "base:flux names no lineage");
+        }
+    }
+
+    #[test]
+    fn a_pony_host_accepts_a_plain_sdxl_adapter_and_not_an_illustrious_one() {
+        let (_, fields) = Fields::build();
+        let host = format!("{:?}", base_compat(&fields, "pony"));
+        assert!(host.contains("sdxl"), "a Pony host accepts an sdxl adapter");
+        assert!(host.contains(ANY_BASE));
+        assert!(
+            !host.contains("illustrious"),
+            "and never an Illustrious one: {host}"
+        );
+        let architecture = format!("{:?}", base_compat(&fields, "sdxl"));
+        assert!(architecture.contains("pony"));
+    }
+
+    #[test]
     fn every_seeded_shelf_parses_and_compiles() {
         let (_, fields) = Fields::build();
         let shelves = seeded_shelves();
         let context = CompileContext::new("2026-09-04T00:00:00Z".parse().expect("clock"))
             .with_shelves(shelves.clone());
-        let bound = QueryFields {
-            fields: &fields,
-            context: &context,
-        };
+        let bound = bound(&fields, &context);
         for (name, _) in &shelves {
             let raw = format!("shelf:{}", crate::search::quoted(name));
             compile(&parse(&raw).tokens, None, &bound)
@@ -794,10 +811,7 @@ mod tests {
                 ("loras".into(), "role:lora".into()),
                 ("loop".into(), "shelf:loop".into()),
             ]);
-        let fields = QueryFields {
-            fields: &schema,
-            context: &context,
-        };
+        let fields = bound(&schema, &context);
         assert!(
             format!(
                 "{:?}",

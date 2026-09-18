@@ -117,6 +117,25 @@ mod tests {
     }
 
     #[test]
+    fn a_pony_lora_fits_a_pony_or_a_plain_sdxl_host_and_never_an_illustrious_one() {
+        let lora = subject("lora", Role::Lora, "pony");
+        for (family, accepted) in [
+            ("pony", Some(CompatRule::HostAcceptsAdapter)),
+            ("sdxl", Some(CompatRule::HostAcceptsAdapter)),
+            ("illustrious", None),
+        ] {
+            let host = subject("ckpt", Role::Ckpt, family);
+            assert_eq!(compatible(&host, &lora), accepted, "a {family} host");
+        }
+        let plain = subject("lora-sdxl", Role::Lora, "sdxl");
+        let pony_host = subject("ckpt", Role::Ckpt, "pony");
+        assert_eq!(
+            compatible(&pony_host, &plain),
+            Some(CompatRule::HostAcceptsAdapter)
+        );
+    }
+
+    #[test]
     fn adapters_never_resolve_against_adapters() {
         let lora = subject("lora", Role::Lora, "sdxl");
         let vae = subject("vae", Role::Vae, "sdxl");

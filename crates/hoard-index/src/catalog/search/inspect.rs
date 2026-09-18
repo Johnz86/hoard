@@ -113,6 +113,7 @@ impl Catalog {
         let bound = QueryFields {
             fields: &fields,
             context,
+            text: open.index.tokenizer_for_field(fields.text)?,
         };
         let compiled = query::compile(&parse(raw).tokens, None, &bound)?;
         let searcher = open.reader.searcher();

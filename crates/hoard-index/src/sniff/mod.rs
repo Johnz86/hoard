@@ -484,7 +484,7 @@ pub(crate) mod tests {
         assert_eq!(inferred.role, Role::Ckpt);
         assert_eq!(
             inferred.base,
-            Base::new("sdxl pony"),
+            Base::new("pony"),
             "the header proves sdxl and the file name refines it"
         );
         assert!(inferred.base.matches(&Base::new("sdxl")));

@@ -7,38 +7,40 @@ use crate::catalog::Listed;
 /// Every `baseModel` spelling a listing service is known to answer with, normalized the way
 /// [`Base::new`] normalizes, against the hoard base it names and the label that spells it.
 ///
-/// Every base here extends an architecture hoard's own rules name, so `base:sdxl` still finds
-/// a file a listing refined to `sdxlillustrious`, and every label normalizes back to its own
-/// base. A spelling this table does not hold names nothing and changes nothing.
+/// A lineage row's key is the lineage itself and [`Base::LINEAGES`] says what it runs on, so
+/// `base:sdxl` still finds a file a listing refined to `illustrious`. Every other base here
+/// extends an architecture hoard's own rules name, every label normalizes back to its own
+/// base, and a label is the spelling the service writes. A spelling this table does not hold
+/// names nothing and changes nothing.
 const LISTED_BASES: &[(&str, &str, &str)] = &[
-    ("illustrious", "sdxlillustrious", "sdxl illustrious"),
-    ("pony", "sdxlpony", "sdxl pony"),
-    ("noobai", "sdxlnoobai", "sdxl noobai"),
-    ("sdxl10", "sdxl", "sdxl"),
-    ("flux2d", "flux2dev", "flux 2 dev"),
-    ("flux2klein4b", "flux2klein4b", "flux 2 klein 4b"),
+    ("illustrious", "illustrious", "Illustrious"),
+    ("pony", "pony", "Pony"),
+    ("noobai", "noobai", "NoobAI"),
+    ("sdxl10", "sdxl", "SDXL"),
+    ("flux2d", "flux2dev", "Flux.2 Dev"),
+    ("flux2klein4b", "flux2klein4b", "Flux.2 Klein 4B"),
     (
         "flux2klein4bbase",
         "flux2klein4bbase",
-        "flux 2 klein 4b base",
+        "Flux.2 Klein 4B-base",
     ),
-    ("flux2klein9b", "flux2klein9b", "flux 2 klein 9b"),
-    ("zimageturbo", "zimageturbo", "zimage turbo"),
-    ("zimagebase", "zimagebase", "zimage base"),
-    ("wanvideo", "wan", "wan"),
-    ("wanvideo14bi2v720p", "wan21i2v14b", "wan 2.1 i2v 14b"),
-    ("wanvideo22i2va14b", "wan22i2va14b", "wan 2.2 i2v a14b"),
-    ("ltxv", "ltx", "ltx"),
-    ("ltxv2", "ltx2", "ltx 2"),
-    ("ltxv23", "ltx23", "ltx 2.3"),
-    ("krea2", "krea2", "krea2"),
-    ("anima", "anima", "anima"),
-    ("ernie", "ernie", "ernie"),
-    ("qwen", "qwenimage", "qwenimage"),
-    ("mageflow", "mageflow", "mageflow"),
-    ("minimaxh3", "minimaxh3", "minimaxh3"),
-    ("hidreamo1", "hidreamo1", "hidreamo1"),
-    ("ideogram40", "ideogram4", "ideogram4"),
+    ("flux2klein9b", "flux2klein9b", "Flux.2 Klein 9B"),
+    ("zimageturbo", "zimageturbo", "ZImageTurbo"),
+    ("zimagebase", "zimagebase", "ZImageBase"),
+    ("wanvideo", "wan", "Wan"),
+    ("wanvideo14bi2v720p", "wan21i2v14b", "Wan 2.1 I2V-14B"),
+    ("wanvideo22i2va14b", "wan22i2va14b", "Wan 2.2 I2V-A14B"),
+    ("ltxv", "ltx", "LTX"),
+    ("ltxv2", "ltx2", "LTX 2"),
+    ("ltxv23", "ltx23", "LTX 2.3"),
+    ("krea2", "krea2", "Krea 2"),
+    ("anima", "anima", "Anima"),
+    ("ernie", "ernie", "Ernie"),
+    ("qwen", "qwenimage", "Qwen Image"),
+    ("mageflow", "mageflow", "MageFlow"),
+    ("minimaxh3", "minimaxh3", "MiniMax H3"),
+    ("hidreamo1", "hidreamo1", "HiDream O1"),
+    ("ideogram40", "ideogram4", "Ideogram 4"),
 ];
 
 /// What a listing is allowed to do to the base an artifact already carries.
@@ -83,13 +85,17 @@ pub fn refine(current: &Base, listed: &Listed) -> Refinement {
             label: label.to_owned(),
         };
     }
-    if base.as_str().starts_with(current.as_str()) {
+    if base.as_str().starts_with(current.as_str())
+        || base.architecture().starts_with(current.as_str())
+    {
         return Refinement::Refined {
             base,
             label: label.to_owned(),
         };
     }
-    if current.as_str().starts_with(base.as_str()) {
+    if current.as_str().starts_with(base.as_str())
+        || current.architecture().starts_with(base.as_str())
+    {
         return Refinement::Unchanged;
     }
     Refinement::Contradicted { listed: base }
@@ -101,7 +107,7 @@ mod tests {
 
     use super::super::families::{ADAPTER_RULES, FAMILY_RULES, txt_norm_family};
     use super::super::fixtures::tensors;
-    use super::super::rules::{BASE_ALIASES, BASE_RULES, CROSS_ATTENTION_DIMS, LINEAGES};
+    use super::super::rules::{BASE_ALIASES, BASE_RULES, CROSS_ATTENTION_DIMS};
     use super::*;
 
     fn listing(base_model: &str) -> Listed {
@@ -129,7 +135,7 @@ mod tests {
                 .map(|(_, family)| (*family).to_owned()),
         );
         named.extend(
-            LINEAGES
+            Base::LINEAGES
                 .iter()
                 .map(|(_, architecture, _)| (*architecture).to_owned()),
         );
@@ -155,11 +161,17 @@ mod tests {
                 "{label} does not spell {base}"
             );
             assert!(
-                architectures
-                    .iter()
-                    .any(|architecture| base.starts_with(architecture.as_str())),
-                "{base} extends no architecture hoard's own rules name"
+                architectures.iter().any(|architecture| {
+                    Base::new(base).architecture().starts_with(architecture)
+                }),
+                "{base} runs on no architecture hoard's own rules name"
             );
+            if let Some(lineage) = Base::new(base).lineage_label() {
+                assert_eq!(
+                    *label, lineage,
+                    "the rule and the listing spell {base} differently"
+                );
+            }
         }
         let mut spellings: Vec<&str> = LISTED_BASES.iter().map(|(key, _, _)| *key).collect();
         spellings.sort_unstable();
@@ -176,15 +188,15 @@ mod tests {
         assert_eq!(
             refine(&Base::new("sdxl"), &listing("Illustrious")),
             Refinement::Refined {
-                base: Base::new("sdxlillustrious"),
-                label: "sdxl illustrious".to_owned(),
+                base: Base::new("illustrious"),
+                label: "Illustrious".to_owned(),
             }
         );
         assert_eq!(
             refine(&Base::new("zimage"), &listing("ZImageTurbo")),
             Refinement::Refined {
                 base: Base::new("zimageturbo"),
-                label: "zimage turbo".to_owned(),
+                label: "ZImageTurbo".to_owned(),
             }
         );
         assert_eq!(
@@ -199,8 +211,36 @@ mod tests {
         assert_eq!(
             refine(&Base::new(""), &listing("Pony")),
             Refinement::Named {
-                base: Base::new("sdxlpony"),
-                label: "sdxl pony".to_owned(),
+                base: Base::new("pony"),
+                label: "Pony".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_listing_names_a_lineage_by_its_own_key() {
+        assert_eq!(
+            refine(&Base::new("sdxl"), &listing("Pony")),
+            Refinement::Refined {
+                base: Base::new("pony"),
+                label: "Pony".to_owned(),
+            }
+        );
+        assert_eq!(
+            refine(&Base::new("pony"), &listing("SDXL 1.0")),
+            Refinement::Unchanged
+        );
+        assert_eq!(
+            refine(&Base::new("pony"), &listing("Illustrious")),
+            Refinement::Contradicted {
+                listed: Base::new("illustrious"),
+            }
+        );
+        assert_eq!(
+            refine(&Base::new(""), &listing("NoobAI")),
+            Refinement::Named {
+                base: Base::new("noobai"),
+                label: "NoobAI".to_owned(),
             }
         );
     }
@@ -210,13 +250,13 @@ mod tests {
         assert_eq!(
             refine(&Base::new("flux"), &listing("Illustrious")),
             Refinement::Contradicted {
-                listed: Base::new("sdxlillustrious"),
+                listed: Base::new("illustrious"),
             }
         );
         assert_eq!(
-            refine(&Base::new("sdxlpony"), &listing("Illustrious")),
+            refine(&Base::new("pony"), &listing("Illustrious")),
             Refinement::Contradicted {
-                listed: Base::new("sdxlillustrious"),
+                listed: Base::new("illustrious"),
             },
             "the owner's own filing outranks an uploader's label"
         );
@@ -225,7 +265,7 @@ mod tests {
     #[test]
     fn a_finer_base_hoard_already_holds_is_kept() {
         assert_eq!(
-            refine(&Base::new("sdxlpony"), &listing("SDXL 1.0")),
+            refine(&Base::new("pony"), &listing("SDXL 1.0")),
             Refinement::Unchanged
         );
         assert_eq!(

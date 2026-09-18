@@ -7,6 +7,7 @@ mod paging;
 mod refresh;
 mod schema;
 mod tally;
+mod tokens;
 
 use serde::Serialize;
 
@@ -28,6 +29,8 @@ pub(super) use self::schema::{
     PRECISION_FIELD, REPO_FIELD, REVISION_FIELD, ROLE_FIELD, SOURCE_FIELD, STATE_FIELD,
     SUB_ROLE_FIELD, TRIGGER_FIELD,
 };
+#[cfg(test)]
+pub(super) use self::tokens::text_analyzer;
 
 /// One query of Hoard's own grammar, the one the search bar, `hoard ls` and shelves speak.
 /// The context carries what the text does not: the shelves, the local node alias and the
@@ -95,6 +98,7 @@ mod test_support {
     pub(super) fn one_segment(rows: &[Indexed]) -> Index {
         let (schema, fields) = Fields::build();
         let index = Index::create_in_ram(schema);
+        super::tokens::register(&index);
         let mut writer = index
             .writer_with_num_threads(1, WRITER_BUDGET)
             .expect("the in-memory index takes a writer");

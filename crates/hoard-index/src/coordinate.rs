@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -83,6 +83,7 @@ impl Coordinator {
                 wake: Notify::new(),
                 admission: tokio::sync::Mutex::new(()),
                 stop: Stop::default(),
+                finished: AtomicU64::new(0),
             }),
             worker: Mutex::new(None),
         }
@@ -129,6 +130,12 @@ impl Coordinator {
         queue.running || !queue.waiting.is_empty()
     }
 
+    /// How many scans the lane has run to their end since it was built, whatever the
+    /// outcome, so a reader polling it can tell that one finished between two looks.
+    pub fn finished(&self) -> u64 {
+        self.lane.finished.load(Ordering::Acquire)
+    }
+
     /// Stops the lane within a batch of work rather than within a whole pass.
     ///
     /// The running scan is asked to stop between units and before each file a hashing pass
@@ -163,6 +170,7 @@ struct Lane {
     wake: Notify,
     admission: tokio::sync::Mutex<()>,
     stop: Stop,
+    finished: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -299,6 +307,7 @@ async fn run_lane(lane: Arc<Lane>) {
         match next {
             Some(item) => {
                 lane.run(item).await;
+                lane.finished.fetch_add(1, Ordering::Release);
                 lane.queue.lock().running = false;
             }
             None => lane.wake.notified().await,
@@ -708,6 +717,40 @@ mod tests {
             0,
             "the merge raised the queued policy above Never, so the run hashed"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_scan_that_ran_is_counted_by_the_lane() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let config = IndexConfig {
+            data_dir: directory.path().join("data"),
+            sources: Vec::new(),
+            ..IndexConfig::default()
+        };
+        let catalog = Arc::new(Catalog::open_or_scan(&config, "test-node", |_, _| {})?);
+        let coordinator = Coordinator::new(catalog, config);
+        assert_eq!(
+            coordinator.finished(),
+            0,
+            "a lane that never ran counts none"
+        );
+
+        let everything = || ScanRequest {
+            sources: None,
+            hash: HashPolicy::Never,
+            origin: Origin::Manual,
+        };
+        coordinator.request(everything()).await?;
+        drained(&coordinator).await;
+        assert_eq!(coordinator.finished(), 1);
+
+        coordinator.request(everything()).await?;
+        drained(&coordinator).await;
+        coordinator.request(everything()).await?;
+        drained(&coordinator).await;
+        assert_eq!(coordinator.finished(), 3);
+        coordinator.shutdown().await?;
         Ok(())
     }
 

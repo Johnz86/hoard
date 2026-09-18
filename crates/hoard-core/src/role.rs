@@ -295,6 +295,15 @@ impl Base {
     /// Adapters and hosts declaring `any` match every family.
     pub const ANY: &'static str = "any";
 
+    /// Every lineage, the architecture it runs on and the label the BASE column prints for
+    /// it. A lineage is stored under its own key, never as a suffix of its architecture;
+    /// everything that needs to know that Pony runs on SDXL reads this table.
+    pub const LINEAGES: &'static [(&'static str, &'static str, &'static str)] = &[
+        ("pony", "sdxl", "Pony"),
+        ("illustrious", "sdxl", "Illustrious"),
+        ("noobai", "sdxl", "NoobAI"),
+    ];
+
     /// Normalizes a family name the way the grammar compares them: lowercase, with spaces,
     /// dots, dashes and underscores stripped, so `SDXL 1.0` and `sdxl-1.0` share a key.
     pub fn new(value: impl AsRef<str>) -> Self {
@@ -324,8 +333,29 @@ impl Base {
         self.0.is_empty()
     }
 
-    /// True when a grammar value selects this family. `base:sdxl` matches `sdxl10`, so the
-    /// shorter normalized token is treated as a prefix of the longer one.
+    /// The architecture this family runs on: the table's answer for a lineage, the family
+    /// itself for anything else.
+    pub fn architecture(&self) -> &str {
+        Self::lineage_row(&self.0).map_or(self.0.as_str(), |(_, architecture, _)| *architecture)
+    }
+
+    /// The label a lineage prints under; nothing for a family that is not one.
+    pub fn lineage_label(&self) -> Option<&'static str> {
+        Self::lineage_row(&self.0).map(|(_, _, label)| *label)
+    }
+
+    /// Every lineage whose architecture starts with `prefix`, which is what `base:` adds to
+    /// its prefix match so `base:sdxl` still finds a Pony file.
+    pub fn lineages_under(prefix: &str) -> impl Iterator<Item = &'static str> {
+        Self::LINEAGES
+            .iter()
+            .filter(move |(_, architecture, _)| architecture.starts_with(prefix))
+            .map(|(lineage, _, _)| *lineage)
+    }
+
+    /// True when a grammar value selects this family: `any` on either side, then one key a
+    /// prefix of the other, then a lineage against a prefix of its architecture in either
+    /// direction. `pony` matches `sdxl` both ways and never `illustrious`.
     pub fn matches(&self, query: &Base) -> bool {
         if self.is_any() || query.is_any() {
             return true;
@@ -333,7 +363,17 @@ impl Base {
         if self.0.is_empty() || query.0.is_empty() {
             return false;
         }
-        self.0.starts_with(query.as_str()) || query.0.starts_with(self.as_str())
+        let asked = query.as_str();
+        self.0.starts_with(asked)
+            || asked.starts_with(self.as_str())
+            || self.architecture().starts_with(asked)
+            || query.architecture().starts_with(self.as_str())
+    }
+
+    fn lineage_row(key: &str) -> Option<&'static (&'static str, &'static str, &'static str)> {
+        Self::LINEAGES
+            .iter()
+            .find(|(lineage, _, _)| *lineage == key)
     }
 }
 
@@ -498,5 +538,61 @@ mod tests {
         assert!(!Base::new("sd15").matches(&Base::new("sdxl")));
         assert!(Base::new("flux").matches(&Base::any()));
         assert!(!Base::new("").matches(&Base::new("sdxl")));
+    }
+
+    #[test]
+    fn a_lineage_matches_its_architecture_and_never_a_sibling() {
+        let table = [
+            ("pony", "sdxl", true),
+            ("sdxl", "pony", true),
+            ("pony", "illustrious", false),
+            ("illustrious", "pony", false),
+            ("pony", "pony", true),
+            ("sdxl10", "sdxl", true),
+            ("sdxl", "sdxl10", true),
+            ("pony", "sdxl10", false),
+            ("pony", "sd", true),
+            ("flux", "sdxl", false),
+            ("sd15", "sdxl", false),
+            ("", "sdxl", false),
+            ("flux", "any", true),
+            ("noobai", "sdxl", true),
+        ];
+        for (stored, asked, selected) in table {
+            assert_eq!(
+                Base::new(stored).matches(&Base::new(asked)),
+                selected,
+                "base {stored:?} against query {asked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lineage_knows_its_architecture_and_its_label() {
+        assert_eq!(Base::new("pony").architecture(), "sdxl");
+        assert_eq!(Base::new("sdxl").architecture(), "sdxl");
+        assert_eq!(Base::new("Pony").lineage_label(), Some("Pony"));
+        assert_eq!(Base::new("sdxl").lineage_label(), None);
+        assert_eq!(
+            Base::lineages_under("sdxl").collect::<Vec<_>>(),
+            ["pony", "illustrious", "noobai"]
+        );
+        assert_eq!(
+            Base::lineages_under("sd").collect::<Vec<_>>(),
+            ["pony", "illustrious", "noobai"]
+        );
+        assert_eq!(Base::lineages_under("flux").count(), 0);
+        for (lineage, architecture, label) in Base::LINEAGES {
+            assert_eq!(
+                Base::new(label),
+                Base::new(lineage),
+                "{label} spells itself"
+            );
+            assert_eq!(
+                Base::new(architecture).as_str(),
+                *architecture,
+                "{architecture} is written the way a base normalizes"
+            );
+        }
     }
 }

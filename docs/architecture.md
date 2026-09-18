@@ -162,6 +162,8 @@ hoard/
           search/build.rs    the rebuild, the metered writer, per-entry documents, publish
           search/refresh.rs  refresh_search, the change log and its cursor, the directory
           search/answer.rs   a query from request to page: path, facet rail, rows
+          search/tokens.rs   the word tokenizer the text field and every free-text query
+                             are cut by
           search/inspect.rs  segment, delete and document counts
           search/paging.rs   the page window, heap or sampled selection, boundaries
           search/tally.rs    per-segment facet tallies and the base rail buckets

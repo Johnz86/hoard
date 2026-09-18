@@ -134,7 +134,7 @@ fn unreadable_token(input: &str) -> Token {
         kind: TokenKind::Text,
         op: None,
         normalized: value.to_ascii_lowercase(),
-        values: vec![value.to_ascii_lowercase()],
+        values: vec![value.clone()],
         value,
         negated: false,
         fuzzy: false,
@@ -217,14 +217,15 @@ fn joined(pieces: &[Piece]) -> String {
 }
 
 fn text_token(raw: &str, value: String, flags: Flags) -> Token {
-    let normalized = value.trim().to_ascii_lowercase();
+    let typed = value.trim().to_owned();
+    let normalized = typed.to_ascii_lowercase();
     Token {
         raw: raw.to_owned(),
         key: None,
         kind: TokenKind::Text,
         op: None,
         value,
-        values: vec![normalized.clone()],
+        values: vec![typed],
         normalized,
         negated: flags.negated,
         fuzzy: flags.fuzzy,
@@ -512,6 +513,27 @@ mod tests {
         assert_eq!(query.tokens[3].raw, "film grain");
         assert_eq!(query.tokens[3].values, vec!["film", "grain"]);
         assert!(query.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_free_word_keeps_the_case_it_was_typed_in() {
+        let token = one("loxsSoulsMixPerfectDoll_v30");
+        assert_eq!(token.values, vec!["loxsSoulsMixPerfectDoll_v30"]);
+        assert_eq!(token.normalized, "loxssoulsmixperfectdoll_v30");
+
+        let merged = parse("cyberrealisticPony oneObsession");
+        assert_eq!(merged.tokens.len(), 1);
+        assert_eq!(
+            merged.tokens[0].values,
+            vec!["cyberrealisticPony", "oneObsession"]
+        );
+        assert_eq!(
+            merged.tokens[0].normalized,
+            "cyberrealisticpony oneobsession"
+        );
+
+        let keyed = one("base:SDXL");
+        assert_eq!(keyed.values, vec!["sdxl"], "a keyed value is normalized");
     }
 
     #[test]

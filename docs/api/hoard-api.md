@@ -68,17 +68,19 @@ matches `diffusion_models`), and warns on a value naming neither a canonical lay
 folder spelling.
 
 A base is the finest architecture the header, the metadata or the path proves, and a lineage
-is stored as a suffix of the architecture it refines rather than as a field of its own:
-`sdxlpony`, `sdxlillustrious`, `sdxlnoobai`, each labelled the way it is written
-(`sdxl pony`). `base:` filters one way, from the architecture down: `base:sdxl` finds every
-lineage stored under it and `base:sdxlpony` finds the Pony ones alone, never the files known
-only as `sdxl`. `compat:` is the two-way test, because resolving an adapter against a host of
-the bare architecture is a compatibility question and not a question about which family a
-file belongs to; a sibling lineage is never compatible.
+is stored under its own key rather than as a suffix of the architecture it refines: `pony`,
+`illustrious`, `noobai`, labelled `Pony`, `Illustrious` and `NoobAI`.
+`hoard_core::Base::LINEAGES` is the one table that says which architecture each lineage runs
+on. `base:` filters one way, from the architecture down: `base:sdxl` finds every lineage of
+SDXL and `base:pony` finds the Pony ones alone, never the files known only as `sdxl`.
+`compat:` is the two-way test, because resolving an adapter against a host of the bare
+architecture is a compatibility question and not a question about which family a file belongs
+to: a Pony adapter fits a Pony host or a plain SDXL one, and never an Illustrious one.
 
-`facets.base` is counted over at most 32 buckets. A bucket's `count` is the prefix-rule count,
-which is how many artifacts the query the bucket opens answers, so a family bucket counts
-the versions under it. The 32 are the largest by that count among the most populous bases by
+`facets.base` is counted over at most 32 buckets. A bucket's `count` is the prefix-rule count
+plus one term for every lineage of that architecture, which is exactly what `base:<value>`
+answers and so exactly how many artifacts the query the bucket opens returns; a family bucket
+counts the versions under it and an architecture bucket counts its lineages. The 32 are the largest by that count among the most populous bases by
 exact term together with the family roots those bases extend, so a root that few artifacts
 carry exactly but many extend is on the rail. A base outside the 32 is not shown and is not
 marked active, and a query naming it still answers. The `any` bucket is active only when a
@@ -131,17 +133,22 @@ offered exactly as it would have been had the row been assembled and paging neve
 short. The server logs the window at `debug`; nothing in the response names it.
 
 A token carrying no `key:` is free text, and it is matched against the words the index holds:
-the value is cut where the index cuts a name, at every non-alphanumeric character, and those
-pieces have to appear consecutively and in that order with the last one matched as a prefix,
-so `gpt-oss`, `Q4_K_M` and `Qwen3-VL-8B` each find the file whose name they were pasted from.
+the value is cut where the index cuts a name, and those pieces have to appear consecutively
+and in that order with the last one matched as a prefix, so `gpt-oss`, `Q4_K_M` and
+`Qwen3-VL-8B` each find the file whose name they were pasted from, and `pony`, `souls` and
+`8B` each find the file they sit inside. A name is cut at every character that is neither a
+letter nor a digit; before an uppercase letter that follows a lowercase one, unless another
+uppercase letter follows it, so `cyberrealisticPony` is `cyberrealistic` and `Pony` while
+`LoRA` and `PONYTAIL` stay one word each; and at every step between a letter and a digit, so
+`v160` is `v` and `160`. Every word is lowercased, and a word of forty bytes or more is
+dropped and leaves its position behind for the phrase to step over.
 Words separated by a space are each required, in any order, and a `~` in front of a token
 relaxes it to every word matched as a prefix in any order. A value of one word is matched
 without any cap, while in a value of several words the last word expands to at most 1024 index
 terms in dictionary order, so a very short last word on a very large catalog can miss a row it
 names; typing one more letter narrows the expansion back under the cap. The limit this leaves
-is that a run from the middle of an unbroken word does not match: the index holds
-`loxsSoulsMixPerfectDoll_v30` as `loxssoulsmixperfectdoll` and `v30`, so `loxsSoulsMix` finds
-it and `SoulsMix` does not.
+is that a word is matched from its start: a run from the middle of one unbroken word does not
+match, so `souls` finds `loxsSoulsMixPerfectDoll_v30` and `oulsmix` and `ulsMixPer` do not.
 
 `GET /api/v1/search/parse?q=` returns only `query`, for the token strip while typing.
 
@@ -358,10 +365,14 @@ second. The sha256 is the whole request: no path, no file name, no `Authorizatio
 query string, one attempt per hash per pass, and no redirect followed, so a 3xx answers
 nothing rather than carrying the hash on to another host. The switch is off by default and is
 ignored while `[mirror] offline = true`, so an offline node opens no socket whatever the
-switch says.
+switch says. A pass runs when the node starts and no scan is running or queued, again as soon
+as a scan has finished - a scan is what restores the hashes a rebuilt catalog is asked about -
+and otherwise every fifteen minutes; while a scan runs the worker looks again every ten
+seconds and asks nothing.
 
-An answer naming a base hoard knows refines the stored one, `sdxl` becoming
-`sdxl illustrious`, and names one when hoard proved nothing; an answer naming another
+An answer naming a base hoard knows refines the stored one, `sdxl` becoming `pony` or
+`illustrious`, and names one when hoard proved nothing. A label is the spelling the service
+writes, `Illustrious` or `Flux.2 Klein 4B`; an answer naming another
 architecture loses to what hoard already has, and a user's verdict is never overwritten - an
 artifact a verdict has settled the base of is never asked about at all. Every answer leaves
 one evidence row on the artifact with source `lookup`, field `base` and a detail sentence

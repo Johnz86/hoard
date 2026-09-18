@@ -105,6 +105,7 @@ pub fn start_lookup(state: &AppState) -> Option<hoard_mirror::lookup::LookupHand
         std::sync::Arc::clone(state.catalog()),
         client,
         config.lookup.clone(),
+        std::sync::Arc::clone(state.coordinator()),
     ))
 }
 

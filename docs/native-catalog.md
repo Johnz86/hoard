@@ -408,10 +408,11 @@ the catalog at `<data_dir>/native`.
   the two families that share `txt_norm.weight` part on the width it normalizes, and a third
   width names neither of them. The module tier (`ADAPTER_RULES`) names a LoRA by the modules
   it patches and is read only for `lora` and `ctrl`, because a host of another family carries
-  the same module names. A lineage of a proven architecture (`rules::LINEAGES`) is then read
-  from the file name or the one folder the file sits in, never from the rest of an absolute
-  path, and stored as a suffix of the architecture, `sdxl pony` as `sdxlpony`, so `base:sdxl`
-  still finds it. A lineage token never names an architecture on its own.
+  the same module names. A lineage of a proven architecture (`hoard_core::Base::LINEAGES`) is
+  then read from the file name or the one folder the file sits in, never from the rest of an
+  absolute path, and stored under its own key, `Pony` as `pony`; that one table says it runs
+  on `sdxl`, which is how `base:sdxl` still finds it. A lineage token never names an
+  architecture on its own.
 - Only weight and dataset formats become artifacts; every file is still an entry record.
 - Shard sets, whether named `model-<n>-of-<m>` or listed by a `*.index.json` weight map,
   become one artifact anchored on the lowest shard. Members are entries pointing at that
@@ -862,10 +863,11 @@ whole token. Every token kind compiles:
 
 - `role:` matches the role, and narrows to a sub-role when the spelling names one, so
   `role:ip-adapter` is `lora` with sub-role `ipa`.
-- `base:` (also `arch:`) matches the family asked for and the families stored under it, one
-  way only, so `base:sdxl` answers for `sdxlpony` and `base:sdxlpony` does not answer for
-  `sdxl`. It never matches `any`, which is a claim about compatibility rather than about a
-  family; `compat:` keeps the other direction and `any` with it.
+- `base:` (also `arch:`) matches the family asked for, the families stored under it and every
+  lineage `hoard_core::Base::LINEAGES` says runs on it, one way only, so `base:sdxl` answers
+  for `pony` and `base:pony` does not answer for `sdxl`. It never matches `any`, which is a
+  claim about compatibility rather than about a family; `compat:` keeps the other direction
+  and `any` with it.
 - `format:` (`fmt:`), `precision:` (`prec:`, `quant:`), `state:` and `source:` (`src:`) are
   equality on that column.
 - `node:` (`host:`) matches the node, resolving `self`, `me`, `local` and `here` to this

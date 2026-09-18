@@ -38,6 +38,8 @@ One line per file in `crates/hoard-index/src/catalog/`:
   in, artifact names, per-file hashes.
 - `search/mod.rs` `QueryRequest`, `QueryPage`, `RefreshReport` and what the catalog imports.
 - `search/schema.rs` `Fields`, the keyword and column constants, the document one entry writes.
+- `search/tokens.rs` the word tokenizer the `text` field and every free-text query are cut by,
+  registered on every index the catalog creates or opens.
 - `search/build.rs` the rebuild, the metered writer, per-entry documents, the directory publish.
 - `search/refresh.rs` `refresh_search`, the change log and its cursor, the published directory.
 - `search/answer.rs` a query from request to page: the path, the facet rail, the rows, a

@@ -106,16 +106,23 @@ fn a_listing_refines_the_stored_base_and_the_search_follows() -> Result<()> {
     let (_config, catalog) = hashed_fixture(directory.path())?;
     let sha = candidate_of(&catalog, "one-obsession")?;
     assert_eq!(search(&catalog, "base:sdxl")?.total, 2);
-    assert_eq!(search(&catalog, "base:sdxlillustrious")?.total, 0);
+    assert_eq!(search(&catalog, "base:illustrious")?.total, 0);
 
     let answers = vec![(sha, answered("Illustrious"))];
     catalog.remember_lookups(&answers)?;
     assert_eq!(catalog.apply_lookups(&answers)?, 1);
 
+    let refined = search(&catalog, "base:illustrious")?;
+    assert_eq!(refined.total, 1, "the refined lineage answers for itself");
     assert_eq!(
-        search(&catalog, "base:sdxlillustrious")?.total,
+        refined.rows[0].base_label.as_deref(),
+        Some("Illustrious"),
+        "the lineage is labelled by its own name"
+    );
+    assert_eq!(
+        search(&catalog, "base:Illustrious")?.total,
         1,
-        "the refined lineage answers for itself"
+        "a base value is normalized before it compiles"
     );
     assert_eq!(
         search(&catalog, "base:sdxl")?.total,
@@ -126,7 +133,7 @@ fn a_listing_refines_the_stored_base_and_the_search_follows() -> Result<()> {
     let rows = lookup_rows(&evidence);
     assert_eq!(rows.len(), 1, "one lookup row, not one per pass");
     assert_eq!(rows[0].field, "base");
-    assert_eq!(rows[0].value, "sdxlillustrious");
+    assert_eq!(rows[0].value, "illustrious");
     assert_eq!(
         rows[0].detail.as_deref(),
         Some("Civitai lists these bytes as One obsession v24, base Illustrious")
@@ -142,13 +149,13 @@ fn a_users_verdict_is_never_overwritten() -> Result<()> {
     let row = catalog
         .artifact_by_sha256(&sha)?
         .ok_or_else(|| IndexError::Catalog("the artifact is indexed".into()))?;
-    catalog.put_override(row.artifact_id, None, None, Some(Base::new("sdxlpony")))?;
+    catalog.put_override(row.artifact_id, None, None, Some(Base::new("pony")))?;
 
     let answers = vec![(sha, answered("Illustrious"))];
     assert_eq!(catalog.apply_lookups(&answers)?, 0);
 
-    assert_eq!(search(&catalog, "base:sdxlpony")?.total, 1);
-    assert_eq!(search(&catalog, "base:sdxlillustrious")?.total, 0);
+    assert_eq!(search(&catalog, "base:pony")?.total, 1);
+    assert_eq!(search(&catalog, "base:illustrious")?.total, 0);
     assert!(
         lookup_rows(&evidence_of(&catalog, &sha)?).is_empty(),
         "an artifact a user decided is left alone entirely"
@@ -166,7 +173,7 @@ fn an_artifact_a_user_decided_is_not_a_candidate() -> Result<()> {
         .ok_or_else(|| IndexError::Catalog("the artifact is indexed".into()))?;
     assert_eq!(catalog.lookup_candidates(16)?.len(), 2);
 
-    catalog.put_override(row.artifact_id, None, None, Some(Base::new("sdxlpony")))?;
+    catalog.put_override(row.artifact_id, None, None, Some(Base::new("pony")))?;
 
     let candidates = catalog.lookup_candidates(16)?;
     assert_eq!(candidates.len(), 1, "a decided artifact leaves the window");

@@ -265,6 +265,7 @@ impl Catalog {
             }
         }
         let index = Index::open_in_dir(self.directory.join(directory))?;
+        super::tokens::register(&index);
         let (schema, _) = Fields::build();
         if index.schema() != schema {
             return Err(IndexError::Catalog(

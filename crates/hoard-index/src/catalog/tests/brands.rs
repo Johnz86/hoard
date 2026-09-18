@@ -117,24 +117,69 @@ fn a_brand_row_unions_its_members_and_never_prefixes_them() -> Result<()> {
 
 #[test]
 fn a_lineage_query_answers_only_that_lineage() -> Result<()> {
-    let (_directory, catalog) = brand_fixture(&[
-        ("sdxl", 3),
-        ("sdxlpony", 1),
-        ("sdxlillustrious", 1),
-        ("flux", 1),
-    ])?;
+    let (_directory, catalog) =
+        brand_fixture(&[("sdxl", 3), ("pony", 1), ("illustrious", 1), ("flux", 1)])?;
     assert_eq!(
         search(&catalog, "base:sdxl")?.total,
         5,
-        "the architecture answers for every lineage stored under it"
+        "the architecture answers for every lineage that runs on it"
     );
     assert_eq!(
-        search(&catalog, "base:sdxlpony")?.total,
+        search(&catalog, "base:pony")?.total,
         1,
         "a lineage answers for itself and never for the bare architecture"
     );
-    assert_eq!(search(&catalog, "base:sdxlillustrious")?.total, 1);
+    assert_eq!(search(&catalog, "base:illustrious")?.total, 1);
     assert_eq!(search(&catalog, "base:flux")?.total, 1);
+    Ok(())
+}
+
+#[test]
+fn a_lineage_bucket_counts_what_its_click_answers() -> Result<()> {
+    let (_directory, catalog) =
+        brand_fixture(&[("sdxl", 3), ("pony", 1), ("illustrious", 1), ("flux", 1)])?;
+    let page = search(&catalog, "")?;
+    for (value, count) in [("sdxl", 5), ("pony", 1), ("illustrious", 1)] {
+        let row = base_row(&page, value);
+        assert_eq!(row.count, count, "the {value} row counts {count}");
+        assert_eq!(
+            row.count,
+            search(&catalog, &format!("base:{value}"))?.total,
+            "a click on the {value} row answers what the row says"
+        );
+    }
+    let values = base_values(&page);
+    for value in ["sdxl", "pony", "illustrious"] {
+        assert!(values.contains(&value), "{value} is a row of its own");
+    }
+    assert!(
+        base_row(&page, "sdxl").members.is_empty(),
+        "a lineage is not a member of its architecture's row"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_lineage_row_is_active_under_its_architecture_and_the_architecture_under_a_lineage()
+-> Result<()> {
+    let (_directory, catalog) =
+        brand_fixture(&[("sdxl", 3), ("pony", 1), ("illustrious", 1), ("flux", 1)])?;
+    let architecture = search(&catalog, "base:sdxl")?;
+    for value in ["sdxl", "pony", "illustrious"] {
+        assert!(
+            base_row(&architecture, value).active,
+            "base:sdxl marks the {value} row"
+        );
+    }
+    assert!(!base_row(&architecture, "flux").active);
+
+    let lineage = search(&catalog, "base:pony")?;
+    assert!(base_row(&lineage, "pony").active);
+    assert!(
+        base_row(&lineage, "sdxl").active,
+        "a lineage marks the architecture it runs on"
+    );
+    assert!(!base_row(&lineage, "illustrious").active);
     Ok(())
 }
 

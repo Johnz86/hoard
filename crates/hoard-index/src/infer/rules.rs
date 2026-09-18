@@ -912,9 +912,9 @@ pub const DIFFUSION_ARCHITECTURES: &[&str] =
 /// Raw base spellings, normalized to alphanumerics, mapped to the family token. Longest
 /// and most specific patterns come first.
 pub const BASE_ALIASES: &[(&str, &str)] = &[
-    ("illustrious", "sdxlillustrious"),
-    ("noobai", "sdxlnoobai"),
-    ("pony", "sdxlpony"),
+    ("illustrious", "illustrious"),
+    ("noobai", "noobai"),
+    ("pony", "pony"),
     ("stablediffusionxl", "sdxl"),
     ("stablediffusion3", "sd3"),
     ("sdxl", "sdxl"),
@@ -939,16 +939,6 @@ pub const BASE_ALIASES: &[(&str, &str)] = &[
     ("animagine", "sdxl"),
     ("animatediff", "sd15"),
     ("anima", "anima"),
-];
-
-/// Lineages of a proven architecture: the token that names one, the architecture it refines
-/// and the label the BASE column prints. A lineage is stored as a suffix of its architecture,
-/// so `base:sdxl` finds every one of them and an adapter resolves against a host of the same
-/// lineage or of the bare architecture.
-pub const LINEAGES: &[(&str, &str, &str)] = &[
-    ("pony", "sdxl", "sdxl pony"),
-    ("illustrious", "sdxl", "sdxl illustrious"),
-    ("noobai", "sdxl", "sdxl noobai"),
 ];
 
 /// Descriptors a `clip.projector_type` appends to the family it projects into, trimmed
