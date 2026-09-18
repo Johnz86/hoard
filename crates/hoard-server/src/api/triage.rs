@@ -94,6 +94,9 @@ pub struct RejectView {
 pub struct NoiseDeleted {
     pub id: i64,
     pub removed: bool,
+    /// The artifact the removal put back in the queue, when the row named one no other
+    /// rejected path still names.
+    pub artifact_id: Option<ArtifactId>,
 }
 
 /// A verdict from the queue. A confirmation always names a role; the base is optional
@@ -150,7 +153,7 @@ pub async fn confirm(
         artifact_id: id,
         role: row.role,
         base: crate::api::common::base_label(&row.base, row.base_label.as_deref()),
-        facts: facts(&row),
+        facts: facts(&row, None),
     }))
 }
 
@@ -182,7 +185,7 @@ pub async fn reject(
     let catalog = Arc::clone(state.catalog());
     blocking(move || {
         for path in &paths {
-            catalog.add_noise(path, Some("rejected from triage"))?;
+            catalog.add_noise(path, Some("rejected from triage"), Some(id))?;
         }
         catalog.clear_triage(id)
     })
@@ -207,10 +210,14 @@ pub async fn delete_noise(
     authorize(&state, &headers)?;
     let catalog = Arc::clone(state.catalog());
     let removed = blocking(move || catalog.remove_noise(id)).await?;
-    if !removed {
+    let Some(artifact_id) = removed else {
         return Err(ApiError::not_found(format!("noise path {id}")));
-    }
-    Ok(Json(NoiseDeleted { id, removed }))
+    };
+    Ok(Json(NoiseDeleted {
+        id,
+        removed: true,
+        artifact_id,
+    }))
 }
 
 /// The artifact one identity names, or the 404 the routes answer with when the catalog

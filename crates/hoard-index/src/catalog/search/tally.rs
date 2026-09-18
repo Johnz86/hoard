@@ -7,6 +7,7 @@ use tantivy::SegmentOrdinal;
 use crate::error::Result;
 use crate::row::FacetBucket;
 use crate::search::FACET_DIMENSIONS;
+use crate::search::token::ParsedQuery;
 
 use super::answer::Summary;
 use super::collapse::{Hit, NO_TERM, SegmentStrings, Spelling};
@@ -15,7 +16,7 @@ pub(super) const BASE_DIMENSION: usize = 2;
 /// How many base buckets the rail carries. The tally orders them, the prefix rule then
 /// counts each one with a query of its own, so this bounds the searches a query pays for
 /// the rail by a constant rather than by how many bases the catalog holds.
-pub(super) const BASE_RAIL: usize = 48;
+pub(in crate::catalog) const BASE_RAIL: usize = 48;
 pub(super) const NODE_DIMENSION: usize = 5;
 /// The six facet dimensions, named as the columns a collapsed hit carries them in.
 pub(super) const FACET_COLUMNS: [&str; FACET_DIMENSIONS.len()] =
@@ -213,6 +214,23 @@ fn by_count_then_value(left: &FacetBucket, right: &FacetBucket) -> Ordering {
 
 pub(super) fn order_buckets(buckets: &mut [FacetBucket]) {
     buckets.sort_unstable_by(by_count_then_value);
+}
+
+/// Moves every bucket a positive `base:` token of the query names ahead of the rail's cut,
+/// so a base a person asked for by its own name is on the rail however few artifacts carry
+/// it and however many larger bases there are. The order among everything else is left as
+/// [`order_buckets`] settled it. The rail cuts twice, once choosing candidates and once
+/// taking the largest of them, so this runs before each cut.
+pub(super) fn keep_named_bases(buckets: &mut [FacetBucket], query: &ParsedQuery) {
+    let named: Vec<Base> = query
+        .tokens_with_key("base")
+        .filter(|token| !token.negated)
+        .flat_map(|token| token.values.iter().map(Base::new))
+        .collect();
+    if named.is_empty() {
+        return;
+    }
+    buckets.sort_by_key(|bucket| !named.contains(&Base::new(&bucket.value)));
 }
 
 /// The base rail's displayed order: [`Base::ANY`] last whatever it counts, because a row

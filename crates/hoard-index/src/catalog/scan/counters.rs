@@ -51,7 +51,7 @@ impl SummaryPart {
         Self {
             artifacts: 1,
             present: u64::from(present),
-            triage: u64::from(record.needs_triage(triage)),
+            triage: u64::from(present && record.needs_triage(triage)),
             indexed_bytes: match present {
                 true => bytes,
                 false => 0,
@@ -423,9 +423,9 @@ mod tests {
             copies,
             group_bytes: None,
             shard_count: None,
+            declared_total: None,
             incomplete: false,
             named_by_repo: false,
-            triage_cleared: false,
             rejected: false,
             first_seen: "2026-01-01T00:00:00Z".to_owned(),
         }

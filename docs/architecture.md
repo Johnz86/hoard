@@ -244,7 +244,7 @@ hoard/
         git/                 git smart HTTP and LFS routes (mod.rs)
         api/                 /api/v1: search.rs compat.rs artifacts.rs repos.rs shelves.rs
                              loadouts.rs triage.rs jobs.rs nodes.rs link.rs system.rs
-                             common.rs common_tests.rs
+                             common.rs common_tests.rs facts_tests.rs
         ui/                  embedded web/ and index.html fallback
   web/
     index.html

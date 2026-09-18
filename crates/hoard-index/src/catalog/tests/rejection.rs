@@ -98,7 +98,18 @@ fn a_lone_shards_row_says_it_is_incomplete() -> Result<()> {
     let row = &page.rows[0];
     assert!(row.incomplete, "the row says its set is short");
     assert_eq!(row.shard_count, 1, "and counts the one file present");
+    assert_eq!(
+        row.shard_total,
+        Some(3),
+        "the index document declares three files"
+    );
     assert!(row.is_set(), "one shard of a declared set is still a set");
+    let queued = catalog.triage_queue(10)?;
+    assert_eq!(
+        queued.first().map(|item| item.reason.as_str()),
+        Some("1 of 3 shards present, incomplete"),
+        "the queue names the total the set declares"
+    );
     let read = catalog
         .artifact_row(row.artifact_id)?
         .ok_or_else(|| IndexError::Catalog("the artifact row is missing".into()))?;
@@ -133,6 +144,7 @@ fn a_whole_sets_row_is_a_set_and_not_incomplete() -> Result<()> {
     let row = &page.rows[0];
     assert!(!row.incomplete, "every file it declares is present");
     assert_eq!(row.shard_count, 3);
+    assert_eq!(row.shard_total, Some(3));
     assert!(row.is_set(), "a whole set is still pulled as a set");
 
     let (_loose, single) = fixture()?;
@@ -215,7 +227,6 @@ fn a_confirm_takes_an_ordinary_artifact_out_of_all_three() -> Result<()> {
     assert!(!row.triage);
     assert_eq!(row.role, Role::Lora);
     let record = stored_record(&catalog, id)?;
-    assert!(record.triage_cleared);
     assert!(!record.rejected, "a confirm is not a rejection");
     assert!(catalog.artifact_override(id)?.is_some());
     Ok(())
@@ -238,8 +249,8 @@ fn a_verdict_that_leaves_the_role_unsettled_keeps_its_path_in_triage() -> Result
 
     assert_eq!(
         three_counts(&catalog)?,
-        (0, 1, 1),
-        "the queue drops a cleared record; the summary and the shelf still count it"
+        (1, 1, 1),
+        "a verdict that settles no role leaves the artifact queued, counted and shelved alike"
     );
     let row = catalog
         .artifact_row(id)?
@@ -252,7 +263,6 @@ fn a_verdict_that_leaves_the_role_unsettled_keeps_its_path_in_triage() -> Result
     assert!(row.triage);
     assert_eq!(row.base, Base::new("sdxl"));
     let record = stored_record(&catalog, id)?;
-    assert!(record.triage_cleared);
     assert!(!record.rejected);
     assert_eq!(catalog.totals()?, catalog.count_summary()?);
     Ok(())
@@ -279,7 +289,6 @@ fn a_confirm_on_an_incomplete_set_moves_no_path() -> Result<()> {
     assert!(row.triage);
     assert!(row.incomplete);
     let record = stored_record(&catalog, id)?;
-    assert!(record.triage_cleared);
     assert!(!record.rejected);
     Ok(())
 }
@@ -331,7 +340,6 @@ fn a_confirm_then_a_rejection_and_the_reverse_end_at_the_same_state() -> Result<
         assert_eq!(row.role, Role::Lora);
         let record = stored_record(&catalog, id)?;
         assert!(record.rejected);
-        assert!(record.triage_cleared);
     }
     assert_eq!(catalog.totals()?, catalog.count_summary()?);
     Ok(())
@@ -440,7 +448,7 @@ fn a_rejected_set_is_walked_past_by_the_next_scan() -> Result<()> {
         walked.contains("/snapshots/"),
         "the walker visits the snapshot link, not the blob: {walked}"
     );
-    catalog.add_noise(&walked, Some("rejected from triage"))?;
+    catalog.add_noise(&walked, Some("rejected from triage"), Some(id))?;
     catalog.clear_triage(id)?;
 
     catalog.rescan(
@@ -456,5 +464,187 @@ fn a_rejected_set_is_walked_past_by_the_next_scan() -> Result<()> {
         "the noise path is the one the walker tests, so the row is gone"
     );
     assert_eq!(three_counts(&catalog)?, (0, 0, 0));
+    Ok(())
+}
+
+fn rejected_as_the_route_does(catalog: &Catalog, id: ArtifactId) -> Result<i64> {
+    let path = catalog
+        .entries_of(id)?
+        .into_iter()
+        .next()
+        .map(|entry| {
+            entry
+                .walked_path
+                .or(entry.abs_path)
+                .unwrap_or(entry.rel_path)
+        })
+        .ok_or_else(|| IndexError::Catalog("the artifact holds no path".into()))?;
+    let noise = catalog.add_noise(&path, Some("rejected from triage"), Some(id))?;
+    catalog.clear_triage(id)?;
+    Ok(noise)
+}
+
+fn one_queued_artifact(catalog: &Catalog) -> Result<ArtifactId> {
+    catalog.seed(&[seeded_revision(
+        seeded_repo("misc/mystery", RepoType::Models),
+        0x77,
+        vec![queued_seed(0x77, "mystery", "mystery.safetensors")],
+    )])?;
+    catalog.rebuild_search(|_| {})?;
+    only_artifact(catalog)
+}
+
+#[test]
+fn an_un_rejected_artifact_returns_to_all_three_at_once() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = mystery_catalog(directory.path())?;
+    let id = one_queued_artifact(&catalog)?;
+    assert_eq!(three_counts(&catalog)?, (1, 1, 1));
+    let noise = rejected_as_the_route_does(&catalog, id)?;
+    assert_eq!(three_counts(&catalog)?, (0, 0, 0));
+
+    assert_eq!(
+        catalog.remove_noise(noise)?,
+        Some(Some(id)),
+        "the noise row names the artifact it was rejected from"
+    );
+
+    assert_eq!(
+        three_counts(&catalog)?,
+        (1, 1, 1),
+        "taking back the rejection queues, counts and shelves it again in one step"
+    );
+    let row = catalog
+        .artifact_row(id)?
+        .ok_or_else(|| IndexError::Catalog("the restored row is gone".into()))?;
+    assert_eq!(
+        row.state,
+        State::Triage,
+        "its path waits for a person again"
+    );
+    assert!(row.triage);
+    assert!(!stored_record(&catalog, id)?.rejected);
+    assert_eq!(catalog.totals()?, catalog.count_summary()?);
+    Ok(())
+}
+
+#[test]
+fn un_rejecting_a_settled_artifact_moves_no_path() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = mystery_catalog(directory.path())?;
+    let id = one_queued_artifact(&catalog)?;
+    catalog.put_override(id, Some(Role::Lora), None, None)?;
+    assert_eq!(three_counts(&catalog)?, (0, 0, 0));
+    let noise = rejected_as_the_route_does(&catalog, id)?;
+    assert_eq!(three_counts(&catalog)?, (0, 0, 0));
+
+    assert_eq!(catalog.remove_noise(noise)?, Some(Some(id)));
+
+    assert_eq!(
+        three_counts(&catalog)?,
+        (0, 0, 0),
+        "a role a person settled is still settled, so nothing is asked again"
+    );
+    let row = catalog
+        .artifact_row(id)?
+        .ok_or_else(|| IndexError::Catalog("the restored row is gone".into()))?;
+    assert_eq!(row.state, State::Local);
+    assert!(!row.triage);
+    assert!(!stored_record(&catalog, id)?.rejected);
+    Ok(())
+}
+
+#[test]
+fn a_noise_row_of_another_artifact_keeps_a_rejection() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = mystery_catalog(directory.path())?;
+    let written = catalog.seed(&[seeded_revision(
+        seeded_repo("misc/mystery", RepoType::Models),
+        0x77,
+        vec![
+            queued_seed(0x77, "mystery-a", "mystery-a.safetensors"),
+            queued_seed(0x78, "mystery-b", "mystery-b.safetensors"),
+        ],
+    )])?;
+    catalog.rebuild_search(|_| {})?;
+    let first = seeded_id(&written, 0x77)?;
+    let second = seeded_id(&written, 0x78)?;
+    let kept = rejected_as_the_route_does(&catalog, first)?;
+    let taken_back = rejected_as_the_route_does(&catalog, second)?;
+    assert_ne!(kept, taken_back, "each path is its own noise row");
+    assert_eq!(three_counts(&catalog)?, (0, 0, 0));
+
+    assert_eq!(catalog.remove_noise(taken_back)?, Some(Some(second)));
+
+    assert!(
+        stored_record(&catalog, first)?.rejected,
+        "a row naming another artifact says nothing about this one"
+    );
+    assert!(!stored_record(&catalog, second)?.rejected);
+    assert_eq!(three_counts(&catalog)?, (1, 1, 1));
+    assert_eq!(catalog.totals()?, catalog.count_summary()?);
+    Ok(())
+}
+
+#[test]
+fn a_single_file_declares_no_total() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = mystery_catalog(directory.path())?;
+    let id = one_queued_artifact(&catalog)?;
+
+    let row = catalog
+        .artifact_row(id)?
+        .ok_or_else(|| IndexError::Catalog("the seeded row is gone".into()))?;
+
+    assert_eq!(row.shard_count, 1);
+    assert!(!row.incomplete);
+    assert_eq!(
+        row.shard_total, None,
+        "a file that is not a set declares no total"
+    );
+    Ok(())
+}
+
+#[test]
+fn un_rejecting_a_served_path_keeps_it_served() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = mystery_catalog(directory.path())?;
+    let written = catalog.seed(&[seeded_revision(
+        seeded_repo("misc/mystery", RepoType::Models),
+        0x77,
+        vec![SeedEntry {
+            state: State::Served,
+            ..queued_seed(0x77, "mystery", "mystery.safetensors")
+        }],
+    )])?;
+    catalog.rebuild_search(|_| {})?;
+    let id = seeded_id(&written, 0x77)?;
+    let noise = rejected_as_the_route_does(&catalog, id)?;
+    let rejected = catalog
+        .artifact_row(id)?
+        .ok_or_else(|| IndexError::Catalog("the rejected row is gone".into()))?;
+    assert_eq!(
+        rejected.state,
+        State::Served,
+        "a rejection keeps the served mark"
+    );
+    assert!(!rejected.triage);
+
+    assert_eq!(catalog.remove_noise(noise)?, Some(Some(id)));
+
+    let restored = catalog
+        .artifact_row(id)?
+        .ok_or_else(|| IndexError::Catalog("the restored row is gone".into()))?;
+    assert_eq!(
+        restored.state,
+        State::Served,
+        "taking the rejection back never downgrades what the mirror serves"
+    );
+    assert!(
+        restored.triage,
+        "but the path is flagged for a person again"
+    );
+    assert!(!stored_record(&catalog, id)?.rejected);
+    assert_eq!(catalog.totals()?, catalog.count_summary()?);
     Ok(())
 }

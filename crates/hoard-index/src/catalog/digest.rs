@@ -511,7 +511,7 @@ impl Applying<'_, '_> {
             named_by_repo: false,
             group_bytes: None,
             shard_count: None,
-            triage_cleared: false,
+            declared_total: None,
             rejected: false,
             first_seen: jiff::Timestamp::now().to_string(),
         })?;

@@ -12,7 +12,7 @@ use hoard_core::{
 };
 use hoard_index::IndexError;
 use hoard_index::catalog::{
-    Catalog, Dedupe, EntryDetail, RepositoryDetail, RepositoryFilter, RevisionDetail,
+    Catalog, Dedupe, EntryDetail, Listed, RepositoryDetail, RepositoryFilter, RevisionDetail,
 };
 use hoard_index::catalog::{PullRow, UsageDay};
 use hoard_index::config::SourceKind;
@@ -471,9 +471,19 @@ pub async fn readme(
             .and_then(|entry| entry.abs_path.clone())
             .map(PathBuf::from);
         let rows = catalog.repository_rows(record.id, REPO_ARTIFACTS)?;
+        let opened_file = opened.row.is_some();
+        let primary = opened.row.or_else(|| pick_primary(&rows).cloned());
+        let listing = match &primary {
+            Some(row) => catalog
+                .artifact_detail(row.artifact_id)?
+                .and_then(|detail| detail.listing),
+            None => None,
+        };
         Ok(Card {
             path,
-            primary: opened.row.or_else(|| pick_primary(&rows).cloned()),
+            primary,
+            opened_file,
+            listing,
             kind: record.kind,
             bin: is_category_bin(&record),
             revision: opened.revision,
@@ -493,7 +503,11 @@ pub async fn readme(
                 &repo,
                 card.kind,
                 card.bin,
-                card.primary.as_ref(),
+                card.primary.as_ref().map(|row| CardFacts {
+                    row,
+                    opened: card.opened_file,
+                    listing: card.listing.as_ref(),
+                }),
             ),
             true,
         ),
@@ -523,6 +537,8 @@ pub async fn readme(
 struct Card {
     path: Option<PathBuf>,
     primary: Option<SearchRow>,
+    opened_file: bool,
+    listing: Option<Listed>,
     kind: SourceKind,
     bin: bool,
     revision: String,
@@ -710,9 +726,12 @@ fn repo_facts(
     let Some(row) = primary else {
         return Ok(Vec::new());
     };
-    let mut list = facts(row);
-    let first_seen = catalog
-        .artifact_detail(row.artifact_id)?
+    let detail = catalog.artifact_detail(row.artifact_id)?;
+    let mut list = facts(
+        row,
+        detail.as_ref().and_then(|detail| detail.listing.as_ref()),
+    );
+    let first_seen = detail
         .and_then(|detail| detail.first_seen)
         .map_or_else(|| "-".to_owned(), |seen| relative_time(now, seen));
     list.push(Fact::new("first seen", first_seen));
@@ -785,6 +804,14 @@ async fn read_card(path: &std::path::Path) -> Option<String> {
     tokio::fs::read_to_string(path).await.ok()
 }
 
+/// What a generated card describes: the row it is about, whether a person opened that file
+/// or the repository's primary was picked for them, and what a listing said of it.
+struct CardFacts<'a> {
+    row: &'a SearchRow,
+    opened: bool,
+    listing: Option<&'a Listed>,
+}
+
 /// The card hoard writes when upstream never shipped one: what the index knows, and how to
 /// pull the repository it describes. A category folder of a tool layout is nobody's
 /// repository, so it is offered no line that would pull every file in it.
@@ -793,21 +820,31 @@ fn generated_card(
     repo: &RepoId,
     kind: SourceKind,
     bin: bool,
-    primary: Option<&SearchRow>,
+    described: Option<CardFacts<'_>>,
 ) -> String {
+    let (heading, subject) = match &described {
+        Some(facts) if facts.opened => (facts.row.name.clone(), "file"),
+        Some(_) | None => (repo.reference(), "repository"),
+    };
     let mut text = format!(
-        "# {}\n\nNo upstream card was recovered for this repository. This page is generated \
-         from hoard's index record.\n\n## What we know\n\n",
-        repo.reference()
+        "# {heading}\n\nNo upstream card was recovered for this {subject}. This page is \
+         generated from hoard's index record.\n\n## What we know\n\n"
     );
-    match primary {
-        Some(row) => {
+    match &described {
+        Some(facts) => {
+            let row = facts.row;
             text.push_str(&format!("- role: {}\n", row.role.as_str()));
             text.push_str(&format!(
                 "- base: {}\n",
                 crate::api::common::base_label(&row.base, row.base_label.as_deref())
                     .unwrap_or_else(|| "unknown".to_owned())
             ));
+            if let Some(listed) = facts.listing {
+                text.push_str(&format!(
+                    "- civitai: {}\n",
+                    format!("{} {}", listed.model, listed.version).trim()
+                ));
+            }
             text.push_str(&format!("- format: {}\n", row.format.as_str()));
             text.push_str(&format!("- size: {}\n", format_size(row.size)));
             if let Some(trigger) = row.trigger.as_deref() {
@@ -880,5 +917,84 @@ mod tests {
     fn the_public_host_is_what_a_served_badge_names() {
         assert_eq!(public_host("http://hoard.lan:7099"), "hoard.lan:7099");
         assert_eq!(public_host("hoard.lan"), "hoard.lan");
+    }
+
+    #[test]
+    fn a_generated_card_describes_the_opened_file() {
+        let repo = RepoId::new(RepoType::Models, Some("kohya".to_owned()), "film-grain");
+        let row = crate::testing::search_row(crate::testing::RowFacts::default());
+        let listing = Listed {
+            base_model: "Illustrious".to_owned(),
+            model: "One obsession".to_owned(),
+            version: "v24".to_owned(),
+            kind: "Checkpoint".to_owned(),
+            trained_words: Vec::new(),
+        };
+
+        let described = generated_card(
+            "http://hoard.lan:7099",
+            &repo,
+            SourceKind::Loose,
+            false,
+            Some(CardFacts {
+                row: &row,
+                opened: true,
+                listing: Some(&listing),
+            }),
+        );
+
+        assert_eq!(
+            described.lines().next(),
+            Some("# film-grain"),
+            "the card is headed by the file it describes: {described}"
+        );
+        assert!(
+            described.contains("No upstream card was recovered for this file."),
+            "{described}"
+        );
+        assert!(
+            described.contains("- civitai: One obsession v24\n"),
+            "{described}"
+        );
+
+        let bare = generated_card(
+            "http://hoard.lan:7099",
+            &repo,
+            SourceKind::Loose,
+            false,
+            None,
+        );
+
+        assert_eq!(
+            bare.lines().next(),
+            Some(&format!("# {}", repo.reference())[..]),
+            "a repository nothing was opened in is headed by its own name: {bare}"
+        );
+        assert!(
+            bare.contains("No upstream card was recovered for this repository."),
+            "{bare}"
+        );
+
+        let picked = generated_card(
+            "http://hoard.lan:7099",
+            &repo,
+            SourceKind::Loose,
+            false,
+            Some(CardFacts {
+                row: &row,
+                opened: false,
+                listing: None,
+            }),
+        );
+
+        assert_eq!(
+            picked.lines().next(),
+            Some(&format!("# {}", repo.reference())[..]),
+            "a primary picked for the reader describes the repository, not a file: {picked}"
+        );
+        assert!(
+            picked.contains("- role: "),
+            "its facts still come from the picked row: {picked}"
+        );
     }
 }

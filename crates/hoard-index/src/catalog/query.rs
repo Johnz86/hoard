@@ -4,7 +4,8 @@ use hoard_core::{Base, Role};
 use jiff::Span;
 use tantivy::Term;
 use tantivy::query::{
-    AllQuery, BooleanQuery, EmptyQuery, Occur, PhrasePrefixQuery, Query, RangeQuery, TermQuery,
+    AllQuery, BooleanQuery, EmptyQuery, Occur, PhrasePrefixQuery, PhraseQuery, Query, RangeQuery,
+    TermQuery,
 };
 use tantivy::schema::{Field, IndexRecordOption};
 use tantivy::tokenizer::{TextAnalyzer, TokenStream};
@@ -200,7 +201,7 @@ fn clause(token: &Token, fields: &QueryFields<'_>, depth: usize) -> Result<Box<d
         TokenKind::Used => used_filter(token, schema.last_used, fields.context),
         TokenKind::Compat => compat_filter(token, fields),
         TokenKind::Shelf => shelf_filter(token, fields, depth),
-        TokenKind::Text => Ok(text_filter(token, schema.text, &fields.text)),
+        TokenKind::Text => Ok(text_filter(token, fields)),
     }
 }
 
@@ -397,12 +398,15 @@ fn cutoff_second(context: &CompileContext, days: i64) -> Result<i64> {
     Ok(cutoff.as_second())
 }
 
-/// Free text: a value is cut into the words the index cut the stored names into, and those
-/// words have to appear at the distances apart the value spells, the last one as a prefix.
-/// Every value of the token is required, and a fuzzy token drops the order and the distances
-/// and matches every word as a prefix.
-fn text_filter(token: &Token, field: Field, analyzer: &TextAnalyzer) -> Box<dyn Query> {
-    let mut analyzer = analyzer.clone();
+/// Free text: a value is cut into the words the index cut the stored names into. Against a
+/// name, an org, a base, the trigger words and the tensor keys those words are matched from
+/// their start and have to appear at the distances apart the value spells; against a card
+/// they are matched whole, so `wan` finds no `want`. Every value of the token is required,
+/// and a fuzzy token drops the order and the distances.
+fn text_filter(token: &Token, fields: &QueryFields<'_>) -> Box<dyn Query> {
+    let mut analyzer = fields.text.clone();
+    let named = fields.fields.text;
+    let card = fields.fields.card;
     all_of(
         token
             .values
@@ -413,15 +417,23 @@ fn text_filter(token: &Token, field: Field, analyzer: &TextAnalyzer) -> Box<dyn 
                     (_, []) => Box::new(EmptyQuery) as Box<dyn Query>,
                     (true, all) => all_of(
                         all.iter()
-                            .map(|(_, word)| starts_with(field, word))
+                            .map(|(_, word)| named_or_written(named, card, word))
                             .collect(),
                     ),
-                    (false, [(_, word)]) => starts_with(field, word),
-                    (false, all) => phrase_prefix(field, all),
+                    (false, [(_, word)]) => named_or_written(named, card, word),
+                    (false, all) => {
+                        any_of(vec![phrase_prefix(named, all), whole_phrase(card, all)])
+                    }
                 }
             })
             .collect(),
     )
+}
+
+/// One word as the two fields hold it: the start of something named, or a whole word of a
+/// card.
+fn named_or_written(named: Field, card: Field, word: &str) -> Box<dyn Query> {
+    any_of(vec![starts_with(named, word), term(card, word)])
 }
 
 /// Every word of `value` with the position the analyzer gave it. A token the index refuses
@@ -434,6 +446,16 @@ fn analyzed_words(analyzer: &mut TextAnalyzer, value: &str) -> Vec<(usize, Strin
         words.push((token.position, token.text.clone()));
     }
     words
+}
+
+/// The same words, in the same places, each one whole: what a card is matched by.
+fn whole_phrase(field: Field, words: &[(usize, String)]) -> Box<dyn Query> {
+    Box::new(PhraseQuery::new_with_offset(
+        words
+            .iter()
+            .map(|(position, word)| (*position, Term::from_field_text(field, word)))
+            .collect(),
+    ))
 }
 
 fn phrase_prefix(field: Field, words: &[(usize, String)]) -> Box<dyn Query> {

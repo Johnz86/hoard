@@ -14,6 +14,7 @@ use crate::discover::RefKind;
 use crate::shard::{covers, directory_of};
 
 use super::jobs::JobState;
+use super::lookup_memo::Listed;
 
 /// A nominated root, with what the last walk of it counted. A source no scan has reached
 /// yet reports no last scan and zeroes.
@@ -141,7 +142,9 @@ pub(super) struct ArtifactRecord {
     /// repository a later pass happens to be walking says nothing about either of them.
     pub(super) named_by_repo: bool,
     pub(super) shard_count: Option<u32>,
-    pub(super) triage_cleared: bool,
+    /// How many files the set says it has, from `ShardSet::declared_total` at scan time;
+    /// `None` for a single file and for a set nothing declared a total for.
+    pub(super) declared_total: Option<u32>,
     /// True once the owner rejected this artifact from triage: it wants nobody and counts in
     /// no triage total, whatever else is true of it.
     pub(super) rejected: bool,
@@ -156,16 +159,6 @@ impl ArtifactRecord {
     /// because it says the files are not wanted rather than that they are all here.
     pub(super) fn needs_triage(&self, threshold: f32) -> bool {
         !self.rejected && (self.artifact.needs_triage(threshold) || self.incomplete)
-    }
-
-    /// Whether the triage queue still holds this record: it wants a person, and nothing that
-    /// could answer it has. A verdict answers what an artifact is and cannot make a set
-    /// complete, so an incomplete set stays queued whatever was cleared on it; the missing
-    /// files landing, a rejection, or a rescan dropping a path rejected as noise, is what
-    /// takes it out. The summary count and the entry state a scan writes read the same
-    /// predicate, so all three move together.
-    pub(super) fn is_queued(&self, threshold: f32) -> bool {
-        self.needs_triage(threshold) && (self.incomplete || !self.triage_cleared)
     }
 }
 
@@ -386,6 +379,8 @@ pub(super) struct ArtifactDetail {
     pub(super) artifact_id: i64,
     pub(super) tensors: Option<TensorSummary>,
     pub(super) evidence: Vec<Evidence>,
+    /// What a listing service said these exact bytes are, kept whatever it did to the base.
+    pub(super) listing: Option<Listed>,
 }
 
 impl ArtifactDetail {
@@ -409,6 +404,7 @@ impl ArtifactDetail {
                 tensors
             }),
             evidence,
+            listing: None,
         }
     }
 }
@@ -654,6 +650,8 @@ pub(super) struct Noise {
     pub(super) path: String,
     pub(super) reason: Option<String>,
     pub(super) added_at: String,
+    /// The artifact this path was rejected from, so removing the row can restore it.
+    pub(super) artifact_id: Option<i64>,
 }
 
 /// One symlink `hoard link` or `hoard apply` wrote into a tool's layout.

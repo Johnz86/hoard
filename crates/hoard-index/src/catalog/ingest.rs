@@ -381,6 +381,7 @@ impl Ingesting<'_, '_> {
             tensors: None,
             group_bytes: None,
             shard_count: None,
+            declared_total: None,
             incomplete: false,
             first_seen: None,
         });

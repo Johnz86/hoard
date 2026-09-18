@@ -27,7 +27,7 @@ use super::nodes::NodeNames;
 use super::scan::preferred_entry;
 use super::search::{EntryFacts, assemble_row, revision_of, source_kind_of};
 use super::usage::last_used_in;
-use super::{Catalog, QueryRequest};
+use super::{Catalog, Listed, QueryRequest};
 
 /// One path an artifact occupies, with the repository and revision it sits in resolved.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -77,7 +77,7 @@ pub struct ArtifactDetailView {
     pub tensors: Option<TensorSummary>,
     pub evidence: Vec<Evidence>,
     pub first_seen: Option<jiff::Timestamp>,
-    pub triage_cleared: bool,
+    pub listing: Option<Listed>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -305,15 +305,15 @@ impl Catalog {
             return Ok(None);
         };
         let detail: Option<ArtifactDetail> = snapshot.get().primary(id.get())?;
-        let (tensors, evidence) = detail.map_or_else(
-            || (None, Vec::new()),
-            |detail| (detail.tensors, detail.evidence),
+        let (tensors, evidence, listing) = detail.map_or_else(
+            || (None, Vec::new(), None),
+            |detail| (detail.tensors, detail.evidence, detail.listing),
         );
         Ok(Some(ArtifactDetailView {
             tensors,
             evidence,
             first_seen: record.first_seen.parse().ok(),
-            triage_cleared: record.triage_cleared,
+            listing,
         }))
     }
 
@@ -541,7 +541,7 @@ impl Catalog {
     /// record. The index is a cache of the records and can lag them: a record written
     /// directly leaves the published document behind it, and a rescan settles a record
     /// before a refresh republishes it. Every page row is therefore measured against its
-    /// own record by `ArtifactRecord::is_queued`, and the query narrows what has to be read
+    /// own record by `ArtifactRecord::needs_triage`, and the query narrows what has to be read
     /// rather than deciding what belongs. A catalog with no search directory answers the same rows
     /// from the records themselves rather than erroring.
     pub fn triage_queue(&self, limit: u32) -> Result<Vec<TriageItem>> {
@@ -569,7 +569,7 @@ impl Catalog {
                 }
                 let id = row.artifact_id.get();
                 let record: Option<ArtifactRecord> = snapshot.get().primary(id)?;
-                let Some(record) = record.filter(|record| record.is_queued(threshold)) else {
+                let Some(record) = record.filter(|record| record.needs_triage(threshold)) else {
                     continue;
                 };
                 let detail: Option<ArtifactDetail> = snapshot.get().primary(record.id)?;
@@ -595,7 +595,7 @@ impl Catalog {
                 break;
             }
             let record: ArtifactRecord = record?;
-            if !record.is_queued(threshold) {
+            if !record.needs_triage(threshold) {
                 continue;
             }
             let Some(entry) = preferred_entry(
@@ -663,9 +663,6 @@ fn triage_item(
 
 /// Why this artifact is in the queue, in the order the predicate decides it: an unclassified
 /// role, then a role the threshold does not trust, then a set missing files it declares.
-///
-/// The incomplete case names the files present and not the total declared, because the
-/// declared total is computed at scan time and no record stores it.
 fn triage_reason(row: &SearchRow, record: &ArtifactRecord, threshold: f32) -> String {
     if row.role == Role::Unk {
         return "role unclassified".to_owned();
@@ -679,13 +676,16 @@ fn triage_reason(row: &SearchRow, record: &ArtifactRecord, threshold: f32) -> St
         );
     }
     let present = record.shard_count.unwrap_or(1);
-    format!(
-        "{present} shard{} present, incomplete",
-        match present == 1 {
-            true => "",
-            false => "s",
-        }
-    )
+    match record.declared_total {
+        Some(total) => format!("{present} of {total} shards present, incomplete"),
+        None => format!(
+            "{present} shard{} present, incomplete",
+            match present == 1 {
+                true => "",
+                false => "s",
+            }
+        ),
+    }
 }
 
 fn strongest<'a>(evidence: &'a [Evidence], field: &str) -> Option<&'a Evidence> {

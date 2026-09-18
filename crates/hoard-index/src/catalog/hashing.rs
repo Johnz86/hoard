@@ -494,7 +494,8 @@ impl Catalog {
             let artifact_id = match entry.artifact_id {
                 Some(id) => {
                     counters.touch(&transaction, id)?;
-                    let outcome = rekey_artifact(&transaction, id, &digest.sha256, counters)?;
+                    let outcome =
+                        rekey_artifact(&transaction, id, &digest.sha256, entry.id, counters)?;
                     merged += u64::from(outcome.merged);
                     Some(outcome.artifact_id)
                 }
@@ -637,11 +638,13 @@ struct Rekeyed {
 
 /// Gives an artifact the identity its content proves. A record that already carries a
 /// sha256 keeps it, and a model split across shards keeps the identity its anchor gave it,
-/// because no single shard's hash names the union of them.
+/// because no single shard's hash names the union of them; the anchor's digest is still
+/// written onto such a record, because that is the sha every row of a set shows.
 fn rekey_artifact(
     transaction: &RwTransaction<'_>,
     artifact_id: i64,
     sha: &Sha256,
+    entry_id: i64,
     counters: &mut Counters,
 ) -> Result<Rekeyed> {
     let unchanged = Ok(Rekeyed {
@@ -651,7 +654,15 @@ fn rekey_artifact(
     let Some(record) = transaction.get().primary::<ArtifactRecord>(artifact_id)? else {
         return unchanged;
     };
-    if record.artifact.sha256.is_some() || record.shard_count.is_some() {
+    if record.artifact.sha256.is_some() {
+        return unchanged;
+    }
+    if record.shard_count.is_some() {
+        if anchored_by(transaction, record.id, entry_id)? {
+            counters.touch(transaction, record.id)?;
+            transaction.upsert(digested(record, sha))?;
+            counters.pending.push(artifact_id);
+        }
         return unchanged;
     }
     let identity = content_key(sha);
@@ -684,12 +695,31 @@ fn rekey_artifact(
 fn identified(record: ArtifactRecord, identity: u128, sha: &Sha256) -> ArtifactRecord {
     ArtifactRecord {
         identity,
+        ..digested(record, sha)
+    }
+}
+
+/// The same record carrying the digest of its bytes, keeping the identity it was filed
+/// under: a set is identified by what its anchor was, not by what one file hashes to.
+fn digested(record: ArtifactRecord, sha: &Sha256) -> ArtifactRecord {
+    ArtifactRecord {
         artifact: hoard_core::Artifact {
             sha256: Some(*sha),
             ..record.artifact
         },
         ..record
     }
+}
+
+/// Whether this entry is the set's anchor: its lowest-numbered shard, which a scan stores
+/// before every member of the set and which therefore holds the lowest entry id of them.
+fn anchored_by(transaction: &RwTransaction<'_>, artifact_id: i64, entry_id: i64) -> Result<bool> {
+    let members: Vec<Entry> = transaction
+        .scan()
+        .secondary::<Entry>(EntryKey::artifact_id)?
+        .start_with(Some(artifact_id))?
+        .collect::<native_db::db_type::Result<_>>()?;
+    Ok(members.iter().map(|entry| entry.id).min() == Some(entry_id))
 }
 
 /// Moves every path of the losing artifact onto the surviving one and removes what hung off

@@ -30,6 +30,8 @@ pub(super) use self::schema::{
     SUB_ROLE_FIELD, TRIGGER_FIELD,
 };
 #[cfg(test)]
+pub(super) use self::tally::BASE_RAIL;
+#[cfg(test)]
 pub(super) use self::tokens::text_analyzer;
 
 /// One query of Hoard's own grammar, the one the search bar, `hoard ls` and shelves speak.

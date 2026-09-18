@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use hoard_core::{ArtifactId, Base, Evidence, RepoId, Role, Sha256, SubRole, format_size};
 use hoard_index::IndexError;
-use hoard_index::catalog::{Catalog, EntryDetail};
+use hoard_index::catalog::{Catalog, EntryDetail, Listed};
 use hoard_index::config::SourceKind;
 use hoard_index::row::SearchRow;
 
@@ -131,6 +131,7 @@ struct Inspection {
     row: SearchRow,
     entries: Vec<EntryDetail>,
     evidence: Vec<Evidence>,
+    listing: Option<Listed>,
     plugs_into: Vec<CompatRowView>,
     override_applied: bool,
     usage: UsageSummary,
@@ -146,7 +147,7 @@ pub async fn detail(
     let catalog = Arc::clone(state.catalog());
     let inspected = blocking(move || inspect(&catalog, id, now)).await?;
     Ok(Json(ArtifactView {
-        facts: facts(&inspected.row),
+        facts: facts(&inspected.row, inspected.listing.as_ref()),
         evidence: inspected.evidence,
         entries: entry_views(&inspected.entries, &host),
         duplicates: Vec::new(),
@@ -161,12 +162,14 @@ fn inspect(catalog: &Catalog, id: ArtifactId, now: Timestamp) -> Result<Inspecti
     let row = require_row(catalog, id)?;
     let plugs = compat_for(catalog, &row, PLUGS_INTO_LIMIT, now)?;
     let usage = catalog.artifact_usage(id)?;
+    let detail = catalog.artifact_detail(id)?;
     Ok(Inspection {
         entries: catalog.entries_of(id)?,
-        evidence: catalog
-            .artifact_detail(id)?
-            .map(|detail| detail.evidence)
+        evidence: detail
+            .as_ref()
+            .map(|detail| detail.evidence.clone())
             .unwrap_or_default(),
+        listing: detail.and_then(|detail| detail.listing),
         plugs_into: plugs.rows,
         override_applied: catalog.artifact_override(id)?.is_some(),
         usage: UsageSummary {
@@ -265,7 +268,7 @@ pub async fn put_override(
         role: row.role,
         sub_role: row.sub_role,
         base: crate::api::common::base_label(&row.base, row.base_label.as_deref()),
-        facts: facts(&row),
+        facts: facts(&row, None),
     }))
 }
 

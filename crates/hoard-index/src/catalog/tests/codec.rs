@@ -571,6 +571,7 @@ fn every_record_round_trips_through_the_compact_codec() -> Result<()> {
         path: "/vault/noise".to_owned(),
         reason: Some("not weights".to_owned()),
         added_at: "2026-09-07T08:02:00Z".to_owned(),
+        artifact_id: Some(4243),
     };
     let projection = models::Projection {
         id: 9003,

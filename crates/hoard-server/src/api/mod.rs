@@ -20,6 +20,8 @@ pub mod triage;
 #[cfg(test)]
 mod common_tests;
 #[cfg(test)]
+mod facts_tests;
+#[cfg(test)]
 mod tests;
 
 use axum::Router;

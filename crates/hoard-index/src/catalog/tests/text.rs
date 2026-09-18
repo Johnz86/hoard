@@ -148,3 +148,38 @@ fn an_index_opened_from_disk_registers_the_word_tokenizer() -> Result<()> {
     let reopened = Catalog::open_or_scan(&config, "n", |_, _| {})?;
     totals(&reopened, &[("pony", 1), ("cyberrealistic", 1)])
 }
+
+#[test]
+fn a_name_is_still_matched_from_its_start() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = scanned_config(
+        directory.path(),
+        &[
+            "gpt-oss-style_v2.safetensors",
+            "Qwen3-VL-8B-Instruct-Q4_K_M.safetensors",
+            "loxsSoulsMixPerfectDoll_v30.safetensors",
+        ],
+    )?;
+    let notes = directory.path().join("files/notes");
+    fs::create_dir_all(&notes)?;
+    fs::write(notes.join("noted.safetensors"), lora_header())?;
+    fs::write(
+        notes.join("README.md"),
+        "If you want to run this, see the docs.\n",
+    )?;
+    let catalog = scanned_into(&config)?;
+
+    totals(
+        &catalog,
+        &[
+            ("gpt-oss", 1),
+            ("souls", 1),
+            ("Qwen3-VL-8B", 1),
+            ("q4", 1),
+            ("wan", 0),
+            ("want", 1),
+            ("docs", 1),
+            ("doc", 0),
+        ],
+    )
+}

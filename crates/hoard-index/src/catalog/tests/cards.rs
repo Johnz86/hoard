@@ -212,3 +212,37 @@ fn a_readme_in_a_subfolder_gives_the_files_beside_that_folder_no_trigger_words()
     }
     Ok(())
 }
+
+#[test]
+fn a_word_inside_a_card_matches_only_whole() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = encoders_tree(directory.path())?;
+
+    assert_eq!(search(&catalog, "chinchilla")?.total, 1);
+    assert_eq!(
+        search(&catalog, "chinch")?.total,
+        0,
+        "a card is matched by whole words, so a prefix of one finds nothing"
+    );
+    assert_eq!(
+        search(&catalog, "trained on")?.total,
+        1,
+        "two whole words of the card in the order it writes them"
+    );
+    assert_eq!(
+        search(&catalog, "chinchilla photo")?.total,
+        0,
+        "the last word of a phrase is whole against a card too"
+    );
+    assert_eq!(
+        search(&catalog, "Trained")?.total,
+        1,
+        "the tokenizer lowercases both sides"
+    );
+    assert_eq!(
+        search(&catalog, "~chinch")?.total,
+        0,
+        "a fuzzy word is a whole word against a card as well"
+    );
+    Ok(())
+}

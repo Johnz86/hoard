@@ -239,7 +239,8 @@ it on purpose: `open_or_scan` answers a format mismatch with `remove_dir_all` of
   and for the same reason: what a third party said about a file's bytes and the shape of a
   catalog record are unrelated facts. A memo of another version, or one whose redb file is
   corrupt, is deleted and started again empty; one another handle holds is reported as
-  `CatalogBusy`.
+  `CatalogBusy`. It reads 2 since the listing gained the `trainedWords` a version carries, so
+  every hash a version 1 memo held is asked about once more.
 
 Both memos grow monotonically, with no eviction, and neither is counted by `Catalog::storage`
 or `hoard doctor`, which report the catalog directory alone. Deleting either by hand at any
@@ -449,22 +450,39 @@ the catalog at `<data_dir>/native`.
   server's category-folder test is that one field rather than a comparison of an org with a
   source name.
 - A verdict cannot make a set complete, and a rejection ends everything.
-  `ArtifactRecord::is_queued` is what the triage queue reads and
-  `ArtifactRecord::needs_triage` is what the summary, the entry state a scan writes and a
-  verdict settling an artifact's paths all read; both begin at the stored `rejected` flag. An
-  incomplete record is queued whatever `triage_cleared` says, so confirming a role on one
-  leaves it in the queue with the incomplete reason and the queue, the summary's
-  `triage_artifacts` and the `state:triage` shelf stay one number. `Catalog::record_verdict`
-  is the one verdict path, used by both `put_override` and `clear_triage`: it writes what the
-  verdict says on the record, decides `needs_triage` once off the record it is about to store
-  and, when the record no longer needs triage, moves every `triage` path of the artifact to
-  `local` through `leave_triage`, `DerivedShift` and `log_changes` in the same transaction.
-  Gating on that predicate rather than on `is_queued` is what keeps a verdict and the next
-  scan of the same file in agreement: a confirm that settles the role settles the paths
-  exactly as a rejection does, while an incomplete set, or a verdict that leaves the role
-  unsettled, keeps its `triage` paths, which is what `scan/store.rs::entry_state` would write
-  for them anyway. Landing the missing files, a rejection, or a rescan dropping a path
-  rejected as noise, is what takes an artifact out.
+  `ArtifactRecord::needs_triage` is the one predicate: the triage queue, the summary, the
+  entry state a scan writes and a verdict settling an artifact's paths all read it, and it
+  begins at the stored `rejected` flag. The summary counts it only for a record some local
+  path holds (`path_count > 0`), so a row only a peer's digest created asks this node nothing.
+  An incomplete record is queued whatever a verdict said, so confirming a role on one leaves
+  it in the queue with the incomplete reason, and a verdict naming only a base, or one whose
+  role is `unk`, leaves the artifact queued, counted and shelved alike: the queue, the
+  summary's `triage_artifacts` and the `state:triage` shelf are one number after every
+  verdict. `Catalog::record_verdict` is the one verdict path, used by `put_override`,
+  `clear_triage` and `remove_noise`: it writes what the verdict says on the record, decides
+  `needs_triage` once off the record it is about to store and, when the record no longer needs
+  triage, moves every `triage` path of the artifact to `local` through `leave_triage`,
+  `DerivedShift` and `log_changes` in the same transaction. A `Verdict::Restored`, which is
+  what taking back a rejection is, does the mirror through `enter_triage`: every `local`
+  path this node holds goes back to `triage` at once and a `served` one keeps its mark and
+  takes the flag, exactly as `leave_triage` leaves it served when it clears the flag, so the
+  three numbers rise together rather than waiting for a scan. A `Noise` row names the artifact it was rejected
+  from, and `Catalog::remove_noise` restores that artifact when no other noise row still names
+  it. Landing the missing files, a rejection, or a rescan dropping a path rejected as noise, is
+  what takes an artifact out.
+- A set record stores the total it declares. `ArtifactRecord::declared_total` is
+  `ShardSet::declared_total` as the scan's grouping pass settled it, `None` for a single file
+  and for a set nothing declared a total for; `SearchRow::shard_total` carries it to the API,
+  and the triage reason reads `1 of 15 shards present, incomplete` where it has one. No
+  writer but a scan fills it: the mirror's ingest and pull paths file a fetched file as its own
+  record and never join a set's, so a scan is still the only thing that turns a set complete.
+- A set's row carries its anchor's sha256. The record's `artifact.sha256` is written at scan
+  time from the anchor's presence, which the hf-cache discoverer fills from the blob name and
+  the loose discoverer leaves empty; `hashing.rs::rekey_artifact` writes it for a set whose
+  record carries none once the digest of its anchor - the entry with the lowest id among the
+  artifact's entries, which is the lowest-numbered shard `store_unit` stores first - arrives,
+  keeping the identity the set was filed under, because a set is not identified by one file's
+  content. A member's digest changes the record not at all.
 - An unreadable file keeps its path and is recorded as an absent entry with no artifact; a
   git-lfs pointer stub is absent with the pointer's size and hash; a fetched LFS weight is an
   ordinary artifact.
@@ -695,6 +713,12 @@ one-document-per-artifact proposal missed: `node:laptop AND state:local` must ma
 satisfying both predicates, and the preferred row must be chosen from the entries that
 matched rather than fixed before filtering.
 
+A document writes the artifact's name, org, base, trigger words and tensor keys into `text`
+and the revision's card, when the card covers the entry, into `card`. Both fields are cut by
+the `hoard_words` tokenizer, so one analyzer serves both sides of a query; they are separate
+fields because a free-text word is matched from its start against `text` and whole against
+`card`, which is what keeps `wan` from finding a card that says `want`.
+
 One document per artifact carries a `primary` mark: the entry a row would be assembled from,
 which is the highest availability preference and on a tie the lowest entry id. A query that
 filters and sorts only on fields every entry of an artifact agrees on is intersected with
@@ -893,6 +917,12 @@ whole token. Every token kind compiles:
   words as prefixes. A key the grammar does not know is free text carrying a warning.
 
 Free text and `trigger:` match whole words or the whole stored string rather than substrings.
+A free-text word is matched from the start of a word of the name, the org, the base, the
+trigger words and the tensor keys, and whole against the revision's card; a phrase is a phrase
+prefix over the first and a whole-word phrase over the second, and a row is answered by either
+side. The base rail cuts to `BASE_RAIL` buckets by count, and a bucket a positive `base:` token
+names is moved ahead of both cuts, so a base asked for by its own name is on the rail however
+few artifacts carry it.
 
 `--sort` takes `role`, `name`, `base`, `format`, `precision`, `size`, `revision`, `node`,
 `state` or `used`, defaults to `name`, and `--desc` reverses it; every order ends on ascending

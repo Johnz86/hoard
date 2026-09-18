@@ -400,6 +400,7 @@ fn filed_artifact(
         tensors: file.sniff.tensors.clone(),
         group_bytes: None,
         shard_count: None,
+        declared_total: None,
         incomplete: false,
         first_seen: None,
     });

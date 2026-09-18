@@ -1010,3 +1010,36 @@ fn source_count_recovery_preserves_timestamps_and_non_scan_sources() -> Result<(
     }
     Ok(())
 }
+
+#[test]
+fn a_record_no_local_path_holds_is_not_counted() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        sources: Vec::new(),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    let laptop = catalog.upsert_peer(&NodeId::new("laptop-1")?, "laptop", None)?;
+    let pass = catalog.begin_pass(laptop.id)?;
+
+    catalog.apply_digest(
+        laptop.id,
+        &[remote_entry(
+            Sha256::from_bytes([0x77; 32]),
+            "loras/only-there.safetensors",
+        )],
+        pass,
+    )?;
+
+    let totals = catalog.totals()?;
+    assert_eq!(totals.artifacts, 1, "the peer's row is a record");
+    assert_eq!(totals.present_artifacts, 0, "no path here holds its bytes");
+    assert_eq!(
+        totals.triage_artifacts, 0,
+        "a record no local path holds asks this node nothing"
+    );
+    assert!(catalog.triage_queue(10)?.is_empty());
+    assert_eq!(totals, catalog.count_summary()?);
+    Ok(())
+}

@@ -12,7 +12,7 @@ mod lora;
 mod precision;
 mod role;
 pub mod rules;
-mod trigger;
+pub(crate) mod trigger;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

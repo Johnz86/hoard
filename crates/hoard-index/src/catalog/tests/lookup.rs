@@ -26,6 +26,7 @@ fn listing(base_model: &str) -> Listed {
         model: "One obsession".to_owned(),
         version: "v24".to_owned(),
         kind: "Checkpoint".to_owned(),
+        trained_words: Vec::new(),
     }
 }
 
@@ -399,4 +400,249 @@ fn the_summary_still_agrees_with_a_fresh_count_after_a_batch() -> Result<()> {
         "the batch refreshed the index it logged"
     );
     Ok(())
+}
+
+fn tagged_lora_header(tags: &str) -> Vec<u8> {
+    crate::sniff::tests::safetensors_fixture(&format!(
+        "{{\"__metadata__\":{{\"ss_network_dim\":\"16\",\"ss_network_alpha\":\"8\",\
+         \"ss_tag_frequency\":{tags}}},\
+         \"lora_unet_down_blocks_0_attn.lora_down.weight\":\
+         {{\"dtype\":\"F16\",\"shape\":[16,768],\"data_offsets\":[0,24576]}},\
+         \"lora_unet_down_blocks_0_attn.lora_up.weight\":\
+         {{\"dtype\":\"F16\",\"shape\":[768,16],\"data_offsets\":[24576,49152]}}}}"
+    ))
+}
+
+/// One hashed LoRA of the given name and header, alone under its own source.
+fn hashed_lora(directory: &Path, name: &str, header: Vec<u8>) -> Result<Catalog> {
+    let input = directory.join("files");
+    fs::create_dir_all(input.join("loras"))?;
+    fs::write(input.join("loras").join(name), header)?;
+    let config = IndexConfig {
+        data_dir: directory.to_path_buf(),
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::scan_sources(
+        &config.native_path(),
+        "n",
+        &config,
+        HashPolicy::Now,
+        |_, _| {},
+    )?;
+    catalog.rebuild_search(|_| {})?;
+    Ok(catalog)
+}
+
+fn only_row(catalog: &Catalog) -> Result<SearchRow> {
+    search(catalog, "")?
+        .rows
+        .first()
+        .cloned()
+        .ok_or_else(|| IndexError::Catalog("the catalog holds no row".into()))
+}
+
+fn listing_with(base_model: &str, trained_words: &[&str]) -> Listed {
+    Listed {
+        trained_words: trained_words
+            .iter()
+            .map(|word| (*word).to_owned())
+            .collect(),
+        ..listing(base_model)
+    }
+}
+
+fn answer_of(listed: Listed) -> LookupAnswer {
+    LookupAnswer {
+        asked_at: crate::time::timestamp_text(crate::time::now()),
+        found: Some(listed),
+    }
+}
+
+#[test]
+fn a_listing_that_names_a_key_the_rules_spell_stores_no_label() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = hashed_lora(directory.path(), "mystery.safetensors", lora_header())?;
+    let row = only_row(&catalog)?;
+    assert!(row.base.is_empty(), "the header proves no architecture");
+    let sha = row
+        .blob_sha256
+        .ok_or_else(|| IndexError::Catalog("the lora was never hashed".into()))?;
+
+    let answers = vec![(sha, answer_of(listing("SDXL 1.0")))];
+    assert_eq!(catalog.apply_lookups(&answers)?, 1);
+
+    let named = only_row(&catalog)?;
+    assert_eq!(named.base, Base::new("sdxl"));
+    assert_eq!(
+        named.base_label, None,
+        "a key hoard's own rules spell is printed the way they spell it"
+    );
+
+    let other = tempfile::tempdir()?;
+    let (_config, checkpoints) = hashed_fixture(other.path())?;
+    let refined = candidate_of(&checkpoints, "one-obsession")?;
+    let answers = vec![(refined, answer_of(listing("Illustrious")))];
+    assert_eq!(checkpoints.apply_lookups(&answers)?, 1);
+    assert_eq!(
+        checkpoints
+            .artifact_by_sha256(&refined)?
+            .and_then(|row| row.base_label),
+        Some("Illustrious".to_owned()),
+        "a lineage no rule of hoard's spells keeps the spelling the listing writes"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_listing_is_kept_on_the_detail() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (_config, catalog) = hashed_fixture(directory.path())?;
+    let sha = candidate_of(&catalog, "one-obsession")?;
+    let id = catalog
+        .artifact_by_sha256(&sha)?
+        .ok_or_else(|| IndexError::Catalog("the artifact is indexed".into()))?
+        .artifact_id;
+
+    let first = listing_with("Illustrious", &["one obsession"]);
+    catalog.apply_lookups(&[(sha, answer_of(first.clone()))])?;
+
+    assert_eq!(
+        catalog
+            .artifact_detail(id)?
+            .and_then(|detail| detail.listing),
+        Some(first),
+        "the detail row keeps what the listing said, trigger words and all"
+    );
+
+    let second = listing_with("NoobAI", &["v24"]);
+    catalog.apply_lookups(&[(sha, answer_of(second.clone()))])?;
+
+    assert_eq!(
+        catalog
+            .artifact_detail(id)?
+            .and_then(|detail| detail.listing),
+        Some(second),
+        "a later answer for the same bytes replaces the one before it"
+    );
+    let row = catalog
+        .artifact_row(id)?
+        .ok_or_else(|| IndexError::Catalog("the row is gone".into()))?;
+    assert_eq!(
+        row.trigger.as_deref(),
+        Some("v24"),
+        "the trigger words follow the listing the detail keeps"
+    );
+    let lookup_rows = catalog.artifact_detail(id)?.map_or(0, |detail| {
+        detail
+            .evidence
+            .iter()
+            .filter(|evidence| {
+                evidence.field == "trigger" && evidence.source == EvidenceSource::Lookup
+            })
+            .count()
+    });
+    assert_eq!(lookup_rows, 1, "one lookup row on the trigger, the latest");
+    Ok(())
+}
+
+#[test]
+fn trained_words_outrank_a_file_name_guess_and_not_metadata() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = hashed_lora(directory.path(), "film-grain-v2.safetensors", lora_header())?;
+    let guessed = only_row(&catalog)?;
+    let sha = guessed
+        .blob_sha256
+        .ok_or_else(|| IndexError::Catalog("the lora was never hashed".into()))?;
+    assert_eq!(
+        strongest_trigger(&catalog, &sha)?,
+        Some(EvidenceSource::Filename),
+        "the file name is all this lora says about its trigger"
+    );
+
+    let listed = listing_with("SDXL 1.0", &["score_9", "rating_safe"]);
+    catalog.apply_lookups(&[(sha, answer_of(listed))])?;
+
+    assert_eq!(
+        only_row(&catalog)?.trigger.as_deref(),
+        Some("score_9, rating_safe"),
+        "the words the uploader lists beat a guess read off the file name"
+    );
+    let evidence = evidence_of(&catalog, &sha)?;
+    let triggers: Vec<&Evidence> = lookup_rows(&evidence)
+        .into_iter()
+        .filter(|row| row.field == "trigger")
+        .collect();
+    assert_eq!(
+        triggers.len(),
+        1,
+        "one lookup row on the trigger, not one per pass"
+    );
+    assert_eq!(
+        triggers[0].detail.as_deref(),
+        Some("Civitai lists the trigger words of One obsession v24")
+    );
+    assert_eq!(
+        search(&catalog, "trigger:rating")?.total,
+        1,
+        "the refresh reindexes the trigger the listing wrote"
+    );
+
+    let metadata = tempfile::tempdir()?;
+    let known = hashed_lora(
+        metadata.path(),
+        "tagged.safetensors",
+        tagged_lora_header("{\"acme\":{\"woodcut\":12,\"linocut\":3}}"),
+    )?;
+    let tagged = only_row(&known)?;
+    let tagged_sha = tagged
+        .blob_sha256
+        .ok_or_else(|| IndexError::Catalog("the lora was never hashed".into()))?;
+    assert_eq!(
+        strongest_trigger(&known, &tagged_sha)?,
+        Some(EvidenceSource::Metadata)
+    );
+    let held = tagged.trigger.clone();
+
+    known.apply_lookups(&[(
+        tagged_sha,
+        answer_of(listing_with("SDXL 1.0", &["score_9"])),
+    )])?;
+
+    assert_eq!(
+        only_row(&known)?.trigger,
+        held,
+        "the uploader's own training metadata outranks the page the file was listed on"
+    );
+    assert!(
+        lookup_rows(&evidence_of(&known, &tagged_sha)?)
+            .into_iter()
+            .all(|row| row.field != "trigger"),
+        "and no lookup row is filed on the trigger at all"
+    );
+
+    let empty = tempfile::tempdir()?;
+    let silent = hashed_lora(empty.path(), "silent.safetensors", lora_header())?;
+    let silent_sha = only_row(&silent)?
+        .blob_sha256
+        .ok_or_else(|| IndexError::Catalog("the lora was never hashed".into()))?;
+    let before = only_row(&silent)?.trigger;
+
+    silent.apply_lookups(&[(silent_sha, answer_of(listing("SDXL 1.0")))])?;
+
+    assert_eq!(
+        only_row(&silent)?.trigger,
+        before,
+        "an answer listing no trigger words writes none"
+    );
+    Ok(())
+}
+
+fn strongest_trigger(catalog: &Catalog, sha: &Sha256) -> Result<Option<EvidenceSource>> {
+    let evidence = evidence_of(catalog, sha)?;
+    Ok(evidence
+        .iter()
+        .filter(|row| row.field == "trigger")
+        .max_by(|left, right| left.confidence.total_cmp(&right.confidence))
+        .map(|row| row.source))
 }

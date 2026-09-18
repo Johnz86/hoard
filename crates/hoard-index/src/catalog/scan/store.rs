@@ -187,7 +187,6 @@ fn store_artifact(
         stored.as_ref().map(|stored| stored.first_seen.clone()),
     );
     if let Some(stored) = &stored {
-        record.triage_cleared = stored.triage_cleared;
         record.rejected = stored.rejected;
         if !names_better(&record, stored) {
             record.name = stored.name.clone();
@@ -280,6 +279,7 @@ pub(in crate::catalog) struct RecordFacts<'a> {
     pub(in crate::catalog) tensors: Option<TensorSummary>,
     pub(in crate::catalog) group_bytes: Option<u64>,
     pub(in crate::catalog) shard_count: Option<u32>,
+    pub(in crate::catalog) declared_total: Option<u32>,
     pub(in crate::catalog) incomplete: bool,
     pub(in crate::catalog) named_by_repo: bool,
     /// When the catalog first recorded this artifact. A record being rewritten passes what
@@ -293,11 +293,12 @@ fn artifact_record(
     draft: &ArtifactDraft,
     first_seen: Option<String>,
 ) -> (ArtifactRecord, ArtifactDetail) {
-    let (tensors, group_bytes, shard_count, incomplete) = match &prepared.role {
+    let (tensors, group_bytes, shard_count, declared_total, incomplete) = match &prepared.role {
         EntryRole::Anchor(facts) => (
             facts.tensors.clone(),
             Some(facts.bytes),
             Some(facts.shard_count),
+            facts.declared_total,
             facts.incomplete,
         ),
         EntryRole::Standalone | EntryRole::Member => (
@@ -305,6 +306,7 @@ fn artifact_record(
                 .sniffed
                 .as_ref()
                 .and_then(|sniffed| sniffed.tensors.clone()),
+            None,
             None,
             None,
             false,
@@ -325,6 +327,7 @@ fn artifact_record(
         tensors,
         group_bytes,
         shard_count,
+        declared_total,
         incomplete,
         named_by_repo: prepared.named_by_repo,
         first_seen,
@@ -344,6 +347,7 @@ pub(in crate::catalog) fn record_of(facts: RecordFacts<'_>) -> (ArtifactRecord, 
         tensors,
         group_bytes,
         shard_count,
+        declared_total,
         incomplete,
         named_by_repo,
         first_seen,
@@ -377,9 +381,9 @@ pub(in crate::catalog) fn record_of(facts: RecordFacts<'_>) -> (ArtifactRecord, 
         },
         group_bytes,
         shard_count,
+        declared_total,
         incomplete,
         named_by_repo,
-        triage_cleared: false,
         rejected: false,
         first_seen: first_seen.unwrap_or_else(|| jiff::Timestamp::now().to_string()),
     };
@@ -435,7 +439,7 @@ mod tests {
             incomplete: false,
             named_by_repo,
             shard_count: None,
-            triage_cleared: false,
+            declared_total: None,
             rejected: false,
             first_seen: "2026-01-01T00:00:00Z".to_owned(),
         }

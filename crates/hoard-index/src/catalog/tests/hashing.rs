@@ -1090,3 +1090,70 @@ fn a_pass_with_nothing_pending_opens_no_memo() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn a_loose_sets_row_carries_its_anchors_sha256_however_it_was_hashed() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let input = directory.path().join("files");
+    fs::create_dir_all(input.join("set"))?;
+    let shards = llm_shards();
+    for (index, bytes) in shards.iter().enumerate() {
+        let name = format!("set/model-{:05}-of-00003.safetensors", index + 1);
+        fs::write(input.join(name), bytes)?;
+    }
+    let config = IndexConfig {
+        sources: vec![source(&input, "files")],
+        ..IndexConfig::default()
+    };
+    let anchor = crate::hash::sha256_bytes(&shards[0]);
+
+    for (policy, native) in [
+        (HashPolicy::Never, "background"),
+        (HashPolicy::Now, "at-scan"),
+    ] {
+        let catalog = Catalog::scan_sources(
+            &directory.path().join(native),
+            "n",
+            &config,
+            policy,
+            |_, _| {},
+        )?;
+        catalog.hash_pending(&config, |_| {})?;
+
+        assert_eq!(
+            catalog.pending_hashes()?,
+            0,
+            "{native}: every file of the set is hashed"
+        );
+        assert_eq!(
+            catalog.totals()?.artifacts,
+            1,
+            "{native}: a set is one artifact and is never merged with a single file"
+        );
+        catalog.rebuild_search(|_| {})?;
+        let page = search(&catalog, "")?;
+        assert_eq!(page.total, 1, "{native}");
+        let row = &page.rows[0];
+        assert_eq!(row.shard_count, 3, "{native}");
+        assert_eq!(
+            row.path_count, 1,
+            "{native}: three files of one set are one copy of it"
+        );
+        assert_eq!(
+            row.blob_sha256,
+            Some(anchor),
+            "{native}: the row carries the digest of its anchor"
+        );
+        let read = catalog.database.r_transaction()?;
+        let entries: Vec<Entry> = read
+            .scan()
+            .primary()?
+            .all()?
+            .collect::<native_db::db_type::Result<_>>()?;
+        assert!(
+            entries.iter().all(|entry| entry.sha256.is_some()),
+            "{native}: every entry carries its own digest"
+        );
+    }
+    Ok(())
+}

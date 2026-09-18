@@ -272,3 +272,34 @@ fn a_base_no_brand_claims_is_its_own_row() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn a_base_the_query_names_stays_on_the_rail() -> Result<()> {
+    let names: Vec<String> = (0..=BASE_RAIL)
+        .map(|index| format!("r{index:02}x"))
+        .collect();
+    let mut populations: Vec<(&str, usize)> = names.iter().map(|name| (name.as_str(), 1)).collect();
+    populations.push(("crowd", 2));
+    let (_directory, catalog) = brand_fixture(&populations)?;
+    let last = names
+        .last()
+        .ok_or_else(|| IndexError::Catalog("the fixture seeded no base".into()))?;
+
+    let capped = search(&catalog, "")?;
+    assert_eq!(capped.facets.base.len(), BASE_RAIL, "the rail is capped");
+    assert!(
+        !base_values(&capped).contains(&last.as_str()),
+        "the alphabetically last of the smallest bases is what the cut drops"
+    );
+
+    let named = search(&catalog, &format!("base:{last}"))?;
+
+    let bucket = base_row(&named, last);
+    assert_eq!(bucket.count, 1, "the bucket counts the query it opens");
+    assert!(bucket.active, "and the rail marks it as the one asked for");
+    assert_eq!(
+        named.facets.base_shown as usize, BASE_RAIL,
+        "keeping it costs the rail nothing: it still shows as many bases as it can"
+    );
+    Ok(())
+}

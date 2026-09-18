@@ -11,7 +11,7 @@ use hoard_core::{
     SubRole, format_size,
 };
 use hoard_index::IndexError;
-use hoard_index::catalog::{EntryDetail, RepositoryDetail};
+use hoard_index::catalog::{EntryDetail, Listed, RepositoryDetail};
 use hoard_index::config::SourceKind;
 use hoard_index::discover::DEFAULT_REF;
 use hoard_index::row::SearchRow;
@@ -213,6 +213,8 @@ pub struct RowView {
     pub shard_count: u32,
     /// True when the set holds fewer files than it declares.
     pub incomplete: bool,
+    /// How many files the set declared, when it declared one.
+    pub shard_total: Option<u32>,
     pub last_used: Option<Timestamp>,
     pub repo: String,
     pub repo_type: RepoType,
@@ -271,6 +273,7 @@ impl From<&SearchRow> for RowView {
             path_count: row.path_count,
             shard_count: row.shard_count,
             incomplete: row.incomplete,
+            shard_total: row.shard_total,
             last_used: row.last_used,
             repo: row.repo.clone(),
             repo_type: repo_type_of(&row.repo),
@@ -375,8 +378,9 @@ impl Fact {
 }
 
 /// The inspector facts in the order the design lists them: role, base, format, size, node,
-/// layout, blob, then the role specific lines.
-pub fn facts(row: &SearchRow) -> Vec<Fact> {
+/// layout, blob, the files of a set, what a listing named the bytes, then the role specific
+/// lines.
+pub fn facts(row: &SearchRow, listing: Option<&Listed>) -> Vec<Fact> {
     let mut facts = vec![
         Fact::new("role", role_value(row.role, row.sub_role)),
         Fact::new(
@@ -389,9 +393,10 @@ pub fn facts(row: &SearchRow) -> Vec<Fact> {
         Fact::new("layout", row.layout.clone()),
         Fact::new("blob", blob_value(row.blob_sha256.as_ref())),
     ];
-    if row.shard_count > 1 {
-        facts.push(Fact::new("files", format!("{} shards", row.shard_count)));
+    if let Some(files) = files_value(row) {
+        facts.push(Fact::new("files", files));
     }
+    facts.extend(listing_fact(listing));
     match row.role {
         Role::Lora => facts.push(Fact::new("rank / alpha", rank_alpha(row.rank, row.alpha))),
         Role::Llm => {
@@ -407,6 +412,25 @@ pub fn facts(row: &SearchRow) -> Vec<Fact> {
         Role::Ctrl | Role::Upsc | Role::Vae | Role::Emb | Role::Ds | Role::Proj | Role::Unk => {}
     }
     facts
+}
+
+/// What a set's row says about its files: how many are here, how many it declares when it
+/// declares any, and that it is short of them when it is. A single complete file says
+/// nothing, because its size and its path already say it.
+fn files_value(row: &SearchRow) -> Option<String> {
+    match (row.incomplete, row.shard_total) {
+        (true, Some(total)) => Some(format!("{} of {total} shards, incomplete", row.shard_count)),
+        (true, None) => Some(format!("{} shards, incomplete", row.shard_count)),
+        (false, _) => (row.shard_count > 1).then(|| format!("{} shards", row.shard_count)),
+    }
+}
+
+/// The inspector's `civitai` line: the model and version a listing named these bytes as.
+pub(super) fn listing_fact(listing: Option<&Listed>) -> Option<Fact> {
+    let listed = listing?;
+    let named = format!("{} {}", listed.model, listed.version);
+    let named = named.trim();
+    (!named.is_empty()).then(|| Fact::new("civitai", named))
 }
 
 fn role_value(role: Role, sub_role: Option<SubRole>) -> String {

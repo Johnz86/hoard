@@ -495,6 +495,7 @@ fn listed_in(body: &[u8]) -> Option<Listed> {
         model,
         version: version.name.unwrap_or_default(),
         kind,
+        trained_words: version.trained_words.unwrap_or_default(),
     })
 }
 
@@ -504,6 +505,8 @@ struct ByHash {
     base_model: Option<String>,
     name: Option<String>,
     model: Option<ByHashModel>,
+    #[serde(rename = "trainedWords")]
+    trained_words: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -544,6 +547,7 @@ mod tests {
     use super::*;
 
     const ILLUSTRIOUS: &str = r#"{"id":1,"name":"v24","baseModel":"Illustrious",
+        "trainedWords":["one obsession","v24"],
         "model":{"name":"One obsession","type":"Checkpoint"}}"#;
 
     fn sha(byte: u8) -> Sha256 {
@@ -982,6 +986,7 @@ mod tests {
                     model: "One obsession".to_owned(),
                     version: "v24".to_owned(),
                     kind: "Checkpoint".to_owned(),
+                    trained_words: Vec::new(),
                 })),
             )])
             .expect("the memo is seeded");
@@ -1179,5 +1184,17 @@ mod tests {
         assert_eq!(listed.model, "One obsession");
         assert_eq!(listed.version, "v24");
         assert_eq!(listed.kind, "Checkpoint");
+        assert_eq!(
+            listed.trained_words,
+            vec!["one obsession".to_owned(), "v24".to_owned()],
+            "the words the uploader lists arrive in the order the answer writes them"
+        );
+        let wordless =
+            listed_in(br#"{"name":"v1","baseModel":"Pony","model":{"name":"x","type":"LORA"}}"#)
+                .expect("a base model is listed");
+        assert!(
+            wordless.trained_words.is_empty(),
+            "an answer naming no trigger words parses with none"
+        );
     }
 }

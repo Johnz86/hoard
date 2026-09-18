@@ -6,7 +6,7 @@ use crate::error::{IndexError, Result};
 use crate::triage::check_verdict;
 
 use super::Catalog;
-use super::models::{ArtifactRecord, Entry, Override};
+use super::models::{ArtifactRecord, Entry, LOCAL_NODE, Override};
 use super::scan::{Counters, log_changes, paths_of_artifact};
 
 /// A user's verdict on one artifact, as the routes that record and read it see it.
@@ -32,9 +32,12 @@ impl From<Override> for OverrideRecord {
 }
 
 #[derive(Debug)]
-enum Verdict {
+pub(super) enum Verdict {
     Confirmed(Override),
     Rejected,
+    /// The rejection is taken back: the record wants a person again if anything about it is
+    /// still open.
+    Restored,
 }
 
 impl Catalog {
@@ -101,17 +104,26 @@ impl Catalog {
         self.record_verdict(id, Verdict::Rejected)
     }
 
-    fn record_verdict(&self, id: ArtifactId, verdict: Verdict) -> Result<()> {
+    pub(super) fn record_verdict(&self, id: ArtifactId, verdict: Verdict) -> Result<()> {
         let threshold = self.stored_triage()?;
         let mut counters = Counters::load(&self.database, threshold)?;
         let transaction = self.database.rw_transaction()?;
         let mut record = require_record(&transaction, id)?;
         counters.touch(&transaction, id.get())?;
-        match &verdict {
-            Verdict::Confirmed(over) => apply_override(&mut record, over),
-            Verdict::Rejected => record.rejected = true,
-        }
-        record.triage_cleared = true;
+        let restored = match &verdict {
+            Verdict::Confirmed(over) => {
+                apply_override(&mut record, over);
+                false
+            }
+            Verdict::Rejected => {
+                record.rejected = true;
+                false
+            }
+            Verdict::Restored => {
+                record.rejected = false;
+                true
+            }
+        };
         let settled = !record.needs_triage(threshold);
         transaction.upsert(record)?;
         if let Verdict::Confirmed(over) = verdict {
@@ -119,6 +131,8 @@ impl Catalog {
         }
         if settled {
             leave_triage(&transaction, &mut counters, id.get())?;
+        } else if restored {
+            enter_triage(&transaction, &mut counters, id.get())?;
         }
         counters.pending.push(id.get());
         log_changes(&transaction, &mut counters)?;
@@ -151,6 +165,37 @@ fn leave_triage(
         };
         counters.derived.added(&settled);
         transaction.upsert(settled)?;
+    }
+    Ok(())
+}
+
+/// The mirror of [`leave_triage`]: every path this node holds settled goes back to `triage`,
+/// so an artifact whose rejection was taken back is queued, counted and shelved again at
+/// once. A served path keeps the mark the mirror gave it and only takes the flag, exactly as
+/// [`leave_triage`] leaves it served when it clears the flag. A path another node
+/// advertises, one being pulled and one already in triage are left as they are.
+fn enter_triage(
+    transaction: &native_db::transaction::RwTransaction<'_>,
+    counters: &mut Counters,
+    id: i64,
+) -> Result<()> {
+    for entry in paths_of_artifact(transaction, id)? {
+        if entry.node != LOCAL_NODE {
+            continue;
+        }
+        let state = match entry.state {
+            State::Local => State::Triage,
+            State::Served => State::Served,
+            State::Triage | State::Stale | State::Pulling | State::Remote => continue,
+        };
+        counters.derived.removed(&entry);
+        let waiting = Entry {
+            state,
+            triage: true,
+            ..entry
+        };
+        counters.derived.added(&waiting);
+        transaction.upsert(waiting)?;
     }
     Ok(())
 }

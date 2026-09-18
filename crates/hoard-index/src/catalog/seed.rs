@@ -345,8 +345,8 @@ impl Seeding<'_, '_> {
             named_by_repo: false,
             group_bytes: seed.group_bytes,
             shard_count: seed.shard_count,
+            declared_total: None,
             incomplete: false,
-            triage_cleared: false,
             rejected: false,
             first_seen: SEEDED_AT.to_owned(),
         })?;

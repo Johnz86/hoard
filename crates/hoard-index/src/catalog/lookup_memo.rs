@@ -14,7 +14,7 @@ use crate::time::{now, timestamp_text};
 use super::Catalog;
 use super::hash_memo::{memo_builder, stamped_version};
 
-const LOOKUP_MEMO_VERSION: u32 = 1;
+const LOOKUP_MEMO_VERSION: u32 = 2;
 
 const LOOKUP_MEMO_DB_FILE: &str = "civitai.redb";
 
@@ -27,6 +27,8 @@ pub struct Listed {
     pub model: String,
     pub version: String,
     pub kind: String,
+    /// The words the uploader says trigger the model, in the order listed, possibly empty.
+    pub trained_words: Vec<String>,
 }
 
 /// One question already asked about one sha256, and the answer it got. `found` is `None` when
@@ -195,6 +197,7 @@ mod tests {
             model: "One obsession".to_owned(),
             version: "v24".to_owned(),
             kind: "Checkpoint".to_owned(),
+            trained_words: Vec::new(),
         }
     }
 
@@ -277,6 +280,36 @@ mod tests {
             reopened.answer(&sha(0x32))?,
             Some(answer("NoobAI")),
             "the wiped memo is usable, not merely empty"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_memo_of_the_previous_version_is_started_again() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        {
+            let memo = LookupMemo::open(directory.path())?;
+            memo.remember(&[(sha(0x41), answer("Pony"))])?;
+        }
+        std::fs::write(
+            directory.path().join(LOOKUP_MEMO_STAMP_FILE),
+            format!("{}\n", LOOKUP_MEMO_VERSION - 1),
+        )?;
+
+        let reopened = LookupMemo::open(directory.path())?;
+
+        assert_eq!(
+            reopened.answer(&sha(0x41))?,
+            None,
+            "an answer of the previous shape is asked again rather than converted"
+        );
+        assert_eq!(
+            stamped_version(&directory.path().join(LOOKUP_MEMO_STAMP_FILE)),
+            Some(LOOKUP_MEMO_VERSION)
+        );
+        assert!(
+            directory.path().join(LOOKUP_MEMO_DB_FILE).exists(),
+            "the fresh memo is on disk beside its stamp"
         );
         Ok(())
     }

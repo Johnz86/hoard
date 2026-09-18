@@ -3,6 +3,124 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest wave: a card by whole words, a stored declared total, one triage predicate
+
+Five things the walk of 2026-09-18 found wrong on the owner's own catalog, and the record
+changes behind them. `catalog::FORMAT_VERSION` is 19 and `LOOKUP_MEMO_VERSION` is 2: the
+catalog is deleted and rebuilt from disk, and every hash the lookup memo held is asked about
+once more.
+
+A card is a field of its own. `search/schema.rs` adds `Fields::card`, written with the same
+`hoard_words` tokenizer as `text`, and `document()` writes the revision's card there instead
+of into `text`. `query.rs::text_filter` now takes the whole `QueryFields` and asks both: a
+word is matched from the start of a word of the name, the org, the base, the trigger words and
+the tensor keys, and whole against the card, a phrase being a `PhrasePrefixQuery` over the
+first and a `PhraseQuery` over the second, with either side answering the row. That is what
+stops `wan` finding a card that says `want` and `2 2` finding `42.2`.
+
+The record stores what a set declares. `ArtifactRecord::declared_total` is
+`ShardSet::declared_total` carried through `GroupFacts` and `RecordFacts`, `SearchRow` and
+`RowView` carry it as `shard_total`, the triage reason reads `1 of 15 shards present,
+incomplete` and the inspector's `files` fact reads `1 of 15 shards, incomplete`. Nothing in the
+mirror's ingest or pull path fills it: neither writer joins a set's record, so a scan remains
+the only thing that turns a set complete. Beside it, `hashing.rs::rekey_artifact` now writes a
+set record's `artifact.sha256` when the digest of its anchor arrives, keeping the identity the
+set was filed under, which is what left two loose sets on this workstation with
+`blob_sha256: null` while every entry under them carried a hash.
+
+One triage predicate. `ArtifactRecord::is_queued` and the `triage_cleared` field are gone;
+the queue, the summary and the entry state a scan writes all read `needs_triage`, and the
+summary counts it only where `path_count > 0`, so a row only a peer's digest created asks this
+node nothing. `Verdict::Restored` and `enter_triage` are the mirror of the rejection path:
+`Noise` carries the artifact it was rejected from, and `Catalog::remove_noise` clears the
+rejection when no other noise row names that artifact, so a path taken off the noise list puts
+its artifact back in the queue, the shelf and the total at once instead of waiting for a scan.
+
+The lookup keeps what it was told. `Listed` carries `trained_words`, `ArtifactDetail` carries
+the `listing`, and `apply_lookups` writes a `base_label` only for a spelling hoard's own rules
+do not produce, so one key is never printed two ways; the eleven `LISTED_BASES` rows whose key
+the rules name (`sdxl`, `wan`, `ltx`, `krea2`, `anima`, `ernie`, `qwenimage`, `mageflow`,
+`minimaxh3`, `hidreamo1`, `ideogram4`) spell their label as the rules do, while the lineages
+keep the label `Base::LINEAGES` gives them and the variants keep Civitai's spelling. An
+answer's `trainedWords` become the artifact's trigger words when nothing stronger than a
+file-name or front-matter guess is stored, never over `ss_tag_frequency`.
+
+The server prints it. `common::facts` says `1 of 15 shards, incomplete` for a short set and
+`common::listing_fact` adds the `civitai` line; `api/artifacts.rs` and `repos.rs::repo_facts`
+both append it, a generated card is headed by the file it describes and prints the listing
+under "What we know", and `LoadoutItem` carries `abs_path` so the comfy export links the path
+this node holds and writes `# <name>: not on this node` for a line nothing here holds.
+
+Measured at this wave's head against the owner's release build of `cd850e3` on port 7099, the
+before column read with GET alone. The after column is a release build of this branch scanning
+this workstation's three sources into a fresh scratch catalog on 7199 with `[mirror] offline =
+true`, `hash_policy = "never"`, `[node] discovery = "none"` and no `[lookup]`; 244 artifacts
+before, 246 after, so the two columns are the same disk a day apart rather than the same
+catalog. `q=` totals, before then after: `wan 2.2` 10 then 6, and all six are Wan files where
+four of the first ten were `Ministral-3-14B-Instruct-2512`, `NVIDIA-Nemotron-Nano-9B-v2-NVFP4`
+and two `rStar-Coder` parquet sets; `want` 4 then 2, the two lost being cards holding `wanted`
+or `wants`; `illustr` 3 then 1, where the plan expected 2: the Qwen card is gone as intended
+and `oneObsession_v24` is not in the after column because the scratch catalog has no lookup and
+its base reads `sdxl` rather than `Illustrious`; `gemma` 17 then 17; `pony` 1 then 1,
+`obsession` 1 then 1, `gpt-oss` 1 then 1, `Q4_K_M` 6 then 6. The gpt-oss row reads
+`shard_total` 15, `incomplete` true, the `files` fact `1 of 15 shards, incomplete` and the
+triage reason `1 of 15 shards present, incomplete`; 15 and not the 14 the plan expected,
+because the total comes from the index document, whose weight map names
+`model-00000-of-00014.safetensors` through `model-00014-of-00014.safetensors`, fifteen files.
+The three numbers, queue at `limit=500`, `/api/v1/stats` `triage` and the `state:triage` total,
+were equal after every step: 24, 24, 24 before any verdict; 23, 23, 23 after confirming
+`Kokoro-82M` as `emb`; 23, 23, 23 after a base-only override of `embedding_model.ckpt`, where
+`cd850e3` would have read 22, 23, 23; 22, 22, 22 after rejecting `classifier.ckpt`; 23, 23, 23
+after `DELETE /api/v1/triage/noise/1`, which answered `artifact_id: a_19` and left that row at
+state `triage`, role `unk`, where `cd850e3` left it `local` and off the queue. The rail shows
+31 base buckets and none of them holds artifacts that disagree on a label. A loadout of
+`cyberrealisticPony_v160.safetensors` and `anima_context_detailer_base10.safetensors` exports
+two `ln -sf` lines naming absolute paths under `/home/johnz86/GIT/ComfyUI/models/`.
+`hoard doctor` on the scratch catalog exits 0 and prints `ok   catalog   format 19,
+generation 4`. A screenshot of `http://127.0.0.1:7199/#/index?q=gpt-oss` shows `files` reading
+`1 of 15 shards, incomplete` in the inspector's DERIVED FACTS.
+
+Tests whose assertions changed, and why. `format_version_is_eighteen` became
+`format_version_is_nineteen`. Every `record.triage_cleared` assertion in
+`catalog/tests/rejection.rs` went with the field.
+`a_verdict_that_leaves_the_role_unsettled_keeps_its_path_in_triage` moved from `(0, 1, 1)` to
+`(1, 1, 1)`, because the queue no longer drops a record a verdict left unsettled.
+`a_verdict_on_an_incomplete_set_leaves_it_queued_and_the_three_counts_equal` and
+`an_incomplete_sets_reason_names_its_present_count` in `catalog/tests/reads.rs` and
+`a_lone_shard_queues_with_a_reason_and_is_not_served_as_a_model` in `catalog/tests/scan.rs`
+were asserting the reason that named no total and now name it.
+`every_listed_base_extends_an_architecture_and_is_spelled_by_its_label` gained the assertion
+that a listed base whose key hoard's rules produce, and which is not a lineage with a label of
+its own, is spelled by that key.
+
+What is left, in the order it will bite:
+
+- The rail still runs one count query per shown bucket, 48 of them at the cap. `count_buckets`
+  already tallies every base exactly once over the same set those queries intersect with, so
+  every bucket's prefix-rule count is a sum over that tally; it is a performance wave with the
+  1M harness number, not a correctness one, and at 246 artifacts nothing shows.
+- A mirror pull never joins a set's record, so a set completed by pulls stays `incomplete`
+  until a scan walks it. The watcher's scan is what completes a set today.
+- A rules-inferred lineage and a Civitai-listed one agree only because `infer/base.rs` takes
+  `Base::lineage_label` for the label; nothing pins that agreement for a lineage a future rule
+  spells differently.
+- The comfy export of a whole shard set links the anchor file `holds_whole` prefers, and an
+  item whose held row records no `abs_path` reads `not on this node`; whether ComfyUI wants
+  the set's directory is the owner's call.
+- `Catalog::remove_noise` answers `Option<Option<ArtifactId>>`, the plan's own interface; an
+  enum naming the three outcomes would read better at the one caller.
+
+The review of this wave found two defects and six lesser points, fewer than a wave of this
+size usually draws; both defects were introduced by the wave and closed before it landed:
+`enter_triage` moved a `served` path to `triage`, which `leave_triage` then wrote back as
+`local`, so a reject and un-reject cycle downgraded what the mirror served (pinned by
+`un_rejecting_a_served_path_keeps_it_served`); and the `civitai` fact was appended after the
+role rows while the contract said before, so `common::facts` now takes the listing and places
+it (pinned by `the_civitai_fact_sits_between_the_files_and_the_role_rows` in
+`api/facts_tests.rs`). A generated card is headed by a file only when a person opened one, a
+later listing for the same bytes now updates the trigger words it wrote before, and the rail's
+keep rule returns at once when the query names no base.
+
 ## Latest wave: a word inside a name, a lineage by its name, a lookup after hashing
 
 Three things that made the search bar and the BASE column read wrong, and one that made the

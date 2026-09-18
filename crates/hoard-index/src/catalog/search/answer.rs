@@ -31,8 +31,8 @@ use super::paging::{
 };
 use super::schema::Fields;
 use super::tally::{
-    BASE_DIMENSION, BASE_RAIL, SegmentTallies, base_candidates, count_buckets, order_base_buckets,
-    order_buckets,
+    BASE_DIMENSION, BASE_RAIL, SegmentTallies, base_candidates, count_buckets, keep_named_bases,
+    order_base_buckets, order_buckets,
 };
 use super::{QueryPage, QueryRequest};
 
@@ -322,6 +322,7 @@ impl Catalog {
             let mut buckets = count_buckets(narrowed.as_ref().unwrap_or(pass.summary), index)?;
             if index == BASE_DIMENSION {
                 base_total = buckets.len() as u64;
+                keep_named_bases(&mut buckets, pass.parsed);
                 buckets = base_candidates(buckets);
                 for bucket in &mut buckets {
                     let scoped = BooleanQuery::intersection(vec![
@@ -331,6 +332,7 @@ impl Catalog {
                     bucket.count = pass.count(scoped)?;
                 }
                 order_buckets(&mut buckets);
+                keep_named_bases(&mut buckets, pass.parsed);
                 buckets.truncate(BASE_RAIL);
                 base_shown = buckets.len() as u64;
                 buckets = pass.consolidate_brands(excluded.as_ref(), buckets)?;
@@ -529,6 +531,7 @@ pub(in crate::catalog) fn assemble_row(facts: &EntryFacts<'_>) -> SearchRow {
         quant: inferred.quant.clone(),
         size: artifact.group_bytes.unwrap_or(inferred.size),
         shard_count: artifact.shard_count.unwrap_or(1),
+        shard_total: artifact.declared_total,
         incomplete: artifact.incomplete,
         rank: inferred.rank,
         alpha: inferred.alpha,

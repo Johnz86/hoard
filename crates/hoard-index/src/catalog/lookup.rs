@@ -4,6 +4,7 @@ use hoard_core::{ArtifactId, Base, Evidence, EvidenceSource, Role, Sha256, State
 
 use crate::error::Result;
 use crate::infer::lookup::{Refinement, listed_base, refine};
+use crate::infer::trigger::MAX_TRIGGER_TAGS;
 use crate::time::{now, parse_timestamp};
 
 use super::hashing::content_key;
@@ -22,6 +23,9 @@ const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
 /// The field a lookup refines, and the one its evidence is filed under.
 const LOOKUP_FIELD: &str = "base";
+
+/// The other field a listing can settle, filed under the same source.
+const TRIGGER_FIELD: &str = "trigger";
 
 /// One artifact a lookup pass may ask about, with the hash that is all it ever sends.
 #[derive(Debug, Clone, PartialEq)]
@@ -107,29 +111,46 @@ impl Catalog {
             let refinement = refine(&record.artifact.base, listed);
             let id = record.id;
             let held = record.artifact.base.clone();
+            let trigger = match is_listed_role(record.artifact.role) {
+                true => listed_trigger(&transaction, id, listed)?,
+                false => None,
+            };
+            let mut record = record;
+            let mut moved = false;
             match &refinement {
                 Refinement::Refined { base, label } => {
-                    counters.touch(&transaction, id)?;
-                    let mut record = record;
+                    record.artifact.base_label = spelled(base, label);
                     record.artifact.base = base.clone();
-                    record.artifact.base_label = Some(label.clone());
-                    transaction.upsert(record)?;
-                    counters.pending.push(id);
-                    changed += 1;
+                    moved = true;
                 }
                 Refinement::Named { base, label } => {
-                    counters.touch(&transaction, id)?;
-                    let mut record = record;
+                    record.artifact.base_label = spelled(base, label);
                     record.artifact.base = base.clone();
-                    record.artifact.base_label = Some(label.clone());
                     record.artifact.base_confidence = EvidenceSource::Lookup.weight();
-                    transaction.upsert(record)?;
-                    counters.pending.push(id);
-                    changed += 1;
+                    moved = true;
                 }
                 Refinement::Unchanged | Refinement::Contradicted { .. } => {}
             }
-            record_evidence(&transaction, id, listed, &refinement, &held)?;
+            if let Some(words) = &trigger {
+                record.artifact.trigger = Some(words.clone());
+                moved = true;
+            }
+            if moved {
+                counters.touch(&transaction, id)?;
+                transaction.upsert(record)?;
+                counters.pending.push(id);
+                changed += 1;
+            }
+            record_listing(
+                &transaction,
+                ListingFacts {
+                    id,
+                    listed,
+                    refinement: &refinement,
+                    held: &held,
+                    trigger: trigger.as_deref(),
+                },
+            )?;
         }
         log_changes(&transaction, &mut counters)?;
         counters.settle_summary(&transaction)?;
@@ -198,6 +219,10 @@ fn is_a_lookup_on_the_base(evidence: &Evidence) -> bool {
     evidence.source == EvidenceSource::Lookup && evidence.field == LOOKUP_FIELD
 }
 
+fn is_a_lookup_on_the_trigger(evidence: &Evidence) -> bool {
+    evidence.source == EvidenceSource::Lookup && evidence.field == TRIGGER_FIELD
+}
+
 /// The record these bytes belong to. A hashed artifact is keyed by its content, so one answer
 /// reaches one artifact however many paths hold it.
 fn artifact_of(transaction: &RwTransaction<'_>, sha256: &Sha256) -> Result<Option<ArtifactRecord>> {
@@ -207,15 +232,69 @@ fn artifact_of(transaction: &RwTransaction<'_>, sha256: &Sha256) -> Result<Optio
     Ok(stored.filter(|record| record.artifact.sha256.as_ref() == Some(sha256)))
 }
 
-/// Records what the listing said and what it did, replacing whatever a previous lookup left,
-/// so an artifact carries one lookup row rather than one per pass.
-fn record_evidence(
+/// The label a listing leaves on a record: the spelling the service writes, and nothing at
+/// all when that is the key itself, which prints the way every rule-inferred base does.
+fn spelled(base: &Base, label: &str) -> Option<String> {
+    (label != base.as_str()).then(|| label.to_owned())
+}
+
+/// The trigger words a listing settles, or nothing when it lists none or when the artifact
+/// already carries a stronger answer than a listing: `ss_tag_frequency` is the uploader's
+/// own training metadata and outranks the page the file was published on, while a file-name
+/// or front-matter guess does not. What an earlier listing wrote is not held against a
+/// later one, so the words follow the listing the detail keeps.
+fn listed_trigger(
     transaction: &RwTransaction<'_>,
     id: i64,
     listed: &Listed,
-    refinement: &Refinement,
-    held: &Base,
-) -> Result<()> {
+) -> Result<Option<String>> {
+    if listed.trained_words.is_empty() {
+        return Ok(None);
+    }
+    let stored: Option<ArtifactDetail> = transaction.get().primary(id)?;
+    let held = stored
+        .iter()
+        .flat_map(|detail| detail.evidence.iter())
+        .filter(|evidence| !is_a_lookup_on_the_trigger(evidence))
+        .fold(0.0_f32, |strongest, evidence| {
+            match evidence.field == TRIGGER_FIELD {
+                true => strongest.max(evidence.confidence),
+                false => strongest,
+            }
+        });
+    if held >= EvidenceSource::Lookup.weight() {
+        return Ok(None);
+    }
+    let words: Vec<&str> = listed
+        .trained_words
+        .iter()
+        .map(|word| word.trim())
+        .filter(|word| !word.is_empty())
+        .take(MAX_TRIGGER_TAGS)
+        .collect();
+    Ok((!words.is_empty()).then(|| words.join(", ")))
+}
+
+/// What one answer leaves on the artifact's detail row: the listing itself, what it did to
+/// the base, and the trigger words it settled when it settled any.
+struct ListingFacts<'a> {
+    id: i64,
+    listed: &'a Listed,
+    refinement: &'a Refinement,
+    held: &'a Base,
+    trigger: Option<&'a str>,
+}
+
+/// Records what the listing said and what it did, replacing whatever a previous lookup left,
+/// so an artifact carries one lookup row per field rather than one per pass.
+fn record_listing(transaction: &RwTransaction<'_>, facts: ListingFacts<'_>) -> Result<()> {
+    let ListingFacts {
+        id,
+        listed,
+        refinement,
+        held,
+        trigger,
+    } = facts;
     let mut detail: ArtifactDetail = transaction
         .get()
         .primary(id)?
@@ -250,6 +329,24 @@ fn record_evidence(
         )
         .with_detail(detail_text),
     );
+    if let Some(words) = trigger {
+        detail
+            .evidence
+            .retain(|evidence| !is_a_lookup_on_the_trigger(evidence));
+        detail.evidence.push(
+            Evidence::new(
+                TRIGGER_FIELD,
+                words,
+                EvidenceSource::Lookup,
+                EvidenceSource::Lookup.weight(),
+            )
+            .with_detail(format!(
+                "Civitai lists the trigger words of {} {}",
+                listed.model, listed.version
+            )),
+        );
+    }
+    detail.listing = Some(listed.clone());
     transaction.upsert(detail)?;
     Ok(())
 }

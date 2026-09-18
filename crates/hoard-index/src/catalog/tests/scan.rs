@@ -310,7 +310,6 @@ fn refs_keep_their_kind() -> Result<()> {
         .all()?
         .collect::<native_db::db_type::Result<_>>()?;
     assert!(!records[0].first_seen.is_empty());
-    assert!(!records[0].triage_cleared);
     Ok(())
 }
 
@@ -1408,7 +1407,7 @@ fn a_lone_shard_queues_with_a_reason_and_is_not_served_as_a_model() -> Result<()
     let queue = catalog.triage_queue(10)?;
     assert_eq!(
         queue.first().map(|item| item.reason.as_str()),
-        Some("1 shard present, incomplete")
+        Some("1 of 3 shards present, incomplete")
     );
     assert_eq!(
         catalog.totals()?.triage_artifacts,

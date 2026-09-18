@@ -33,6 +33,9 @@ pub struct SearchRow {
     /// `shard_count` then counts the files present, which can be one.
     #[serde(default)]
     pub incomplete: bool,
+    /// How many files the set declared, when it declared one. `None` for a single file and
+    /// for a set nothing named a total for.
+    pub shard_total: Option<u32>,
     pub rank: Option<u32>,
     pub alpha: Option<f32>,
     pub params: Option<u64>,

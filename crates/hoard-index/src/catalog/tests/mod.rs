@@ -47,7 +47,7 @@ use super::models::{
     LocationKey, Manifest, Node, Placement, Repository, RepositoryKey, SearchChange, Shelf, Source,
 };
 use super::scan::{Counters, Presence, identity, location_hash, preference};
-use super::search::{Cost, INDEX_FLUSH_BYTES, Paging, QueryPath, source_kind_of};
+use super::search::{BASE_RAIL, Cost, INDEX_FLUSH_BYTES, Paging, QueryPath, source_kind_of};
 use super::seed::{SeedArtifact, SeedEntry, SeedRepository, SeedRevision};
 use super::usage::{HISTORY_DAYS, Window};
 use super::{

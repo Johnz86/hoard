@@ -11,7 +11,10 @@ use crate::discover::NoiseFilter;
 use crate::error::{IndexError, Result};
 
 use super::Catalog;
-use super::models::{Node, Noise, NoiseKey, Projection, ProjectionKey, Setting, Shelf, ShelfKey};
+use super::models::{
+    ArtifactRecord, Node, Noise, NoiseKey, Projection, ProjectionKey, Setting, Shelf, ShelfKey,
+};
+use super::verdict::Verdict;
 
 /// The fixed shelves hoard ships with, in the order the rail lists them. The triage queue
 /// leads, because what a node has not classified is the one shelf whose emptiness is the
@@ -56,6 +59,7 @@ pub struct NoiseRecord {
     pub path: String,
     pub reason: Option<String>,
     pub added_at: String,
+    pub artifact_id: Option<ArtifactId>,
 }
 
 impl From<Noise> for NoiseRecord {
@@ -65,6 +69,7 @@ impl From<Noise> for NoiseRecord {
             path: noise.path,
             reason: noise.reason,
             added_at: noise.added_at,
+            artifact_id: noise.artifact_id.map(ArtifactId::new),
         }
     }
 }
@@ -216,14 +221,21 @@ impl Catalog {
         Ok(seeded)
     }
 
-    /// Marks a path as noise. Recording the same path again keeps its id, and keeps the
-    /// reason it already carries when this one names none.
-    pub fn add_noise(&self, path: &str, reason: Option<&str>) -> Result<i64> {
+    /// Marks a path as noise, naming the artifact it was rejected from when one is known.
+    /// Recording the same path again keeps its id, and keeps the reason and the artifact it
+    /// already carries when this one names none.
+    pub fn add_noise(
+        &self,
+        path: &str,
+        reason: Option<&str>,
+        artifact: Option<ArtifactId>,
+    ) -> Result<i64> {
         let transaction = self.database.rw_transaction()?;
         let stored: Option<Noise> = transaction.get().secondary(NoiseKey::path, path)?;
         let noise = match stored {
             Some(noise) => Noise {
                 reason: reason.map(str::to_owned).or(noise.reason),
+                artifact_id: artifact.map(ArtifactId::get).or(noise.artifact_id),
                 ..noise
             },
             None => Noise {
@@ -231,6 +243,7 @@ impl Catalog {
                 path: path.to_owned(),
                 reason: reason.map(str::to_owned),
                 added_at: jiff::Timestamp::now().to_string(),
+                artifact_id: artifact.map(ArtifactId::get),
             },
         };
         let id = noise.id;
@@ -250,18 +263,28 @@ impl Catalog {
         Ok(rows.into_iter().map(NoiseRecord::from).collect())
     }
 
-    pub fn remove_noise(&self, id: i64) -> Result<bool> {
+    /// Removes the row and, when it named an artifact no other noise row still names, clears
+    /// that artifact's rejection so it returns to the queue at once. Answers the artifact it
+    /// restored, `Some(None)` for a row that named none, `None` for an id that was no row.
+    pub fn remove_noise(&self, id: i64) -> Result<Option<Option<ArtifactId>>> {
         let transaction = self.database.rw_transaction()?;
-        let stored: Option<Noise> = transaction.get().primary(id)?;
-        let removed = match stored {
-            Some(noise) => {
-                transaction.remove(noise)?;
-                true
+        let Some(noise) = transaction.get().primary::<Noise>(id)? else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let rejected_from = noise.artifact_id;
+        transaction.remove(noise)?;
+        let restored = match rejected_from {
+            Some(artifact) if restorable(&transaction, artifact)? => {
+                Some(ArtifactId::new(artifact))
             }
-            None => false,
+            Some(_) | None => None,
         };
         transaction.commit()?;
-        Ok(removed)
+        if let Some(artifact) = restored {
+            self.record_verdict(artifact, Verdict::Restored)?;
+        }
+        Ok(Some(restored))
     }
 
     pub fn is_noise(&self, path: &str) -> Result<bool> {
@@ -401,6 +424,23 @@ impl Catalog {
         transaction.commit()?;
         Ok(removed)
     }
+}
+
+/// Whether taking back one rejection is what un-rejects an artifact: it still has a record,
+/// that record is rejected, and no other noise row names it. The noise table holds one row
+/// per path a person rejected, so the scan is over what triage refused rather than the index.
+fn restorable(transaction: &RwTransaction<'_>, artifact: i64) -> Result<bool> {
+    let record: Option<ArtifactRecord> = transaction.get().primary(artifact)?;
+    if !record.is_some_and(|record| record.rejected) {
+        return Ok(false);
+    }
+    for row in transaction.scan().primary::<Noise>()?.all()? {
+        let row: Noise = row?;
+        if row.artifact_id == Some(artifact) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The primary key a record was given, so a fresh one can continue the sequence.

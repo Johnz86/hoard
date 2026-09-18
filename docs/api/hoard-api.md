@@ -150,13 +150,29 @@ names; typing one more letter narrows the expansion back under the cap. The limi
 is that a word is matched from its start: a run from the middle of one unbroken word does not
 match, so `souls` finds `loxsSoulsMixPerfectDoll_v30` and `oulsmix` and `ulsMixPer` do not.
 
+A name, an org, a base, the trigger words and the tensor keys are matched from the start of a
+word this way. A revision's card is not: it is a field of its own, cut by the same tokenizer,
+and a free-text word is matched against it whole, so `wan 2.2` finds the Wan files and no
+card that says `want`, and a phrase is matched whole word for whole word in the card and as a
+phrase prefix in the name. A word matching either side answers the row.
+
+A row carries `shard_total`, how many files the set declared at scan time, `null` for a
+single file and for a set nothing declared a total for. `shard_count` counts the files
+present, so a set that declares more than it holds reads `incomplete` with the two numbers
+apart.
+
 `GET /api/v1/search/parse?q=` returns only `query`, for the token strip while typing.
 
 ## Artifacts and blobs
 
 - `GET /api/v1/artifacts/{id}`: row fields plus `facts` (ordered key/value pairs exactly
-  as the inspector shows them), `evidence` (`[{ "field", "value", "source", "detail",
-  "confidence" }]`), `entries` (`repo`, `revision`, `path`, `blob_path`, `node`, `state`,
+  as the inspector shows them, `role base format size node layout blob` and then, when there
+  is one, `files` - `4 shards` for a whole set, `1 of 15 shards, incomplete` for one short of
+  its declared total, `1 shards, incomplete` where nothing declared a total, and nothing at
+  all for a single whole file - then `civitai`, the model and version a listing named these
+  bytes as, and then the role-specific rows; the confirm and triage routes answer the same
+  order with no `civitai` row), `evidence` (`[{ "field", "value", "source",
+  "detail", "confidence" }]`), `entries` (`repo`, `revision`, `path`, `blob_path`, `node`, `state`,
   `symlink`; `path` is the path a person walked, and `blob_path` names the shortened cache
   blob it links to when that is somewhere else, otherwise `null`),
   `duplicates`, `plugs_into` (first four compatible artifacts), `usage` summary,
@@ -211,10 +227,10 @@ match, so `souls` finds `loxsSoulsMixPerfectDoll_v30` and `oulsmix` and `ulsMixP
 - `GET /api/v1/triage`: artifacts still waiting for a verdict, with `guess` (`role`, `base`,
   `confidence`), `header` (tensor count, key prefixes, hidden dim, dtype) and `reason`, the
   sentence naming why the artifact is queued: `role unclassified`, `role vae at 0.51, below
-  0.85`, or `3 shards present, incomplete`, which reads `1 shard present, incomplete` for one
-  shard of a set whose index document names fifteen. A verdict answers the role questions and
-  cannot make a set complete, so an incomplete artifact stays in this queue after one, with
-  the incomplete sentence as its reason. The count, the prefixes and
+  0.85`, or `1 of 15 shards present, incomplete` for one shard of a set whose index document
+  names fifteen; a set that declared no total reads `3 shards present, incomplete`. A verdict
+  answers the role questions and cannot make a set complete, so an incomplete artifact stays
+  in this queue after one, with the incomplete sentence as its reason. The count, the prefixes and
   the dtype are what the sniff measured over the whole file; the hidden dimension is read
   from the at most sixteen tensor samples the stored header keeps, thinned by a stride from
   the sniff's draw rather than taken off its front, not from every tensor the file holds. Inference itself ran over all of them before the row was written.
@@ -223,15 +239,23 @@ match, so `souls` finds `loxsSoulsMixPerfectDoll_v30` and `oulsmix` and `ulsMixP
   artifact's paths from `triage` to `local` in the same transaction a rejection uses, so the
   queue, the `state:triage` shelf and the stats triage total drop together. A record that
   still needs triage after the verdict, an incomplete set or one whose role is left `unk`,
-  stays with its paths in `triage`. `sub_role` is optional.
+  stays with its paths in `triage` and stays in all three: a verdict naming only a base leaves
+  the artifact queued, counted and shelved alike, because the role question is still open.
+  `sub_role` is optional.
 - `POST /api/v1/triage/{id}/reject`: records the path a scan walks as noise, which for an
   hf-cache file is the snapshot link rather than the blob, so later scans skip it. The
   rejection is stored on the artifact and settles its paths in the same transaction, so the
   artifact leaves this queue, the `state:triage` shelf and the stats triage total at once. An
   incomplete set leaves the queue this way or by its missing files landing, and no other.
-- `GET /api/v1/triage/noise` and `DELETE /api/v1/triage/noise/{id}`. The delete removes the
-  row so the next scan walks the path again; it does not clear `rejected` on the record, so
-  the artifact returns to the queue only when a scan re-stores it.
+- `GET /api/v1/triage/noise` and `DELETE /api/v1/triage/noise/{id}`. A noise row names the
+  artifact it was rejected from in `artifact_id`, `null` for a path recorded any other way.
+  The delete removes the row so the next scan walks the path again and, when the row named an
+  artifact no other noise row still names, clears that artifact's rejection at once: when the
+  artifact still needs a person, its `local` paths go back to `triage` (a `served` path keeps
+  its mark and takes the flag) and the queue, the shelf and the stats total rise together;
+  when a confirm had already settled its role, only the flag clears and nothing moves. It
+  answers `{ "id", "removed", "artifact_id" }`, `artifact_id` being the artifact it restored
+  or `null`, and 404s for an id that was no row.
 
 ## Repos and README
 
@@ -307,7 +331,10 @@ rest being counted.
 - `POST /api/v1/loadouts/{id}/apply { "node", "profile" }`: starts a job, answering
   `{ "job_id", "node", "apply_preview" }` with the same `apply_preview` shape as loadout
   detail, resolved before the pull runs.
-- `GET /api/v1/loadouts/{id}/export?format=toml|hf-script|comfy`. The `hf-script` writes one
+- `GET /api/v1/loadouts/{id}/export?format=toml|hf-script|comfy`. An item carries
+  `abs_path`, the path on this node holding the whole artifact, `null` when none does; the
+  `comfy` script links that path and writes `# <name>: not on this node` for a line nothing
+  here holds, so it never links a path that resolves to nothing. The `hf-script` writes one
   `hf download` line per item in the spelling `GET /api/v1/artifacts/{id}/pull-command` gives,
   without the companion file, so a pinned shard set exports its `--include` globs, a pinned
   dataset its `--repo-type` and a line pinned outside `main` its `--revision`. A pin whose
@@ -372,13 +399,20 @@ seconds and asks nothing.
 
 An answer naming a base hoard knows refines the stored one, `sdxl` becoming `pony` or
 `illustrious`, and names one when hoard proved nothing. A label is the spelling the service
-writes, `Illustrious` or `Flux.2 Klein 4B`; an answer naming another
+writes, `Illustrious` or `Flux.2 Klein 4B`, except on a key hoard's own rules produce, which
+keeps the spelling those rules give it and is stored with no label at all, so one key is
+never printed two ways on the rail or in the BASE column. An answer naming another
 architecture loses to what hoard already has, and a user's verdict is never overwritten - an
 artifact a verdict has settled the base of is never asked about at all. Every answer leaves
 one evidence row on the artifact with source `lookup`, field `base` and a detail sentence
 saying what was listed and what it did, which `GET /api/v1/artifacts/{id}` returns beside the
-tensor and header evidence. Answers are remembered in `<data_dir>/civitai.redb`, so a catalog
-rebuilt after a format change restores them without asking again.
+tensor and header evidence, and the listing itself is kept on the artifact, which is what the
+`civitai` fact prints. An answer listing `trainedWords` writes them as the artifact's trigger
+words when nothing stronger than a file-name or front-matter guess is stored, leaves a second
+lookup evidence row on the field `trigger`, and never displaces a trigger read from
+`ss_tag_frequency`. Answers are remembered in `<data_dir>/civitai.redb`, at memo version 2, so
+a catalog rebuilt after a format change restores them without asking again; a memo of the
+previous version is deleted and asked again once.
 
 ## Nodes and peers
 

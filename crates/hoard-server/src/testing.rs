@@ -57,6 +57,7 @@ pub(crate) fn search_row(facts: RowFacts<'_>) -> SearchRow {
         "path": "loras/film-grain.safetensors", "abs_path": null,
         "path_count": 1, "dupe": false, "triage": false, "last_used": null,
         "repo": "models/kohya/film-grain", "repo_id": 1, "entry_id": 1,
+        "shard_total": null,
         "source": null, "is_symlink": false, "lfs_pointer": false
     }))
     .expect("a search row parses")

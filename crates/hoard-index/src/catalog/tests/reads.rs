@@ -716,8 +716,8 @@ fn a_verdict_on_an_incomplete_set_leaves_it_queued_and_the_three_counts_equal() 
     let queue = catalog.triage_queue(10)?;
     assert_eq!(
         queue.first().map(|item| item.reason.as_str()),
-        Some("1 shard present, incomplete"),
-        "a verdict answered its role, and the thirteen files it still lacks queue it"
+        Some("1 of 3 shards present, incomplete"),
+        "a verdict answered its role, and the two files it still lacks queue it"
     );
     assert_eq!(
         catalog.totals()?.triage_artifacts,
@@ -800,7 +800,7 @@ fn an_incomplete_sets_reason_names_its_present_count() -> Result<()> {
     let queue = catalog.triage_queue(10)?;
     assert_eq!(
         queue.first().map(|item| item.reason.as_str()),
-        Some("2 shards present, incomplete")
+        Some("2 of 3 shards present, incomplete")
     );
     Ok(())
 }
@@ -1809,9 +1809,9 @@ fn shelves_settings_and_noise_live_in_the_catalog_and_noise_reaches_the_scan() -
         .join("loras/gone.safetensors")
         .to_string_lossy()
         .into_owned();
-    let id = catalog.add_noise(&gone, Some("rejected from triage"))?;
+    let id = catalog.add_noise(&gone, Some("rejected from triage"), None)?;
     assert_eq!(
-        catalog.add_noise(&gone, None)?,
+        catalog.add_noise(&gone, None, None)?,
         id,
         "adding the same path again keeps its id"
     );
@@ -1827,7 +1827,11 @@ fn shelves_settings_and_noise_live_in_the_catalog_and_noise_reaches_the_scan() -
         report.absent, 1,
         "a noisy path is walked past, so its row goes absent"
     );
-    assert!(catalog.remove_noise(id)?);
+    assert_eq!(
+        catalog.remove_noise(id)?,
+        Some(None),
+        "a noise row naming no artifact restores none"
+    );
     assert!(!catalog.is_noise(&gone)?);
     Ok(())
 }

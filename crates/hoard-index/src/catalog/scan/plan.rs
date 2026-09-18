@@ -113,6 +113,7 @@ pub(in crate::catalog) struct GroupFacts {
     label: String,
     pub(super) bytes: u64,
     pub(super) shard_count: u32,
+    pub(super) declared_total: Option<u32>,
     pub(super) tensors: Option<TensorSummary>,
     pub(super) incomplete: bool,
 }
@@ -332,6 +333,7 @@ fn group_facts(
         label,
         bytes: presences.iter().map(|presence| presence.size).sum(),
         shard_count: u32::try_from(presences.len()).unwrap_or(u32::MAX),
+        declared_total: set.declared_total,
         tensors: (!parts.is_empty()).then(|| shard::merge_tensor_summaries(&parts)),
         incomplete: set.is_incomplete(),
     }

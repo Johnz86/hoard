@@ -3,7 +3,7 @@ use hoard_core::{Evidence, EvidenceSource};
 use super::InferInput;
 use super::rules;
 
-const MAX_TRIGGER_TAGS: usize = 5;
+pub(crate) const MAX_TRIGGER_TAGS: usize = 5;
 const FRONTMATTER_KEYS: &[&str] = &["instance_prompt", "trigger_words", "tags"];
 const FILENAME_NOISE: &[&str] = &[
     "final",

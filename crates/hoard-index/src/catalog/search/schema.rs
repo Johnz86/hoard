@@ -60,6 +60,8 @@ pub(in crate::catalog) struct Fields {
     pub(super) preference: Field,
     pub(in crate::catalog) size: Field,
     pub(in crate::catalog) text: Field,
+    /// The revision's card, cut by the same tokenizer as `text`, matched by whole words.
+    pub(in crate::catalog) card: Field,
     /// The column the name sort orders by, written lowercased so that the order a reader
     /// sees is the one they expect rather than the byte order capitals impose.
     ///
@@ -123,6 +125,7 @@ impl Fields {
             preference: schema.add_i64_field("preference", FAST),
             size: schema.add_u64_field("size", FAST | INDEXED),
             text: schema.add_text_field("text", text_options()),
+            card: schema.add_text_field("card", text_options()),
             name: schema.add_text_field("name", column_only.clone()),
             base_label: schema.add_text_field(BASE_LABEL_COLUMN, column_only),
             revision_sha: schema.add_text_field("revision_sha", filter.clone()),
@@ -230,7 +233,7 @@ impl Fields {
             document.add_text(self.text, &text.keys);
         }
         if !card.is_empty() {
-            document.add_text(self.text, card);
+            document.add_text(self.card, card);
         }
         document
     }

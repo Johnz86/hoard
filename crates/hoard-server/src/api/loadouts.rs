@@ -44,6 +44,8 @@ pub struct LoadoutItem {
     pub prefix: String,
     pub repo: String,
     pub path: String,
+    /// The path on this node that holds the whole artifact, when one does.
+    pub abs_path: Option<String>,
     pub revision: Option<String>,
     pub weight: Option<f32>,
     pub weight_label: String,
@@ -781,6 +783,7 @@ fn item_of(
         name: pin.display_name().to_owned(),
         repo: pin.repo.qualified(),
         path: pin.path.clone(),
+        abs_path: held.and_then(|row| row.abs_path.clone()),
         revision: row
             .map(|row| row.revision.clone())
             .or_else(|| pin.sha.map(|sha| sha.short())),
@@ -842,10 +845,14 @@ fn comfy_script(view: &LoadoutView) -> String {
         view.name
     );
     for item in &view.items {
+        let Some(held) = item.abs_path.as_deref() else {
+            text.push_str(&format!("# {}: not on this node\n", item.name));
+            continue;
+        };
         let directory = link::comfy_directory(item.role);
         text.push_str(&format!(
             "mkdir -p \"$COMFYUI/models/{directory}\" && ln -sf {} \"$COMFYUI/models/{directory}\"/{}\n",
-            shell_quoted(&item.path),
+            shell_quoted(held),
             shell_quoted(&item.name)
         ));
     }
@@ -905,6 +912,74 @@ mod tests {
         );
         assert_eq!(file_name("model.gguf"), "model.gguf");
         assert_eq!(file_name("a/b/"), "b");
+    }
+
+    fn linked_item(name: &str, abs_path: Option<&str>) -> LoadoutItem {
+        LoadoutItem {
+            slot: LoadoutSlot::Adapter,
+            role: Role::Lora,
+            role_code: Role::Lora.code().to_owned(),
+            artifact_id: None,
+            name: name.to_owned(),
+            prefix: String::new(),
+            repo: "models/kohya/film-grain".to_owned(),
+            path: format!("loras/{name}"),
+            abs_path: abs_path.map(str::to_owned),
+            revision: None,
+            weight: None,
+            weight_label: "-".to_owned(),
+            size: 0,
+            size_human: "0 B".to_owned(),
+            state: None,
+            resolution: PinResolution::Missing,
+            hf_arguments: String::new(),
+        }
+    }
+
+    fn one_item_view(item: LoadoutItem) -> LoadoutView {
+        let now = Timestamp::UNIX_EPOCH;
+        LoadoutView {
+            id: LoadoutId::new(1),
+            name: "portraits".to_owned(),
+            document: String::new(),
+            items: vec![item],
+            apply_preview: ApplyPreview::default(),
+            violations: Vec::new(),
+            node: "workstation".to_owned(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn a_comfy_script_links_the_held_path_or_says_the_file_is_elsewhere() {
+        let held = one_item_view(linked_item(
+            "film-grain.safetensors",
+            Some("/vault/loras/film-grain.safetensors"),
+        ));
+
+        let script = comfy_script(&held);
+
+        assert!(
+            script.contains(
+                "ln -sf '/vault/loras/film-grain.safetensors' \
+                 \"$COMFYUI/models/loras\"/'film-grain.safetensors'"
+            ),
+            "the script links the path the node holds: {script}"
+        );
+
+        let absent = one_item_view(linked_item("film-grain.safetensors", None));
+
+        let script = comfy_script(&absent);
+
+        assert!(
+            script.contains("# film-grain.safetensors: not on this node\n"),
+            "{script}"
+        );
+        assert!(
+            !script.contains("ln -sf"),
+            "a path that resolves to nothing is never linked: {script}"
+        );
     }
 
     #[test]

@@ -9,14 +9,15 @@ use crate::catalog::Listed;
 ///
 /// A lineage row's key is the lineage itself and [`Base::LINEAGES`] says what it runs on, so
 /// `base:sdxl` still finds a file a listing refined to `illustrious`. Every other base here
-/// extends an architecture hoard's own rules name, every label normalizes back to its own
-/// base, and a label is the spelling the service writes. A spelling this table does not hold
-/// names nothing and changes nothing.
+/// extends an architecture hoard's own rules name, and every label normalizes back to its own
+/// base. A label is the spelling the service writes, except on a key hoard's own rules
+/// produce, which keeps the spelling those rules give it so one key is never printed two
+/// ways. A spelling this table does not hold names nothing and changes nothing.
 const LISTED_BASES: &[(&str, &str, &str)] = &[
     ("illustrious", "illustrious", "Illustrious"),
     ("pony", "pony", "Pony"),
     ("noobai", "noobai", "NoobAI"),
-    ("sdxl10", "sdxl", "SDXL"),
+    ("sdxl10", "sdxl", "sdxl"),
     ("flux2d", "flux2dev", "Flux.2 Dev"),
     ("flux2klein4b", "flux2klein4b", "Flux.2 Klein 4B"),
     (
@@ -27,20 +28,20 @@ const LISTED_BASES: &[(&str, &str, &str)] = &[
     ("flux2klein9b", "flux2klein9b", "Flux.2 Klein 9B"),
     ("zimageturbo", "zimageturbo", "ZImageTurbo"),
     ("zimagebase", "zimagebase", "ZImageBase"),
-    ("wanvideo", "wan", "Wan"),
+    ("wanvideo", "wan", "wan"),
     ("wanvideo14bi2v720p", "wan21i2v14b", "Wan 2.1 I2V-14B"),
     ("wanvideo22i2va14b", "wan22i2va14b", "Wan 2.2 I2V-A14B"),
-    ("ltxv", "ltx", "LTX"),
+    ("ltxv", "ltx", "ltx"),
     ("ltxv2", "ltx2", "LTX 2"),
     ("ltxv23", "ltx23", "LTX 2.3"),
-    ("krea2", "krea2", "Krea 2"),
-    ("anima", "anima", "Anima"),
-    ("ernie", "ernie", "Ernie"),
-    ("qwen", "qwenimage", "Qwen Image"),
-    ("mageflow", "mageflow", "MageFlow"),
-    ("minimaxh3", "minimaxh3", "MiniMax H3"),
-    ("hidreamo1", "hidreamo1", "HiDream O1"),
-    ("ideogram40", "ideogram4", "Ideogram 4"),
+    ("krea2", "krea2", "krea2"),
+    ("anima", "anima", "anima"),
+    ("ernie", "ernie", "ernie"),
+    ("qwen", "qwenimage", "qwenimage"),
+    ("mageflow", "mageflow", "mageflow"),
+    ("minimaxh3", "minimaxh3", "minimaxh3"),
+    ("hidreamo1", "hidreamo1", "hidreamo1"),
+    ("ideogram40", "ideogram4", "ideogram4"),
 ];
 
 /// What a listing is allowed to do to the base an artifact already carries.
@@ -116,6 +117,7 @@ mod tests {
             model: "One obsession".to_owned(),
             version: "v24".to_owned(),
             kind: "Checkpoint".to_owned(),
+            trained_words: Vec::new(),
         }
     }
 
@@ -166,6 +168,12 @@ mod tests {
                 }),
                 "{base} runs on no architecture hoard's own rules name"
             );
+            if architectures.contains(*base) && Base::new(base).lineage_label().is_none() {
+                assert_eq!(
+                    label, base,
+                    "{base} is a key hoard's own rules spell, so the listing may not respell it"
+                );
+            }
             if let Some(lineage) = Base::new(base).lineage_label() {
                 assert_eq!(
                     *label, lineage,
