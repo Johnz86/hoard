@@ -1,6 +1,4 @@
 const KEY = "hoard.settings";
-const THEMES = ["system", "dark", "light"];
-
 const DEFAULTS = {
     theme: "system",
     density: "Condensed",
@@ -43,14 +41,4 @@ export function updateSettings(patch) {
     write(settings);
     applySettings();
     return settings;
-}
-
-export function cycleTheme() {
-    const next = THEMES[(THEMES.indexOf(settings.theme) + 1) % THEMES.length];
-    updateSettings({ theme: next });
-    return next;
-}
-
-export function themeLabel() {
-    return settings.theme.toUpperCase();
 }

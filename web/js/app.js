@@ -11,7 +11,7 @@ import { loadJobs, loadSources, renderJobsView, renderScansView } from "./jobs.j
 import { initSearch, renderTokenStrip, setSearchValue } from "./search.js";
 import { loadShelves, renderShelfRail, renderShelvesView } from "./shelves.js";
 import { renderTable, revealCursor } from "./table.js";
-import { applySettings, cycleTheme, settings, themeLabel, updateSettings } from "./theme.js";
+import { applySettings, settings, updateSettings } from "./theme.js";
 
 const NAV = [
     { label: "INDEX", route: "/index" },
@@ -738,6 +738,7 @@ function render() {
 
 function paintPrefs() {
     const host = document.getElementById("prefs-panel");
+    document.getElementById("prefs-btn").setAttribute("aria-expanded", String(state.prefsOpen));
     host.hidden = !state.prefsOpen;
     if (!state.prefsOpen) {
         host.replaceChildren();
@@ -765,7 +766,6 @@ function paintPrefs() {
         choice("THEME", ["system", "dark", "light"], settings.theme, (value) => {
             updateSettings({ theme: value });
             paintPrefs();
-            paintThemeButton();
         }),
         choice("DENSITY", ["Condensed", "Roomy"], settings.density, (value) => {
             updateSettings({ density: value });
@@ -782,10 +782,6 @@ function paintPrefs() {
     );
 }
 
-function paintThemeButton() {
-    document.getElementById("theme-btn").textContent = themeLabel();
-}
-
 function initTopbar() {
     document.getElementById("wordmark").addEventListener("click", () => goIndex());
     document.getElementById("loadout-btn").addEventListener("click", () => {
@@ -793,11 +789,6 @@ function initTopbar() {
         else openDrawer();
     });
     document.getElementById("node-pulse").addEventListener("click", () => navigate("#/nodes"));
-    document.getElementById("theme-btn").addEventListener("click", () => {
-        cycleTheme();
-        paintThemeButton();
-        paintPrefs();
-    });
     document.getElementById("prefs-btn").addEventListener("click", (event) => {
         event.stopPropagation();
         state.prefsOpen = !state.prefsOpen;
@@ -809,7 +800,6 @@ function initTopbar() {
         state.prefsOpen = false;
         paintPrefs();
     });
-    paintThemeButton();
 }
 
 function start() {

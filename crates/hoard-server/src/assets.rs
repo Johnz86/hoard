@@ -3,6 +3,7 @@ use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 
 const INDEX: &str = "index.html";
+const CACHE_CONTROL: &str = "no-cache";
 
 /// The web UI. Embedded in the binary for release builds and read from disk in debug, so a
 /// developer editing `web/` sees the change on reload without a rebuild.
@@ -14,9 +15,8 @@ struct WebAssets;
 
 /// Serves an embedded file, falling back to `index.html` so deep links into the UI work.
 ///
-/// A request that presents the file's current entity tag is answered 304, which is what
-/// keeps `index.html` from being sent again on every load: it is served `no-cache`, so the
-/// browser revalidates it every time and the whole shell would otherwise be resent.
+/// A request that presents the file's current entity tag is answered 304. UI assets
+/// revalidate on every load so a new shell cannot run with an older cached script.
 pub async fn serve(uri: Uri, headers: HeaderMap) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { INDEX } else { path };
@@ -36,13 +36,12 @@ pub async fn serve(uri: Uri, headers: HeaderMap) -> Response {
 fn embedded_response(path: &str, file: rust_embed::EmbeddedFile, headers: &HeaderMap) -> Response {
     let mime = mime_guess::from_path(path).first_or_octet_stream();
     let etag = entity_tag(&file.metadata.sha256_hash());
-    let cache = cache_control(path);
     if presented_etag_matches(headers, &etag) {
         return (
             StatusCode::NOT_MODIFIED,
             [
                 (header::ETAG, etag),
-                (header::CACHE_CONTROL, cache.to_owned()),
+                (header::CACHE_CONTROL, CACHE_CONTROL.to_owned()),
             ],
         )
             .into_response();
@@ -51,7 +50,7 @@ fn embedded_response(path: &str, file: rust_embed::EmbeddedFile, headers: &Heade
         [
             (header::CONTENT_TYPE, mime.as_ref().to_owned()),
             (header::ETAG, etag),
-            (header::CACHE_CONTROL, cache.to_owned()),
+            (header::CACHE_CONTROL, CACHE_CONTROL.to_owned()),
         ],
         file.data.into_owned(),
     )
@@ -70,14 +69,6 @@ fn presented_etag_matches(headers: &HeaderMap, etag: &str) -> bool {
                 candidate == "*" || candidate.trim_start_matches("W/") == etag
             })
         })
-}
-
-const fn cache_control(path: &str) -> &'static str {
-    if matches!(path.as_bytes(), b"index.html") {
-        "no-cache"
-    } else {
-        "public, max-age=3600"
-    }
 }
 
 /// The quoted hex spelling of a file's content hash.
@@ -213,5 +204,32 @@ mod tests {
             serve(Uri::from_static("/"), stale).await.status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn scripts_and_styles_revalidate_with_the_shell() {
+        for (path, content_type) in [
+            ("/js/app.js?v=prefs-icon", "text/javascript"),
+            ("/css/hoard.css?v=prefs-icon", "text/css"),
+        ] {
+            let response = serve(path.parse().expect("asset path"), HeaderMap::new()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some(content_type),
+                "{path} must serve the asset instead of the shell"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some(CACHE_CONTROL),
+                "{path} must revalidate before the shell runs"
+            );
+        }
     }
 }
