@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use hoard_core::Base;
+use hoard_core::{Base, Role};
 use tantivy::SegmentOrdinal;
 
 use crate::error::Result;
@@ -12,10 +12,8 @@ use crate::search::token::ParsedQuery;
 use super::answer::Summary;
 use super::collapse::{Hit, NO_TERM, SegmentStrings, Spelling};
 
+pub(super) const ROLE_DIMENSION: usize = 0;
 pub(super) const BASE_DIMENSION: usize = 2;
-/// How many base buckets the rail carries. The tally orders them, the prefix rule then
-/// counts each one with a query of its own, so this bounds the searches a query pays for
-/// the rail by a constant rather than by how many bases the catalog holds.
 pub(in crate::catalog) const BASE_RAIL: usize = 48;
 pub(super) const NODE_DIMENSION: usize = 5;
 /// The six facet dimensions, named as the columns a collapsed hit carries them in.
@@ -158,51 +156,22 @@ pub(super) fn count_buckets(summary: &Summary, dimension: usize) -> Result<Vec<F
     }
     let mut buckets: Vec<FacetBucket> = tallies
         .into_iter()
-        .map(|(value, tally)| FacetBucket {
-            value,
-            label: tally.label,
-            count: tally.count,
-            active: false,
-            members: Vec::new(),
+        .map(|(value, tally)| {
+            let label = match dimension == ROLE_DIMENSION {
+                true => Role::from_alias(&value).map(|role| role.facet_label().to_owned()),
+                false => tally.label,
+            };
+            FacetBucket {
+                value,
+                label,
+                count: tally.count,
+                active: false,
+                members: Vec::new(),
+            }
         })
         .collect();
     order_buckets(&mut buckets);
     Ok(buckets)
-}
-
-/// Which base buckets the rail counts before it ranks them: the most populous by exact
-/// term, and every family root among the rest that one of those extends.
-///
-/// A bucket is shown with the prefix rule's count, not the tally's, so a root carried by
-/// few artifacts but prefixing many is a larger bucket than its own tally says. Ranking on
-/// the tally alone would cut such a root before it was ever counted. Only a base the tally
-/// already holds is a candidate, so capping the rail can drop a bucket and never invent one.
-/// The extra candidates are themselves capped, so the searches a rail costs stay bounded by
-/// a constant.
-pub(super) fn base_candidates(buckets: Vec<FacetBucket>) -> Vec<FacetBucket> {
-    if buckets.len() <= BASE_RAIL {
-        return buckets;
-    }
-    let mut kept = buckets;
-    let rest = kept.split_off(BASE_RAIL);
-    let mut extra = {
-        let roots: HashSet<&str> = kept
-            .iter()
-            .flat_map(|bucket| {
-                bucket
-                    .value
-                    .char_indices()
-                    .skip(1)
-                    .map(|(end, _)| &bucket.value[..end])
-            })
-            .collect();
-        rest.into_iter()
-            .filter(|bucket| roots.contains(bucket.value.as_str()))
-            .collect::<Vec<FacetBucket>>()
-    };
-    extra.truncate(BASE_RAIL);
-    kept.extend(extra);
-    kept
 }
 
 fn by_count_then_value(left: &FacetBucket, right: &FacetBucket) -> Ordering {
@@ -219,8 +188,7 @@ pub(super) fn order_buckets(buckets: &mut [FacetBucket]) {
 /// Moves every bucket a positive `base:` token of the query names ahead of the rail's cut,
 /// so a base a person asked for by its own name is on the rail however few artifacts carry
 /// it and however many larger bases there are. The order among everything else is left as
-/// [`order_buckets`] settled it. The rail cuts twice, once choosing candidates and once
-/// taking the largest of them, so this runs before each cut.
+/// [`order_buckets`] settled it.
 pub(super) fn keep_named_bases(buckets: &mut [FacetBucket], query: &ParsedQuery) {
     let named: Vec<Base> = query
         .tokens_with_key("base")
@@ -230,7 +198,13 @@ pub(super) fn keep_named_bases(buckets: &mut [FacetBucket], query: &ParsedQuery)
     if named.is_empty() {
         return;
     }
-    buckets.sort_by_key(|bucket| !named.contains(&Base::new(&bucket.value)));
+    buckets.sort_by_key(|bucket| {
+        !named.contains(&Base::new(&bucket.value))
+            && !bucket
+                .members
+                .iter()
+                .any(|member| named.contains(&Base::new(member)))
+    });
 }
 
 /// The base rail's displayed order: [`Base::ANY`] last whatever it counts, because a row

@@ -690,7 +690,7 @@ fn a_segment_with_deletes_answers_what_a_fresh_index_answers() -> Result<()> {
 }
 
 #[test]
-fn a_base_bucket_keeps_its_label_only_when_every_segment_agrees() -> Result<()> {
+fn a_family_label_stays_stable_when_exact_base_spellings_disagree() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let config = IndexConfig {
         data_dir: directory.path().join("data"),
@@ -733,7 +733,7 @@ fn a_base_bucket_keeps_its_label_only_when_every_segment_agrees() -> Result<()> 
             .facets
             .base
             .into_iter()
-            .find(|bucket| bucket.value == "sdxl10")
+            .find(|bucket| bucket.value == "sdxl")
             .and_then(|bucket| bucket.label))
     };
     catalog.seed(&[
@@ -743,8 +743,8 @@ fn a_base_bucket_keeps_its_label_only_when_every_segment_agrees() -> Result<()> 
     catalog.rebuild_search(|_| {})?;
     assert_eq!(
         bucket_label(&catalog)?,
-        Some("SDXL 1.0".to_owned()),
-        "one segment whose artifacts agree carries the label"
+        Some("sdxl".to_owned()),
+        "the drawer uses the family name"
     );
     catalog.seed(&[labelled("third", "SDXL Turbo", 0x3)])?;
     catalog.refresh_search(|_| {})?;
@@ -752,18 +752,10 @@ fn a_base_bucket_keeps_its_label_only_when_every_segment_agrees() -> Result<()> 
         catalog.search_segments()? > 1,
         "the refresh puts the differing label in a segment of its own"
     );
-    assert_eq!(
-        bucket_label(&catalog)?,
-        None,
-        "a segment that spells another label takes the label off the bucket"
-    );
+    assert_eq!(bucket_label(&catalog)?, Some("sdxl".to_owned()));
     catalog.seed(&[labelled("fourth", "SDXL 1.0", 0x4)])?;
     catalog.refresh_search(|_| {})?;
-    assert_eq!(
-        bucket_label(&catalog)?,
-        None,
-        "an agreeing segment afterwards does not restore it"
-    );
+    assert_eq!(bucket_label(&catalog)?, Some("sdxl".to_owned()));
     assert_eq!(search(&catalog, "")?.total, 4);
     Ok(())
 }

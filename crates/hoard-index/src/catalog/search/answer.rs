@@ -31,8 +31,8 @@ use super::paging::{
 };
 use super::schema::Fields;
 use super::tally::{
-    BASE_DIMENSION, BASE_RAIL, SegmentTallies, base_candidates, count_buckets, keep_named_bases,
-    order_base_buckets, order_buckets,
+    BASE_DIMENSION, BASE_RAIL, SegmentTallies, count_buckets, keep_named_bases, order_base_buckets,
+    order_buckets,
 };
 use super::{QueryPage, QueryRequest};
 
@@ -304,10 +304,6 @@ impl Catalog {
 
     /// Each dimension counted over the set its own key does not narrow, which is what keeps
     /// a facet click from reducing the rail it was clicked in to one bucket.
-    ///
-    /// The base rail is [`base_candidates`] counted by the prefix rule, each with a query of
-    /// its own, and then cut to the [`BASE_RAIL`] largest by that count, so the searches one
-    /// query pays for the rail do not grow with the number of bases the catalog holds.
     fn facets(&self, pass: &FacetPass<'_>) -> Result<Facets> {
         let mut dimensions: [Vec<FacetBucket>; FACET_DIMENSIONS.len()] =
             std::array::from_fn(|_| Vec::new());
@@ -322,20 +318,24 @@ impl Catalog {
             let mut buckets = count_buckets(narrowed.as_ref().unwrap_or(pass.summary), index)?;
             if index == BASE_DIMENSION {
                 base_total = buckets.len() as u64;
-                keep_named_bases(&mut buckets, pass.parsed);
-                buckets = base_candidates(buckets);
-                for bucket in &mut buckets {
-                    let scoped = BooleanQuery::intersection(vec![
-                        excluded.box_clone(),
-                        query::base_filter(pass.bound.fields, &bucket.value),
-                    ]);
-                    bucket.count = pass.count(scoped)?;
-                }
+                buckets = FacetPass::consolidate_brands(buckets);
                 order_buckets(&mut buckets);
                 keep_named_bases(&mut buckets, pass.parsed);
                 buckets.truncate(BASE_RAIL);
-                base_shown = buckets.len() as u64;
-                buckets = pass.consolidate_brands(excluded.as_ref(), buckets)?;
+                base_shown = buckets
+                    .iter()
+                    .map(|bucket| bucket.members.len().max(1) as u64)
+                    .sum();
+                for bucket in &mut buckets {
+                    let selection = match bucket.members.is_empty() {
+                        true => bucket.value.clone(),
+                        false => bucket.members.join(","),
+                    };
+                    let parsed = parse(&format!("base:{selection}"));
+                    let selection = query::compile(&parsed.tokens, None, pass.bound)?;
+                    let scoped = BooleanQuery::intersection(vec![excluded.box_clone(), selection]);
+                    bucket.count = pass.count(scoped)?;
+                }
                 order_base_buckets(&mut buckets);
             }
             dimensions[index] = buckets;
@@ -629,51 +629,28 @@ impl FacetPass<'_> {
         })
     }
 
-    /// The rail's base rows once every brand has claimed the buckets belonging to it: one row
-    /// per brand, standing where its first member stood and carrying the values it stands for,
-    /// and every bucket no brand claims passed through as it was.
-    ///
-    /// A brand row is counted by running the very query it offers - the union of exactly the
-    /// member values, through the same grammar a typed `base:a,b` compiles through - so an
-    /// artifact two members both hold is counted once and a row can never open a result its
-    /// count disagrees with. The brand key itself is never the query: only a value
-    /// [`brands::brand_of`] claims joins a row, which is what keeps `qwenimage` out of `qwen`.
-    fn consolidate_brands(
-        &self,
-        excluded: &dyn Query,
-        buckets: Vec<FacetBucket>,
-    ) -> Result<Vec<FacetBucket>> {
+    fn consolidate_brands(buckets: Vec<FacetBucket>) -> Vec<FacetBucket> {
         let mut rows: Vec<FacetBucket> = Vec::with_capacity(buckets.len());
-        let mut claimed: Vec<(&'static str, usize)> = Vec::new();
+        let mut claimed: HashMap<String, usize> = HashMap::new();
         for bucket in buckets {
-            let Some(key) = brands::brand_of(&bucket.value) else {
-                rows.push(bucket);
-                continue;
-            };
-            match claimed.iter().find(|(held, _)| *held == key) {
-                Some((_, position)) => rows[*position].members.push(bucket.value),
+            let key = brands::brand_of(&bucket.value);
+            match claimed.get(key) {
+                Some(position) => {
+                    rows[*position].count += bucket.count;
+                    rows[*position].members.push(bucket.value);
+                }
                 None => {
-                    claimed.push((key, rows.len()));
+                    claimed.insert(key.to_string(), rows.len());
                     rows.push(FacetBucket {
-                        value: key.to_owned(),
-                        label: Some(key.to_owned()),
-                        count: 0,
+                        value: key.to_string(),
+                        label: Some(key.to_string()),
+                        count: bucket.count,
                         active: false,
                         members: vec![bucket.value],
                     });
                 }
             }
         }
-        for (_, position) in claimed {
-            let union = {
-                let parsed = parse(&format!("base:{}", rows[position].members.join(",")));
-                query::compile(&parsed.tokens, None, self.bound)?
-            };
-            rows[position].count = self.count(BooleanQuery::intersection(vec![
-                excluded.box_clone(),
-                union,
-            ]))?;
-        }
-        Ok(rows)
+        rows
     }
 }

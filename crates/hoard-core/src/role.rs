@@ -104,6 +104,22 @@ impl Role {
         }
     }
 
+    /// The label shown in the role filter, independent of the stored role code.
+    pub const fn facet_label(self) -> &'static str {
+        match self {
+            Role::Ckpt => "Checkpoint",
+            Role::Lora => "LoRA",
+            Role::Ctrl => "ControlNet",
+            Role::Upsc => "Upscaler",
+            Role::Vae => "VAE",
+            Role::Emb => "Embedding",
+            Role::Llm => "LLM",
+            Role::Ds => "Dataset",
+            Role::Proj => "Projector",
+            Role::Unk => "Unclassified",
+        }
+    }
+
     pub fn is_adapter(self) -> bool {
         Self::ADAPTERS.contains(&self)
     }
@@ -458,6 +474,26 @@ mod tests {
             assert_eq!(Role::from_alias(alias), Some(expected), "alias {alias}");
         }
         assert_eq!(Role::from_alias("nonsense"), None);
+    }
+
+    #[test]
+    fn role_filter_labels_name_each_role_without_changing_its_code() {
+        let labels = [
+            (Role::Ckpt, "ckpt", "Checkpoint"),
+            (Role::Lora, "lora", "LoRA"),
+            (Role::Ctrl, "ctrl", "ControlNet"),
+            (Role::Upsc, "upsc", "Upscaler"),
+            (Role::Vae, "vae", "VAE"),
+            (Role::Emb, "emb", "Embedding"),
+            (Role::Llm, "llm", "LLM"),
+            (Role::Ds, "ds", "Dataset"),
+            (Role::Proj, "proj", "Projector"),
+            (Role::Unk, "unk", "Unclassified"),
+        ];
+        for (role, code, label) in labels {
+            assert_eq!(role.as_str(), code);
+            assert_eq!(role.facet_label(), label);
+        }
     }
 
     #[test]

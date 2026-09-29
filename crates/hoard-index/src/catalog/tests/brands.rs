@@ -66,13 +66,12 @@ fn a_brand_row_stands_alone_and_its_members_are_not_rows() -> Result<()> {
     let page = search(&catalog, "")?;
     assert_eq!(
         base_values(&page),
-        vec!["qwen", "qwenimage2512"],
+        vec!["qwen"],
         "a brand replaces the rows it claims rather than heading them"
     );
-    assert_eq!(members(&page, "qwen"), vec!["qwen3", "qwen35moe"]);
-    assert!(
-        base_row(&page, "qwenimage2512").members.is_empty(),
-        "a row no brand claims stands for itself alone"
+    assert_eq!(
+        members(&page, "qwen"),
+        vec!["qwenimage2512", "qwen3", "qwen35moe"]
     );
     assert_eq!(
         page.facets.base_shown, 3,
@@ -83,7 +82,7 @@ fn a_brand_row_stands_alone_and_its_members_are_not_rows() -> Result<()> {
 }
 
 #[test]
-fn a_brand_row_unions_its_members_and_never_prefixes_them() -> Result<()> {
+fn a_brand_row_unions_its_members_and_never_counts_twice() -> Result<()> {
     let (_directory, catalog) = brand_fixture(&[
         ("qwen3", 3),
         ("qwen35moe", 2),
@@ -98,20 +97,20 @@ fn a_brand_row_unions_its_members_and_never_prefixes_them() -> Result<()> {
         "a brand row labels itself with the key its members spell, not a second vocabulary"
     );
     assert_eq!(
-        qwen.count, 5,
-        "the row counts its two members and never the unrelated qwen-image family"
+        qwen.count, 9,
+        "the family includes both language and image variants"
     );
     assert_eq!(
         members(&page, "qwen"),
-        vec!["qwen3", "qwen35moe"],
+        vec!["qwenimage2512", "qwen3", "qwen35moe"],
         "the members are the rail's own, in the order the rail listed them"
     );
     assert_eq!(
-        search(&catalog, "base:qwen3,qwen35moe")?.total,
+        search(&catalog, "base:qwenimage2512,qwen3,qwen35moe")?.total,
         qwen.count,
         "the query a brand row opens counts what the brand row says"
     );
-    assert_eq!(base_row(&page, "qwenimage2512").count, 4);
+    assert_eq!(search(&catalog, "base:qwenimage2512")?.total, 4);
     Ok(())
 }
 
@@ -153,7 +152,7 @@ fn a_lineage_bucket_counts_what_its_click_answers() -> Result<()> {
         assert!(values.contains(&value), "{value} is a row of its own");
     }
     assert!(
-        base_row(&page, "sdxl").members.is_empty(),
+        base_row(&page, "sdxl").members == ["sdxl"],
         "a lineage is not a member of its architecture's row"
     );
     Ok(())
@@ -234,7 +233,7 @@ fn a_brand_row_is_active_only_when_its_whole_union_is_selected() -> Result<()> {
         !base_row(&one, "gemma").active,
         "a brand the query never names is untouched"
     );
-    let whole = search(&catalog, "base:qwen35moe,qwen3vl")?;
+    let whole = search(&catalog, "base:qwen35moe,qwen3vl,qwenimage2512")?;
     assert!(
         base_row(&whole, "qwen").active,
         "the query the brand row itself opens marks it"
@@ -245,14 +244,14 @@ fn a_brand_row_is_active_only_when_its_whole_union_is_selected() -> Result<()> {
         !qwen.active,
         "qwen-image is neither counted by the brand nor marks it"
     );
-    assert!(base_row(&unrelated, "qwenimage2512").active);
+    assert_eq!(search(&catalog, "base:qwenimage2512")?.total, 3);
     assert_eq!(
-        qwen.count, 4,
-        "the brand still counts its own two members, over the set the base key does not narrow"
+        qwen.count, 7,
+        "the brand counts all three members over the set the base key does not narrow"
     );
     assert_eq!(
         base_values(&search(&catalog, "")?),
-        vec!["gemma", "qwen", "qwenimage2512"],
+        vec!["qwen", "gemma"],
         "a brand row is re-sorted by its own union count, not left at its first member's rank"
     );
     Ok(())
@@ -260,14 +259,11 @@ fn a_brand_row_is_active_only_when_its_whole_union_is_selected() -> Result<()> {
 
 #[test]
 fn a_base_no_brand_claims_is_its_own_row() -> Result<()> {
-    let (_directory, catalog) = brand_fixture(&[("sdxl", 2), ("qwenimage2512", 1)])?;
+    let (_directory, catalog) = brand_fixture(&[("sdxl", 2), ("pony", 1)])?;
     let page = search(&catalog, "")?;
-    for value in ["sdxl", "qwenimage2512"] {
+    for value in ["sdxl", "pony"] {
         let row = base_row(&page, value);
-        assert!(
-            row.members.is_empty(),
-            "{value} names no brand anchor and stands for itself"
-        );
+        assert!(row.members == [value], "{value} stands for its exact base");
         assert_eq!(row.label.as_deref(), Some(value));
     }
     Ok(())
@@ -276,7 +272,13 @@ fn a_base_no_brand_claims_is_its_own_row() -> Result<()> {
 #[test]
 fn a_base_the_query_names_stays_on_the_rail() -> Result<()> {
     let names: Vec<String> = (0..=BASE_RAIL)
-        .map(|index| format!("r{index:02}x"))
+        .map(|index| {
+            format!(
+                "r{}{}x",
+                (b'a' + (index / 26) as u8) as char,
+                (b'a' + (index % 26) as u8) as char
+            )
+        })
         .collect();
     let mut populations: Vec<(&str, usize)> = names.iter().map(|name| (name.as_str(), 1)).collect();
     populations.push(("crowd", 2));
@@ -301,5 +303,29 @@ fn a_base_the_query_names_stays_on_the_rail() -> Result<()> {
         named.facets.base_shown as usize, BASE_RAIL,
         "keeping it costs the rail nothing: it still shows as many bases as it can"
     );
+    Ok(())
+}
+
+#[test]
+fn a_family_includes_variants_that_would_fall_below_the_rail_cap() -> Result<()> {
+    let names: Vec<String> = (0..BASE_RAIL)
+        .map(|index| {
+            format!(
+                "r{}{}x",
+                (b'a' + (index / 26) as u8) as char,
+                (b'a' + (index % 26) as u8) as char
+            )
+        })
+        .collect();
+    let mut populations: Vec<(&str, usize)> = names.iter().map(|name| (name.as_str(), 1)).collect();
+    populations.extend([("qwen3", 3), ("qwenimage2512", 1)]);
+    let (_directory, catalog) = brand_fixture(&populations)?;
+
+    let page = search(&catalog, "")?;
+    let qwen = base_row(&page, "qwen");
+    assert_eq!(qwen.count, 4);
+    assert_eq!(qwen.members, vec!["qwen3", "qwenimage2512"]);
+    assert_eq!(page.facets.base_total, BASE_RAIL as u64 + 2);
+    assert_eq!(page.facets.base_shown, BASE_RAIL as u64 + 1);
     Ok(())
 }

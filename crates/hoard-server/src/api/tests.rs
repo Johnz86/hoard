@@ -592,12 +592,12 @@ async fn search_answers_the_documented_shape() {
     );
     assert_eq!(
         body["facets"]["base_shown"], base_total,
-        "a rail whose bases share no brand shows each of them as its own row"
+        "each displayed family stands for one exact base in this fixture"
     );
     assert_eq!(
         body["facets"]["base"][0]["members"],
-        json!([]),
-        "a bucket the rail lists on its own stands for no other value"
+        json!(["sdxl10"]),
+        "a family row lists even its sole exact base"
     );
 }
 
@@ -775,6 +775,34 @@ async fn a_facet_dimension_is_counted_with_its_own_key_removed() {
     assert_eq!(active.len(), 1);
     assert_eq!(active[0]["value"], "lora");
     assert_eq!(active[0]["token"], "role:lora");
+}
+
+#[tokio::test]
+async fn role_facets_show_names_while_short_and_long_queries_agree() {
+    let world = seeded();
+    let body = get(&world.state, "/api/v1/search").await;
+    let roles = body["facets"]["role"].as_array().expect("role facets");
+    for (code, label) in [
+        ("ckpt", "Checkpoint"),
+        ("lora", "LoRA"),
+        ("vae", "VAE"),
+        ("llm", "LLM"),
+        ("ds", "Dataset"),
+        ("unk", "Unclassified"),
+    ] {
+        let bucket = roles
+            .iter()
+            .find(|bucket| bucket["value"] == code)
+            .expect("the role is listed");
+        assert_eq!(bucket["label"], label);
+        assert_eq!(bucket["token"], format!("role:{code}"));
+    }
+    for (short, long) in [("ckpt", "checkpoint"), ("ds", "dataset")] {
+        let short = get(&world.state, &format!("/api/v1/search?q=role:{short}")).await;
+        let long = get(&world.state, &format!("/api/v1/search?q=role:{long}")).await;
+        assert_eq!(short["total"], long["total"]);
+        assert_eq!(short["rows"], long["rows"]);
+    }
 }
 
 #[tokio::test]

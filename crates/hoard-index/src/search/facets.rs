@@ -9,7 +9,7 @@ use crate::search::token::{ParsedQuery, Token, TokenKind};
 pub const FACET_DIMENSIONS: [(&str, &str); 6] = [
     ("role", "ROLE"),
     ("layout", "SOURCE LAYOUT"),
-    ("base", "BASE ARCHITECTURE"),
+    ("base", "MODEL FAMILY"),
     ("format", "FORMAT"),
     ("precision", "PRECISION"),
     ("node", "NODE"),
@@ -25,12 +25,9 @@ pub struct Facets {
     pub precision: Vec<FacetBucket>,
     pub node: Vec<FacetBucket>,
     pub disk_pressure: DiskPressure,
-    /// How many distinct bases the result set holds, before the rail was cut to the
-    /// largest of them, so the rail can say what it is not showing.
+    /// How many distinct bases the result set holds before family grouping and the rail cap.
     pub base_total: u64,
-    /// How many exact base buckets the rows of `base` stand for, counted after the rail was
-    /// cut and before brands claimed their members, so the cap note still compares like with
-    /// like now that one row can stand for several buckets.
+    /// How many exact base buckets the displayed family rows stand for.
     pub base_shown: u64,
 }
 
@@ -65,14 +62,7 @@ impl Facets {
     }
 }
 
-/// Marks the buckets the query selects, reading a brand row off the values it stands for
-/// rather than off its own.
-///
-/// A brand key is not a stored base value and is shorter than every member it names, so the
-/// base key's prefix rule would light a brand row up for values it never holds -
-/// `base:qwenimage2512` would mark `qwen`, the very artifact the row is built to exclude. A
-/// row that stands for members is selected when every one of them is, because that is the
-/// union its own click issues.
+/// Marks a family when the query selects every exact base its row stands for.
 ///
 /// The base value `any` is compared for equality here rather than through the compatibility
 /// wildcard: the `any` bucket is marked only by a token holding `any`, and a token holding

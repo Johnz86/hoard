@@ -37,8 +37,7 @@ pub struct FacetBucketView {
     pub active: bool,
     pub token: String,
     pub query: String,
-    /// The exact base values a brand row stands for, empty on every row that stands for
-    /// itself. It is what the row's `token` and `query` select and what its hover text names.
+    /// The exact base values a family row stands for. They determine its query and tooltip.
     pub members: Vec<String>,
 }
 
@@ -54,8 +53,7 @@ pub struct FacetsView {
     pub node: Vec<FacetBucketView>,
     pub disk_pressure: DiskPressureView,
     pub base_total: u64,
-    /// How many exact bases the rows of `base` stand for, which is more than `base.len()`
-    /// wherever a brand row claimed several of them.
+    /// How many exact bases the displayed family rows of `base` stand for.
     pub base_shown: u64,
 }
 
@@ -280,10 +278,12 @@ mod tests {
 
     fn grouped() -> Facets {
         Facets {
-            base: vec![
-                brand("qwen", "qwen", 5, &["qwen3", "qwen35moe"]),
-                bucket("qwenimage2512", 4),
-            ],
+            base: vec![brand(
+                "qwen",
+                "qwen",
+                9,
+                &["qwen3", "qwen35moe", "qwenimage2512"],
+            )],
             base_total: 3,
             base_shown: 3,
             ..Facets::default()
@@ -296,10 +296,10 @@ mod tests {
         let family = &view.base[0];
         assert_eq!(family.value, "qwen");
         assert_eq!(family.label, "qwen");
-        assert_eq!(family.count, 5);
-        assert_eq!(family.members, vec!["qwen3", "qwen35moe"]);
-        assert_eq!(family.token, "base:qwen3,qwen35moe");
-        assert_eq!(family.query, "role:llm base:qwen3,qwen35moe");
+        assert_eq!(family.count, 9);
+        assert_eq!(family.members, vec!["qwen3", "qwen35moe", "qwenimage2512"]);
+        assert_eq!(family.token, "base:qwen3,qwen35moe,qwenimage2512");
+        assert_eq!(family.query, "role:llm base:qwen3,qwen35moe,qwenimage2512");
     }
 
     #[test]
@@ -307,11 +307,9 @@ mod tests {
         let view = facets(&grouped(), &parse(""));
         assert_eq!(
             view.base.len(),
-            2,
+            1,
             "consolidation removes the rows a brand claims, it adds no parallel list"
         );
-        assert_eq!(view.base[1].value, "qwenimage2512");
-        assert_eq!(view.base[1].query, "base:qwenimage2512");
         assert_eq!(
             view.base_shown, 3,
             "two rows still stand for the three bases the rail counted"

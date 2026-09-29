@@ -89,16 +89,14 @@ pub struct FacetBucket {
     ///
     /// `value` is the normalized matching key, so a base family reads `nemotronh` while the
     /// architecture is written `nemotron_h`. Where a bucket holds one spelling it is shown;
-    /// where it holds several the key is the only honest label for the group. A brand row
-    /// restates its key here rather than disagreeing with it, so the rail names a brand the
-    /// way its members spell it.
+    /// where it holds several the key is the only honest label for the group. A family row
+    /// uses its lowercase, numberless name and lists exact bases in `members`.
     pub label: Option<String>,
     pub count: u64,
     pub active: bool,
     /// The exact base values this row stands for.
     ///
-    /// Empty on a bucket the rail lists on its own; on a brand row, every value the rail would
-    /// otherwise have shown separately, in the order they would have appeared.
+    /// A family row lists every exact base it groups, including a family with one base.
     pub members: Vec<String>,
 }
 

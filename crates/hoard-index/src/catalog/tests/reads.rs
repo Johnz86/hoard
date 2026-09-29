@@ -1374,8 +1374,6 @@ fn an_any_base_answers_only_its_own_bucket() -> Result<()> {
     Ok(())
 }
 
-/// A catalog of 46 distinct bases: two families whose roots the rail has to add, and forty
-/// siblings no root joins, which together are more bases than the rail can hold.
 fn base_rail_fixture() -> Result<(TempDir, Catalog, usize)> {
     let directory = tempfile::tempdir()?;
     let config = IndexConfig {
@@ -1392,8 +1390,16 @@ fn base_rail_fixture() -> Result<(TempDir, Catalog, usize)> {
         ("sdxl".to_owned(), 2),
         ("sd".to_owned(), 1),
     ];
-    populations.extend((0..43).map(|index| (format!("base-{index:02}"), 2)));
-    populations.extend((43..60).map(|index| (format!("base-{index:02}"), 1)));
+    populations.extend((0..60).map(|index| {
+        (
+            format!(
+                "base-{}{}",
+                (b'a' + (index / 26) as u8) as char,
+                (b'a' + (index % 26) as u8) as char
+            ),
+            usize::from(index < 43) + 1,
+        )
+    }));
     let mut entries = Vec::new();
     let mut identity = 0x4000_u128;
     for (base, held) in &populations {
@@ -1447,16 +1453,19 @@ fn the_base_rail_holds_at_most_the_capped_buckets_and_counts_them_by_prefix() ->
         .map(|bucket| bucket.value.as_str())
         .collect();
     shown.sort_unstable();
-    let mut expected: Vec<String> = ["fam", "fam20", "sd", "sd15", "sd21"]
+    let mut expected: Vec<String> = ["fam", "sd", "sdxl"]
         .into_iter()
         .map(str::to_owned)
         .collect();
-    expected.extend((0..43).map(|index| Base::new(format!("base-{index:02}")).as_str().to_owned()));
+    expected.extend((0..45).map(|index| {
+        format!(
+            "base{}{}",
+            (b'a' + (index / 26) as u8) as char,
+            (b'a' + (index % 26) as u8) as char
+        )
+    }));
     expected.sort_unstable();
-    assert_eq!(
-        shown, expected,
-        "the rail holds the bases the prefix rule makes largest"
-    );
+    assert_eq!(shown, expected, "the rail holds the most common families");
 
     let root = page
         .facets
@@ -1490,7 +1499,7 @@ fn the_base_rail_holds_at_most_the_capped_buckets_and_counts_them_by_prefix() ->
         "the bucket counts the query it opens"
     );
     assert_eq!(
-        search(&catalog, "base:base55")?.total,
+        search(&catalog, "base:basecd")?.total,
         1,
         "a base the rail does not show still answers its own query"
     );
@@ -1530,7 +1539,7 @@ fn a_total_counts_what_the_page_path_counts_without_answering_a_page() -> Result
         seeded as u64,
         "the empty query counts every artifact, over more bases than the rail can show"
     );
-    for raw in ["base:sd", "base:base55", "role:lora", "role:ds", "size:>1"] {
+    for raw in ["base:sd", "base:basecd", "role:lora", "role:ds", "size:>1"] {
         totals_agree(&catalog, raw)?;
     }
     let (_mirrored, collapsing) = paging_fixture(40)?;

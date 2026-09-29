@@ -77,42 +77,33 @@ SDXL and `base:pony` finds the Pony ones alone, never the files known only as `s
 architecture is a compatibility question and not a question about which family a file belongs
 to: a Pony adapter fits a Pony host or a plain SDXL one, and never an Illustrious one.
 
-`facets.base` is counted over at most 48 buckets. A bucket's `count` is the prefix-rule count
-plus one term for every lineage of that architecture, which is exactly what `base:<value>`
-answers and so exactly how many artifacts the query the bucket opens returns; a family bucket
-counts the versions under it and an architecture bucket counts its lineages. The 32 are the largest by that count among the most populous bases by
-exact term together with the family roots those bases extend, so a root that few artifacts
-carry exactly but many extend is on the rail. A base outside the 32 is not shown and is not
-marked active, and a query naming it still answers. The `any` bucket is active only when a
+`facets.base` contains at most 48 model family rows. Exact indexed base values are grouped
+before that limit, so a displayed family includes even its less common variants. Families
+are ranked by the sum of their exact-term populations, then each displayed row is counted
+with the same union query its click opens. A family outside the limit is not shown; a query
+naming one of its exact bases still answers. The `any` bucket is active only when a
 positive `base:` token holds the value `any`, and the value `any` marks no other bucket, so
 `base:any,flux` marks both and `base:flux` does not mark `any`, although compatibility still
 reads a stored `any` as matching every base.
 
 `facets.base_total` is how many distinct bases the result set holds by exact term, counted
-before the rail added any family root and before it was cut to 32, so a rail standing for
+before grouping and the limit, so a rail standing for
 fewer bases than `base_total` is hiding the rest and can say so. It answers only for `base`;
 no other dimension is capped.
 
-`facets.base` is one flat list: a bucket the server groups under no brand stands for itself,
-and where a brand claims one or more buckets it replaces them with a single row rather than
-heading them. A brand row's `value` and its `label` are both the brand key, so the row names
-a brand the way its own members spell it, while its `members` holds the exact base values it
-stands for, in the order the rail would have listed them. The `any` row sorts after every
-other base row whatever its count. `members` is empty on every row that stands for itself,
-and such a row's `label` is the architecture as it was written where it was read. A row's
-`token` and
-`query` select `members` as a union (`base:qwen3,qwen35moe`), never the brand key as a prefix:
-two unrelated products sharing a string root are never counted together. A brand row's `count`
-is that union's own count, so an artifact two members both hold is counted once, which is why
-it is not the sum of its members'. Its `active` is read off its members rather than off its own
-value: true only while every member is itself selected, so a query naming one member, or naming
-an unrelated base that merely starts with the brand key, leaves the row unselected and its
-click still opens the whole brand.
+`facets.base` is one flat list of lowercase family names without version numbers. Known
+aliases combine related roots such as `qwen` and `qwenimage`, `zimage` and `zimageturbo`, and
+all `flux`, `ltx`, and `wan` variants. Other bases use the letters before their first digit.
+Every row's `members` lists its exact indexed bases. Its `token` and `query` select those
+members as a union, so an artifact matching overlapping base prefixes counts once. A row is
+active only when every member is selected. The `any` row sorts last.
 
-`facets.base_shown` is how many exact bases the rows of `facets.base` stand for, counted after
-the rail was cut to 32 and before brands claimed their members, which is the number `base_total`
-is compared against: a brand row makes `facets.base` shorter than `base_shown` without hiding
-anything.
+`facets.base_shown` is how many exact bases the displayed family rows stand for. Comparing it
+with `base_total` shows whether the rail hides any families.
+
+Role facet rows use readable labels such as `Checkpoint`, `ControlNet`, and `Dataset`, while
+their `value` and `token` retain the stored codes (`ckpt`, `ctrl`, `ds`). Search accepts both
+spellings, for example `role:ckpt` and `role:checkpoint`.
 
 `shard_count` is how many files the model spans: a checkpoint split into
 `model-00001-of-00040.safetensors` and its siblings is one row whose `size` is the whole

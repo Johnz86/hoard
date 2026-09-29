@@ -45,7 +45,7 @@ pub(crate) fn hex_decode(value: &str, out: &mut [u8]) -> Result<(), ()> {
     if bytes.len() != out.len() * 2 {
         return Err(());
     }
-    for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+    for (slot, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
         let high = nibble(pair[0])?;
         let low = nibble(pair[1])?;
         *slot = (high << 4) | low;

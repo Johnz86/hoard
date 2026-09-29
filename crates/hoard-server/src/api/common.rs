@@ -38,7 +38,7 @@ const BLOB_NAME_CHARS: usize = 12;
 const BLOBS_DIR: &str = "blobs";
 /// The bytes beside the alphanumerics a shell reads as themselves, so a value made only of
 /// them needs no quotes.
-const BARE_WORD_BYTES: [u8; 5] = [b'.', b'_', b'/', b':', b'-'];
+const BARE_WORD_BYTES: [u8; 5] = *b"._/:-";
 
 const SECONDS_PER_MINUTE: i64 = 60;
 const SECONDS_PER_HOUR: i64 = 60 * SECONDS_PER_MINUTE;

@@ -414,8 +414,11 @@ impl CacheEntry {
             MirrorError::CacheCorrupt(format!("chunks.crc is short for block {index}: {error}"))
         })?;
         Ok(raw
-            .chunks_exact(4)
-            .map(|slot| u32::from_le_bytes([slot[0], slot[1], slot[2], slot[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
             .collect())
     }
 

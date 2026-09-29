@@ -114,29 +114,29 @@ Token strip (shown when the query is non-empty): `PARSED` label, one chip per to
 
 Index view grid: `214px minmax(0,1fr) 288px` (rail collapses to `0px` when hidden).
 
-Facet rail (`--panel`, right rule): sections ROLE, SOURCE LAYOUT, BASE ARCHITECTURE,
+Facet rail (`--panel`, right rule): sections ROLE, SOURCE LAYOUT, MODEL FAMILY,
 FORMAT · PRECISION, NODE, each a 10px 0.16em label with a rule below, then rows of 8px
 square mark + label + count (mono 12px, 3.5px 4px padding). SOURCE LAYOUT sits second, between
-ROLE and BASE ARCHITECTURE: it names the folder discovery filed the entry's repository under,
+ROLE and MODEL FAMILY: it names the folder discovery filed the entry's repository under,
 the placement decision the tree already carries, so a file filed correctly but recognized by
 no tensor rule still says where it came from. Active facet: amber mark filled, `--panel2` row.
 Count `—` when zero. A row whose label the rail cannot show whole recovers it on hover: as
 `label (value)` whenever the two differ, and as the label alone when it is longer than the
 22 characters the column fits. A short label that is its own value carries no tooltip,
-because repeating it says nothing. BASE ARCHITECTURE prints `27 of 213 — showing the most
+because repeating it says nothing. MODEL FAMILY prints `27 of 213 — showing the most
 common` (mono 11px, `--dim`) under its rows whenever the rail stands for fewer bases than the
 result set holds, counted over the bases the rows stand for so a brand row never deflates it.
-BASE ARCHITECTURE renders one row per brand and one row per base value no brand claims, sorted
-together by count like every other section, with no header, no indentation and no second tier,
+MODEL FAMILY renders one row per lowercase, numberless family, sorted by count with no
+indentation or second tier,
 except that `any` sorts last whatever it counts and carries the tooltip `any (works with every
-architecture)`. A brand row carries its brand key as both its value and its label (`qwen`),
-so it is spelled the way its own members are, and carries a tooltip naming the exact values
-it stands for, the same hover mechanism every truncated label already uses. It selects the
-union of exactly those values, never a prefix, and its mark is filled only while every one
-of them is selected, so the row a click on one variant reaches still opens the whole brand. A
-brand holding one value is a brand row too, so the rail's vocabulary does not flip between a
-brand name and an architecture string. No section carries a filter field of its own: the
+architecture)`. A family row carries its name as both value and label (`qwen`) and has a
+tooltip naming its exact indexed bases. It selects their union; its mark is filled only while
+every member is selected. Families are grouped before the 48-row limit, so a visible family
+includes its less common variants. No section carries a filter field of its own: the
 search bar above the rail is the one place a query is typed.
+ROLE rows show Checkpoint, ControlNet, Upscaler, Embedding, Dataset, Projector, and
+Unclassified in full; LoRA, VAE, and LLM keep their familiar acronyms. Clicking a row still
+uses its short search code, and the search bar accepts both short and full names.
 Below, SAVED SHELVES list (mono 11.5px, `--muted`, amber on hover,
 count in `--dim` then `›` at right). The triage queue sorts first among the shelves and the
 SAVED SHELVES title carries its count, `SAVED SHELVES (25)`, so the number of artifacts
