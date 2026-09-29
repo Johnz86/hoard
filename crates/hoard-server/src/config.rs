@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use hoard_index::config::IndexConfig;
+use hoard_index::config::{IndexConfig, SourceConfig};
 use hoard_mirror::config::MirrorConfig;
 use hoard_mirror::lookup::LookupConfig;
 
@@ -140,7 +140,56 @@ impl HoardConfig {
     pub fn load(path: &Path) -> Result<Self, ApiError> {
         let text = std::fs::read_to_string(path)
             .map_err(|error| ApiError::bad_request(format!("{}: {error}", path.display())))?;
-        Self::parse(&text)
+        let mut config = Self::parse(&text)?;
+        config.load_managed_sources()?;
+        Ok(config)
+    }
+
+    /// Adds folders created through the UI to the configured sources at startup.
+    pub fn load_managed_sources(&mut self) -> Result<(), ApiError> {
+        for source in self.managed_sources()? {
+            if self.index.source(&source.name).is_some() {
+                return Err(ApiError::bad_request(format!(
+                    "source {} exists in both hoard.toml and managed sources",
+                    source.name
+                )));
+            }
+            self.index.sources.push(source);
+        }
+        Ok(())
+    }
+
+    /// Persists one UI-created folder without rewriting the user's hoard.toml.
+    pub fn append_managed_source(&self, source: &SourceConfig) -> Result<(), ApiError> {
+        let path = self.managed_sources_path();
+        let mut sources = self.managed_sources()?;
+        sources.push(source.clone());
+        let bytes = serde_json::to_vec_pretty(&sources)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        std::fs::create_dir_all(&self.server.data_dir)
+            .map_err(|error| ApiError::internal(format!("{}: {error}", path.display())))?;
+        let temporary = path.with_extension("json.tmp");
+        std::fs::write(&temporary, bytes)
+            .map_err(|error| ApiError::internal(format!("{}: {error}", temporary.display())))?;
+        std::fs::rename(&temporary, &path)
+            .map_err(|error| ApiError::internal(format!("{}: {error}", path.display())))
+    }
+
+    fn managed_sources(&self) -> Result<Vec<SourceConfig>, ApiError> {
+        let path = self.managed_sources_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(ApiError::internal(format!("{}: {error}", path.display())));
+            }
+        };
+        serde_json::from_slice(&bytes)
+            .map_err(|error| ApiError::internal(format!("{}: {error}", path.display())))
+    }
+
+    fn managed_sources_path(&self) -> PathBuf {
+        self.server.data_dir.join("sources.json")
     }
 
     /// Expands `~`, then makes the data directory the single root every other path hangs

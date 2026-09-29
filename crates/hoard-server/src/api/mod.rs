@@ -93,7 +93,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/loadouts/{id}/apply", post(loadouts::apply))
         .route("/api/v1/loadouts/{id}/export", get(loadouts::export))
         .route("/api/v1/link", post(link::link))
-        .route("/api/v1/sources", get(jobs::sources))
+        .route(
+            "/api/v1/sources",
+            get(jobs::sources).post(jobs::create_source),
+        )
         .route("/api/v1/scan", post(jobs::scan))
         .route("/api/v1/jobs", get(jobs::list))
         .route("/api/v1/jobs/{id}", get(jobs::detail))

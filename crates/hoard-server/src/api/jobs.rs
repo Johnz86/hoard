@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Json;
@@ -12,14 +13,14 @@ use hoard_index::IndexError;
 use hoard_index::catalog::{
     Catalog, JobRecord, JobState, MIRROR_SOURCE, PEER_SOURCE, PULL_SOURCE, SourceRecord,
 };
-use hoard_index::config::{HashPolicy, IndexConfig};
+use hoard_index::config::{HashPolicy, IndexConfig, SourceConfig, SourceKind};
 use hoard_index::coordinate::{Origin, ScanRequest};
 
 use crate::api::common::{authorize, blocking};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
-/// One source the catalog holds and what the last scan of it counted.
+/// One configured or cataloged source and what its last scan counted, if one has run.
 ///
 /// Sources carry no identity of their own in the catalog yet, so `id` is the source's
 /// one-based position in this listing, which is also how a scan request naming an id is
@@ -40,13 +41,22 @@ pub struct SourceView {
     /// only how many files it owes.
     pub pending_bytes: u64,
     /// Whether `POST /api/v1/scan` will accept this source: it is named in the
-    /// configuration.
+    /// active configuration.
     pub can_scan: bool,
     /// Who writes this source when it is not the scanner: "downloads", "pulls", "peer", or
     /// "nobody" for a stored source the configuration no longer names. Absent when
     /// `can_scan` is true.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed_by: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceBody {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub kind: SourceKind,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -87,13 +97,126 @@ pub async fn sources(State(state): State<AppState>) -> ApiResult<Json<Vec<Source
 async fn source_views(state: &AppState) -> ApiResult<Vec<SourceView>> {
     let catalog = Arc::clone(state.catalog());
     let records = blocking(move || catalog.sources()).await?;
-    let node = state.node_name();
-    let index = &state.config().index;
-    Ok(records
+    let mut records: BTreeMap<String, SourceRecord> = records
         .into_iter()
-        .enumerate()
-        .map(|(position, record)| source_view(position, record, node, index))
-        .collect())
+        .map(|record| (record.name.clone(), record))
+        .collect();
+    let node = state.node_name();
+    let index = state.coordinator().config();
+    let mut views = Vec::with_capacity(index.sources.len() + records.len());
+    for source in &index.sources {
+        let position = views.len();
+        let view = match records.remove(&source.name) {
+            Some(record) => source_view(position, record, node, &index),
+            None => SourceView {
+                id: SourceId::new(position as i64 + 1),
+                name: source.name.clone(),
+                path: source.path.to_string_lossy().into_owned(),
+                kind: source.kind.as_str().to_owned(),
+                node: node.to_owned(),
+                files: 0,
+                bytes: 0,
+                bytes_human: format_size(0),
+                last_scan: None,
+                pending_hashes: 0,
+                pending_bytes: 0,
+                can_scan: true,
+                managed_by: None,
+            },
+        };
+        views.push(view);
+    }
+    for record in records.into_values() {
+        views.push(source_view(views.len(), record, node, &index));
+    }
+    Ok(views)
+}
+
+pub async fn create_source(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SourceBody>,
+) -> ApiResult<Json<SourceView>> {
+    authorize(&state, &headers)?;
+    let blocked: Vec<PathBuf> = [
+        state.config().server.data_dir.clone(),
+        state.config().index.data_dir.clone(),
+        state.config().cache_root(),
+    ]
+    .into_iter()
+    .chain(state.config().server.projection_roots.iter().cloned())
+    .collect();
+    let source = tokio::task::spawn_blocking(move || validate_source(body, &blocked))
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))??;
+    let name = source.name.clone();
+    state.add_source(source).await?;
+    state
+        .coordinator()
+        .request(ScanRequest {
+            sources: Some(BTreeSet::from([name.clone()])),
+            hash: state.coordinator().config().hash_policy,
+            origin: Origin::Manual,
+        })
+        .await?;
+    let view = source_views(&state)
+        .await?
+        .into_iter()
+        .find(|view| view.name == name)
+        .ok_or_else(|| ApiError::internal("new source is missing"))?;
+    Ok(Json(view))
+}
+
+fn validate_source(body: SourceBody, blocked: &[PathBuf]) -> ApiResult<SourceConfig> {
+    if !body.path.is_absolute() {
+        return Err(ApiError::bad_request(
+            "folder path must be absolute on this node",
+        ));
+    }
+    let path = body
+        .path
+        .canonicalize()
+        .map_err(|error| ApiError::bad_request(format!("{}: {error}", body.path.display())))?;
+    if !path.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "{} is not a directory",
+            path.display()
+        )));
+    }
+    if blocked.iter().any(|root| {
+        let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        path.starts_with(&root) || root.starts_with(&path)
+    }) {
+        return Err(ApiError::bad_request(
+            "folder overlaps a Hoard-managed directory",
+        ));
+    }
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .ok_or_else(|| ApiError::bad_request("folder needs a name"))?;
+    if name == MIRROR_SOURCE || name == PULL_SOURCE || name.starts_with(PEER_SOURCE) {
+        return Err(ApiError::bad_request("source name is reserved"));
+    }
+    if name.len() > 128 || name.chars().any(char::is_control) {
+        return Err(ApiError::bad_request("source name is invalid"));
+    }
+    Ok(SourceConfig {
+        name,
+        path,
+        kind: body.kind,
+        include: Vec::new(),
+        exclude: Vec::new(),
+        follow_symlinks: false,
+        repo_per_folder: true,
+    })
 }
 
 fn source_view(
@@ -173,7 +296,8 @@ pub async fn scan(
 /// Reads what a scan request named: a configured source name, or the name, id or path of a
 /// source the index already knows, resolved back to the name the scanner accepts.
 async fn resolve_source(state: &AppState, wanted: &str) -> ApiResult<String> {
-    if state.config().index.source(wanted).is_some() {
+    let index = state.coordinator().config();
+    if index.source(wanted).is_some() {
         return Ok(wanted.to_owned());
     }
     let stored = source_views(state)
@@ -182,7 +306,7 @@ async fn resolve_source(state: &AppState, wanted: &str) -> ApiResult<String> {
         .find(|view| view.name == wanted || view.id.to_string() == wanted || view.path == wanted);
     stored
         .map(|view| view.name)
-        .filter(|name| state.config().index.source(name).is_some())
+        .filter(|name| index.source(name).is_some())
         .ok_or_else(|| ApiError::not_found(format!("source {wanted}")))
 }
 

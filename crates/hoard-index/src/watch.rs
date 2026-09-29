@@ -110,6 +110,25 @@ impl Watcher {
         config: &IndexConfig,
         options: WatchOptions,
     ) -> Result<Self> {
+        Self::start_with_reconciliation(coordinator, config, options, true)
+    }
+
+    /// Registers the current roots after a source change; the caller queues the new root's
+    /// first scan, so periodic reconciliation begins after its normal interval.
+    pub fn restart(
+        coordinator: Arc<Coordinator>,
+        config: &IndexConfig,
+        options: WatchOptions,
+    ) -> Result<Self> {
+        Self::start_with_reconciliation(coordinator, config, options, false)
+    }
+
+    fn start_with_reconciliation(
+        coordinator: Arc<Coordinator>,
+        config: &IndexConfig,
+        options: WatchOptions,
+        reconcile_immediately: bool,
+    ) -> Result<Self> {
         let WatchOptions {
             debounce,
             excluded,
@@ -168,6 +187,7 @@ impl Watcher {
                 config,
                 debounce,
                 reconcile_every,
+                reconcile_immediately,
                 submitted: Arc::clone(&submitted),
                 lost,
                 marks: Arc::clone(&marks),
@@ -289,6 +309,7 @@ struct Pump {
     config: IndexConfig,
     debounce: Duration,
     reconcile_every: Option<Duration>,
+    reconcile_immediately: bool,
     submitted: Arc<AtomicU64>,
     lost: Arc<AtomicBool>,
     marks: Arc<Mutex<Marks>>,
@@ -302,7 +323,9 @@ enum Wake {
 impl Pump {
     async fn run(self, mut events: Receiver<Signal>) {
         let ceiling = self.debounce.saturating_mul(MAX_DEBOUNCE_WINDOWS);
-        let mut timer = self.reconcile_every.map(reconciliation_timer);
+        let mut timer = self
+            .reconcile_every
+            .map(|period| reconciliation_timer(period, self.reconcile_immediately));
         loop {
             let woken = match timer.as_mut() {
                 Some(timer) => tokio::select! {
@@ -373,8 +396,9 @@ fn named(config: &IndexConfig, pending: BTreeSet<String>) -> Option<ScanRequest>
     }
 }
 
-fn reconciliation_timer(period: Duration) -> Interval {
-    let mut timer = tokio::time::interval(period);
+fn reconciliation_timer(period: Duration, immediate: bool) -> Interval {
+    let start = tokio::time::Instant::now() + if immediate { Duration::ZERO } else { period };
+    let mut timer = tokio::time::interval_at(start, period);
     timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
     timer
 }
@@ -561,6 +585,7 @@ mod tests {
             config: config.clone(),
             debounce: Duration::from_millis(20),
             reconcile_every: None,
+            reconcile_immediately: true,
             submitted: Arc::clone(&submitted),
             lost,
             marks: Arc::new(Mutex::new(Marks::default())),

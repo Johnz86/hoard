@@ -153,6 +153,9 @@ pub fn load_config(config_path: Option<&Path>) -> Result<HoardConfig> {
             } else {
                 let mut config = HoardConfig::default();
                 config.normalize(std::env::var_os("HOME").map(PathBuf::from).as_deref());
+                config.load_managed_sources().map_err(|error| {
+                    anyhow::anyhow!("loading managed sources: {}", error.message())
+                })?;
                 Ok(config)
             }
         }

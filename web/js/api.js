@@ -102,6 +102,7 @@ export const applyLoadout = (id, node, profile) =>
 
 export const nodes = () => get("/nodes");
 export const sources = () => get("/sources");
+export const createSource = (source) => post("/sources", source);
 export const startScan = (source) => post("/scan", { source: source ?? null, hash: "later" });
 export const jobs = (state) => get("/jobs", { state });
 export const cancelJob = (id) => post(`/jobs/${segment(id)}/cancel`);

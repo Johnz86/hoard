@@ -124,15 +124,24 @@ pub fn start_lookup(state: &AppState) -> Option<hoard_mirror::lookup::LookupHand
 /// million files is a filesystem pass, so it runs on a blocking thread rather than holding
 /// the reactor before the listener is served.
 pub async fn start_watcher(state: &AppState) {
+    start_watcher_with_reconciliation(state, true).await;
+}
+
+pub(crate) async fn restart_watcher(state: &AppState) {
+    start_watcher_with_reconciliation(state, false).await;
+}
+
+async fn start_watcher_with_reconciliation(state: &AppState, immediate: bool) {
     let config = state.config();
-    if !config.index.watch || config.index.sources.is_empty() {
+    let index = state.coordinator().config();
+    if !index.watch || index.sources.is_empty() {
         return;
     }
     let options = watch_options(config);
-    let index = config.index.clone();
     let coordinator = std::sync::Arc::clone(state.coordinator());
-    let started = tokio::task::spawn_blocking(move || {
-        hoard_index::watch::Watcher::start(coordinator, &index, options)
+    let started = tokio::task::spawn_blocking(move || match immediate {
+        true => hoard_index::watch::Watcher::start(coordinator, &index, options),
+        false => hoard_index::watch::Watcher::restart(coordinator, &index, options),
     })
     .await;
     match started {

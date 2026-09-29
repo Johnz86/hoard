@@ -44,7 +44,7 @@ pub struct HealthView {
     pub peers: u64,
 }
 
-/// The totals the SCANS and NODES screens print above their tables.
+/// The totals the index and Sources view present.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StatsView {
     pub artifacts: u64,

@@ -16,7 +16,7 @@ use crate::api::common::{authorize, blocking};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
-/// One node of the LAN as the NODES tab and the pulse show it.
+/// One node of the LAN as the Sources view and the pulse show it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NodeView {
     pub id: NodeId,

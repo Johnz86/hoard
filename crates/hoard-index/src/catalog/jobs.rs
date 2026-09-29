@@ -69,7 +69,7 @@ pub struct JobProgress {
     pub rate_bps: Option<u64>,
 }
 
-/// A scan, hash run, pull or apply as the JOBS tab shows it.
+/// A scan, hash run, pull or apply as the Sources activity section shows it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct JobRecord {
     pub id: JobId,

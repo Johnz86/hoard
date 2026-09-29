@@ -6,8 +6,9 @@ import { renderFacets } from "./facets.js";
 import { renderInspector } from "./inspector.js";
 import { initKeys, renderKeySheet } from "./keys.js";
 import { loadLoadout, loadoutItems, renderDrawer } from "./loadout.js";
-import { loadNodes, renderNodePulse, renderNodesView } from "./nodes.js";
-import { loadJobs, loadSources, renderJobsView, renderScansView } from "./jobs.js";
+import { loadNodes, renderNodePulse } from "./nodes.js";
+import { loadJobs, loadSources } from "./jobs.js";
+import { paintSourcesView } from "./sources.js";
 import { initSearch, renderTokenStrip, setSearchValue } from "./search.js";
 import { initShelfActions, loadShelves, openShelfMenu } from "./shelves.js";
 import { renderTable, revealCursor } from "./table.js";
@@ -15,9 +16,7 @@ import { applySettings, settings, updateSettings } from "./theme.js";
 
 const NAV = [
     { label: "INDEX", route: "/index" },
-    { label: "NODES", route: "/nodes" },
-    { label: "SCANS", route: "/scans" },
-    { label: "JOBS", route: "/jobs" }
+    { label: "SOURCES", route: "/sources" }
 ];
 const SEARCH_LIMIT = 100;
 const INSPECTOR_DELAY = 160;
@@ -50,6 +49,8 @@ const state = {
     sourcesError: null,
     jobs: null,
     jobsError: null,
+    sourceFormOpen: false,
+    recentJobsOpen: false,
     loadoutId: null,
     loadoutCreating: null,
     loadouts: null,
@@ -83,6 +84,7 @@ function emptyDetail() {
 
 let inspectorTimer = null;
 let suppressHashChange = false;
+let refreshingSources = false;
 
 const app = {
     state,
@@ -190,6 +192,7 @@ function readHash() {
     const params = new URLSearchParams(search || "");
     const parts = path.split("/").filter(Boolean);
     const head = parts[0] || "index";
+    if (!["sources", "nodes", "scans", "jobs"].includes(head)) state.sourceFormOpen = false;
     const repoMatch = /^\/repo\/([^/]*)\/([^/]*)\/(.+)$/.exec(path);
 
     if (repoMatch) {
@@ -226,12 +229,13 @@ function readHash() {
         return;
     }
 
-    if (["nodes", "scans", "jobs"].includes(head)) {
-        state.view = head;
+    if (["sources", "nodes", "scans", "jobs"].includes(head)) {
+        state.view = "sources";
+        if (head !== "sources") syncHash();
         render();
-        if (head === "nodes" && !state.nodes) loadNodes(app);
-        if (head === "scans" && !state.sources) loadSources(app);
-        if (head === "jobs") loadJobs(app);
+        if (!state.nodes) loadNodes(app);
+        if (!state.sources) loadSources(app);
+        loadJobs(app);
         return;
     }
 
@@ -737,9 +741,7 @@ function render() {
 
     if (state.view === "index") paintIndex();
     else if (state.view === "detail") mount(detail, renderDetail(app));
-    else if (state.view === "nodes") mount(panel, renderNodesView(app));
-    else if (state.view === "scans") mount(panel, renderScansView(app));
-    else if (state.view === "jobs") mount(panel, renderJobsView(app));
+    else if (state.view === "sources") paintSourcesView(app, panel);
 
     renderDrawer(app);
     renderKeySheet(app);
@@ -798,7 +800,7 @@ function initTopbar() {
         if (state.drawerOpen) closeDrawer();
         else openDrawer();
     });
-    document.getElementById("node-pulse").addEventListener("click", () => navigate("#/nodes"));
+    document.getElementById("node-pulse").addEventListener("click", () => navigate("#/sources"));
     document.getElementById("prefs-btn").addEventListener("click", (event) => {
         event.stopPropagation();
         state.prefsOpen = !state.prefsOpen;
@@ -827,6 +829,22 @@ function start() {
     loadShelves(app);
     loadNodes(app);
     loadLoadout(app);
+    setInterval(async () => {
+        if (state.view !== "sources" || refreshingSources) return;
+        refreshingSources = true;
+        try {
+            await Promise.all([
+                loadSources(app, false),
+                loadJobs(app, false),
+                loadNodes(app, false)
+            ]);
+            if (state.view === "sources") {
+                paintSourcesView(app, document.getElementById("view-panel"));
+            }
+        } finally {
+            refreshingSources = false;
+        }
+    }, 5000);
 }
 
 start();

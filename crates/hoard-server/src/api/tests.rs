@@ -1892,6 +1892,120 @@ async fn sources_scans_and_jobs_are_listed() {
     assert_eq!(bad["error"]["code"], "BadRequest");
 }
 
+#[tokio::test]
+async fn a_folder_added_in_the_ui_is_listed_scanned_and_restored() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let folder = directory.path().join("models");
+    let data = directory.path().join("data");
+    std::fs::create_dir_all(&folder).expect("folder creates");
+    std::fs::write(folder.join("sample.safetensors"), weights("sample")).expect("model writes");
+    let mut config = HoardConfig::default();
+    config.server.data_dir = data.clone();
+    config.index.data_dir = data;
+    let catalog = std::sync::Arc::new(
+        Catalog::open_or_scan(&config.index, "workstation", |_, _| {}).expect("catalog opens"),
+    );
+    let state = AppState::new(config.clone(), catalog).expect("state builds");
+
+    let added = post(
+        &state,
+        "/api/v1/sources",
+        json!({ "path": folder, "name": "models", "kind": "loose" }),
+    )
+    .await;
+    assert_eq!(added["name"], "models");
+    assert_eq!(added["can_scan"], true);
+    assert_eq!(get(&state, "/healthz").await["watch"], "ok");
+    let (duplicate, _) = call(
+        &state,
+        Method::POST,
+        "/api/v1/sources",
+        Some(json!({ "path": folder, "name": "models" })),
+    )
+    .await;
+    assert_eq!(duplicate, StatusCode::CONFLICT);
+    let (inside_data, _) = call(
+        &state,
+        Method::POST,
+        "/api/v1/sources",
+        Some(json!({ "path": state.config().server.data_dir, "name": "data" })),
+    )
+    .await;
+    assert_eq!(inside_data, StatusCode::BAD_REQUEST);
+
+    let jobs = get(&state, "/api/v1/jobs").await;
+    let job = jobs[0]["id"].as_str().expect("job id");
+    assert_eq!(settle(&state, job).await["state"], "done");
+    assert_eq!(
+        get(&state, "/api/v1/jobs")
+            .await
+            .as_array()
+            .expect("jobs")
+            .len(),
+        1,
+        "adding a folder starts one scan"
+    );
+    let listed = get(&state, "/api/v1/sources").await;
+    assert_eq!(listed[0]["files"], 1);
+    assert_ne!(listed[0]["last_scan"], Value::Null);
+
+    config
+        .load_managed_sources()
+        .expect("managed sources reload");
+    assert_eq!(config.index.sources.len(), 1);
+    assert_eq!(config.index.sources[0].name, "models");
+    let config_file = directory.path().join("hoard.toml");
+    std::fs::write(
+        &config_file,
+        format!(
+            "[server]\ndata_dir = {:?}\n",
+            state.config().server.data_dir.to_string_lossy()
+        ),
+    )
+    .expect("config writes");
+    let reopened = HoardConfig::load(&config_file).expect("config reloads managed sources");
+    assert_eq!(reopened.index.sources[0].name, "models");
+
+    if let Some(watcher) = state.take_watcher() {
+        watcher.shutdown().await;
+    }
+    state
+        .coordinator()
+        .shutdown()
+        .await
+        .expect("scan lane stops");
+}
+
+#[tokio::test]
+async fn a_configured_folder_is_visible_before_its_first_scan() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let folder = directory.path().join("models");
+    let data = directory.path().join("data");
+    std::fs::create_dir_all(&folder).expect("folder creates");
+    let mut config = HoardConfig::default();
+    config.server.data_dir = data.clone();
+    config.index.data_dir = data;
+    let catalog = std::sync::Arc::new(
+        Catalog::open_or_scan(&config.index, "workstation", |_, _| {}).expect("catalog opens"),
+    );
+    config.index.sources.push(SourceConfig {
+        name: "models".to_owned(),
+        path: folder.clone(),
+        kind: SourceKind::Auto,
+        include: Vec::new(),
+        exclude: Vec::new(),
+        follow_symlinks: false,
+        repo_per_folder: true,
+    });
+    let state = AppState::new(config, catalog).expect("state builds");
+
+    let sources = get(&state, "/api/v1/sources").await;
+    assert_eq!(sources[0]["name"], "models");
+    assert_eq!(sources[0]["path"], folder.to_string_lossy().as_ref());
+    assert_eq!(sources[0]["can_scan"], true);
+    assert_eq!(sources[0]["last_scan"], Value::Null);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn a_second_request_for_a_waiting_source_answers_the_job_it_merged_into() {
     let world = seeded();

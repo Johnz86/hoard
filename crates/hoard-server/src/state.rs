@@ -103,6 +103,7 @@ pub struct AppState {
 
 struct Inner {
     config: HoardConfig,
+    source_update: tokio::sync::Mutex<()>,
     mirror_config: Arc<MirrorConfig>,
     catalog: Arc<Catalog>,
     coordinator: Arc<Coordinator>,
@@ -165,6 +166,7 @@ impl AppState {
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
+                source_update: tokio::sync::Mutex::new(()),
                 mirror_config,
                 usage: UsageSink::spawn(
                     Arc::clone(&catalog),
@@ -202,6 +204,41 @@ impl AppState {
     /// than spawning, and shutdown stops it.
     pub fn coordinator(&self) -> &Arc<Coordinator> {
         &self.inner.coordinator
+    }
+
+    /// Persists a folder and admits it to scans and watches while this node runs.
+    pub async fn add_source(
+        &self,
+        source: hoard_index::config::SourceConfig,
+    ) -> Result<(), ApiError> {
+        let _update = self.inner.source_update.lock().await;
+        let index = self.coordinator().config();
+        if index.source(&source.name).is_some() {
+            return Err(ApiError::conflict(format!(
+                "source {} already exists",
+                source.name
+            )));
+        }
+        if index.sources.iter().any(|existing| {
+            let path = existing
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| existing.path.clone());
+            source.path.starts_with(&path) || path.starts_with(&source.path)
+        }) {
+            return Err(ApiError::conflict("folder overlaps an existing source"));
+        }
+        let config = self.inner.config.clone();
+        let stored = source.clone();
+        tokio::task::spawn_blocking(move || config.append_managed_source(&stored))
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))??;
+        self.coordinator().add_source(source)?;
+        if let Some(watcher) = self.take_watcher() {
+            watcher.shutdown().await;
+        }
+        crate::restart_watcher(self).await;
+        Ok(())
     }
 
     /// Records the watcher this node started. [`crate::serve`] joins it before stopping the

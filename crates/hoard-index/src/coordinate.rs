@@ -10,14 +10,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use hoard_core::JobId;
 
 use crate::catalog::{Catalog, HashProgress, JobProgress, RescanReport, RescanScope, Stop};
-use crate::config::{HashPolicy, IndexConfig};
+use crate::config::{HashPolicy, IndexConfig, SourceConfig};
 use crate::error::{IndexError, Result};
 
 /// The `job.kind` every scan the lane runs records.
@@ -78,7 +78,7 @@ impl Coordinator {
         Self {
             lane: Arc::new(Lane {
                 catalog,
-                config,
+                config: RwLock::new(config),
                 queue: Mutex::new(Queue::default()),
                 wake: Notify::new(),
                 admission: tokio::sync::Mutex::new(()),
@@ -115,6 +115,24 @@ impl Coordinator {
             origin: request.origin,
         })?;
         Ok(job)
+    }
+
+    /// The sources currently accepted by this scan lane, including roots added at runtime.
+    pub fn config(&self) -> IndexConfig {
+        self.lane.config.read().clone()
+    }
+
+    /// Accepts a new source for later scan requests without interrupting a running scan.
+    pub fn add_source(&self, source: SourceConfig) -> Result<()> {
+        let mut config = self.lane.config.write();
+        if config.source(&source.name).is_some() {
+            return Err(IndexError::Config(format!(
+                "source {} is already configured",
+                source.name
+            )));
+        }
+        config.sources.push(source);
+        Ok(())
     }
 
     fn start(&self) {
@@ -165,7 +183,7 @@ impl Coordinator {
 #[derive(Debug)]
 struct Lane {
     catalog: Arc<Catalog>,
-    config: IndexConfig,
+    config: RwLock<IndexConfig>,
     queue: Mutex<Queue>,
     wake: Notify,
     admission: tokio::sync::Mutex<()>,
@@ -193,8 +211,9 @@ impl Lane {
         let Some(names) = sources.filter(|names| !names.is_empty()) else {
             return Ok(None);
         };
+        let config = self.config.read();
         for name in &names {
-            if self.config.source(name).is_none() {
+            if config.source(name).is_none() {
                 return Err(IndexError::Config(format!("no source named {name}")));
             }
         }
@@ -231,7 +250,7 @@ impl Lane {
         let job = item.job;
         let origin = item.origin.as_str();
         let catalog = Arc::clone(&self.catalog);
-        let config = narrowed(&self.config, item.sources.as_ref());
+        let config = narrowed(&self.config.read(), item.sources.as_ref());
         let stop = Stop::clone(&self.stop);
         tracing::info!(%job, origin, "scan started");
         match tokio::task::spawn_blocking(move || settle(&catalog, &config, &item, &stop)).await {
