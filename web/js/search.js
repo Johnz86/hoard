@@ -1,4 +1,5 @@
 import { el, mount } from "./dom.js";
+import { renderShelfActions } from "./shelves.js";
 
 const PARSE_DELAY = 120;
 const SEARCH_DELAY = 300;
@@ -22,11 +23,12 @@ export function initSearch(app) {
     input = document.getElementById("search-input");
     clearBtn = document.getElementById("search-clear");
     hint = document.getElementById("search-hint");
-    strip = document.getElementById("token-strip");
+    strip = document.getElementById("token-content");
 
     input.addEventListener("input", () => {
         const value = input.value;
         clearBtn.hidden = value.length === 0;
+        renderShelfActions(app);
         clearTimeout(parseTimer);
         clearTimeout(searchTimer);
         parseTimer = setTimeout(() => app.previewQuery(value), PARSE_DELAY);
@@ -74,9 +76,11 @@ export function searchHasFocus() {
 export function renderTokenStrip(app) {
     if (!strip) return;
     const raw = String(app.state.q || "").trim();
-    strip.hidden = raw.length === 0;
-    if (strip.hidden) {
+    const stripRow = document.getElementById("token-strip");
+    stripRow.hidden = raw.length === 0;
+    if (stripRow.hidden) {
         strip.replaceChildren();
+        renderShelfActions(app);
         return;
     }
     const tokens = (app.state.query && app.state.query.tokens) || [];
@@ -107,4 +111,5 @@ export function renderTokenStrip(app) {
         warnings.map((warning) => el("span", { class: "strip-warning", text: warning })),
         el("span", { class: "strip-result", text: app.resultLine() })
     );
+    renderShelfActions(app);
 }

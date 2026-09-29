@@ -4,7 +4,7 @@ import { focusSearch } from "./search.js";
 const SHEET = [
     ["GLOBAL", [
         ["/", "focus the search field"],
-        ["ESC", "blur search, else close the drawer, else leave detail"],
+        ["ESC", "close shelves, blur search, else close the drawer or leave detail"],
         ["?", "this sheet"]
     ]],
     ["INDEX", [

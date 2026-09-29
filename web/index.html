@@ -7,7 +7,7 @@
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="vendor/pico.min.css">
 <link rel="stylesheet" href="css/tokens.css">
-<link rel="stylesheet" href="css/hoard.css?v=prefs-icon">
+<link rel="stylesheet" href="css/hoard.css?v=shelf-search">
 </head>
 <body>
 <div class="shell">
@@ -15,7 +15,9 @@
         <span class="wordmark" id="wordmark">HOARD</span>
         <nav class="nav-tabs" id="nav-tabs"></nav>
         <div class="search" id="search">
-            <span class="search-glyph">&#9906;</span>
+            <button class="search-glyph" id="shelf-trigger" type="button"
+                    aria-label="Shelves" aria-controls="shelf-popover" aria-expanded="false"
+                    aria-haspopup="dialog" title="Shelves">&#9906;</button>
             <input id="search-input" type="text" spellcheck="false" autocomplete="off"
                    placeholder="role:lora base:sdxl size:&lt;400mb film grain">
             <span class="search-clear" id="search-clear" hidden>CLEAR</span>
@@ -37,7 +39,12 @@
         </div>
     </header>
 
-    <div class="token-strip" id="token-strip" hidden></div>
+    <div class="token-strip" id="token-strip" hidden>
+        <div class="token-content" id="token-content"></div>
+        <button class="strip-add-shelf" id="add-shelf" type="button" hidden
+                aria-controls="shelf-popover" aria-expanded="false"
+                aria-haspopup="dialog">ADD TO SHELF</button>
+    </div>
 
     <main class="views">
         <section class="view view-index" id="view-index">
@@ -58,6 +65,6 @@
 <div id="keysheet-root"></div>
 <div id="toast-root"></div>
 
-<script type="module" src="js/app.js?v=prefs-icon"></script>
+<script type="module" src="js/app.js?v=shelf-search"></script>
 </body>
 </html>

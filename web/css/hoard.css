@@ -313,6 +313,7 @@ input.field:focus {
 }
 
 .search {
+    position: relative;
     flex: 1;
     display: flex;
     align-items: center;
@@ -328,12 +329,23 @@ input.field:focus {
 .search.is-focused { border-color: var(--amb); }
 
 .search-glyph {
+    display: grid;
+    place-items: center;
+    flex: 0 0 18px;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
     color: var(--amb);
     font-family: var(--mono);
     font-size: 13px;
+    cursor: pointer;
 }
 
-.search input {
+.search-glyph:hover,
+.search-glyph[aria-expanded="true"] { color: var(--text); }
+
+.search > input {
     flex: 1;
     background: transparent;
     border: 0;
@@ -347,7 +359,7 @@ input.field:focus {
     height: auto;
 }
 
-.search input::placeholder { color: var(--dim); }
+.search > input::placeholder { color: var(--dim); }
 
 .search-clear {
     font-family: var(--mono);
@@ -465,6 +477,205 @@ button.btn-prefs {
     flex-wrap: wrap;
 }
 
+.token-content {
+    display: flex;
+    align-items: center;
+    flex: 0 1 auto;
+    flex-wrap: wrap;
+    gap: 8px;
+    min-width: 0;
+}
+
+.token-strip[hidden],
+.strip-add-shelf[hidden],
+.shelf-popover[hidden],
+.shelf-menu-save[hidden],
+.shelf-menu-library[hidden] { display: none; }
+
+button.strip-add-shelf {
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 4px 9px;
+    border: 1px solid var(--amb);
+    border-radius: 0;
+    background: transparent;
+    color: var(--amb);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    line-height: 1.3;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+button.strip-add-shelf:hover,
+button.strip-add-shelf[aria-expanded="true"] {
+    background: var(--amb);
+    color: var(--bg);
+}
+
+.shelf-popover {
+    position: absolute;
+    top: calc(100% + 8px);
+    left: 0;
+    z-index: 60;
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    width: min(390px, calc(100vw - 32px));
+    max-height: min(72vh, 560px);
+    padding: 14px;
+    border: 1px solid var(--rule);
+    background: var(--panel);
+    box-shadow: 0 12px 32px var(--scrim);
+}
+
+.shelf-menu-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--rule);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+}
+
+button.shelf-menu-close,
+button.shelf-menu-retry {
+    margin: 0;
+    padding: 2px 0;
+    border: 0;
+    background: transparent;
+    color: var(--dim);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    cursor: pointer;
+}
+
+button.shelf-menu-close:hover,
+button.shelf-menu-retry:hover { color: var(--amb); }
+
+.shelf-menu-save {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 0;
+}
+
+.shelf-menu-library {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    min-height: 0;
+}
+
+.shelf-menu-label {
+    color: var(--dim);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+}
+
+.shelf-menu-preview {
+    overflow: hidden;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.shelf-menu-save-row { display: flex; gap: 6px; }
+
+input.shelf-menu-input { width: 100%; min-width: 0; }
+
+button.shelf-menu-submit { margin: 0; }
+
+.shelf-menu-list {
+    min-height: 0;
+    overflow-y: auto;
+    border-top: 1px solid var(--rule2);
+}
+
+.shelf-menu-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-bottom: 1px solid var(--rule2);
+}
+
+.shelf-menu-row:hover { background: var(--panel2); }
+
+button.shelf-menu-open {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    align-items: flex-start;
+    min-width: 0;
+    margin: 0;
+    padding: 8px 3px;
+    border: 0;
+    background: transparent;
+    text-align: left;
+    cursor: pointer;
+}
+
+.shelf-menu-name,
+.shelf-menu-query {
+    display: block;
+    width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.shelf-menu-name {
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.shelf-menu-query {
+    color: var(--dim);
+    font-family: var(--mono);
+    font-size: 10px;
+}
+
+.shelf-menu-count {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+button.shelf-menu-remove {
+    margin: 0;
+    padding: 3px 7px;
+    border: 0;
+    background: transparent;
+    color: var(--dim);
+    font-family: var(--mono);
+    font-size: 16px;
+    cursor: pointer;
+}
+
+button.shelf-menu-remove:hover { color: var(--red); }
+
+.shelf-menu-empty {
+    padding: 12px 3px;
+    color: var(--dim);
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+.shelf-popover button:focus-visible {
+    outline: 1px solid var(--amb);
+    outline-offset: 2px;
+}
+
 .strip-label {
     font-family: var(--mono);
     font-size: 10px;
@@ -553,17 +764,6 @@ button.btn-prefs {
     margin-bottom: 7px;
 }
 
-.rail-shelves {
-    border-top: 1px solid var(--rule);
-    padding-top: 6px;
-}
-
-.rail-shelves .rail-title {
-    border-bottom: 0;
-    padding: 12px 0 9px;
-    margin-bottom: 0;
-}
-
 .rail-empty {
     font-family: var(--mono);
     font-size: 11px;
@@ -620,33 +820,6 @@ button.btn-prefs {
     color: var(--dim);
     padding: 5px 4px 0;
 }
-
-.shelf-row {
-    font-family: var(--mono);
-    font-size: 11.5px;
-    padding: 4px;
-    color: var(--muted);
-    cursor: pointer;
-    display: flex;
-    justify-content: space-between;
-    gap: 8px;
-}
-
-.shelf-row:hover {
-    color: var(--amb);
-    background: var(--panel2);
-}
-
-.shelf-name {
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.shelf-count { color: var(--dim); }
-
-.shelf-chevron { color: var(--dim); }
 
 .disk-bars {
     display: flex;
@@ -1858,8 +2031,6 @@ input.field.drawer-rename:focus {
 .keysheet-key { color: var(--amb); }
 .keysheet-what { color: var(--muted); }
 
-/* ---------- panel views: shelves / nodes / scans / jobs ---------- */
-
 .panel-view {
     padding: 20px 18px 40px;
     animation: hoardIn 160ms ease-out;
@@ -1894,12 +2065,6 @@ input.field.drawer-rename:focus {
 }
 
 .panel-row:hover { background: var(--panel); }
-
-.shelf-grid {
-    display: grid;
-    grid-template-columns: 220px minmax(0, 1fr) 70px 90px 40px;
-    gap: 12px;
-}
 
 .node-grid {
     display: grid;

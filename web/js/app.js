@@ -9,13 +9,12 @@ import { loadLoadout, loadoutItems, renderDrawer } from "./loadout.js";
 import { loadNodes, renderNodePulse, renderNodesView } from "./nodes.js";
 import { loadJobs, loadSources, renderJobsView, renderScansView } from "./jobs.js";
 import { initSearch, renderTokenStrip, setSearchValue } from "./search.js";
-import { loadShelves, renderShelfRail, renderShelvesView } from "./shelves.js";
+import { initShelfActions, loadShelves, openShelfMenu } from "./shelves.js";
 import { renderTable, revealCursor } from "./table.js";
 import { applySettings, settings, updateSettings } from "./theme.js";
 
 const NAV = [
     { label: "INDEX", route: "/index" },
-    { label: "SHELVES", route: "/shelves" },
     { label: "NODES", route: "/nodes" },
     { label: "SCANS", route: "/scans" },
     { label: "JOBS", route: "/jobs" }
@@ -41,6 +40,7 @@ const state = {
     viewMode: "TABLE",
     searchError: null,
     searching: false,
+    searchedQuery: null,
     cursorArtifact: null,
     shelves: null,
     shelvesError: null,
@@ -217,10 +217,18 @@ function readHash() {
         return;
     }
 
-    if (["shelves", "nodes", "scans", "jobs"].includes(head)) {
+    if (head === "shelves") {
+        state.view = "index";
+        syncHash();
+        render();
+        openShelfMenu(app);
+        if (!state.rows.length && !state.searching) runSearch();
+        return;
+    }
+
+    if (["nodes", "scans", "jobs"].includes(head)) {
         state.view = head;
         render();
-        if (head === "shelves" && !state.shelves) loadShelves(app);
         if (head === "nodes" && !state.nodes) loadNodes(app);
         if (head === "scans" && !state.sources) loadSources(app);
         if (head === "jobs") loadJobs(app);
@@ -268,12 +276,13 @@ function commitQuery(q, options) {
 }
 
 async function runSearch() {
+    const query = state.q;
     state.searching = true;
     state.searchError = null;
     render();
     try {
         const data = await api.search({
-            q: state.q,
+            q: query,
             sort: state.sort,
             dir: state.sort ? state.dir : null,
             limit: SEARCH_LIMIT
@@ -287,8 +296,10 @@ async function runSearch() {
         state.dirApplied = data.dir || state.dirApplied;
         state.cursor = Math.min(state.cursor, Math.max(state.rows.length - 1, 0));
         state.cursorArtifact = null;
+        state.searchedQuery = query;
     } catch (error) {
         state.searchError = error;
+        state.searchedQuery = null;
         state.rows = [];
         state.facets = {};
         state.query = { raw: state.q, tokens: [], warnings: [] };
@@ -679,7 +690,7 @@ function paintFooter() {
 }
 
 function paintIndex() {
-    mount(document.getElementById("facet-rail"), renderFacets(app), renderShelfRail(app));
+    mount(document.getElementById("facet-rail"), renderFacets(app));
 
     mount(
         document.getElementById("results-head"),
@@ -726,7 +737,6 @@ function render() {
 
     if (state.view === "index") paintIndex();
     else if (state.view === "detail") mount(detail, renderDetail(app));
-    else if (state.view === "shelves") mount(panel, renderShelvesView(app));
     else if (state.view === "nodes") mount(panel, renderNodesView(app));
     else if (state.view === "scans") mount(panel, renderScansView(app));
     else if (state.view === "jobs") mount(panel, renderJobsView(app));
@@ -807,6 +817,7 @@ function start() {
     initTopbar();
     initSearch(app);
     initKeys(app);
+    initShelfActions(app);
     window.addEventListener("hashchange", () => {
         if (suppressHashChange) return;
         readHash();

@@ -101,16 +101,24 @@ path in `--muted`).
 App shell is `height: 100vh; min-width: 1180px; overflow: hidden`, column flex.
 
 Top bar (`--panel`, 11px 16px padding, 1px `--rule` bottom):
-`HOARD` wordmark, nav tabs INDEX / SHELVES / NODES / SCANS / JOBS (mono 11px, 6px 12px
+`HOARD` wordmark, nav tabs INDEX / NODES / SCANS / JOBS (mono 11px, 6px 12px
 padding, active has `--rule` border, `--bg` fill, `--amb` text), search field (flex 1,
 34px tall, `--bg` fill, border `--rule` or `--amb` when focused, amber glyph, mono 12.5px
 input, CLEAR affordance when non-empty, hint `/` or `ESC` at right), node pulse
 `4 NODES` in green with a 6px pulsing dot, `LOADOUT n` button in amber outline.
 
-Token strip (shown when the query is non-empty): `PARSED` label, one chip per token
+The leading icon in the search field opens the SHELVES list beneath the field's left edge.
+Clicking inside the text field only edits the query. The second row is hidden when the query
+is empty. When the query is non-empty it shows a `PARSED` label and one chip per token
 (`--panel2` fill, `--rule` border, key in `--amb`, value in `--text`, a `x` remover in
 `--dim` that turns `--red` on hover), then the result line
-`N ARTIFACTS · M NODES` in `--muted`.
+`N ARTIFACTS · M NODES` in `--muted`. After the current query has been searched, an
+`ADD TO SHELF` button appears beside the chips if no shelf already stores that query. It
+opens the naming form beneath the left edge of the search field. The first form row shows
+the query; the second has a focused name
+field and an add button. Enter also adds the shelf. The icon's list can be searched by shelf
+name, opens a saved query on click, and offers removal for user-created shelves. Seeded
+shelves have no remove action. Escape and clicking outside close either panel.
 
 Index view grid: `214px minmax(0,1fr) 288px` (rail collapses to `0px` when hidden).
 
@@ -137,12 +145,8 @@ search bar above the rail is the one place a query is typed.
 ROLE rows show Checkpoint, ControlNet, Upscaler, Embedding, Dataset, Projector, and
 Unclassified in full; LoRA, VAE, and LLM keep their familiar acronyms. Clicking a row still
 uses its short search code, and the search bar accepts both short and full names.
-Below, SAVED SHELVES list (mono 11.5px, `--muted`, amber on hover,
-count in `--dim` then `›` at right). The triage queue sorts first among the shelves and the
-SAVED SHELVES title carries its count, `SAVED SHELVES (25)`, so the number of artifacts
-waiting to be classified is on screen without opening anything; the title drops the count
-when no shelf named `triage queue` was counted. The proposal also shows a DISK PRESSURE
-mini bar chart with `311 GB reclaimable — 47 duplicate blobs`.
+The proposal also shows a DISK PRESSURE mini bar chart with
+`311 GB reclaimable — 47 duplicate blobs`.
 
 Results header (`--panel`): `N ARTIFACTS · M NODES · SORT KEY ↑` at left, view tabs
 TABLE / CARDS (TREE and DISK are listed in the proposal, not built) at right.
@@ -322,11 +326,9 @@ produces zero. Shelves in the prototype: `triage queue` = `role:?`, `sdxl · lor
 `role:llm fmt:gguf`, `cold + duplicate` = `dupe:true`, `everything on laptop` =
 `node:laptop`, in that order.
 
-The SHELVES tab lists them in the same order, one row per shelf over the grid
-`220px minmax(0,1fr) 70px 90px 40px`, headed NAME, QUERY, COUNT, KIND and an unlabelled
-column for the delete glyph. COUNT is the shelf's own count, right-aligned and mono, `—`
-when the shelf was not counted; KIND reads `builtin` or `saved`, and only a saved shelf
-carries the `×`.
+The SHELVES dropdown lists them in the same order, with name, query, and count. COUNT is
+the shelf's own count, shown as `—` when the shelf was not counted. Only a user-created
+shelf carries the remove button.
 
 ## Compatibility rule
 
@@ -347,7 +349,7 @@ boolean. These become user settings persisted in `localStorage`.
 
 ## Not in the prototype, named in the proposal
 
-Nav tabs SHELVES, NODES, SCANS, JOBS; TREE and DISK views; `?` key sheet; the
+Nav tabs NODES, SCANS, JOBS; TREE and DISK views; `?` key sheet; the
 `used:` and `trigger:` keys; DISK PRESSURE facet; git-over-HTTP face; filesystem
 projection `hoard link --profile comfyui ./models`; peer discovery and gossip. See
 `docs/feature-plan.md` for where each lands.

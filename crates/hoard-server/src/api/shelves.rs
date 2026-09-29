@@ -14,7 +14,7 @@ use crate::api::common::{authorize, blocking};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
-/// A shelf as the rail and the SHELVES tab show it. `count` is how many artifacts the
+/// A shelf as the search dropdown shows it. `count` is how many artifacts the
 /// shelf's query answers, and null when it was not counted, whatever the reason: the
 /// listing counts every shelf it can, and a write answers with the row it wrote rather than
 /// re-running its query.
