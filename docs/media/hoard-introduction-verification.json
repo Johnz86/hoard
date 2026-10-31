@@ -1,36 +1,19 @@
 {
   "passed": true,
   "mode": "record",
-  "generated_at": "2026-10-31T14:41:28.387Z",
-  "git_commit": "4f14167bb7bd5b579f188433f6925284963ac058",
+  "generated_at": "2026-10-31T17:31:29.592Z",
+  "git_commit": "35c7fefa9dfd18057f16d2b5a294bf98c4fc090b",
   "git_dirty": true,
   "git_dirty_paths": [
-    "M README.md",
-    " M crates/hoard-server/src/api/mod.rs",
-    " M crates/hoard-server/src/api/tests.rs",
-    " M crates/hoard-server/src/config.rs",
-    " M crates/hoard-server/src/lib.rs",
-    " M crates/hoard-server/src/state.rs",
-    " M docs/api/hoard-api.md",
-    " M docs/architecture.md",
-    " M docs/design/README.md",
-    " M docs/design/ui-spec.md",
-    " M docs/handoff.md",
-    " M web/css/hoard.css",
-    " M web/js/api.js",
-    " M web/js/app.js",
-    " M web/js/keys.js",
-    " M web/js/sources.js",
-    "?? crates/hoard-server/src/api/setup.rs",
-    "?? crates/hoard-server/src/api/tests/setup.rs",
-    "?? docs/first-run.md",
-    "?? docs/introduction-video.md",
-    "?? docs/media/",
-    "?? scripts/",
-    "?? web/js/setup.js"
+    "M scripts/introduction-storyboard.json",
+    " M scripts/record-introduction.mjs",
+    "?? docs/media/hoard-introduction-narration.txt",
+    "?? docs/media/narration/",
+    "?? scripts/narration-timing.mjs",
+    "?? scripts/narration-timing.test.mjs"
   ],
   "source_snapshot": {
-    "sha256": "acf407b82e726f410971e15d76600f2e39e649554e69c3c57a9624f04a5885bd",
+    "sha256": "23dfbe5ec0dfdc94201dc42bcd573112770cd484c938e75782a14ee6b84cceb3",
     "files": {
       "Cargo.toml": "c95022e9d62c8dad76c8b723a5c3cd79948ac161f9af98cb65f583fce6c36600",
       "crates/hoard-core/Cargo.toml": "5a63272e51cf7df538ce6f6030577692366525280511991b19019d9a5f69d2e6",
@@ -226,8 +209,9 @@
       "crates/hoard-server/src/state.rs": "d8ec3d6dffa6ab0a4b61932665601a39c987c2e36d5ad517351ced40ddb492c6",
       "crates/hoard-server/src/testing.rs": "66730f35ff05bdd8ac0541d39512beff87cb0101060501b84a2666937bb0a6f2",
       "crates/hoard-server/src/ui/mod.rs": "e99273d6d996a9d6915f408e3204cc6cd292f733eca8cfe3a0ec85e0f3296476",
-      "scripts/introduction-storyboard.json": "aa8796fbae7ab882812726c6a884612398fa398ad494b8a72eb3bf13fa42a7d0",
-      "scripts/record-introduction.mjs": "e45fb4592b8a7972fd04c7c8aacef1099cde74775de92a8d46bc7f67508ac1bf",
+      "scripts/introduction-storyboard.json": "fe130d4721187cab2d8314125a9c6895281db91e4ba24f359851b58034127bb1",
+      "scripts/narration-timing.mjs": "6893fef3905390a2b0ce6348318704ad74454b08ec48cb51971b23942ac14d9d",
+      "scripts/record-introduction.mjs": "681770b09bf8ad7565dfeb1e584a8b4b7172313a2f39c4ca3c868598038ebe02",
       "src/cli/apply.rs": "6611e2668c508b981597e324285b78ac65be570d920c9cd7c6ac55de03399111",
       "src/cli/catalog.rs": "bfa1dce1533afd54323a9c2da56eae0f66f3ce857d5f67c2bfaa69f7e4727433",
       "src/cli/doctor.rs": "f3f776a36a66d744a067b8a530a843c6e67631e6b6d37caca6596f8fad9e7d92",
@@ -268,7 +252,9 @@
       "web/js/sources.js": "4d25f5639df6736f1bbf1ba1feef4653ada09b46d110bddd6ba1d2580cce88f0",
       "web/js/table.js": "b2a091c9f1d796e7ebd593f5e857566a5e5b2fc4dedee81d718712cb974143bc",
       "web/js/theme.js": "fa2340ded3df710635885a0b23e55147cfab12ca59ea4ce4c6606946a1992026",
-      "web/vendor/pico.min.css": "fbc9a63fc9fc9f72d12fd7fc9806e11fa9f77ae4f9cad146b27003a1119ba3db"
+      "web/vendor/pico.min.css": "fbc9a63fc9fc9f72d12fd7fc9806e11fa9f77ae4f9cad146b27003a1119ba3db",
+      "docs/media/narration/hoard-introduction.wav": "9a445bf044edf9a746ab286b07557ea2d8e660124945fe91ea5b4004b993ae87",
+      "docs/media/hoard-introduction-narration.txt": "c835c94033631afed908fd9a4cd1e78289be5c252ac0a03a374a989cf44c5d72"
     }
   },
   "isolated": true,
@@ -293,111 +279,156 @@
     "application-and-recording-sources-stable-during-capture",
     "video-and-audio-streams-match-full-timeline",
     "narration-is-audible-and-below-clipping",
-    "narration-pace-and-reading-pauses-verified"
+    "supplied-narration-preserved-at-original-speed",
+    "chapters-aligned-to-recorded-paragraph-pauses"
   ],
   "artifact": {
-    "duration": 101.55,
+    "duration": 99.168,
     "width": 1920,
     "height": 1080,
     "codec": "h264",
     "audio": "aac",
-    "bytes": 2409776,
-    "video_seconds": 101.541667,
-    "audio_seconds": 101.55,
+    "bytes": 2582302,
+    "video_seconds": 99.166667,
+    "audio_seconds": 99.168,
     "audio_levels": {
-      "mean_db": -18.8,
-      "peak_db": -4.5
+      "mean_db": -18.6,
+      "peak_db": -2
     }
+  },
+  "narration_source": {
+    "file": "docs/media/narration/hoard-introduction.wav",
+    "sha256": "9a445bf044edf9a746ab286b07557ea2d8e660124945fe91ea5b4004b993ae87",
+    "text_sha256": "c835c94033631afed908fd9a4cd1e78289be5c252ac0a03a374a989cf44c5d72",
+    "duration": 97.468542,
+    "lead": 0.45,
+    "tail": 1.25,
+    "alignment": "midpoints of 0.8s paragraph pauses at -35dB",
+    "ranges": [
+      {
+        "start": 0,
+        "end": 6.537084999999999
+      },
+      {
+        "start": 6.537084999999999,
+        "end": 17.98375
+      },
+      {
+        "start": 17.98375,
+        "end": 26.66355
+      },
+      {
+        "start": 26.66355,
+        "end": 34.5715
+      },
+      {
+        "start": 34.5715,
+        "end": 42.8785
+      },
+      {
+        "start": 42.8785,
+        "end": 52.20805
+      },
+      {
+        "start": 52.20805,
+        "end": 60.5985
+      },
+      {
+        "start": 60.5985,
+        "end": 67.9948
+      },
+      {
+        "start": 67.9948,
+        "end": 75.4957
+      },
+      {
+        "start": 75.4957,
+        "end": 84.9144
+      },
+      {
+        "start": 84.9144,
+        "end": 97.468542
+      }
+    ]
   },
   "scenes": [
     {
       "id": "welcome",
-      "duration": 8,
-      "narration_seconds": 6.233875,
-      "narration_words_per_minute": 154,
-      "voice_lead_in_seconds": 0.45,
-      "trailing_pause_seconds": 1.316
+      "duration": 6.9870849999999995,
+      "visual_timing_scale": 1,
+      "narration_seconds": 6.537084999999999,
+      "narration_words_per_minute": 147
     },
     {
       "id": "sharing",
-      "duration": 12,
-      "narration_seconds": 8.477,
-      "narration_words_per_minute": 156,
-      "voice_lead_in_seconds": 0.45,
-      "trailing_pause_seconds": 3.073
+      "duration": 11.446665000000001,
+      "visual_timing_scale": 1,
+      "narration_seconds": 11.446665000000001,
+      "narration_words_per_minute": 131
     },
     {
       "id": "project-folder",
-      "duration": 11,
-      "narration_seconds": 8.122813,
-      "narration_words_per_minute": 140,
-      "voice_lead_in_seconds": 0.45,
-      "trailing_pause_seconds": 2.427
+      "duration": 8.6798,
+      "visual_timing_scale": 1,
+      "narration_seconds": 8.6798,
+      "narration_words_per_minute": 124
     },
     {
       "id": "project-ready",
-      "duration": 7,
-      "narration_seconds": 5.466,
-      "narration_words_per_minute": 143,
-      "voice_lead_in_seconds": 0.45,
-      "trailing_pause_seconds": 1.084
+      "duration": 7.90795,
+      "visual_timing_scale": 1,
+      "narration_seconds": 7.90795,
+      "narration_words_per_minute": 121
     },
     {
       "id": "models-folder",
-      "duration": 10,
-      "narration_seconds": 7.116875,
-      "narration_words_per_minute": 143,
-      "voice_lead_in_seconds": 0.45,
-      "trailing_pause_seconds": 2.433
+      "duration": 8.307000000000002,
+      "visual_timing_scale": 1,
+      "narration_seconds": 8.307000000000002,
+      "narration_words_per_minute": 166
     },
     {
       "id": "index",
-      "duration": 9,
-      "narration_seconds": 6.802125,
-      "narration_words_per_minute": 176,
-      "voice_lead_in_seconds": 0.45,
-      "trailing_pause_seconds": 1.748
+      "duration": 9.329549999999998,
+      "visual_timing_scale": 1,
+      "narration_seconds": 9.329549999999998,
+      "narration_words_per_minute": 161
     },
     {
       "id": "search",
-      "duration": 8,
-      "narration_seconds": 6.315563,
-      "narration_words_per_minute": 181,
-      "voice_lead_in_seconds": 0.45,
-      "trailing_pause_seconds": 1.234
+      "duration": 8.390450000000001,
+      "visual_timing_scale": 1,
+      "narration_seconds": 8.390450000000001,
+      "narration_words_per_minute": 186
     },
     {
       "id": "readme",
-      "duration": 9,
-      "narration_seconds": 6.793813,
-      "narration_words_per_minute": 150,
-      "voice_lead_in_seconds": 0.45,
-      "trailing_pause_seconds": 1.756
+      "duration": 7.3962999999999965,
+      "visual_timing_scale": 1,
+      "narration_seconds": 7.3962999999999965,
+      "narration_words_per_minute": 138
     },
     {
       "id": "files",
-      "duration": 8,
-      "narration_seconds": 6.277875,
-      "narration_words_per_minute": 172,
-      "voice_lead_in_seconds": 0.45,
-      "trailing_pause_seconds": 1.272
+      "duration": 7.5009000000000015,
+      "visual_timing_scale": 1,
+      "narration_seconds": 7.5009000000000015,
+      "narration_words_per_minute": 152
     },
     {
       "id": "clone",
-      "duration": 9,
-      "narration_seconds": 6.420375,
-      "narration_words_per_minute": 178,
-      "voice_lead_in_seconds": 0.45,
-      "trailing_pause_seconds": 2.13
+      "duration": 9.418700000000001,
+      "visual_timing_scale": 1,
+      "narration_seconds": 9.418700000000001,
+      "narration_words_per_minute": 140
     },
     {
       "id": "finish",
-      "duration": 10.55025,
-      "narration_seconds": 9.05025,
-      "narration_words_per_minute": 152,
-      "voice_lead_in_seconds": 0.45,
-      "trailing_pause_seconds": 1.05
+      "duration": 13.804141999999999,
+      "visual_timing_scale": 1,
+      "narration_seconds": 12.554141999999999,
+      "narration_words_per_minute": 162
     }
   ],
-  "work_directory": "/tmp/hoard-intro-ayqwZf"
+  "work_directory": "/tmp/hoard-intro-6E1Cj7"
 }

@@ -1,6 +1,5 @@
 {
   "title": "Hoard: from scattered folders to shared resources",
-  "voice": "slt",
   "scenes": [
     {
       "id": "welcome",
@@ -14,70 +13,70 @@
       "seconds": 12,
       "heading": "01 / SET UP YOUR NODE",
       "caption": "Name this node and review its sharing address. Saved node settings apply after restart.",
-      "narration": "Name your node and review its sharing address. Saved node settings apply after a restart. This recording uses an isolated local node."
+      "narration": "Name your node and review its sharing address. Saved settings apply after a restart. This demonstration uses a local address, reachable only from this machine."
     },
     {
       "id": "project-folder",
       "seconds": 11,
       "heading": "02 / ADD WHAT YOU ALREADY HAVE",
       "caption": "Choose a folder on the server. Auto-detect works for Git projects, model folders and Hub caches.",
-      "narration": "Add a folder from the machine running Hoard. Auto detect recognizes Git projects, model folders, and Hugging Face caches."
+      "narration": "Add a folder from the machine running Hoard. Auto-detect recognizes Git projects, model folders, and Hugging Face caches."
     },
     {
       "id": "project-ready",
       "seconds": 7,
       "heading": "INDEX IN PLACE",
       "caption": "Add and scan. Sources shows the folder and its scan state; the original files stay untouched.",
-      "narration": "Add and scan. Sources shows what is indexed. Your original files stay untouched."
+      "narration": "Choose Add and Scan. Hoard indexes your resources in place, while your original files stay untouched."
     },
     {
       "id": "models-folder",
       "seconds": 10,
       "heading": "BRING YOUR COLLECTION TOGETHER",
       "caption": "Add another folder. These tiny synthetic models demonstrate the same flow as a real collection.",
-      "narration": "Add another folder to bring your collection together. These synthetic examples keep the demonstration small and repeatable."
+      "narration": "Add another folder to bring your collection together. These small demonstration models show the same workflow you can use with your own collection."
     },
     {
       "id": "index",
       "seconds": 9,
       "heading": "03 / FIND YOUR NEXT RESOURCE",
       "caption": "Projects and models share one Index. Select a row for facts; open it when you want more.",
-      "narration": "Projects and models share one searchable index. Select a row to inspect it, then open it when you want more."
+      "narration": "Projects and models share one searchable index. Select a row to see its details in the inspector. Open it when you want to explore further."
     },
     {
       "id": "search",
       "seconds": 8,
       "heading": "SEARCH THE CONTENT",
       "caption": "Search names, committed README text and file paths. A repository needs no model files to be found.",
-      "narration": "Find a project by its name, committed readme, or file paths. It does not need to contain a model."
+      "narration": "Find a project by its name, the text in its read me, or its file paths. A Git project does not need to contain a model."
     },
     {
       "id": "readme",
       "seconds": 9,
       "heading": "REVIEW BEFORE YOU ACQUIRE",
       "caption": "Read the committed README, follow its documentation links and check the selected revision.",
-      "narration": "Read the committed readme before you acquire anything. Follow its documentation links and check the selected revision."
+      "narration": "Read the project's documentation before downloading it. Follow links to related guides, and check the selected revision."
     },
     {
       "id": "files",
       "seconds": 8,
       "heading": "LOOK INSIDE",
       "caption": "Browse files and preview text. Escape returns to the list without losing your place.",
-      "narration": "Browse the files and preview their content. Escape takes you back to the list without losing your place."
+      "narration": "Browse the files and preview their content. Press Escape to return to the file list without losing your place."
     },
     {
       "id": "clone",
       "seconds": 9,
       "heading": "ACQUIRE WITH THE TOOLS YOU KNOW",
       "caption": "Copy the clone command. This walkthrough verifies a real HTTP Git clone and its commit.",
-      "narration": "Copy the clone command and use Git as usual. This walkthrough verifies an actual clone and checks its commit."
+      "narration": "Copy the clone command and use Git as usual. Hoard serves the repository directly, so its source files and documentation travel together."
     },
     {
       "id": "finish",
       "seconds": 9,
       "heading": "FIND IT HERE. SHARE IT FROM HERE.",
       "caption": "For other machines, configure a reachable LAN address. Add more folders whenever you need them.",
-      "narration": "To share with other machines, configure a reachable network address. Then keep adding folders as your collection grows. Your horde, ready to find."
+      "narration": "To share with other machines, configure a reachable network address and check that it works from another computer. Keep adding folders as your collection grows. Find it, review it, and share it with Hoard."
     }
   ]
 }

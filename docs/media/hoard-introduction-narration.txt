@@ -1,0 +1,21 @@
+Meet Hoard. Find and share the resources you already have, without moving or renaming your files.
+
+Name your node and review its sharing address. Saved settings apply after a restart. This demonstration uses a local address, reachable only from this machine.
+
+Add a folder from the machine running Hoard. Auto-detect recognizes Git projects, model folders, and Hugging Face caches.
+
+Choose Add and Scan. Hoard indexes your resources in place, while your original files stay untouched.
+
+Add another folder to bring your collection together. These small demonstration models show the same workflow you can use with your own collection.
+
+Projects and models share one searchable index. Select a row to see its details in the inspector. Open it when you want to explore further.
+
+Find a project by its name, the text in its read me, or its file paths. A Git project does not need to contain a model.
+
+Read the project's documentation before downloading it. Follow links to related guides, and check the selected revision.
+
+Browse the files and preview their content. Press Escape to return to the file list without losing your place.
+
+Copy the clone command and use Git as usual. Hoard serves the repository directly, so its source files and documentation travel together.
+
+To share with other machines, configure a reachable network address and check that it works from another computer. Keep adding folders as your collection grows. Find it, review it, and share it with Hoard.

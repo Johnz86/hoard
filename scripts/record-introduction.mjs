@@ -4,8 +4,9 @@ import { spawn } from "node:child_process";
 import { access, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { chapterTimings } from "./narration-timing.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const options = parseOptions(process.argv.slice(2));
@@ -24,6 +25,8 @@ function parseOptions(args) {
     const parsed = { output: join(root, "docs/media/hoard-introduction.mp4"),
         binary: join(root, "target/debug/hoard"), browser: process.env.HOARD_BROWSER || "/usr/bin/brave-browser",
         storyboard: join(root, "scripts/introduction-storyboard.json"), overwrite: false,
+        narration: join(root, "docs/media/narration/hoard-introduction.wav"),
+        narrationText: join(root, "docs/media/hoard-introduction-narration.txt"),
         verify: false, keepWork: false };
     for (let index = 0; index < args.length; index += 1) {
         const argument = args[index];
@@ -31,12 +34,12 @@ function parseOptions(args) {
         else if (argument === "--verify") parsed.verify = true;
         else if (argument === "--keep-work") parsed.keepWork = true;
         else if (argument === "--help") {
-            process.stdout.write("Usage: node scripts/record-introduction.mjs [--verify] [--output FILE.mp4] [--binary FILE] [--browser FILE] [--storyboard FILE] [--overwrite] [--keep-work]\n");
+            process.stdout.write("Usage: node scripts/record-introduction.mjs [--verify] [--output FILE.mp4] [--narration FILE.wav] [--narration-text FILE.txt] [--binary FILE] [--browser FILE] [--storyboard FILE] [--overwrite] [--keep-work]\n");
             process.exit(0);
-        } else if (["--output", "--binary", "--browser", "--storyboard"].includes(argument)) {
+        } else if (["--output", "--binary", "--browser", "--storyboard", "--narration", "--narration-text"].includes(argument)) {
             const value = args[++index];
             if (!value || value.startsWith("--")) throw new Error(`Missing value for ${argument}`);
-            parsed[argument.slice(2)] = resolve(value);
+            parsed[argument === "--narration-text" ? "narrationText" : argument.slice(2)] = resolve(value);
         } else throw new Error(`Unknown argument: ${argument}`);
     }
     if (!parsed.output.endsWith(".mp4")) throw new Error("Output must end in .mp4");
@@ -255,9 +258,13 @@ class Capture {
         await this.browser.evaluate("document.fonts.ready");
         await this.frame(0.4);
         const actionDuration = this.frames.slice(first).reduce((sum, frame) => sum + frame.duration, 0);
-        const duration = Math.max(specification.seconds, actionDuration + 1.5, (specification.audioDuration || 0) + 1.5);
-        if (!options.verify) this.frames.at(-1).duration += duration - actionDuration;
-        this.scenes.push({ ...specification, first, duration });
+        const duration = specification.timelineDuration || Math.max(specification.seconds, actionDuration + 1.5);
+        const visualScale = Math.min(1, (duration - 0.8) / Math.max(actionDuration, 0.01));
+        if (!options.verify) {
+            for (const frame of this.frames.slice(first)) frame.duration *= visualScale;
+            this.frames.at(-1).duration += duration - actionDuration * visualScale;
+        }
+        this.scenes.push({ ...specification, first, duration, visualScale });
     }
     async move(selector) {
         const rectangle = await this.browser.evaluate(`(()=>{const node=document.querySelector(${JSON.stringify(selector)});if(!node)throw new Error("Missing target: "+${JSON.stringify(selector)});node.scrollIntoView({block:"nearest"});const r=node.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);
@@ -304,27 +311,36 @@ class Capture {
     }
 }
 
-async function prepareNarration(storyboard, scratch) {
+async function prepareNarration(storyboard) {
     if (options.verify) return;
-    for (const scene of storyboard.scenes) {
-        const text = join(scratch, `${scene.id}-narration.txt`);
-        const audio = join(scratch, `${scene.id}-voice.wav`);
-        await writeFile(text, scene.narration);
-        await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-            `flite=textfile='${filterPath(text)}':voice=${storyboard.voice}`, "-af", "atempo=0.96,loudnorm=I=-18:TP=-2:LRA=7",
-            "-ar", "48000", "-ac", "1", "-threads", "1", "-y", audio]);
-        scene.audio = audio;
-        scene.audioDuration = Number((await probe(audio)).format.duration);
-        const wordsPerMinute = scene.narration.split(/\s+/).length / scene.audioDuration * 60;
-        assert(wordsPerMinute >= 100 && wordsPerMinute <= 200, `Narration pace outside the introductory range for ${scene.id}`);
+    const text = await readFile(options.narrationText, "utf8");
+    const paragraphs = text.trim().split(/\r?\n\s*\r?\n/);
+    assert.equal(paragraphs.length, storyboard.scenes.length, "Narration needs one paragraph per scene");
+    const bytes = await readFile(options.narration);
+    const duration = Number((await probe(options.narration)).format.duration);
+    const silence = await run("ffmpeg", ["-hide_banner", "-threads", "2", "-i", options.narration,
+        "-af", "silencedetect=noise=-35dB:d=0.8", "-f", "null", "-"], root, true);
+    const ranges = chapterTimings(silence.diagnostics, duration, paragraphs.length);
+    const lead = 0.45;
+    const tail = 1.25;
+    storyboard.narrationSource = { file: options.narration, sha256: createHash("sha256").update(bytes).digest("hex"),
+        text_sha256: createHash("sha256").update(text).digest("hex"), duration, lead, tail,
+        alignment: "midpoints of 0.8s paragraph pauses at -35dB", ranges };
+    for (const [index, scene] of storyboard.scenes.entries()) {
+        scene.narration = paragraphs[index];
+        scene.audioDuration = ranges[index].end - ranges[index].start;
+        scene.timelineDuration = scene.audioDuration + (index === 0 ? lead : 0)
+            + (index === storyboard.scenes.length - 1 ? tail : 0);
+        assert(scene.timelineDuration > 1, `Narration chapter too short: ${scene.id}`);
     }
 }
 
 async function sourceSnapshot() {
     const names = (await run("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--",
-        "web", "crates", "src", "Cargo.toml", "scripts/record-introduction.mjs", "scripts/introduction-storyboard.json"]))
+        "web", "crates", "src", "Cargo.toml", "scripts/record-introduction.mjs", "scripts/narration-timing.mjs", "scripts/introduction-storyboard.json"]))
         .split("\0").filter(name => name && (/\.(rs|js|mjs|css|html|toml|woff2)$/.test(name)
             || name === "scripts/introduction-storyboard.json")).sort();
+    if (!options.verify) names.push(relative(root, options.narration), relative(root, options.narrationText));
     const files = {};
     const combined = createHash("sha256");
     for (const name of names) {
@@ -353,9 +369,8 @@ async function render(capture, scratch, destination) {
     visual.push(concatPath(capture.frames.at(-1).path));
     const visualList = join(scratch, "frames.ffconcat");
     await writeFile(visualList, visual.join("\n"));
-    const audio = [];
     const captions = ["WEBVTT", ""];
-    const transcript = ["# Hoard introduction transcript", "", "Narration is synthesized locally with FFmpeg/libflite (voice: slt).", ""];
+    const transcript = ["# Hoard introduction transcript", "", "Narration uses the owner-supplied recording at its original speed. Chapter boundaries follow the recording's paragraph pauses.", ""];
     const plannedDuration = capture.scenes.reduce((sum, scene) => sum + scene.duration, 0);
     const filters = ["fps=24", `tpad=stop_mode=clone:stop_duration=${plannedDuration}`,
         "pad=1920:1080:160:0:color=0x181919", "drawbox=x=160:y=908:w=1600:h=2:color=0xfa901e:t=fill"];
@@ -363,11 +378,6 @@ async function render(capture, scratch, destination) {
     const mono = filterPath(join(root, "web/fonts/space-mono-400-latin.woff2"));
     let time = 0;
     for (const scene of capture.scenes) {
-        const segment = join(scratch, `${scene.id}-padded.wav`);
-        await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", scene.audio,
-            "-af", `adelay=450,apad=whole_dur=${scene.duration},atrim=duration=${scene.duration}`,
-            "-ar", "48000", "-ac", "1", "-threads", "1", "-y", segment]);
-        audio.push(concatPath(segment));
         const heading = join(scratch, `${scene.id}-heading.txt`);
         const caption = join(scratch, `${scene.id}-caption.txt`);
         await writeFile(heading, `HOARD  /  ${scene.heading}`);
@@ -375,20 +385,20 @@ async function render(capture, scratch, destination) {
         const enabled = `gte(t,${time.toFixed(6)})*lt(t,${(time + scene.duration).toFixed(6)})`;
         filters.push(`drawtext=fontfile='${mono}':textfile='${filterPath(heading)}':expansion=none:fontcolor=0xfa901e:fontsize=18:x=160:y=931:enable='${enabled}'`);
         filters.push(`drawtext=fontfile='${sans}':textfile='${filterPath(caption)}':expansion=none:fontcolor=0xf4f0e7:fontsize=30:line_spacing=10:x=160:y=973:enable='${enabled}'`);
-        captions.push(`${timestamp(time)} --> ${timestamp(time + scene.duration)}`, scene.caption, "");
+        captions.push(`${timestamp(time)} --> ${timestamp(time + scene.duration)}`, wrapped(scene.narration, 72), "");
         transcript.push(`## ${timestamp(time)} - ${scene.heading}`, "", scene.narration, "", `On screen: ${scene.caption}`, "");
         time += scene.duration;
     }
-    const audioList = join(scratch, "audio.ffconcat");
-    await writeFile(audioList, audio.join("\n"));
     const filter = join(scratch, "render-filter.txt");
     await writeFile(filter, filters.join(",\n"));
     const temporary = join(scratch, "introduction.mp4");
     await run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", visualList,
-        "-f", "concat", "-safe", "0", "-i", audioList, "-filter_script:v", filter, "-c:v", "libx264", "-preset", "fast",
+        "-i", options.narration, "-filter_script:v", filter,
+        "-af", `adelay=450,apad=whole_dur=${plannedDuration},atrim=duration=${plannedDuration},loudnorm=I=-18:TP=-2:LRA=7`,
+        "-ar", "48000", "-ac", "1", "-c:v", "libx264", "-preset", "fast",
         "-crf", "23", "-pix_fmt", "yuv420p", "-r", "24", "-c:a", "aac", "-b:a", "96k", "-threads", "2",
         "-filter_threads", "1", "-t", time.toFixed(6), "-movflags", "+faststart", "-metadata", `title=${capture.storyboard.title}`,
-        "-metadata", "comment=Recorded from the real Hoard UI with isolated synthetic resources. Local synthetic narration.", "-y", temporary]);
+        "-metadata", "comment=Real Hoard UI with isolated synthetic resources. Owner-supplied narration at original speed.", "-y", temporary]);
     const metadata = await probe(temporary);
     const levels = await audioLevels(temporary);
     const video = metadata.streams.find(stream => stream.codec_type === "video");
@@ -424,7 +434,6 @@ async function main() {
     const origin = `http://127.0.0.1:${await freePort()}`;
     const source = await fixtures(scratch, origin);
     const storyboard = JSON.parse(await readFile(options.storyboard, "utf8"));
-    assert(["slt", "rms", "awb", "kal", "kal16"].includes(storyboard.voice), "Choose an installed libflite voice");
     assert.equal(new Set(storyboard.scenes.map(scene => scene.id)).size, storyboard.scenes.length, "Scene IDs must be unique");
     for (const scene of storyboard.scenes) {
         assert(/^[a-z][a-z-]*$/.test(scene.id), "Scene IDs must be lowercase words separated by hyphens");
@@ -454,7 +463,7 @@ async function main() {
         return response.json();
     };
     try {
-        await prepareNarration(storyboard, scratch);
+        await prepareNarration(storyboard);
         await startServer();
         assert.equal((await api("/sources")).length, 0);
         assert.equal((await api("/search")).resource_total, 0);
@@ -584,17 +593,17 @@ async function main() {
         assert.equal(sourcesAfter.sha256, sourcesBefore.sha256, "Application/recording sources changed during capture; repeat with stable sources");
         checks.push("application-and-recording-sources-stable-during-capture");
         const artifact = options.verify ? null : await render(capture, scratch, options.output);
-        if (artifact) checks.push("video-and-audio-streams-match-full-timeline", "narration-is-audible-and-below-clipping", "narration-pace-and-reading-pauses-verified");
+        if (artifact) checks.push("video-and-audio-streams-match-full-timeline", "narration-is-audible-and-below-clipping", "supplied-narration-preserved-at-original-speed", "chapters-aligned-to-recorded-paragraph-pauses");
         const report = { passed: true, mode: options.verify ? "verify" : "record", generated_at: new Date().toISOString(),
             git_commit: await run("git", ["rev-parse", "HEAD"]),
             git_dirty: Boolean(await run("git", ["status", "--porcelain"])),
             git_dirty_paths: (await run("git", ["status", "--porcelain"])).split("\n").filter(Boolean),
             source_snapshot: sourcesBefore, isolated: true, production_touched: false,
             resources: { projects: 1, models: 3 }, checks, artifact,
-            scenes: capture.scenes.map(({ id, duration, narration, audioDuration }) => ({ id, duration,
+            ...(storyboard.narrationSource ? { narration_source: { ...storyboard.narrationSource, file: relative(root, options.narration) } } : {}),
+            scenes: capture.scenes.map(({ id, duration, narration, audioDuration, visualScale }) => ({ id, duration, visual_timing_scale: visualScale,
                 ...(audioDuration ? { narration_seconds: audioDuration,
-                    narration_words_per_minute: Math.round(narration.split(/\s+/).length / audioDuration * 60),
-                    voice_lead_in_seconds: 0.45, trailing_pause_seconds: Number((duration - audioDuration - 0.45).toFixed(3)) } : {}) })),
+                    narration_words_per_minute: Math.round(narration.split(/\s+/).length / audioDuration * 60) } : {}) })),
             ...(options.keepWork ? { work_directory: scratch } : {}) };
         if (!options.verify) await writeFile(`${outputStem}-verification.json`, `${JSON.stringify(report, null, 2)}\n`);
         process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);

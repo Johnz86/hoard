@@ -28,6 +28,14 @@ audio/video durations, audible unclipped narration and reading pauses. Source fi
 and a dirty-checkout declaration distinguish recording evidence from an exact clean-commit
 claim. No production configuration, catalog or service is part of the recording.
 
+The original libflite voice was rejected. The current video instead uses the owner's
+supplied `docs/media/narration/hoard-introduction.wav`, with its matching narration text.
+The recorder aligns chapters to the ten paragraph pauses, preserves continuous audio at
+its original speed, and records the source audio hash and boundaries. It does not call an
+audio generation service; the supplied file suffices for future reshoots. Captions and
+transcript follow the new narration. Focused timing tests and a complete candidate reshoot
+verify this replacement independently of the earlier application test results below.
+
 `node scripts/verify-first-run.mjs` separately checks fresh arrival, explicit empty queries,
 owner access, invalid-path recovery, empty scans, polling focus, form position during a
 background scan, active/pending settings, restart, deep-link reload with setup unavailable,
