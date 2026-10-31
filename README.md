@@ -48,3 +48,12 @@ cp hoard.example.toml hoard.toml
 cargo run -- serve --config hoard.toml
 export HF_ENDPOINT=http://localhost:7099
 ```
+
+The Sources page can add folders while the server runs. Their paths refer to the server's
+filesystem. Hoard saves them in `<data_dir>/sources.json` and loads them alongside the
+`[[index.sources]]` entries in `hoard.toml` on the next start.
+
+See [design status and next work](docs/design/README.md) for the redesign review and the
+remaining source-removal, completed-scan cleanup and repository-browsing work. Git repositories
+without model artifacts are currently available through the repository API and Git face,
+but have no listing in the web UI.

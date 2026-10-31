@@ -101,7 +101,7 @@ path in `--muted`).
 App shell is `height: 100vh; min-width: 1180px; overflow: hidden`, column flex.
 
 Top bar (`--panel`, 11px 16px padding, 1px `--rule` bottom):
-`HOARD` wordmark, nav tabs INDEX / NODES / SCANS / JOBS (mono 11px, 6px 12px
+`HOARD` wordmark, nav tabs INDEX / SOURCES (mono 11px, 6px 12px
 padding, active has `--rule` border, `--bg` fill, `--amb` text), search field (flex 1,
 34px tall, `--bg` fill, border `--rule` or `--amb` when focused, amber glyph, mono 12.5px
 input, CLEAR affordance when non-empty, hint `/` or `ESC` at right), node pulse
@@ -188,6 +188,22 @@ role bar + role code, name 18px, path in `--dim` 11.5px; facts list (dashed rows
 blob sha256, plus rank / alpha for lora, context for llm, resolution for ckpt; buttons
 `OPEN REPO ↵` (amber primary), `ADD TO LOADOUT`, `YANK PULL COMMAND` (outline); PLUGS INTO
 list of up to four compatible artifacts (`role · name`, amber on hover, click opens).
+
+## Sources view
+
+One SOURCES tab combines folders, nodes, and jobs. Its header summarizes their counts and
+offers ADD FOLDER. The form takes an absolute path on this node, an editable name, and a layout
+choice defaulting to auto. Adding persists the folder, queues its first scan, and registers it
+with the watcher while the server runs. Configured folders appear before their first scan.
+
+FOLDERS ON THIS NODE lists path, layout, file count, size, last scan, status, and SCAN. OTHER
+LOCAL STORAGE holds download and pull sources, plus catalog rows no longer configured. NODES
+shows this node first, then peers with online state, address, indexed size, and last seen.
+ACTIVITY shows running jobs with their subject, phase, progress, rate, and cancel action;
+recent completed jobs are under a collapsible heading. These sections refresh while visible.
+
+Source removal, completed-scan cleanup and repository browsing are not implemented yet.
+See [design status and next work](README.md) for the reviewed gaps and next priorities.
 
 ## Repo detail view
 
@@ -349,7 +365,7 @@ boolean. These become user settings persisted in `localStorage`.
 
 ## Not in the prototype, named in the proposal
 
-Nav tabs NODES, SCANS, JOBS; TREE and DISK views; `?` key sheet; the
+TREE and DISK views; `?` key sheet; the
 `used:` and `trigger:` keys; DISK PRESSURE facet; git-over-HTTP face; filesystem
 projection `hoard link --profile comfyui ./models`; peer discovery and gossip. See
 `docs/feature-plan.md` for where each lands.

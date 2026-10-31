@@ -368,6 +368,15 @@ no `dir` at all and always uses the configured root.
 
 ## Sources, scans, jobs
 
+- `POST /api/v1/sources { "path": "/absolute/server/path", "name": "optional-name",
+  "kind": "auto" }`: validates a directory on the server, persists it in
+  `<data_dir>/sources.json`, admits it to the scan lane and watcher, and queues its first
+  scan. Returns a source view. `kind` defaults to `auto` and also accepts `git`, `loose`
+  and `hf-cache`; a missing or blank name uses the directory's name. Relative paths, reserved
+  names and overlap with managed storage are rejected; duplicate names and overlap with
+  existing sources return 409. Configured folders are listed before their first scan.
+  There is currently no source-removal route. Source IDs are positional listing IDs;
+  use the source's name when requesting a scan.
 - `GET /api/v1/sources`: kind, files, bytes, last scan, `pending_hashes` and the
   `pending_bytes` those files hold. There is no blob count: the catalog counts content by
   artifact rather than by blob, and a column that always read zero is not one.
@@ -395,7 +404,8 @@ no `dir` at all and always uses the configured root.
   `lookup` has subject `civitai` and reports how many hashes of its window it has asked about
   out of how many that window holds; it is failed with the reason when the service rate limits
   it and cancelled when the node stops mid-pass. `GET /api/v1/jobs/{id}`,
-  `POST /api/v1/jobs/{id}/cancel`.
+  `POST /api/v1/jobs/{id}/cancel`. Cancellation refuses already-finished jobs with 409;
+  there is currently no deletion route for completed scan history.
 
 ## The lookup
 

@@ -3,6 +3,34 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest review: Sources and repository discovery (2026-10-31)
+
+The redesign through `ce1c098` is implemented: preferences replace the top-bar theme control,
+the rail groups model families and spells out roles, shelves live in the search controls,
+and Sources combines folders, nodes and job activity. UI-added folders persist in
+`<data_dir>/sources.json`, load alongside TOML sources and join the running scan lane and
+watcher. The README and UI specification now describe that delivery.
+
+Three gaps remain: there is no source-removal endpoint or button, completed scan jobs cannot
+be cleared, and no UI consumes `GET /api/v1/repos`. The owner requested both folder removal
+and completed-scan cleanup. A Git repository without model artifacts is therefore invisible
+in the Index even when successfully scanned. Read-only checks found the reported `pose-character`
+source and repository, and `git ls-remote http://127.0.0.1:7099/pose-character.git HEAD`
+succeeded. Its Git clone URL works independently of artifact search.
+Its existing detail page is reachable at `#/repo/models/-/pose-character`. The UI's orgless
+URL builder instead emits or omits an empty segment, which fails the API's three-segment
+route; fix that when adding repository navigation.
+
+[Design status and next work](design/README.md) maps the historical plans to landed commits
+and records the next implementation: persistent source removal coordinated with scans and
+watchers, completed-scan cleanup, then repository browsing and server-generated clone commands
+from Sources. Removing a source must leave its disk files intact. Clearing completed jobs
+only removes their history and must refuse active jobs.
+
+Production occupies port 8080 and the machine is shared with other work. This review did not
+restart services or mutate the running catalog. Future verification must use temporary data,
+an available loopback port and limited build/test/hash concurrency.
+
 ## Latest wave: several named loadouts
 
 A node now holds any number of loadouts and no pin replaces a line silently. No stored record
