@@ -16,6 +16,68 @@ such as INDEX / SOURCES navigation are recorded in the UI specification. The his
 reviews below explain earlier decisions; their claims about current behavior refer to their
 stated commits, not to today's application.
 
+## UI change workflow
+
+The owner accepted the cohesion correction in `82bc336`: Index, Sources and project details
+now behave as expected within Hoard's design. Use that implementation as the baseline for
+future extensions. The initial Git delivery demonstrated a working find/review/clone journey
+but failed broader design acceptance. Functional success and visual/interaction consistency
+are separate review requirements.
+
+### Before implementation
+
+1. Read the current specification and inspect the actual affected screens and their renderers.
+   Capture before screenshots with representative existing data, including an artifact-only
+   Index. Identify the current table/cards, inspector, detail tabs, revision bar, right rail,
+   row actions, keyboard controls and scroll containers that the feature can reuse.
+2. Describe the user's complete journey and the existing behavior it must preserve. Hoard
+   helps people find, review and acquire resources over a network. A Git project is a resource
+   with its own facts and actions; an internal Hub namespace does not make it a model or
+   dataset. Keep model-only controls scoped to models. Repository hosting features are outside
+   this resource-sharing journey.
+3. Map each new action onto an existing surface before introducing markup or CSS. A new
+   resource type belongs in the shared result list, cursor, selection, inspector, sort and
+   pagination. Sources BROWSE opens an Index query. Detail content uses the shared header,
+   tabs and right rail. Additional result groups, nested browsers and oversized headers need
+   a concrete user need and an explicit design decision.
+4. Write observable acceptance checks before coding, including existing-resource regressions.
+   Resolve material ambiguity in user language: removing a scanned folder and clearing a
+   completed scan are distinct actions. Define what each action changes, preserves and does
+   after restart; endpoint success alone is insufficient evidence.
+
+### During implementation and review
+
+- Reuse shared renderers, layout classes and tokens. Add only the type-specific facts,
+  content and actions needed. Keep the existing density, spacing, columns and action placement.
+- Keep typed form values, focus, confirmation, selection and scroll stable through polling
+  and rerenders. Exercise navigation while requests are pending, not only after they finish.
+  Cancel/Escape returns to a sensible control; returning from detail preserves loaded pages.
+- Verify resource totals, facets and saved-shelf counts against the displayed list. Test
+  mixed-resource ordering and pagination so resources cannot disappear, repeat or be skipped.
+- For removal, verify the visible action and the full lifecycle: persistent intent, queued
+  and running work, watcher exclusion, caller disconnection, restart and re-add. Preserve
+  original files, other sources and shared artifacts. Scan-history cleanup changes history
+  only and protects work still owned by the scan lane. Reuse existing catalog retirement,
+  counter and search-refresh paths; avoid rescanning unrelated sources as a shortcut.
+- Review screenshots beside the baseline and use both mouse and keyboard. For shared layout
+  changes, cover 1600/1180px, light/dark, Condensed/Roomy, inspector on/off and TABLE/CARDS
+  (32 combinations). Check overflow, row height, action fit and scroll ownership. For a
+  smaller change, choose affected states and explain the coverage rather than rerunning
+  unrelated journeys.
+- Review the whole application as a user, including existing artifact inspection/loadouts,
+  source-query browsing, README/file/ref navigation, deep-link reload and actual acquisition.
+  A clone advertisement or copied command does not prove that cloning works. If another
+  reviewer or agent is involved, give them both the feature journey and the broader design
+  contract; a narrow journey review missed the original regression.
+- Use synthetic fixtures, temporary catalogs and ephemeral loopback ports. Keep production,
+  port 8080 and live sources untouched. Limit build/hash/test concurrency on the shared
+  machine, and stop only the processes created for verification.
+
+Before reporting completion, run the applicable checks in `CLAUDE.md`, including release
+asset tests for web/server changes. Record the observed behavior, review outcome and any
+remaining limitations in the handoff. Keep current contracts separate from dated proposals;
+do not present a superseded plan or a narrow test result as current design approval.
+
 ## What the code currently delivers
 
 | Area | Implementation | State |
@@ -119,8 +181,9 @@ ephemeral ports, never production or port 8080.
 1. **Remove a folder from Sources.** Add a named-source removal action with confirmation
    that it stops indexing and serving that source and removes its catalog metadata, while
    leaving the original files intact. Address UI-added and TOML-configured sources explicitly:
-   removing a UI source must update `sources.json`; disabling a configured source needs a
-   persistent exclusion or an explicit configuration edit so it cannot return on restart.
+   both use persistent exclusions in `sources.disabled.json`, while UI definitions can remain
+   masked in `sources.json` and TOML stays untouched. Re-adding clears the exclusion and
+   updates the managed definition so the source stays restored after restart.
    Coordinate admission, queued/running scans and watcher reconfiguration so no stale scan
    can recreate removed rows. Reuse the catalog's existing retirement path and refresh search
    and derived counts. Do not trigger a full scan of unrelated sources as a removal shortcut.

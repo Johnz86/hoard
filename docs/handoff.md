@@ -3,6 +3,15 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Accepted design baseline and lessons
+
+The owner confirmed that `82bc336` behaves as expected within the application design.
+The durable [UI change workflow](design/README.md#ui-change-workflow) records the lessons:
+reuse existing surfaces, establish before/after evidence, review existing resource types,
+and verify polling, navigation and removal lifecycle alongside the new feature journey.
+`CLAUDE.md` and the web rules point future implementers to that workflow. The current
+specification now explicitly distinguishes accepted changes from historical prototypes.
+
 ## Latest delivery: cohesive resource browsing and removable Sources
 
 The first Git delivery passed a narrow acquisition journey but introduced a separate results
@@ -18,8 +27,8 @@ files. `sources.disabled.json` persists exclusions alongside `sources.json`; TOM
 UI restoration by name overrides that TOML source without rewriting it. Startup completes
 persisted removals before watchers and requests start. The coordinator serializes removal
 with scan execution/admission, prunes queued source requests and their displayed subjects,
-retires only the target source
-through the existing bounded catalog path and refreshes search. Owned tasks retain guards
+retires only the target source through the existing bounded catalog path and refreshes
+search. Owned tasks retain guards
 even after a caller disconnects. Other sources and shared artifacts remain intact.
 
 Finished scan history can be dismissed or cleared separately. Queued/running scan IDs stay

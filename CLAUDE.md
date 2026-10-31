@@ -15,6 +15,8 @@ datasets and repos, with a dense keyboard-first web UI. Read these before changi
 - `docs/api/hoard-api.md`: the `/api/v1` JSON contract consumed by the UI and CLI.
 - `docs/design/ui-spec.md`: UI tokens, layout, columns, keyboard map extracted from the
   design handoff in `docs/design/handoff/project/`. Match it, do not reinterpret it.
+- `docs/design/README.md` (UI change workflow): required baseline, reuse decisions and
+  application-wide UX acceptance for changes to web interactions or resource types.
 - `docs/handoff.md`: the current state of the repository and what is left to do.
 
 ## Crate boundaries
@@ -79,6 +81,11 @@ thing that does; run it after any change under `crates/hoard-server/` or `web/`.
   logs its artifacts through `scan::log_changes`. See `.claude/skills/hoard-catalog/SKILL.md`.
 - Everything the UI computes (query parsing, facets, Markdown, compat) is a Rust endpoint.
   `web/js` renders JSON and handles input; no logic that could be a unit test lives in JS.
+- A working feature journey does not establish UI acceptance. Follow the design workflow:
+  compare existing screens before/after, preserve their interaction patterns, and verify
+  existing resource types as well as the new one. Reuse the shared surfaces before adding
+  layouts or CSS. Later explicitly accepted changes in the current specification supersede
+  historical prototypes and plans.
 - Fixture files for tests are synthetic headers generated in the test, never real weights.
 - No emoji or unicode symbols in source or docs except where the design specifies glyphs.
 - Do not touch `docs/design/handoff/`; it is the imported design and stays verbatim.

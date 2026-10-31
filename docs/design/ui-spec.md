@@ -1,12 +1,17 @@
 # Hoard UI specification
 
 Extracted from the Claude Design handoff in `docs/design/handoff/project/` (`Hoard App.dc.html` is the
-product screen, `Hoard Proposal.dc.html` is the narrative deck). The prototypes are the
-source of truth for dimensions, colors and behaviour; this file is the readable index into
-them. When the two disagree, the App file wins for the product UI.
+product screen, `Hoard Proposal.dc.html` is the narrative deck). This specification records
+the current accepted UI, including later changes described in the
+[design status](README.md). Explicit later user decisions recorded here supersede the
+imported prototypes and historical plans. For details not changed by those decisions, the
+App prototype supplies dimensions, colors and behavior and takes precedence over the
+proposal deck. Keep the imported handoff unchanged.
 
 Implementation target: `web/` vanilla JS modules plus `web/css/hoard.css` over Pico CSS.
 All values below are already declared as custom properties in `web/css/tokens.css`.
+Before changing a screen or adding a resource type, follow the
+[UI change workflow](README.md#ui-change-workflow).
 
 ## Palette (oklch)
 
@@ -170,7 +175,7 @@ Row: `padding: 5px 14px` and 12.5px font when Condensed (28px rows), `10px 14px`
 selected rows. Click sets cursor, double-click opens. Header click sorts, second click
 flips direction, arrow `↑`/`↓` after the label, active header in `--amb`.
 
-Empty state: `NO ARTIFACT MATCHES THIS QUERY` and a clickable example query
+Empty state: `NO RESOURCE MATCHES THIS QUERY` and a clickable example query
 `compat:sdxl-base-1.0 role:lora`.
 
 Cards view (LoRA identity): grid `repeat(auto-fill, minmax(228px, 1fr))`, 12px gap. Card:
