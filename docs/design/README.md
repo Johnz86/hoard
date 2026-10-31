@@ -83,6 +83,8 @@ do not present a superseded plan or a narrow test result as current design appro
 | Area | Implementation | State |
 | --- | --- | --- |
 | Navigation | `web/js/app.js`, `web/js/sources.js` | INDEX / SOURCES; old nodes, scans and jobs routes open Sources |
+| First run | `web/js/setup.js`, `api/setup.rs` | Empty bare arrival opens guided Sources; explicit links and existing catalogs retain their routes |
+| Sharing setup | Sources SHARING & SETUP | Managed node name/address, active versus pending state, restart instructions and tab-only owner token |
 | Family rail | `web/js/facets.js`, `hoard-index/src/search/brands.rs` | Flat MODEL FAMILY rows; full role labels |
 | Shelves | `web/js/shelves.js` | Search controls hold the shelf picker and add action |
 | Preferences | `web/js/app.js`, `web/js/theme.js` | Theme and display settings in preferences |

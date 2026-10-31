@@ -16,7 +16,7 @@ use hoard_mirror::resolve::Mirror;
 use hoard_mirror::upstream::{Hub, UpstreamClient};
 use hoard_mirror::usage::{SINK_CAPACITY, SINK_INTERVAL, UsageSink};
 
-use crate::config::HoardConfig;
+use crate::config::{HoardConfig, NodeSettings};
 use crate::error::ApiError;
 
 /// Where a profile's links land under the data directory. Every projection is confined to
@@ -337,6 +337,23 @@ impl AppState {
         &self.inner.config
     }
 
+    pub(crate) async fn save_node_settings(&self, settings: NodeSettings) -> Result<(), ApiError> {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let _update = state.inner.source_update.lock().await;
+            let config = state.inner.config.clone();
+            tokio::task::spawn_blocking(move || config.save_node_settings(&settings))
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?
+        })
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+    }
+
+    pub(crate) fn write_token_required(&self) -> bool {
+        self.node_token.is_some()
+    }
+
     pub fn mirror_config(&self) -> &Arc<MirrorConfig> {
         &self.inner.mirror_config
     }
@@ -508,6 +525,6 @@ mod tests {
     #[test]
     fn the_public_url_is_what_pull_commands_print() {
         let (_dir, state) = state();
-        assert_eq!(state.public_url(), "http://0.0.0.0:7099");
+        assert_eq!(state.public_url(), "http://127.0.0.1:7099");
     }
 }

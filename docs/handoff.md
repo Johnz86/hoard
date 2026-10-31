@@ -3,6 +3,46 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest delivery: first-run setup and repeatable introduction
+
+An empty installation needs no TOML file or example folders. The bare URL opens Sources
+only when the server confirms no configured sources and no resources, including peers.
+Explicit queries and shared details retain their routes; detail loading does not wait for
+setup status. The short Sources guide uses the accepted shell, existing add-folder form
+and normal Index. It disappears after resources arrive, deferring removal while a folder
+form is being edited to avoid layout shifts. Empty searches, empty folders and background
+scanning have distinct guidance. Removing the last source makes setup useful again.
+
+SHARING & SETUP persists validated node name/address overrides in `node.json`. Active and
+pending values remain distinct until restart; saving neither restarts nor rebinds. Local
+command URLs use loopback rather than a wildcard, while LAN discovery preserves its existing
+hostname behavior. The browser can hold an owner write token in tab memory, cleared on
+reload. Reads/downloads stay public to reachable clients; the write token is not read access
+control. See [first-run guidance](first-run.md) and the [API contract](api/hoard-api.md).
+
+The [narrated introduction](introduction-video.md) uses real UI actions, synthetic Git/model
+fixtures, a verified HTTP clone, captions and offline narration. Its checked-in recorder and
+editable storyboard reproduce the journey from an empty temporary catalog through sharing
+configuration, restart, indexing, search and review. Media validation checks complete decode,
+audio/video durations, audible unclipped narration and reading pauses. Source fingerprints
+and a dirty-checkout declaration distinguish recording evidence from an exact clean-commit
+claim. No production configuration, catalog or service is part of the recording.
+
+`node scripts/verify-first-run.mjs` separately checks fresh arrival, explicit empty queries,
+owner access, invalid-path recovery, empty scans, polling focus, form position during a
+background scan, active/pending settings, restart, deep-link reload with setup unavailable,
+token storage and removal of the last source. Fresh screenshots cover both themes at
+1180/1600px; the existing 32-state resource/layout journey also passes. Keep these broader
+checks separate from the promotional recording's narrower assertions.
+
+Final checks: 1,314 workspace tests passed, 0 failed and 11 pre-existing tests ignored;
+formatting, all-target Clippy with warnings denied, workspace build, six release asset tests
+and documentation build passed without warnings. First-run browser acceptance and the
+existing 32-state regression journey passed. The complete narrated reshoot passed its
+16 assertions, including actual cloning, stable source fingerprints, complete decode,
+matched audio/video duration and narration levels. The UX agent accepted the final flow
+and recording frames. Production, port 8080 and live catalogs were untouched.
+
 ## Accepted design baseline and lessons
 
 The owner confirmed that `82bc336` behaves as expected within the application design.

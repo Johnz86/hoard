@@ -87,6 +87,10 @@ The project APIs read Git objects on blocking workers with bounded previews; can
 - Space Grotesk and Space Mono vendored as woff2 under `web/fonts/` with local `@font-face`.
 - Vanilla ES modules in `web/js/`, no bundler. JS renders JSON from `/api/v1/*` and handles
   keyboard and mouse input; nothing that could be unit tested lives in JS.
+- `web/js/setup.js` presents server-derived first-run state, actionable empty results and
+  sharing configuration inside Sources. `/api/v1/setup` counts all resources independently
+  of the current query. Managed node settings in `node.json` apply after restart; local
+  command URLs fall back to loopback while discovery retains wildcard-to-hostname resolution.
 
 ## Crate layout
 
@@ -251,7 +255,7 @@ hoard/
         hub/                 Hub-compatible routes: mod.rs meta.rs files.rs proxy.rs
         git/                 git smart HTTP and LFS routes (mod.rs)
         api/                 /api/v1: search.rs compat.rs artifacts.rs repos.rs shelves.rs
-                             loadouts.rs triage.rs jobs.rs nodes.rs link.rs system.rs
+                             loadouts.rs triage.rs jobs.rs nodes.rs link.rs system.rs setup.rs
                              common.rs common_tests.rs facts_tests.rs
         ui/                  embedded web/ and index.html fallback
   web/

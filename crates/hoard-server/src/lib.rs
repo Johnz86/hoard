@@ -43,14 +43,17 @@ pub async fn start_gossip(state: &AppState) -> Option<hoard_net::GossipHandle> {
             return None;
         }
     };
-    let identity =
-        match hoard_net::NodeIdentity::new(local.node_id, &config.node.name, state.public_url()) {
-            Ok(identity) => identity,
-            Err(error) => {
-                tracing::warn!(%error, "this node cannot advertise itself; federation is off");
-                return None;
-            }
-        };
+    let identity = match hoard_net::NodeIdentity::new(
+        local.node_id,
+        &config.node.name,
+        &config.server.discovery_url(),
+    ) {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!(%error, "this node cannot advertise itself; federation is off");
+            return None;
+        }
+    };
     let mode = match config.node.discovery {
         config::Discovery::Mdns => hoard_net::DiscoveryMode::Mdns,
         config::Discovery::Static => hoard_net::DiscoveryMode::Static,

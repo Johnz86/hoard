@@ -44,17 +44,22 @@ cargo fmt --check
 ## Run
 
 ```sh
-cp hoard.example.toml hoard.toml
-cargo run -- serve --config hoard.toml
-export HF_ENDPOINT=http://localhost:7099
+cargo run -- serve --bind 127.0.0.1:7099
 ```
+
+No configuration file or example sources are required. Open `http://127.0.0.1:7099/`;
+an empty installation opens Sources with guidance for adding your first folder. This command
+listens locally. See [first-time setup](docs/first-run.md) for adding resources and enabling
+network sharing, or [watch the narrated introduction](docs/introduction-video.md).
+Use `--config hoard.toml` for an explicit configuration; `hoard.example.toml` documents the
+options. Clients can set `HF_ENDPOINT` to the node's reachable address.
 
 The Sources page can add folders while the server runs. Their paths refer to the server's
 filesystem. Hoard saves them in `<data_dir>/sources.json` and loads them alongside the
 `[[index.sources]]` entries in `hoard.toml` on the next start.
 
 See [design status and next work](docs/design/README.md) for the redesign review and the
-the current interaction and verification notes.
+current interaction and verification notes.
 
 Git projects share the Index table/cards, cursor and inspector with artifacts. Search by
 project name, committed README text or file path; click to inspect, double-click or Enter

@@ -25,6 +25,7 @@ mod loadouts;
 mod opened;
 mod projects;
 mod resources;
+mod setup;
 mod source_management;
 
 use crate::api;
@@ -2461,6 +2462,11 @@ fn mutating_routes(world: &World) -> Vec<(Method, String, Option<Value>)> {
     vec![
         (
             Method::PUT,
+            "/api/v1/setup".to_owned(),
+            Some(json!({ "node_name": "studio", "public_url": "http://studio.lan:7099" })),
+        ),
+        (
+            Method::PUT,
             format!("/api/v1/artifacts/{lora}/override"),
             Some(json!({ "role": "ckpt" })),
         ),
@@ -2548,7 +2554,7 @@ async fn every_mutating_route_refuses_a_request_without_the_node_token() {
     let routes = mutating_routes(&world);
     assert_eq!(
         routes.len(),
-        18,
+        19,
         "every route that writes belongs in this table"
     );
 

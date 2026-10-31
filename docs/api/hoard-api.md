@@ -357,6 +357,38 @@ links retain their model inspection and loadout behavior.
   is the first `x-forwarded-for` or `x-real-ip` value that parses as an IP address,
   otherwise the socket the request arrived on.
 
+## First-run setup and sharing
+
+`GET /api/v1/setup` reports `first_run`, `configured_sources`, `resource_count`, `scanning`,
+`node_name`, `bind`, `public_url`, `address_state`, `address_message`, `write_token_required`,
+`access_message`, `pending` and `restart_required`. Counts include artifacts and Git projects,
+including peer resources, independently of search filters. `first_run` is true only when
+there are no configured sources and no resources. A configured empty folder or an empty
+search is not a fresh installation. Scan state comes from the coordinator.
+
+Address states are `local_only`, `unusable` and `configured`. A loopback listener is
+local-only even when the advertised address names another host. No state asserts that a
+remote client has successfully connected. Unconfigured wildcard listeners produce usable
+loopback URLs for local commands; discovery still uses its existing hostname resolution.
+
+`PUT /api/v1/setup { "node_name", "public_url" }` requires write authorization and returns
+the same view. Node names must contain 1-64 characters after trimming, with no control
+characters. Addresses must be absolute root HTTP/S URLs with a host, without userinfo,
+query, fragment or a wildcard/unspecified host. Invalid input returns 400 without changing
+the saved settings. Loopback addresses are allowed for local use.
+
+The write persists `<data_dir>/node.json` without rewriting TOML, rebinding the listener or
+restarting the service. On startup it overrides the TOML node name and public URL. Different
+saved values appear as `pending: { "node_name", "public_url" }` with `restart_required: true`;
+active fields and generated links remain unchanged until restart. Saving the active values
+cancels a pending change. Deleting `node.json` returns control to TOML/default values.
+Listener changes remain process/configuration settings. No token is stored in this file.
+
+Reads and resource downloads remain public to clients that can reach the node. A configured
+`HOARD_NODE_TOKEN` protects mutations; the browser can hold an owner-provided token in tab
+memory and send it as a Bearer header on writes. It is cleared on reload and never persisted
+in browser storage. Setup status exposes whether a token is required, never its value.
+
 ## Shelves
 
 `GET /api/v1/shelves`, `POST { "name", "query" }`, `PUT /{id}`, `DELETE /{id}`. Seeded

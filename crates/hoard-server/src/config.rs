@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use url::{Host, Url};
 
 use hoard_index::config::{IndexConfig, SourceConfig};
 use hoard_mirror::config::MirrorConfig;
@@ -65,11 +66,73 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    /// The public URL, falling back to the bind address so a single node works unconfigured.
+    /// Uses the configured URL, or a local address when listening on all interfaces.
     pub fn resolved_public_url(&self) -> String {
+        if let Some(url) = &self.public_url {
+            return url.clone();
+        }
+        let mut address = self.bind;
+        if address.ip().is_unspecified() {
+            address.set_ip(match address.ip() {
+                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            });
+        }
+        format!("http://{address}")
+    }
+
+    pub(crate) fn discovery_url(&self) -> String {
         self.public_url
             .clone()
             .unwrap_or_else(|| format!("http://{}", self.bind))
+    }
+}
+
+/// Settings saved by the web UI take effect together on the next process start.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeSettings {
+    pub node_name: String,
+    pub public_url: String,
+}
+
+impl NodeSettings {
+    pub(crate) fn validated(self) -> Result<Self, ApiError> {
+        let node_name = self.node_name.trim();
+        if node_name.is_empty()
+            || node_name.chars().count() > hoard_net::identity::MAX_NAME
+            || node_name.chars().any(char::is_control)
+        {
+            return Err(ApiError::bad_request(format!(
+                "node name must contain 1 to {} characters without line breaks",
+                hoard_net::identity::MAX_NAME
+            )));
+        }
+        let url = Url::parse(self.public_url.trim()).map_err(|_| {
+            ApiError::bad_request("public URL must be an absolute HTTP or HTTPS address")
+        })?;
+        let usable_host = match url.host() {
+            Some(Host::Domain(host)) => !host.is_empty() && host != "*",
+            Some(Host::Ipv4(host)) => !host.is_unspecified(),
+            Some(Host::Ipv6(host)) => !host.is_unspecified(),
+            None => false,
+        };
+        if !matches!(url.scheme(), "http" | "https")
+            || !usable_host
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.path() != "/"
+        {
+            return Err(ApiError::bad_request(
+                "public URL must name an HTTP or HTTPS host without credentials, a path, query or fragment",
+            ));
+        }
+        Ok(Self {
+            node_name: node_name.to_owned(),
+            public_url: url.as_str().trim_end_matches('/').to_owned(),
+        })
     }
 }
 
@@ -146,9 +209,13 @@ impl HoardConfig {
         Ok(config)
     }
 
-    /// Applies UI sources and persisted removals at startup. Restoring a removed name in
-    /// the UI overrides its TOML definition without rewriting the TOML file.
+    /// Applies saved node settings, UI sources and persisted removals at startup. Managed
+    /// settings override TOML without rewriting it; restoring a source overrides its name.
     pub fn load_managed_sources(&mut self) -> Result<(), ApiError> {
+        if let Some(settings) = self.managed_node_settings()? {
+            self.node.name = settings.node_name;
+            self.server.public_url = Some(settings.public_url);
+        }
         for source in self.managed_sources()? {
             if let Some(existing) = self
                 .index
@@ -166,6 +233,16 @@ impl HoardConfig {
             .sources
             .retain(|source| !disabled.contains(&source.name));
         Ok(())
+    }
+
+    pub(crate) fn managed_node_settings(&self) -> Result<Option<NodeSettings>, ApiError> {
+        read_source_file::<Option<NodeSettings>>(&self.server.data_dir.join("node.json"))?
+            .map(NodeSettings::validated)
+            .transpose()
+    }
+
+    pub(crate) fn save_node_settings(&self, settings: &NodeSettings) -> Result<(), ApiError> {
+        write_source_file(&self.server.data_dir.join("node.json"), settings)
     }
 
     /// Persists one UI-created folder without rewriting the user's hoard.toml.
@@ -349,8 +426,103 @@ mod tests {
     }
 
     #[test]
-    fn public_url_falls_back_to_the_bind_address() {
+    fn public_url_uses_a_local_fallback_instead_of_an_unspecified_address() {
         let config = HoardConfig::default();
-        assert_eq!(config.server.resolved_public_url(), "http://0.0.0.0:7099");
+        assert_eq!(config.server.resolved_public_url(), "http://127.0.0.1:7099");
+        assert_eq!(config.server.discovery_url(), "http://0.0.0.0:7099");
+        let config = ServerConfig {
+            bind: "[::]:7099".parse().expect("IPv6 address"),
+            ..ServerConfig::default()
+        };
+        assert_eq!(config.resolved_public_url(), "http://[::1]:7099");
+        assert_eq!(config.discovery_url(), "http://[::]:7099");
+        let config = ServerConfig {
+            bind: "192.0.2.4:7099".parse().expect("specific address"),
+            ..ServerConfig::default()
+        };
+        assert_eq!(config.resolved_public_url(), "http://192.0.2.4:7099");
+        assert_eq!(config.discovery_url(), "http://192.0.2.4:7099");
+        let config = ServerConfig {
+            public_url: Some("http://studio.lan:7099".to_owned()),
+            ..ServerConfig::default()
+        };
+        assert_eq!(config.resolved_public_url(), "http://studio.lan:7099");
+        assert_eq!(config.discovery_url(), "http://studio.lan:7099");
+    }
+
+    #[test]
+    fn node_settings_reject_unusable_addresses_and_normalize_valid_input() {
+        for public_url in [
+            "http://0.0.0.0:7099",
+            "http://[::]:7099",
+            "http://*:7099",
+            "file:///tmp",
+            "http://user:password@hoard.lan:7099",
+            "http://hoard.lan/path",
+            "http://hoard.lan?token=x",
+            "http://hoard.lan#page",
+            "hoard.lan:7099",
+        ] {
+            let settings = NodeSettings {
+                node_name: "Hoard".to_owned(),
+                public_url: public_url.to_owned(),
+            };
+            assert!(settings.validated().is_err(), "{public_url}");
+        }
+        for node_name in ["", "   ", "Node\nName"] {
+            let settings = NodeSettings {
+                node_name: node_name.to_owned(),
+                public_url: "http://hoard.lan".to_owned(),
+            };
+            assert!(settings.validated().is_err(), "{node_name:?}");
+        }
+        let mut settings = NodeSettings {
+            node_name: "a".repeat(hoard_net::identity::MAX_NAME),
+            public_url: "http://hoard.lan".to_owned(),
+        };
+        assert!(settings.clone().validated().is_ok());
+        settings.node_name.push('a');
+        assert!(settings.validated().is_err());
+        let settings = NodeSettings {
+            node_name: " Studio ".to_owned(),
+            public_url: " https://hoard.lan:7099/ ".to_owned(),
+        }
+        .validated()
+        .expect("valid settings");
+        assert_eq!(settings.node_name, "Studio");
+        assert_eq!(settings.public_url, "https://hoard.lan:7099");
+    }
+
+    #[test]
+    fn saved_node_settings_override_toml_without_rewriting_it() {
+        let directory = tempfile::tempdir().expect("temporary config");
+        let path = directory.path().join("hoard.toml");
+        let text = format!(
+            "[server]\ndata_dir = {:?}\npublic_url = \"http://old.lan\"\n[node]\nname = \"old\"\n",
+            directory.path()
+        );
+        std::fs::write(&path, &text).expect("config writes");
+        let config = HoardConfig::load(&path).expect("config loads");
+        assert!(
+            config
+                .managed_node_settings()
+                .expect("settings read")
+                .is_none()
+        );
+        let settings = NodeSettings {
+            node_name: "Studio".to_owned(),
+            public_url: "http://studio.lan:7099".to_owned(),
+        };
+        config.save_node_settings(&settings).expect("settings save");
+        let reopened = HoardConfig::load(&path).expect("config reloads");
+        assert_eq!(reopened.node.name, settings.node_name);
+        assert_eq!(
+            reopened.server.public_url.as_deref(),
+            Some(settings.public_url.as_str())
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).expect("original config"),
+            text
+        );
     }
 }

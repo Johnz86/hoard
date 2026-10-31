@@ -2,6 +2,7 @@ import * as api from "./api.js";
 import { el, errorPanel, fmtAge, fmtBytes, fmtRate, loadingPanel, mount, toast } from "./dom.js";
 import { loadJobs, loadSources } from "./jobs.js";
 import { loadNodes } from "./nodes.js";
+import { paintSetup, renderSharing, renderWelcome } from "./setup.js";
 
 function section(title, content, id) {
     return el("section", { class: "operations-section", id },
@@ -80,7 +81,7 @@ function folderRow(app, source) {
         ? `${job.phase || "Scanning"} ${Math.round((Number(job.progress) || 0) * 100)}%`
         : source.pending_hashes
             ? `${source.pending_hashes} hashes pending`
-            : source.last_scan ? "Indexed" : "Not scanned";
+            : source.last_scan ? source.files ? "Indexed" : "No files found" : "Not scanned";
     return el("div", { class: "panel-row source-grid" },
         el("div", { class: "source-identity" },
             el("span", { class: "source-name", text: source.name }),
@@ -258,14 +259,18 @@ function addFolderForm(app) {
                 name: name.value.trim(), kind: kind.value });
             app.state.sourceFormOpen = false;
             toast(`folder added · scanning ${source.name}`);
-            await Promise.all([loadSources(app), loadJobs(app)]);
+            await Promise.all([loadSources(app), loadJobs(app), app.refreshSetup()]);
         } catch (error) {
             button.disabled = false;
-            message.textContent = error.message;
+            message.textContent = error.status === 401
+                ? "Owner access required. Enter the write token in SHARING & SETUP below, then try again."
+                : error.message;
             message.hidden = false;
+            if (error.status === 401) document.getElementById("source-sharing").open = true;
         }
     } },
         el("div", { class: "operations-heading", text: "ADD A FOLDER ON THIS NODE" }),
+        el("p", { class: "setup-note", text: "A folder on the machine running Hoard, not the browser's machine. Files stay in place. Choose Auto-detect, or Git for a repository." }),
         el("div", { class: "source-form-fields" },
             el("label", null, el("span", { text: "PATH ON THIS NODE" }), path),
             el("label", null, el("span", { text: "NAME" }), name),
@@ -289,8 +294,8 @@ function renderSourcesView(app) {
                     app.render();
                     if (app.state.sourceFormOpen) document.getElementById("source-path").focus();
                 } })),
-        app.state.sourceFormOpen ? addFolderForm(app) : null,
-        folders(app), managedStorage(app), nodes(app), activity(app));
+        renderWelcome(app), app.state.sourceFormOpen ? addFolderForm(app) : null,
+        folders(app), managedStorage(app), renderSharing(app), nodes(app), activity(app));
 }
 
 function sourcesSnapshot(app) {
@@ -324,7 +329,7 @@ export function paintSourcesView(app, panel) {
 
     const form = view.querySelector(".source-add-form");
     if (app.state.sourceFormOpen && !form) {
-        view.querySelector(".operations-top").after(addFolderForm(app));
+        (view.querySelector("#source-welcome") || view.querySelector(".operations-top")).after(addFolderForm(app));
     } else if (!app.state.sourceFormOpen && form) {
         form.remove();
     }
@@ -356,5 +361,6 @@ export function paintSourcesView(app, panel) {
         if (history) app.state.recentJobsOpen = history.open;
         view.querySelector("#source-activity").replaceWith(activity(app));
     }
+    paintSetup(app, view);
     view.sourcesSnapshot = next;
 }

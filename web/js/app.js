@@ -14,6 +14,7 @@ import { initSearch, renderTokenStrip, setSearchValue } from "./search.js";
 import { initShelfActions, loadShelves, openShelfMenu } from "./shelves.js";
 import { renderTable, revealCursor } from "./table.js";
 import { applySettings, settings, updateSettings } from "./theme.js";
+import { loadSetup, renderCatalogEmpty } from "./setup.js";
 
 const NAV = [
     { label: "INDEX", route: "/index" },
@@ -58,6 +59,9 @@ const state = {
     jobs: null,
     jobsError: null,
     sourceFormOpen: false,
+    setup: null,
+    setupError: null,
+    ownerTokenSet: false,
     recentJobsOpen: false,
     loadoutId: null,
     loadoutCreating: null,
@@ -116,6 +120,14 @@ const app = {
     loadMoreResources,
     rowKey,
     cancelSourceRemoval,
+    openSourceForm,
+    cancelSourceForm: () => {
+        state.sourceFormOpen = false;
+        render();
+        document.querySelector(".operations-top button")?.focus();
+    },
+    openSources: () => navigate("#/sources"),
+    refreshSetup: () => loadSetup(app),
     addToLoadout,
     removeFromLoadout,
     switchLoadout,
@@ -140,7 +152,7 @@ const app = {
     resultLine,
     render,
     async refreshIndex() {
-        await Promise.all([runSearch(), loadShelves(app)]);
+        await Promise.all([runSearch(), loadShelves(app), loadSetup(app)]);
     }
 };
 
@@ -217,6 +229,15 @@ function navigate(hash) {
     location.hash = hash;
 }
 
+function openSourceForm() {
+    state.sourceFormOpen = true;
+    if (state.view !== "sources") navigate("#/sources?add=1");
+    else {
+        render();
+        document.getElementById("source-path")?.focus();
+    }
+}
+
 function readHash() {
     const raw = location.hash.replace(/^#/, "") || "/index";
     const [path, search] = raw.split("?");
@@ -279,6 +300,7 @@ function readHash() {
 
     if (["sources", "nodes", "scans", "jobs"].includes(head)) {
         state.view = "sources";
+        if (params.get("add") === "1") state.sourceFormOpen = true;
         const source = params.get("source");
         if (source) {
             commitQuery(`source:${JSON.stringify(source)}`, { echo: true });
@@ -286,6 +308,8 @@ function readHash() {
         }
         if (head !== "sources") syncHash();
         render();
+        if (state.sourceFormOpen) document.getElementById("source-path")?.focus();
+        loadSetup(app);
         if (!state.nodes) loadNodes(app);
         if (!state.sources) loadSources(app);
         loadJobs(app);
@@ -851,6 +875,7 @@ function paintIndex() {
     const offset = scroller ? scroller.scrollTop : 0;
     if (state.searchError) mount(body, errorPanel(state.searchError, () => runSearch()));
     else if (state.searching && !state.rows.length) mount(body, loadingPanel("searching the index…"));
+    else if (!state.rows.length) mount(body, renderCatalogEmpty(app));
     else if (state.viewMode === "CARDS") mount(body, renderCards(app));
     else mount(body, renderTable(app, exampleQuery()));
     const next = body.firstElementChild;
@@ -989,7 +1014,7 @@ function initTopbar() {
     });
 }
 
-function start() {
+async function start() {
     applySettings();
     initTopbar();
     initSearch(app);
@@ -999,19 +1024,36 @@ function start() {
         if (suppressHashChange) return;
         readHash();
     });
+    const initialHash = location.hash;
+    const bareArrival = !initialHash || initialHash === "#/" || initialHash === "#";
+    state.searching = bareArrival;
     render();
+    if (bareArrival) await loadSetup(app, false);
+    else if (!initialHash.startsWith("#/sources")) loadSetup(app);
+    state.searching = false;
+    if (bareArrival && location.hash === initialHash && state.setup?.first_run) {
+        history.replaceState(null, "", "#/sources");
+    }
     readHash();
     loadShelves(app);
     loadNodes(app);
     loadLoadout(app);
     setInterval(async () => {
-        if (state.view !== "sources" || refreshingSources) return;
+        const waitingForResources = state.view === "index" && !state.rows.length
+            && state.setup?.resource_count === 0 && state.setup.configured_sources > 0;
+        if ((state.view !== "sources" && !waitingForResources) || refreshingSources) return;
         refreshingSources = true;
         try {
+            if (waitingForResources) {
+                await loadSetup(app, false);
+                if (state.view === "index") await runSearch();
+                return;
+            }
             await Promise.all([
                 loadSources(app, false),
                 loadJobs(app, false),
-                loadNodes(app, false)
+                loadNodes(app, false),
+                loadSetup(app, false)
             ]);
             if (state.view === "sources") {
                 paintSourcesView(app, document.getElementById("view-panel"));

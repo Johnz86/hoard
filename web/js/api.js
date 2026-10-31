@@ -1,4 +1,9 @@
 const BASE = "/api/v1";
+let writeToken = "";
+
+export function setWriteToken(token) {
+    writeToken = token;
+}
 
 export class ApiError extends Error {
     constructor(code, message, status) {
@@ -28,7 +33,10 @@ async function request(method, path, body) {
     try {
         response = await fetch(BASE + path, {
             method,
-            headers: body === undefined ? {} : { "content-type": "application/json" },
+            headers: {
+                ...(body === undefined ? {} : { "content-type": "application/json" }),
+                ...(method !== "GET" && writeToken ? { authorization: `Bearer ${writeToken}` } : {})
+            },
             body: body === undefined ? undefined : JSON.stringify(body)
         });
     } catch {
@@ -111,3 +119,5 @@ export const clearScanJobs = () => del("/jobs?kind=scan");
 
 export const settings = () => get("/settings");
 export const saveSettings = (body) => put("/settings", body);
+export const setup = () => get("/setup");
+export const saveSetup = (body) => put("/setup", body);

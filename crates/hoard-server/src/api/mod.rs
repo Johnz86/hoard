@@ -16,6 +16,7 @@ pub mod projects;
 pub mod repos;
 pub mod resources;
 pub mod search;
+pub mod setup;
 pub mod shelves;
 pub mod system;
 pub mod triage;
@@ -40,6 +41,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/healthz", get(system::healthz))
         .route("/api/v1/search", get(search::search))
+        .route("/api/v1/setup", get(setup::get).put(setup::put))
         .route("/api/v1/search/parse", get(search::parse_query))
         .route("/api/v1/projects", get(project_search::list))
         .route("/api/v1/projects/{id}", get(projects::detail))

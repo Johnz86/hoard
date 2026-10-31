@@ -196,6 +196,23 @@ list of up to four compatible artifacts (`role · name`, amber on hover, click o
 
 ## Sources view
 
+A bare initial URL opens Sources when `/api/v1/setup` confirms zero configured folders and
+zero resources. Existing nodes keep Index as their landing view; explicit queries and shared
+detail links are preserved. There is no permanent onboarding-complete flag. The compact
+`Build your shared catalog` section appears while no resources are indexed, with Add a folder,
+Review resources and Share access guidance. It reuses the shell and existing add-folder form.
+Keep configured-empty, scanning, failed scan and unmatched-search states distinct. Empty
+Index results offer CLEAR SEARCH and/or an actionable Sources link instead of an irrelevant
+model query example. Background scans refresh an empty Index until resources appear.
+
+SHARING & SETUP remains a collapsible section in Sources after resources appear. It shows
+the active address/listener, node name/address fields and honest local-only or unverified
+sharing status. Saved settings show a restart requirement without changing active labels.
+Do not silently restart or rebind. Token-protected nodes offer password input for owner
+access, held only in tab memory; explain that reads remain public. Preserve unsaved form
+input, focus and expanded state through polling. Paths in the add-folder form explicitly
+refer to the machine running Hoard, with files left in place.
+
 One SOURCES tab combines folders, nodes, and jobs. Its header summarizes their counts and
 offers ADD FOLDER. The form takes an absolute path on this node, an editable name, and a layout
 choice defaulting to auto. Adding persists the folder, queues its first scan, and registers it

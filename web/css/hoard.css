@@ -2421,3 +2421,30 @@ input.field.drawer-rename:focus {
     color: var(--red);
     border-color: var(--red);
 }
+
+.setup-welcome {
+    margin: 24px 0;
+    padding: 20px 0;
+    border-block: 1px solid var(--rule);
+}
+
+.setup-welcome h2 { margin: 0 0 8px; font-size: 21px; }
+.setup-welcome > p { max-width: 78ch; margin: 0 0 20px; color: var(--muted); }
+.setup-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 28px; }
+.setup-steps h3 { margin: 0 0 10px; font: 11px var(--mono); letter-spacing: 0.1em; }
+.setup-steps p { min-height: 3.2em; margin: 0 0 14px; color: var(--muted); font-size: 13px; }
+.setup-note { margin: 8px 0 16px; color: var(--muted); font-size: 13px; max-width: 90ch; }
+.sharing-panel { margin-top: 32px; padding: 16px 0; border-block: 1px solid var(--rule); }
+.sharing-panel > summary { color: var(--muted); font: 11px var(--mono); letter-spacing: 0.1em; }
+.sharing-active { padding-top: 18px; }
+.sharing-status { margin: 0 0 10px; font-size: 13px; color: var(--text); }
+.sharing-address { overflow-wrap: anywhere; font-size: 11px; }
+.sharing-fields { display: grid; grid-template-columns: 1fr 2fr; gap: 16px; }
+.sharing-fields label { min-width: 0; font: 10px var(--mono); color: var(--muted); letter-spacing: 0.1em; }
+.sharing-fields .field { width: 100%; margin-top: 8px; font: 12px var(--mono); height: 40px; }
+.owner-access { border-top: 1px solid var(--rule); margin-top: 20px; padding-top: 8px; }
+.owner-access-fields { display: flex; gap: 12px; max-width: 620px; margin-bottom: 12px; }
+.owner-access-fields .field { flex: 1; min-width: 0; height: 38px; font: 12px var(--mono); }
+.owner-access-fields .btn { flex-shrink: 0; }
+.catalog-empty { flex: 1; }
+.setup-empty-actions { display: flex; gap: 12px; justify-content: center; margin-top: 20px; }

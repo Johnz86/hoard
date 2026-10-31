@@ -1,0 +1,34 @@
+WEBVTT
+
+00:00:00.000 --> 00:00:08.000
+Start with the folders you already have. Hoard keeps your files where they are.
+
+00:00:08.000 --> 00:00:20.000
+Name this node and review its sharing address. Saved node settings apply after restart.
+
+00:00:20.000 --> 00:00:31.000
+Choose a folder on the server. Auto-detect works for Git projects, model folders and Hub caches.
+
+00:00:31.000 --> 00:00:38.000
+Add and scan. Sources shows the folder and its scan state; the original files stay untouched.
+
+00:00:38.000 --> 00:00:48.000
+Add another folder. These tiny synthetic models demonstrate the same flow as a real collection.
+
+00:00:48.000 --> 00:00:57.000
+Projects and models share one Index. Select a row for facts; open it when you want more.
+
+00:00:57.000 --> 00:01:05.000
+Search names, committed README text and file paths. A repository needs no model files to be found.
+
+00:01:05.000 --> 00:01:14.000
+Read the committed README, follow its documentation links and check the selected revision.
+
+00:01:14.000 --> 00:01:22.000
+Browse files and preview text. Escape returns to the list without losing your place.
+
+00:01:22.000 --> 00:01:31.000
+Copy the clone command. This walkthrough verifies a real HTTP Git clone and its commit.
+
+00:01:31.000 --> 00:01:41.550
+For other machines, configure a reachable LAN address. Add more folders whenever you need them.
