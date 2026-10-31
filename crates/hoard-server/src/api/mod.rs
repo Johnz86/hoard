@@ -14,6 +14,7 @@ pub mod nodes;
 pub(crate) mod project_search;
 pub mod projects;
 pub mod repos;
+pub mod resources;
 pub mod search;
 pub mod shelves;
 pub mod system;
@@ -106,8 +107,15 @@ pub fn routes() -> Router<AppState> {
             get(jobs::sources).post(jobs::create_source),
         )
         .route("/api/v1/scan", post(jobs::scan))
-        .route("/api/v1/jobs", get(jobs::list))
-        .route("/api/v1/jobs/{id}", get(jobs::detail))
+        .route("/api/v1/sources/{name}", delete(jobs::remove_source))
+        .route(
+            "/api/v1/jobs",
+            get(jobs::list).delete(jobs::clear_scan_jobs),
+        )
+        .route(
+            "/api/v1/jobs/{id}",
+            get(jobs::detail).delete(jobs::delete_job),
+        )
         .route("/api/v1/jobs/{id}/cancel", post(jobs::cancel))
         .route("/api/v1/nodes", get(nodes::list))
         .route("/api/v1/peers", post(nodes::add_peer))

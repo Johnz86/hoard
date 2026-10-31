@@ -2,7 +2,8 @@
 
 Reviewed on 2026-10-31, initially against `ce1c098`, then against the Git-project delivery.
 The navigation, family rail, shelves, preferences, combined Sources view and Git-project
-search and browsing are implemented. Source removal and completed-job cleanup remain open.
+search and browsing are implemented. The subsequent cohesion correction integrates projects
+into the established Index/detail layouts and delivers source removal and scan-history cleanup.
 
 ## Current references
 
@@ -24,8 +25,8 @@ stated commits, not to today's application.
 | Shelves | `web/js/shelves.js` | Search controls hold the shelf picker and add action |
 | Preferences | `web/js/app.js`, `web/js/theme.js` | Theme and display settings in preferences |
 | Add a folder | `api/jobs.rs`, `state.rs`, `config.rs` | Saves UI sources in `sources.json`, queues a scan, restarts the watcher |
-| Remove a folder | No route or UI action | Missing |
-| Clear completed scans | Jobs support listing and cancellation only | Missing |
+| Remove a folder | Source row REMOVE / CONFIRM / CANCEL | Persistent removal, original files kept, queued scans and watchers coordinated |
+| Clear completed scans | Activity DISMISS / CLEAR FINISHED SCANS | History-only cleanup; active jobs protected |
 | Git projects | `GET /api/v1/projects`, `web/js/projects.js` | Main search and Sources lead to README, files, revisions and clone/share controls |
 | Git serving | `hoard-server/src/git/` | Canonical `/git/projects/{id}.git` clones projects independently of Hub namespaces |
 
@@ -61,10 +62,11 @@ routes. Projects use neutral `#/project/{id}` routes and do not expose a model n
 Git verification was limited to the ref advertisement; no clone, scan, download or production
 mutation was performed during this review.
 
-## Git-project delivery
+## Initial Git-project delivery (UI superseded below)
 
-A prospective-user agent reviewed the find, review and clone journey and accepted the final
-implementation after the browser checks. This is a resource catalog and read-only sharing
+A prospective-user agent reviewed the find, review and clone journey, but that narrow review
+missed the broader layout regression. The UI description in this section is historical; the
+cohesion correction below supersedes it. This is a resource catalog and read-only sharing
 interface; it adds no forge, editing, issues or pull-request features.
 
 - Main search returns a separate Git-project group, even when there are no model artifacts.
@@ -89,7 +91,30 @@ tests also cover bare repositories, safe paths, shell quoting and refresh after 
 No production service, configuration or live catalog was modified. LAN sharing uses the
 configured reachable `public_url`; the local deployment's loopback setting was left intact.
 
-## Next implementation, in priority order
+## Cohesion correction and broad acceptance
+
+The owner rejected the separate project-results block and tall project header because they
+changed both Index and Sources layouts. The correction uses the established result table and
+cards for both kinds, with one cursor, inspector, sort, scrollbar and pagination. Project
+details reuse the existing detail header, tabs, revision bar and right rail. Sources keeps
+BROWSE / SCAN / REMOVE in each row; BROWSE opens a normal source query in Index rather than
+inserting another result section. Model inspection, loadouts and existing density/theme
+controls retain their patterns. Shelf counts agree with the resources their queries show.
+
+REMOVE arms CONFIRM / CANCEL in place and says files stay on disk. UI and TOML folders stay
+removed across restart; re-adding restores them. Finished-scan cleanup is separate and cannot
+delete active/queued work. Removal survives caller disconnection and startup repairs persisted
+intent. Existing catalog record shapes and format 19 are unchanged.
+
+Acceptance compares artifact-only layouts at 1600/1180px across two themes, two densities,
+inspector on/off and TABLE/CARDS (32 combinations), then mixed-resource click/double-click,
+J/K/Enter/Y/L behavior, sorting/filtering/inspector, source-query browsing, project files/refs,
+scroll and deep links. Sources tests preserve form and confirmation focus through polling,
+remove UI/TOML sources while keeping files/other sources, restart, re-add and clone. Async
+removal/navigation and loaded-page return are included. Verification uses isolated data and
+ephemeral ports, never production or port 8080.
+
+## Removal acceptance requirements retained from the review
 
 1. **Remove a folder from Sources.** Add a named-source removal action with confirmation
    that it stops indexing and serving that source and removes its catalog metadata, while

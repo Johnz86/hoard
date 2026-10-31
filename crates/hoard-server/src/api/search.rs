@@ -24,6 +24,7 @@ pub struct SearchParams {
     pub sort: Option<String>,
     pub dir: Option<String>,
     pub cursor: Option<String>,
+    pub resource_cursor: Option<String>,
     pub limit: Option<u32>,
 }
 
@@ -81,6 +82,9 @@ impl From<DiskPressure> for DiskPressureView {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchResponse {
+    pub resources: Vec<crate::api::resources::ResourceRow>,
+    pub resource_total: u64,
+    pub resource_next_cursor: Option<String>,
     pub projects: crate::api::project_search::ProjectList,
     pub query: ParsedQuery,
     pub facets: FacetsView,
@@ -111,6 +115,8 @@ pub async fn search(
     let limit = clamp_limit(params.limit);
     let key = cursor_key(&raw, params.sort.as_deref(), params.dir.as_deref());
     let offset = decode_cursor(params.cursor.as_deref(), &key)?;
+    let resource_key = format!("resources|{key}");
+    let resource_offset = decode_cursor(params.resource_cursor.as_deref(), &resource_key)?;
     let applied_sort = sort.key.column().to_owned();
     let applied_dir = match sort.descending {
         true => "desc",
@@ -120,9 +126,27 @@ pub async fn search(
     if page.stale {
         tracing::debug!("the search index is behind the catalog and is being refreshed");
     }
+    let resources = crate::api::resources::find(
+        &state,
+        crate::api::resources::ResourceRequest {
+            raw: raw.clone(),
+            sort,
+            offset: resource_offset,
+            limit,
+            cursor_key: resource_key,
+        },
+        &page,
+        offset,
+    )
+    .await?;
+    let project_facets = crate::api::project_search::facet_counts(&state, raw.clone()).await?;
+    let counted = resource_facets(&page.facets, &page.query, project_facets);
     Ok(Json(SearchResponse {
+        resources: resources.rows,
+        resource_total: resources.total,
+        resource_next_cursor: resources.next_cursor,
         projects: crate::api::project_search::find(&state, raw, None, 0, limit).await?,
-        facets: facets(&page.facets, &page.query),
+        facets: facets(&counted, &page.query),
         rows: page.rows.iter().map(RowView::from).collect(),
         next_cursor: next_cursor(offset, limit, walked(&page), page.total, &key),
         total: page.total,
@@ -134,10 +158,47 @@ pub async fn search(
     }))
 }
 
+fn resource_facets(
+    artifacts: &Facets,
+    query: &ParsedQuery,
+    projects: crate::api::project_search::ProjectFacetCounts,
+) -> Facets {
+    let mut counted = artifacts.clone();
+    let add = |buckets: &mut Vec<FacetBucket>, value: &str, label: Option<&str>, count: u64| {
+        if count == 0 {
+            return;
+        }
+        if let Some(bucket) = buckets.iter_mut().find(|bucket| bucket.value == value) {
+            bucket.count = bucket.count.saturating_add(count);
+        } else {
+            buckets.push(FacetBucket {
+                value: value.to_owned(),
+                label: label.map(str::to_owned),
+                count,
+                active: false,
+                members: Vec::new(),
+            });
+        }
+        buckets.sort_unstable_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.value.cmp(&right.value))
+        });
+    };
+    add(&mut counted.role, "git", Some("Git project"), projects.role);
+    add(&mut counted.format, "git", None, projects.format);
+    for (node, count) in projects.nodes {
+        add(&mut counted.node, &node, None, count);
+    }
+    counted.mark_query(query);
+    counted
+}
+
 /// How far into the result this page reached: the rows it assembled plus the candidates it
 /// walked past because a rescan had replaced them. A skipped candidate still occupies its
 /// position in the order, so a page holding one is a full page and the cursor advances.
-fn walked(page: &QueryPage) -> usize {
+pub(crate) fn walked(page: &QueryPage) -> usize {
     page.rows
         .len()
         .saturating_add(usize::try_from(page.skipped).unwrap_or(usize::MAX))
@@ -145,7 +206,7 @@ fn walked(page: &QueryPage) -> usize {
 
 /// One page of the catalog, compiled against the shelves it holds and read on a blocking
 /// thread because the catalog and its index are file work.
-async fn run_query(
+pub(crate) async fn run_query(
     state: &AppState,
     raw: String,
     sort: SortSpec,

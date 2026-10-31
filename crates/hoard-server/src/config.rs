@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -145,17 +146,25 @@ impl HoardConfig {
         Ok(config)
     }
 
-    /// Adds folders created through the UI to the configured sources at startup.
+    /// Applies UI sources and persisted removals at startup. Restoring a removed name in
+    /// the UI overrides its TOML definition without rewriting the TOML file.
     pub fn load_managed_sources(&mut self) -> Result<(), ApiError> {
         for source in self.managed_sources()? {
-            if self.index.source(&source.name).is_some() {
-                return Err(ApiError::bad_request(format!(
-                    "source {} exists in both hoard.toml and managed sources",
-                    source.name
-                )));
+            if let Some(existing) = self
+                .index
+                .sources
+                .iter_mut()
+                .find(|held| held.name == source.name)
+            {
+                *existing = source;
+            } else {
+                self.index.sources.push(source);
             }
-            self.index.sources.push(source);
         }
+        let disabled = self.disabled_sources()?;
+        self.index
+            .sources
+            .retain(|source| !disabled.contains(&source.name));
         Ok(())
     }
 
@@ -163,29 +172,35 @@ impl HoardConfig {
     pub fn append_managed_source(&self, source: &SourceConfig) -> Result<(), ApiError> {
         let path = self.managed_sources_path();
         let mut sources = self.managed_sources()?;
-        sources.push(source.clone());
-        let bytes = serde_json::to_vec_pretty(&sources)
-            .map_err(|error| ApiError::internal(error.to_string()))?;
-        std::fs::create_dir_all(&self.server.data_dir)
-            .map_err(|error| ApiError::internal(format!("{}: {error}", path.display())))?;
-        let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, bytes)
-            .map_err(|error| ApiError::internal(format!("{}: {error}", temporary.display())))?;
-        std::fs::rename(&temporary, &path)
-            .map_err(|error| ApiError::internal(format!("{}: {error}", path.display())))
+        if let Some(existing) = sources.iter_mut().find(|held| held.name == source.name) {
+            *existing = source.clone();
+        } else {
+            sources.push(source.clone());
+        }
+        write_source_file(&path, &sources)?;
+        let mut disabled = self.disabled_sources()?;
+        if disabled.remove(&source.name) {
+            write_source_file(&self.disabled_sources_path(), &disabled)?;
+        }
+        Ok(())
     }
 
     fn managed_sources(&self) -> Result<Vec<SourceConfig>, ApiError> {
-        let path = self.managed_sources_path();
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => {
-                return Err(ApiError::internal(format!("{}: {error}", path.display())));
-            }
-        };
-        serde_json::from_slice(&bytes)
-            .map_err(|error| ApiError::internal(format!("{}: {error}", path.display())))
+        read_source_file(&self.managed_sources_path())
+    }
+
+    pub(crate) fn disabled_sources(&self) -> Result<BTreeSet<String>, ApiError> {
+        read_source_file(&self.disabled_sources_path())
+    }
+
+    pub(crate) fn disable_source(&self, name: &str) -> Result<(), ApiError> {
+        let mut disabled = self.disabled_sources()?;
+        disabled.insert(name.to_owned());
+        write_source_file(&self.disabled_sources_path(), &disabled)
+    }
+
+    fn disabled_sources_path(&self) -> PathBuf {
+        self.server.data_dir.join("sources.disabled.json")
     }
 
     fn managed_sources_path(&self) -> PathBuf {
@@ -225,6 +240,29 @@ fn hostname() -> Option<String> {
         .ok()
         .map(|raw| raw.trim().to_owned())
         .filter(|name| !name.is_empty())
+}
+
+fn read_source_file<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T, ApiError> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| ApiError::internal(format!("{}: {error}", path.display()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Err(error) => Err(ApiError::internal(format!("{}: {error}", path.display()))),
+    }
+}
+
+fn write_source_file(path: &Path, value: &impl Serialize) -> Result<(), ApiError> {
+    let bytes =
+        serde_json::to_vec_pretty(value).map_err(|error| ApiError::internal(error.to_string()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| ApiError::internal(format!("{}: {error}", parent.display())))?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, bytes)
+        .map_err(|error| ApiError::internal(format!("{}: {error}", temporary.display())))?;
+    std::fs::rename(&temporary, path)
+        .map_err(|error| ApiError::internal(format!("{}: {error}", path.display())))
 }
 
 #[cfg(test)]

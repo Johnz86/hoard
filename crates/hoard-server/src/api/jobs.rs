@@ -43,6 +43,8 @@ pub struct SourceView {
     /// Whether `POST /api/v1/scan` will accept this source: it is named in the
     /// active configuration.
     pub can_scan: bool,
+    pub can_remove: bool,
+    pub browse_query: String,
     /// Who writes this source when it is not the scanner: "downloads", "pulls", "peer", or
     /// "nobody" for a stored source the configuration no longer names. Absent when
     /// `can_scan` is true.
@@ -88,6 +90,24 @@ pub struct ScanStarted {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct JobFilter {
     pub state: Option<String>,
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SourceRemoved {
+    pub name: String,
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct JobDeleted {
+    pub id: JobId,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct JobsCleared {
+    pub deleted: usize,
 }
 
 pub async fn sources(State(state): State<AppState>) -> ApiResult<Json<Vec<SourceView>>> {
@@ -121,6 +141,8 @@ async fn source_views(state: &AppState) -> ApiResult<Vec<SourceView>> {
                 pending_hashes: 0,
                 pending_bytes: 0,
                 can_scan: true,
+                can_remove: manager_of(&source.name) == "nobody",
+                browse_query: format!("source:{}", hoard_index::search::quoted(&source.name)),
                 managed_by: None,
             },
         };
@@ -165,6 +187,19 @@ pub async fn create_source(
         .find(|view| view.name == name)
         .ok_or_else(|| ApiError::internal("new source is missing"))?;
     Ok(Json(view))
+}
+
+pub async fn remove_source(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<SourceRemoved>> {
+    authorize(&state, &headers)?;
+    state.remove_source(name.clone()).await?;
+    Ok(Json(SourceRemoved {
+        name,
+        removed: true,
+    }))
 }
 
 fn validate_source(body: SourceBody, blocked: &[PathBuf]) -> ApiResult<SourceConfig> {
@@ -230,6 +265,8 @@ fn source_view(
         true => None,
         false => Some(manager_of(&record.name)),
     };
+    let browse_query = format!("source:{}", hoard_index::search::quoted(&record.name));
+    let can_remove = manager_of(&record.name) == "nobody";
     SourceView {
         id: SourceId::new(position as i64 + 1),
         name: record.name,
@@ -243,6 +280,8 @@ fn source_view(
         pending_hashes: record.pending_hashes,
         pending_bytes: record.pending_bytes,
         can_scan,
+        can_remove,
+        browse_query,
         managed_by,
     }
 }
@@ -323,8 +362,48 @@ pub async fn list(
         .transpose()
         .map_err(ApiError::from)?;
     let catalog = Arc::clone(state.catalog());
-    let rows = blocking(move || catalog.list_jobs(wanted)).await?;
+    let mut rows = blocking(move || catalog.list_jobs(wanted)).await?;
+    if let Some(kind) = filter.kind {
+        rows.retain(|job| job.kind == kind);
+    }
     Ok(Json(rows))
+}
+
+pub async fn delete_job(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<Json<JobDeleted>> {
+    authorize(&state, &headers)?;
+    let id = job_id(&id)?;
+    state
+        .coordinator()
+        .remove_finished_scan_job(id)
+        .await
+        .map_err(cleanup_conflict)?;
+    Ok(Json(JobDeleted { id, deleted: true }))
+}
+
+pub async fn clear_scan_jobs(
+    State(state): State<AppState>,
+    Query(filter): Query<JobFilter>,
+    headers: HeaderMap,
+) -> ApiResult<Json<JobsCleared>> {
+    authorize(&state, &headers)?;
+    if filter.kind.as_deref() != Some("scan") || filter.state.is_some() {
+        return Err(ApiError::bad_request(
+            "clearing completed scans requires kind=scan",
+        ));
+    }
+    let deleted = state.coordinator().clear_finished_scan_jobs().await?;
+    Ok(Json(JobsCleared { deleted }))
+}
+
+fn cleanup_conflict(error: IndexError) -> ApiError {
+    match error {
+        IndexError::Query(message) => ApiError::conflict(message),
+        other => ApiError::from(other),
+    }
 }
 
 pub async fn detail(

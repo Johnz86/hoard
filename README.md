@@ -54,13 +54,20 @@ filesystem. Hoard saves them in `<data_dir>/sources.json` and loads them alongsi
 `[[index.sources]]` entries in `hoard.toml` on the next start.
 
 See [design status and next work](docs/design/README.md) for the redesign review and the
-remaining source-removal and completed-scan cleanup work.
+the current interaction and verification notes.
 
-Git projects appear in the main Index alongside artifacts. Search by project name, committed
-README text or file path, then open a project to read its README, browse files and select a
-branch or tag. Sources also offers BROWSE PROJECTS for Git folders. COPY CLONE uses the
+Git projects share the Index table/cards, cursor and inspector with artifacts. Search by
+project name, committed README text or file path; click to inspect, double-click or Enter
+to open. Project details reuse the standard header, tabs and right rail for README, files,
+refs and clone/share actions. Sources offers BROWSE for any folder as a normal source query.
+COPY CLONE uses the
 Hoard server's read-only Git endpoint; COPY PROJECT LINK shares the current revision and file.
 Git projects do not need model artifacts or triage before they can be found and shared.
+
+Sources offers REMOVE, then CONFIRM or CANCEL, on each indexed folder. Removal stops indexing
+and sharing that source, preserves files on disk and survives restart, including folders from
+`hoard.toml`. Add the folder again to restore it. Finished scans can be dismissed individually
+or cleared from Activity; this only removes history.
 
 For other machines to use those links, configure `[server] bind` and `public_url` with a
 reachable LAN address, as in `hoard.example.toml`. A loopback address works on its own machine.

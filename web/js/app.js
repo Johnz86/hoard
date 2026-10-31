@@ -9,7 +9,7 @@ import { loadLoadout, loadoutItems, renderDrawer } from "./loadout.js";
 import { loadNodes, renderNodePulse } from "./nodes.js";
 import { loadJobs, loadSources } from "./jobs.js";
 import { paintSourcesView } from "./sources.js";
-import { loadProject, renderProject, renderProjectResults } from "./projects.js";
+import { loadProject, renderProject } from "./projects.js";
 import { initSearch, renderTokenStrip, setSearchValue } from "./search.js";
 import { initShelfActions, loadShelves, openShelfMenu } from "./shelves.js";
 import { renderTable, revealCursor } from "./table.js";
@@ -29,11 +29,12 @@ const state = {
     query: null,
     rows: [],
     projects: { rows: [], total: 0 },
-    projectsLoading: false,
+    resourcesNext: null,
+    resourcesLoading: false,
     project: null,
-    sourceProjectName: null,
-    sourceProjects: null,
-    sourceProjectsError: null,
+    sourceDeleting: null,
+    sourceRemovalPending: null,
+    jobDeleting: null,
     facets: {},
     total: 0,
     nodeCount: 0,
@@ -112,8 +113,9 @@ const app = {
     selectProjectRevision,
     selectProjectTab,
     browseProjects,
-    loadSourceProjects,
-    loadMoreProjects,
+    loadMoreResources,
+    rowKey,
+    cancelSourceRemoval,
     addToLoadout,
     removeFromLoadout,
     switchLoadout,
@@ -136,7 +138,10 @@ const app = {
     hideKeySheet,
     selfNodeName,
     resultLine,
-    render
+    render,
+    async refreshIndex() {
+        await Promise.all([runSearch(), loadShelves(app)]);
+    }
 };
 
 function repoTypeOf(row) {
@@ -187,9 +192,6 @@ function buildHash() {
         const path = [detail.type, detail.org, detail.name].map(encodeURIComponent).join("/");
         return `#/repo/${path}?${params.toString()}`;
     }
-    if (state.view === "sources" && state.sourceProjectName) {
-        return `#/sources?${new URLSearchParams({ source: state.sourceProjectName })}`;
-    }
     if (state.view !== "index") return `#/${state.view}`;
     const params = new URLSearchParams();
     if (state.q) params.set("q", state.q);
@@ -225,7 +227,8 @@ function readHash() {
         const id = decodeURIComponent(parts[1]);
         const revision = params.get("rev") || "";
         const path = params.get("path") || "";
-        const tab = path || params.get("tab") === "FILES" ? "FILES" : "README";
+        const requested = params.get("tab");
+        const tab = ["README", "FILES", "REFS"].includes(requested) ? requested : path ? "FILES" : "README";
         if (state.project?.id !== id || state.project.revision !== revision) {
             state.project = { id, revision, path, tab };
         } else {
@@ -276,24 +279,16 @@ function readHash() {
 
     if (["sources", "nodes", "scans", "jobs"].includes(head)) {
         state.view = "sources";
-        if (state.sourceProjectName !== params.get("source")) state.sourceProjects = null;
-        state.sourceProjectName = params.get("source");
+        const source = params.get("source");
+        if (source) {
+            commitQuery(`source:${JSON.stringify(source)}`, { echo: true });
+            return;
+        }
         if (head !== "sources") syncHash();
         render();
         if (!state.nodes) loadNodes(app);
         if (!state.sources) loadSources(app);
         loadJobs(app);
-        if (state.sourceProjectName) {
-            loadSourceProjects();
-            requestAnimationFrame(() => {
-                const section = document.getElementById("source-projects");
-                if (section) {
-                    section.tabIndex = -1;
-                    section.focus({ preventScroll: true });
-                    section.scrollIntoView({ block: "start" });
-                }
-            });
-        }
         return;
     }
 
@@ -301,7 +296,8 @@ function readHash() {
     const mode = params.get("view") === "CARDS" ? "CARDS" : "TABLE";
     const sort = params.get("sort");
     const dir = params.get("dir") === "desc" ? "desc" : "asc";
-    const changed = q !== state.q || sort !== state.sort || dir !== state.dir || state.view !== "index";
+    const changed = q !== state.q || sort !== state.sort || dir !== state.dir
+        || state.searchedQuery !== q;
     state.view = "index";
     state.viewMode = mode;
     state.q = q;
@@ -351,7 +347,8 @@ async function runSearch() {
             limit: SEARCH_LIMIT
         });
         if (version !== searchVersion) return;
-        state.rows = data.rows || [];
+        state.rows = data.resources || data.rows || [];
+        state.resourcesNext = data.resource_next_cursor || null;
         state.projects = data.projects || { rows: [], total: 0 };
         state.facets = data.facets || {};
         state.query = data.query || null;
@@ -367,6 +364,7 @@ async function runSearch() {
         state.searchError = error;
         state.searchedQuery = null;
         state.rows = [];
+        state.resourcesNext = null;
         state.projects = { rows: [], total: 0 };
         state.facets = {};
         state.query = { raw: state.q, tokens: [], warnings: [] };
@@ -406,6 +404,10 @@ function cursorRow() {
     return state.rows[Math.min(state.cursor, state.rows.length - 1)] || null;
 }
 
+function rowKey(row) {
+    return row && (row.artifact_id || row.project_id);
+}
+
 function scheduleInspector() {
     clearTimeout(inspectorTimer);
     const row = cursorRow();
@@ -435,7 +437,7 @@ function paintCursor() {
         const index = Number(node.dataset.index);
         const row = state.rows[index];
         node.classList.toggle("is-cursor", index === state.cursor);
-        node.classList.toggle("is-selected", !!row && state.selection.has(row.artifact_id));
+        node.classList.toggle("is-selected", !!row && state.selection.has(rowKey(row)));
     });
     revealCursor(body, state.cursor);
     paintInspector();
@@ -457,8 +459,8 @@ function moveCursor(delta) {
 function toggleSelection() {
     const row = cursorRow();
     if (!row) return;
-    if (state.selection.has(row.artifact_id)) state.selection.delete(row.artifact_id);
-    else state.selection.add(row.artifact_id);
+    if (state.selection.has(rowKey(row))) state.selection.delete(rowKey(row));
+    else state.selection.add(rowKey(row));
     paintCursor();
 }
 
@@ -490,6 +492,7 @@ function openProjectFile(path) {
 
 function selectProjectRevision(revision) {
     state.project.revision = revision;
+    state.project.tab = state.project.path ? "FILES" : "README";
     syncHash();
     loadProject(app);
     render();
@@ -504,48 +507,42 @@ function selectProjectTab(tab) {
 }
 
 function browseProjects(source) {
-    navigate(source ? `#/sources?${new URLSearchParams({ source })}` : "#/sources");
+    commitQuery(source.browse_query, { echo: true });
 }
 
-async function loadSourceProjects() {
-    const source = state.sourceProjectName;
-    state.sourceProjectsError = null;
-    try {
-        const projects = await api.projects({ source, limit: SEARCH_LIMIT });
-        if (source !== state.sourceProjectName) return;
-        state.sourceProjects = projects;
-    } catch (error) {
-        if (source !== state.sourceProjectName) return;
-        state.sourceProjectsError = error;
-    }
-    if (state.view === "sources") render();
-}
-
-async function loadMoreProjects() {
-    if (state.projectsLoading) return;
-    const sources = state.view === "sources";
-    const listing = sources ? state.sourceProjects : state.projects;
-    if (!listing?.next_cursor) return;
+async function loadMoreResources() {
+    if (state.resourcesLoading || !state.resourcesNext) return;
     const query = state.q;
-    const source = state.sourceProjectName;
-    state.projectsLoading = true;
+    const version = searchVersion;
+    state.resourcesLoading = true;
+    render();
     try {
-        const next = await api.projects({ q: sources ? null : query,
-            source: sources ? source : null, cursor: listing.next_cursor, limit: SEARCH_LIMIT });
-        if ((sources && source !== state.sourceProjectName) || (!sources && query !== state.q)) return;
-        const merged = { ...next, rows: [...listing.rows, ...next.rows] };
-        if (sources) state.sourceProjects = merged;
-        else state.projects = merged;
+        const next = await api.search({ q: query, sort: state.sort,
+            dir: state.sort ? state.dir : null, resource_cursor: state.resourcesNext, limit: SEARCH_LIMIT });
+        if (version !== searchVersion) return;
+        state.rows = [...state.rows, ...next.resources];
+        state.resourcesNext = next.resource_next_cursor;
     } catch (error) {
-        toast(`projects could not be loaded · ${error.message}`);
+        toast(`results could not be loaded · ${error.message}`);
     } finally {
-        state.projectsLoading = false;
+        state.resourcesLoading = false;
         render();
     }
 }
 
+function cancelSourceRemoval() {
+    if (state.sourceRemovalPending) return;
+    const name = state.sourceDeleting;
+    state.sourceDeleting = null;
+    render();
+    document.querySelectorAll('button[data-action="remove"]').forEach(button => {
+        if (button.dataset.source === name) button.focus();
+    });
+}
+
 function openRow(row) {
     if (!row) return;
+    if (row.project_id) return openProject(row.project_id);
     const params = new URLSearchParams({ tab: "FILES" });
     if (row.artifact_id) params.set("aid", row.artifact_id);
     navigate(`#/repo/${repoPathOf(row)}?${params.toString()}`);
@@ -571,6 +568,10 @@ function detailArtifact() {
 }
 
 async function addToLoadout(row) {
+    if (row?.project_id) {
+        toast("Select a model artifact to add to a loadout.");
+        return;
+    }
     if (!row || !row.artifact_id) {
         toast("nothing under the cursor to pin");
         return;
@@ -665,6 +666,7 @@ async function removeFromLoadout(item) {
 }
 
 async function yank(row) {
+    if (row?.project_id) return copyCommand(row.clone_command);
     if (!row || !row.artifact_id) return;
     try {
         const command = await api.pullCommand(row.artifact_id);
@@ -806,8 +808,8 @@ function paintFooter() {
         ["J/K", "move"],
         ["↵", "open"],
         ["SPC", "select"],
-        ["L", "loadout"],
-        ["Y", "yank"],
+        ...(!cursorRow()?.project_id ? [["L", "loadout"]] : []),
+        ["Y", cursorRow()?.project_id ? "clone" : "yank"],
         ["/", "search"],
         ["?", "keys"]
     ];
@@ -849,13 +851,8 @@ function paintIndex() {
     const offset = scroller ? scroller.scrollTop : 0;
     if (state.searchError) mount(body, errorPanel(state.searchError, () => runSearch()));
     else if (state.searching && !state.rows.length) mount(body, loadingPanel("searching the index…"));
-    else {
-        const projects = renderProjectResults(app, state.projects);
-        const artifacts = state.rows.length || !projects
-            ? (state.viewMode === "CARDS" ? renderCards(app) : renderTable(app, exampleQuery()))
-            : null;
-        mount(body, el("div", { class: "resource-results" }, projects, artifacts));
-    }
+    else if (state.viewMode === "CARDS") mount(body, renderCards(app));
+    else mount(body, renderTable(app, exampleQuery()));
     const next = body.firstElementChild;
     if (next && offset) next.scrollTop = offset;
 
@@ -889,10 +886,19 @@ function render() {
 
 function paintProject(panel) {
     const project = state.project;
+    if (!project) {
+        mount(panel, el("div", { class: "state-panel" },
+            el("div", { class: "state-panel-title", text: "PROJECT NO LONGER INDEXED" }),
+            el("div", { class: "state-panel-body", text: "Its source was removed. The files remain on disk." }),
+            el("button", { class: "btn", type: "button", text: "BACK TO INDEX", onClick: () => goIndex() })));
+        return;
+    }
     const key = `${project.id}@${project.revision}`;
     const same = panel.dataset.projectKey === key;
     const scroll = (selector) => panel.querySelector(selector)?.scrollTop || 0;
-    const listOffset = same ? scroll(".project-file-list") : 0;
+    if (same && panel.dataset.projectTab === "FILES" && !panel.dataset.projectPath) {
+        project.fileScroll = scroll(".project-content");
+    }
     const previewOffset = same && panel.dataset.projectPath === project.path
         ? scroll(".project-source") : 0;
     const contentOffset = same && panel.dataset.projectTab === project.tab
@@ -904,9 +910,9 @@ function paintProject(panel) {
         const node = panel.querySelector(selector);
         if (node) node.scrollTop = offset;
     };
-    restore(".project-file-list", listOffset);
     restore(".project-source", previewOffset);
-    restore(".project-content", contentOffset);
+    restore(".project-content", project.tab === "FILES" && !project.path
+        ? project.fileScroll || 0 : contentOffset);
     if (focused) {
         const file = [...panel.querySelectorAll(".project-file")].find(
             (node) => node.getAttribute("title") === focused);
@@ -1002,17 +1008,12 @@ function start() {
         if (state.view !== "sources" || refreshingSources) return;
         refreshingSources = true;
         try {
-            const previousScan = (state.sources || []).find(
-                (source) => source.name === state.sourceProjectName)?.last_scan;
             await Promise.all([
                 loadSources(app, false),
                 loadJobs(app, false),
                 loadNodes(app, false)
             ]);
             if (state.view === "sources") {
-                const scanned = (state.sources || []).find(
-                    (source) => source.name === state.sourceProjectName)?.last_scan;
-                if (state.sourceProjectName && previousScan !== scanned) await loadSourceProjects();
                 paintSourcesView(app, document.getElementById("view-panel"));
             }
         } finally {

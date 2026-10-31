@@ -286,6 +286,9 @@ fn split_values(body: &str, quoted: bool) -> Vec<&str> {
 fn normalize(kind: TokenKind, value: &str) -> (String, Option<String>) {
     let trimmed = value.trim();
     let lowered = trimmed.to_ascii_lowercase();
+    if lowered == "git" && matches!(kind, TokenKind::Role | TokenKind::Format) {
+        return (lowered, None);
+    }
     match kind {
         TokenKind::Role => match Role::from_alias(trimmed) {
             Some(role) => (role.as_str().to_owned(), None),
@@ -366,6 +369,16 @@ fn parse_age_days(value: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_resource_filters_are_recognized_without_becoming_artifact_types() {
+        let query = parse("role:GIT format:git");
+        assert!(query.warnings.is_empty());
+        assert_eq!(query.tokens[0].values, ["git"]);
+        assert_eq!(query.tokens[1].values, ["git"]);
+        assert!(Role::from_alias("git").is_none());
+        assert!("git".parse::<ArtifactFormat>().is_err());
+    }
 
     fn one(input: &str) -> Token {
         let query = parse(input);

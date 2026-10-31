@@ -14,7 +14,7 @@ use crate::api::common::{authorize, blocking};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
-/// A shelf as the search dropdown shows it. `count` is how many artifacts the
+/// A shelf as the search dropdown shows it. `count` is how many resources the
 /// shelf's query answers, and null when it was not counted, whatever the reason: the
 /// listing counts every shelf it can, and a write answers with the row it wrote rather than
 /// re-running its query.
@@ -72,7 +72,7 @@ pub struct DeletedView {
 
 pub async fn list(State(state): State<AppState>) -> ApiResult<Json<Vec<ShelfView>>> {
     let catalog = Arc::clone(state.catalog());
-    let rows = blocking(move || {
+    let mut rows = blocking(move || {
         Ok(catalog
             .shelves_with_counts(Timestamp::now())?
             .into_iter()
@@ -80,6 +80,17 @@ pub async fn list(State(state): State<AppState>) -> ApiResult<Json<Vec<ShelfView
             .collect::<Vec<ShelfView>>())
     })
     .await?;
+    let projects = crate::api::project_search::query_counts(
+        &state,
+        rows.iter().map(|row| row.query.clone()).collect(),
+    )
+    .await?;
+    for (row, count) in rows.iter_mut().zip(projects) {
+        row.count = row
+            .count
+            .zip(count)
+            .map(|(artifacts, projects)| artifacts.saturating_add(projects));
+    }
     Ok(Json(rows))
 }
 

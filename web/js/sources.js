@@ -2,7 +2,6 @@ import * as api from "./api.js";
 import { el, errorPanel, fmtAge, fmtBytes, fmtRate, loadingPanel, mount, toast } from "./dom.js";
 import { loadJobs, loadSources } from "./jobs.js";
 import { loadNodes } from "./nodes.js";
-import { renderProjectResults } from "./projects.js";
 
 function section(title, content, id) {
     return el("section", { class: "operations-section", id },
@@ -12,22 +11,72 @@ function section(title, content, id) {
 function scanAction(app, source) {
     return el("button", { class: "btn btn-tiny", type: "button", text: "SCAN",
         onClick: async (event) => {
-            event.currentTarget.disabled = true;
+            const button = event.currentTarget;
+            button.disabled = true;
             try {
                 await api.startScan(source.name);
                 toast(`scan queued · ${source.name}`);
                 await loadJobs(app);
             } catch (error) {
-                event.currentTarget.disabled = false;
+                button.disabled = false;
                 toast(`scan failed · ${error.message}`);
             }
         } });
 }
 
+function removeAction(app, source) {
+    if (!source.can_remove) return null;
+    const armed = app.state.sourceDeleting === source.name;
+    const pending = app.state.sourceRemovalPending === source.name;
+    if (!armed) {
+        return el("button", { class: "btn btn-tiny", type: "button", text: "REMOVE",
+            dataset: { source: source.name, action: "remove" },
+            disabled: !!app.state.sourceRemovalPending,
+            title: "Stop indexing this folder. Files stay on disk.",
+            onClick: () => {
+                app.state.sourceDeleting = source.name;
+                app.render();
+                document.querySelector(".source-remove-confirm")?.focus();
+            } });
+    }
+    return [el("button", { class: "btn btn-tiny source-remove-confirm", type: "button",
+        dataset: { source: source.name, action: "confirm" },
+        text: pending ? "REMOVING..." : "CONFIRM", disabled: pending,
+        title: `Remove ${source.name} from the index. Files stay on disk.`,
+        onClick: async () => {
+            app.state.sourceRemovalPending = source.name;
+            app.render();
+            try {
+                await api.deleteSource(source.name);
+                app.state.sourceDeleting = null;
+                app.state.rows = [];
+                app.state.searchedQuery = null;
+                if (app.state.project?.detail?.source === source.name) {
+                    if (app.state.view === "project") {
+                        app.state.view = "index";
+                        app.goIndex();
+                    }
+                    app.state.project = null;
+                }
+                await Promise.all([loadSources(app), loadJobs(app), app.refreshIndex()]);
+                toast(`removed ${source.name} · files kept on disk`);
+            } catch (error) {
+                toast(`removal not confirmed · ${error.message}`);
+                await loadSources(app);
+            } finally {
+                app.state.sourceRemovalPending = null;
+                app.render();
+            }
+        } }), el("button", { class: "btn btn-tiny", type: "button", text: "CANCEL",
+        dataset: { source: source.name, action: "cancel" },
+        disabled: pending, onClick: () => app.cancelSourceRemoval() })];
+}
+
 function folderRow(app, source) {
     const job = (app.state.jobs || []).find((item) =>
         item.kind === "scan" && item.subject === source.name && !item.finished);
-    const status = job
+    const removing = app.state.sourceDeleting === source.name;
+    const status = removing ? (app.state.sourceRemovalPending ? "Removing..." : "Files stay on disk") : job
         ? `${job.phase || "Scanning"} ${Math.round((Number(job.progress) || 0) * 100)}%`
         : source.pending_hashes
             ? `${source.pending_hashes} hashes pending`
@@ -35,21 +84,21 @@ function folderRow(app, source) {
     return el("div", { class: "panel-row source-grid" },
         el("div", { class: "source-identity" },
             el("span", { class: "source-name", text: source.name }),
-            el("span", { class: "source-path", text: source.path, title: source.path }),
-            source.kind === "git" ? el("button", { class: "btn btn-tiny source-browse",
-                type: "button", text: "BROWSE PROJECTS",
-                onClick: () => app.browseProjects(source.name) }) : null),
+            el("span", { class: "source-path", text: source.path, title: source.path })),
         el("span", { class: "mono-dim", text: source.kind }),
         el("span", { class: "align-right", text: String(source.files ?? 0) }),
         el("span", { class: "align-right", text: fmtBytes(source.bytes) }),
         el("span", { class: "align-right mono-dim", text: fmtAge(source.last_scan) }),
-        el("span", { class: job ? "st-served" : "mono-dim", text: status,
+        el("span", { class: removing ? "source-removing" : job ? "st-served" : "mono-dim", text: status,
             title: source.pending_hashes
                 ? `${source.pending_hashes} files · ${fmtBytes(source.pending_bytes)} pending`
                 : status }),
-        el("span", { class: "align-right" }, job
-            ? el("span", { class: "mono-dim", text: "RUNNING" })
-            : scanAction(app, source)));
+        el("span", { class: "source-actions" },
+            !removing ? el("button", { class: "btn btn-tiny", type: "button", text: "BROWSE",
+                onClick: () => app.browseProjects(source) }) : null,
+            !removing ? (job ? el("span", { class: "mono-dim", text: "RUNNING" })
+                : scanAction(app, source)) : null,
+            removeAction(app, source)));
 }
 
 function folders(app) {
@@ -80,7 +129,8 @@ function managedStorage(app) {
             el("span", { class: "source-path", text: source.path || source.name }),
             el("span", { class: "mono-dim", text: source.managed_by === "nobody"
                 ? "No longer configured" : `Managed by ${source.managed_by}` }),
-            el("span", { class: "align-right", text: fmtBytes(source.bytes) }))),
+            el("span", { class: "align-right", text: fmtBytes(source.bytes) }),
+            el("span", { class: "source-actions" }, removeAction(app, source)))),
     "source-managed");
 }
 
@@ -126,7 +176,17 @@ function jobRow(app, job) {
         el("span", { class: "align-right", text: job.finished && !job.bytes
             ? "—" : `${fmtBytes(job.bytes)} · ${fmtRate(job.rate_bps)}` }),
         el("span", { class: "align-right mono-dim", text: fmtAge(job.started) }),
-        el("span", { class: "align-right" }, job.finished ? null : el("button", {
+        el("span", { class: "align-right" }, job.finished
+            ? job.kind === "scan" ? el("button", { class: "btn btn-tiny", type: "button", text: "DISMISS",
+                disabled: app.state.jobDeleting === job.id,
+                title: "Remove this finished scan from Activity. Indexed files stay available.",
+                onClick: async () => {
+                    app.state.jobDeleting = job.id;
+                    app.render();
+                    try { await api.deleteJob(job.id); await loadJobs(app); }
+                    catch (error) { toast(`dismiss failed · ${error.message}`); }
+                    finally { app.state.jobDeleting = null; app.render(); }
+                } }) : null : el("button", {
             class: "btn btn-tiny", type: "button", text: "CANCEL",
             onClick: async () => {
                 try {
@@ -158,6 +218,15 @@ function activity(app) {
             open: app.state.recentJobsOpen,
             onToggle: (event) => { app.state.recentJobsOpen = event.currentTarget.open; } },
             el("summary", { text: `RECENT JOBS · ${recent.length}` }),
+            app.state.jobs.some((job) => job.finished && job.kind === "scan")
+                ? el("button", { class: "btn btn-tiny", type: "button", text: "CLEAR FINISHED SCANS",
+                    title: "Clear finished scan history. Active jobs and indexed files stay unchanged.",
+                    onClick: async (event) => {
+                        const button = event.currentTarget;
+                        button.disabled = true;
+                        try { await api.clearScanJobs(); await loadJobs(app); toast("finished scan history cleared"); }
+                        catch (error) { toast(`clear failed · ${error.message}`); button.disabled = false; }
+                    } }) : null,
             recent.map((job) => jobRow(app, job))) : null
     ) : el("div", { class: "operations-empty", text: "No jobs yet." });
     return section(`ACTIVITY · ${active.length} ACTIVE`, rows, "source-activity");
@@ -205,20 +274,6 @@ function addFolderForm(app) {
             el("button", { class: "btn btn-amber", type: "submit", text: "ADD & SCAN" })));
 }
 
-function projectResults(app) {
-    const source = app.state.sourceProjectName;
-    if (!source) return el("div", { id: "source-projects", hidden: true });
-    const contents = app.state.sourceProjectsError
-        ? errorPanel(app.state.sourceProjectsError, () => app.loadSourceProjects())
-        : app.state.sourceProjects
-            ? renderProjectResults(app, app.state.sourceProjects) || el("div", {
-                class: "operations-empty", text: "No Git projects found yet. Wait for the scan to finish or scan this folder again." })
-            : loadingPanel("reading Git projects...");
-    return section(`PROJECTS IN ${source}`, el("div", null,
-        el("button", { class: "btn btn-tiny", type: "button", text: "CLOSE PROJECTS",
-            onClick: () => app.browseProjects(null) }), contents), "source-projects");
-}
-
 function renderSourcesView(app) {
     const count = (app.state.sources || []).filter((source) => source.can_scan).length;
     const active = (app.state.jobs || []).filter((job) => !job.finished).length;
@@ -235,7 +290,7 @@ function renderSourcesView(app) {
                     if (app.state.sourceFormOpen) document.getElementById("source-path").focus();
                 } })),
         app.state.sourceFormOpen ? addFolderForm(app) : null,
-        folders(app), projectResults(app), managedStorage(app), nodes(app), activity(app));
+        folders(app), managedStorage(app), nodes(app), activity(app));
 }
 
 function sourcesSnapshot(app) {
@@ -244,12 +299,10 @@ function sourcesSnapshot(app) {
     const activeScans = (app.state.jobs || []).filter((job) =>
         job.kind === "scan" && !job.finished);
     return {
-        projects: JSON.stringify([app.state.sourceProjectName, app.state.sourceProjects,
-            app.state.sourceProjectsError?.message]),
-        folders: JSON.stringify([sources, activeScans, minute]),
-        managed: sources,
+        folders: JSON.stringify([sources, activeScans, minute, app.state.sourceDeleting, app.state.sourceRemovalPending]),
+        managed: JSON.stringify([sources, app.state.sourceDeleting, app.state.sourceRemovalPending]),
         nodes: JSON.stringify([app.state.nodes, app.state.nodesError?.message, minute]),
-        activity: JSON.stringify([app.state.jobs, app.state.jobsError?.message, minute])
+        activity: JSON.stringify([app.state.jobs, app.state.jobsError?.message, minute, app.state.jobDeleting])
     };
 }
 
@@ -278,11 +331,15 @@ export function paintSourcesView(app, panel) {
 
     const next = sourcesSnapshot(app);
     const previous = view.sourcesSnapshot;
-    if (next.projects !== previous.projects) {
-        view.querySelector("#source-projects").replaceWith(projectResults(app));
-    }
     if (next.folders !== previous.folders) {
+        const focused = document.activeElement?.dataset;
+        const restoreFocus = focused?.source && view.querySelector("#source-folders").contains(document.activeElement);
         view.querySelector("#source-folders").replaceWith(folders(app));
+        if (restoreFocus) {
+            const replacement = [...view.querySelectorAll("#source-folders button[data-source]")].find(
+                (button) => button.dataset.source === focused.source && button.dataset.action === focused.action);
+            replacement?.focus({ preventScroll: true });
+        }
     }
     if (next.managed !== previous.managed) {
         const managed = managedStorage(app);

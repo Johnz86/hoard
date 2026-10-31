@@ -4,7 +4,7 @@ import { roleClass, roleCode, stateClass } from "./table.js";
 function card(app, item, index) {
     const classes = ["card", roleClass(item.role)];
     if (index === app.state.cursor) classes.push("is-cursor");
-    if (app.state.selection.has(item.artifact_id)) classes.push("is-selected");
+    if (app.state.selection.has(app.rowKey(item))) classes.push("is-selected");
     const line = [item.prefix || "", dash(item.base)].join("");
     return el(
         "div",
@@ -27,9 +27,10 @@ function card(app, item, index) {
         el("div", { class: "card-name", text: item.name }),
         el("div", {
             class: "card-meta",
-            text: `${line} · ${dash(item.precision)} · ${sizeText(item)}`
+            text: item.project_id ? `${item.revision} · ${sizeText(item)} · ${item.node}`
+                : `${line} · ${dash(item.precision)} · ${sizeText(item)}`
         }),
-        el("div", { class: "card-trigger", text: dash(item.trigger) })
+        el("div", { class: "card-trigger", text: item.project_id ? item.source : dash(item.trigger) })
     );
 }
 
@@ -39,12 +40,15 @@ export function renderCards(app) {
         return el(
             "div",
             { class: "cards-empty" },
-            el("div", { class: "empty-title", text: "NO ARTIFACT MATCHES THIS QUERY" })
+            el("div", { class: "empty-title", text: "NO RESOURCE MATCHES THIS QUERY" })
         );
     }
     return el(
         "div",
         { class: "cards-grid" },
-        rows.map((item, index) => card(app, item, index))
+        rows.map((item, index) => card(app, item, index)),
+        app.state.resourcesNext ? el("button", { class: "btn resource-more", type: "button",
+            text: app.state.resourcesLoading ? "LOADING..." : "MORE RESULTS",
+            disabled: app.state.resourcesLoading, onClick: () => app.loadMoreResources() }) : null
     );
 }

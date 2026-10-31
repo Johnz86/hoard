@@ -184,6 +184,13 @@ session are excluded. Temporary checkouts and generated data have been removed.
 
 ## Compatibility
 
+Source removal reuses the existing bounded retirement path, derived counters, artifact sweep
+and search outbox. It has no stored shape or format change. Runtime removal is serialized
+with the coordinator scan lane; persisted server exclusions are replayed at startup. Finished
+scan history uses a reserved `jobs.high_water` Setting so deleting job rows never reuses IDs,
+including after reopening a catalog that predates that counter. History edits protect active
+IDs under the admission gate; cancelled records can still belong to work the lane is finishing.
+
 Git-project search adds no persisted record or format bump. `Catalog::git_repositories` and
 `repository_by_id` expose existing source/repository metadata. The server builds a transient
 `hoard_index::projects::ProjectIndex` over names, paths and bounded committed README text,

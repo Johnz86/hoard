@@ -1,6 +1,7 @@
 import { ApiError } from "./api.js";
 import { el, errorPanel, fmtBytes, loadingPanel } from "./dom.js";
 import { renderCard } from "./readme.js";
+import { factRows } from "./inspector.js";
 
 const requests = new WeakMap();
 
@@ -67,12 +68,12 @@ export async function loadProject(app) {
         project.errors = {};
     }
     const tasks = [loadPart(app, request, "detail", "", null)];
-    if (project.tab === "FILES" || project.path) {
+    if (project.tab === "FILES") {
         tasks.push(loadPart(app, request, "files", "/files", null));
         if (project.path) {
             tasks.push(loadPart(app, request, "preview", "/file", project.path));
         }
-    } else {
+    } else if (project.tab === "README") {
         tasks.push(loadPart(app, request, "readme", "/readme", null));
     }
     await Promise.all(tasks);
@@ -89,48 +90,60 @@ function projectLink(project) {
     return url.href;
 }
 
-function revisionPicker(app, project, detail) {
-    const current = project.revision || detail.revision;
-    const names = new Set((detail.refs || []).map((ref) => ref.name));
-    if (current) names.add(current);
-    const select = el("select", { class: "field", "aria-label": "Project revision",
-        onChange: (event) => app.selectProjectRevision(event.currentTarget.value) },
-    [...names].map((name) => el("option", { value: name, text: name, selected: name === current })));
-    return el("label", { class: "project-revision" },
-        el("span", { text: "REVISION" }), select,
-        detail.revision_sha ? el("span", { class: "mono-dim",
-            text: detail.revision_sha.slice(0, 12), title: detail.revision_sha }) : null);
-}
-
 function projectHeader(app, project, detail) {
-    return el("header", { class: "project-header" },
-        el("div", { class: "project-title-row" },
-            el("button", { class: "btn", type: "button", text: "BACK TO INDEX",
-                onClick: () => app.goIndex() }),
-            el("div", { class: "project-heading" },
-                el("span", { class: "project-kind", text: "GIT PROJECT" }),
-                el("h1", { text: detail.name }),
-                el("p", { text: `Available on ${detail.node} · source ${detail.source} · ${detail.files} files · ${detail.bytes_human || fmtBytes(detail.bytes)}` }))),
-        el("div", { class: "project-share" },
-            el("input", { class: "field project-clone", readonly: true,
-                value: detail.clone_command || "Clone command unavailable",
-                "aria-label": "Git clone command",
-                onFocus: (event) => event.currentTarget.select() }),
-            el("button", { class: "btn btn-amber", type: "button", text: "COPY CLONE",
-                disabled: !detail.clone_command,
-                onClick: () => app.copyCommand(detail.clone_command) }),
-            el("button", { class: "btn", type: "button", text: "COPY PROJECT LINK",
-                onClick: () => app.copyCommand(projectLink(project)) })),
-        revisionPicker(app, project, detail));
+    return el("header", { class: "detail-head r-git" },
+        el("button", { class: "btn btn-back", type: "button", text: "← ESC",
+            onClick: () => app.goIndex() }),
+        el("span", { class: "role-mark role-mark-xl" }),
+        el("span", { class: "detail-title", text: detail.name }),
+        el("span", { class: "badge", text: "GIT PROJECT" }),
+        el("span", { class: "badge st-local", text: "LOCAL" }),
+        el("span", { class: "detail-meta", text: `${detail.source} · ${detail.files} files · ${detail.bytes_human || fmtBytes(detail.bytes)} · ${detail.node}` }));
 }
 
 function projectTabs(app, project) {
-    return el("nav", { class: "project-tabs", "aria-label": "Project views" },
-        ["README", "FILES"].map((tab) => el("button", {
-            class: `btn${project.tab === tab ? " is-active" : ""}`, type: "button",
+    return el("nav", { class: "detail-tabs", "aria-label": "Project views" },
+        ["README", "FILES", "REFS"].map((tab) => el("button", {
+            class: `detail-tab${project.tab === tab ? " is-active" : ""}`, type: "button",
             text: tab, "aria-pressed": project.tab === tab,
             onClick: () => app.selectProjectTab(tab)
-        })));
+        })), el("span", { class: "detail-tabs-fill" }));
+}
+
+function revisionBar(app, project, detail) {
+    return el("div", { class: "rev-bar" },
+        el("span", { class: "rev-label", text: "REVISION" }),
+        el("span", { class: "rev-chip", text: project.revision || detail.revision }),
+        el("span", { class: "rev-meta", text: `${String(detail.revision_sha || "").slice(0, 7)} · ${detail.files} files` }),
+        el("button", { class: "rev-switch", type: "button", text: "SWITCH ▾",
+            onClick: () => app.selectProjectTab("REFS") }));
+}
+
+function refsTab(app, project) {
+    return el("div", { class: "refs" }, (project.detail.refs || []).map((ref) =>
+        el("button", { class: `ref-row${ref.name === (project.revision || project.detail.revision) ? " is-current" : ""}`,
+            type: "button", onClick: () => app.selectProjectRevision(ref.name) },
+            el("span", { class: "ref-dot", text: ref.kind === "tag" ? "⊢" : "●" }),
+            el("span", { class: "ref-name", text: ref.name }),
+            el("span", { class: "ref-sha", text: String(ref.sha || "").slice(0, 7) }),
+            el("span", { class: "ref-when", text: "" }),
+            el("span", { class: "ref-kind", text: ref.kind }))));
+}
+
+function projectRail(app, project, detail) {
+    return el("aside", { class: "detail-rail" },
+        el("div", null, el("div", { class: "rail-title", text: "CLONE TO THIS MACHINE" }),
+            el("div", { class: "code-box" }, el("div", { class: "code-line", text: detail.clone_command })),
+            el("button", { class: "btn btn-wide btn-amber", type: "button", text: "COPY CLONE",
+                onClick: () => app.copyCommand(detail.clone_command) }),
+            el("button", { class: "btn btn-wide", type: "button", text: "COPY PROJECT LINK",
+                onClick: () => app.copyCommand(projectLink(project)) })),
+        el("div", null, el("div", { class: "rail-title", text: "PROJECT FACTS" }),
+            el("div", { class: "fact-list" }, factRows([
+                { key: "type", value: "Git project" }, { key: "source", value: detail.source },
+                { key: "node", value: detail.node }, { key: "files", value: detail.files },
+                { key: "size", value: detail.bytes_human }, { key: "revision", value: project.revision || detail.revision }
+            ]))));
 }
 
 function readmeTab(app, project) {
@@ -172,6 +185,8 @@ function filePreview(app, project) {
     }
     const download = projectBase(project) + "/raw" + projectQuery(project, project.path);
     const header = el("div", { class: "project-preview-header" },
+        el("button", { class: "btn btn-tiny", type: "button", text: "← FILES",
+            onClick: () => app.openProjectFile("") }),
         el("span", { class: "project-file-path", text: project.path }),
         el("a", { class: "btn btn-tiny", href: download, text: "DOWNLOAD FILE" }));
     if (project.errors?.preview) {
@@ -189,24 +204,23 @@ function filePreview(app, project) {
                 el("code", { text: preview.text }))
             : el("div", { class: "project-empty", text: preview.message ||
                 "This file cannot be previewed as text. Download it or clone the project to inspect it." }),
-        preview.truncated ? el("p", { class: "project-preview-note",
-            text: "Preview shortened. Download the file or clone the project for its full content." }) : null);
+        null);
 }
 
 function filesTab(app, project) {
     if (project.errors?.files) return errorPanel(project.errors.files, () => loadProject(app));
     if (!project.files) return loadingPanel("Reading the project files...");
     const rows = project.files.rows || [];
-    return el("div", { class: "project-browser" },
-        el("nav", { class: "project-file-list", "aria-label": "Project files" },
-            rows.length ? rows.map((file) => el("button", {
-                class: `project-file${file.path === project.path ? " is-active" : ""}`,
-                type: "button", "aria-current": file.path === project.path ? "true" : null,
-                title: file.path, onClick: () => app.openProjectFile(file.path)
-            }, el("span", { text: file.path }),
-            el("span", { class: "mono-dim", text: file.size_human || fmtBytes(file.size) })))
-                : el("div", { class: "project-empty", text: "This revision has no files." })),
-        filePreview(app, project));
+    if (project.path) return filePreview(app, project);
+    return el("div", { class: "files project-file-list", "aria-label": "Project files" },
+        rows.length ? rows.map((file) => el("button", {
+            class: "file-row project-file", type: "button", title: file.path,
+            onClick: () => app.openProjectFile(file.path)
+        }, el("span", { class: "file-path", text: file.path }),
+        el("span", { class: "file-kind", text: file.kind }),
+        el("span", { class: "file-size", text: file.size_human || fmtBytes(file.size) }),
+        el("span", { class: "file-state st-local", text: "LOCAL" })))
+            : el("div", { class: "project-empty", text: "This revision has no files." }));
 }
 
 export function renderProject(app) {
@@ -215,33 +229,13 @@ export function renderProject(app) {
         return errorPanel(project.errors?.detail || project.error, () => loadProject(app));
     }
     if (!project?.detail) return loadingPanel("Opening the Git project...");
-    return el("article", { class: "project-view" },
+    return el("div", { class: "detail project-view" },
         projectHeader(app, project, project.detail),
-        projectTabs(app, project),
-        el("div", { class: "project-content" },
-            project.tab === "FILES" || project.path ? filesTab(app, project) : readmeTab(app, project)));
-}
-
-export function renderProjectResults(app, projects) {
-    const rows = Array.isArray(projects) ? projects : projects?.rows || [];
-    if (!rows.length) return null;
-    return el("section", { class: "project-results", "aria-label": "Git projects",
-        onKeydown: (event) => {
-            if (event.key === "Enter" || event.key === " ") event.stopPropagation();
-        } },
-        el("div", { class: "project-results-heading", text: `GIT PROJECTS · ${projects.total ?? rows.length}` }),
-        rows.map((project) => el("div", { class: "project-result" },
-            el("button", { class: "project-result-open", type: "button",
-                onClick: () => app.openProject(project.id) },
-                el("span", { class: "project-result-name", text: project.name }),
-                project.description ? el("span", { class: "project-result-description",
-                    text: project.description }) : null,
-                el("span", { class: "project-result-meta",
-                    text: `Git project${project.available === false ? " (unavailable)" : ""} · ${project.source} · ${project.node} · ${project.revision} · ${project.files} files · ${project.bytes_human || fmtBytes(project.bytes)}` })),
-            project.clone_command ? el("button", { class: "btn btn-tiny", type: "button",
-                text: "COPY CLONE", "aria-label": `Copy clone command for ${project.name}`,
-                disabled: project.available === false,
-                onClick: () => app.copyCommand(project.clone_command) }) : null)),
-        projects.next_cursor && app.loadMoreProjects ? el("button", { class: "btn", type: "button",
-            text: "MORE PROJECTS", onClick: () => app.loadMoreProjects() }) : null);
+        el("div", { class: "detail-body" },
+            el("div", { class: "detail-main" }, projectTabs(app, project),
+                revisionBar(app, project, project.detail),
+                el("div", { class: "detail-panel project-content" },
+                    project.tab === "FILES" ? filesTab(app, project)
+                        : project.tab === "REFS" ? refsTab(app, project) : readmeTab(app, project))),
+            projectRail(app, project, project.detail)));
 }

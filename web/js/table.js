@@ -46,7 +46,7 @@ function header(app) {
 }
 
 function row(app, item, index) {
-    const selected = app.state.selection.has(item.artifact_id);
+    const selected = app.state.selection.has(app.rowKey(item));
     const classes = ["trow", roleClass(item.role)];
     if (index === app.state.cursor) classes.push("is-cursor");
     if (selected) classes.push("is-selected");
@@ -87,7 +87,7 @@ function emptyState(app, example) {
     return el(
         "div",
         { class: "empty" },
-        el("div", { class: "empty-title", text: "NO ARTIFACT MATCHES THIS QUERY" }),
+        el("div", { class: "empty-title", text: "NO RESOURCE MATCHES THIS QUERY" }),
         el(
             "div",
             { class: "empty-body" },
@@ -112,7 +112,10 @@ export function renderTable(app, example) {
             header(app),
             rows.map((item, index) => row(app, item, index)),
             rows.length ? null : emptyState(app, example)
-        )
+        ),
+        app.state.resourcesNext ? el("button", { class: "btn resource-more", type: "button",
+            text: app.state.resourcesLoading ? "LOADING..." : "MORE RESULTS",
+            disabled: app.state.resourcesLoading, onClick: () => app.loadMoreResources() }) : null
     );
 }
 

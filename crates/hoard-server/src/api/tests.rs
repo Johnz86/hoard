@@ -24,6 +24,8 @@ use hoard_index::discover::RefKind;
 mod loadouts;
 mod opened;
 mod projects;
+mod resources;
+mod source_management;
 
 use crate::api;
 use crate::config::HoardConfig;

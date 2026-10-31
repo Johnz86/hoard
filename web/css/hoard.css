@@ -892,22 +892,6 @@ button.shelf-menu-remove:hover { color: var(--red); }
     display: flex;
 }
 
-.resource-results {
-    flex: 1;
-    min-width: 0;
-    min-height: 0;
-    overflow: auto;
-}
-
-.resource-results > .table-scroll {
-    overflow: visible;
-}
-
-.source-browse {
-    align-self: flex-start;
-    margin-top: 4px;
-}
-
 .table-scroll {
     flex: 1;
     overflow: auto;
@@ -2107,7 +2091,7 @@ input.field.drawer-rename:focus {
 .source-grid {
     display: grid;
     grid-template-columns: minmax(260px, 2.5fr) minmax(90px, .7fr) 70px 95px 105px
-        minmax(130px, 1fr) 88px;
+        minmax(120px, 1fr) 216px;
     gap: 16px;
 }
 
@@ -2130,7 +2114,7 @@ input.field.drawer-rename:focus {
 
 .managed-source-row {
     display: grid;
-    grid-template-columns: minmax(0, 2fr) minmax(200px, 1fr) 110px;
+    grid-template-columns: minmax(0, 2fr) minmax(160px, 1fr) 110px 216px;
     gap: 16px;
 }
 
@@ -2294,17 +2278,8 @@ input.field.drawer-rename:focus {
     margin-bottom: 14px;
     line-height: 1.7;
 }
-
-.project-view {
-    display: flex;
-    flex: 1;
-    min-height: 0;
-    margin: 0;
-    padding: 0;
-    flex-direction: column;
-    border-radius: 0;
-    background: var(--bg);
-    box-shadow: none;
+.r-git {
+    --role-color: var(--role-unk);
 }
 
 .view-panel-host.project-host {
@@ -2312,111 +2287,49 @@ input.field.drawer-rename:focus {
     overflow: hidden;
 }
 
-.project-header {
-    flex: none;
-    padding: 22px 26px 14px;
-    border-bottom: 1px solid var(--rule);
-}
-
-.project-title-row {
-    display: flex;
-    align-items: flex-start;
-    gap: 24px;
-}
-
-.project-heading {
+.project-view {
+    flex: 1;
     min-width: 0;
 }
 
-.project-kind {
-    color: var(--amb);
-    font-family: var(--mono);
-    font-size: 11px;
-    letter-spacing: .12em;
+.project-view .detail-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
-.project-heading h1 {
-    margin: 4px 0 6px;
-    font-size: 26px;
-    overflow-wrap: anywhere;
-}
-
-.project-heading p {
-    margin: 0;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 11px;
-}
-
-.project-share {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin: 20px 0 14px;
-}
-
-.project-clone {
-    flex: 1;
-    min-width: 120px;
-    margin: 0;
-    font-family: var(--mono);
-    font-size: 12px;
-}
-
-.project-revision {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    margin: 0;
-    font-family: var(--mono);
-    font-size: 11px;
-}
-
-.project-revision > span:first-child {
-    color: var(--dim);
-    letter-spacing: .1em;
-}
-
-.project-revision select {
+.project-view .detail-tab {
     width: auto;
-    max-width: 360px;
-    height: 34px;
     margin: 0;
-    padding: 4px 30px 4px 10px;
-    font-size: 12px;
+    border-radius: 0;
 }
 
-.project-tabs {
-    display: flex;
-    flex: none;
-    gap: 8px;
-    padding: 12px 26px;
-    border-bottom: 1px solid var(--rule);
-}
-
-.project-tabs .is-active {
-    color: var(--amb);
-    border-color: var(--amb);
-}
-
-.project-content {
-    flex: 1;
-    min-height: 0;
-    overflow: auto;
-}
-
-.project-document {
-    max-width: 1100px;
-    margin: 0 auto;
-    padding: 24px;
-}
-
-.project-document .card-wrap {
+.project-view .rev-switch {
+    width: auto;
     padding: 0;
+    margin: 0 0 0 auto;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
 }
 
-.project-document .prose {
-    overflow-wrap: anywhere;
+.project-view .ref-row, .project-view .file-row {
+    width: 100%;
+    margin: 0;
+    border-radius: 0;
+    border-top: 0;
+    border-right: 0;
+    text-align: left;
+    background: transparent;
+    box-shadow: none;
+}
+
+.project-view .file-row:hover {
+    background: var(--panel);
+}
+
+.project-view .ref-row:hover, .project-view .ref-row.is-current {
+    background: var(--panel2);
 }
 
 .project-document .prose img {
@@ -2424,182 +2337,87 @@ input.field.drawer-rename:focus {
     height: auto;
 }
 
-.project-empty {
-    padding: 36px 24px;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 12px;
-    line-height: 1.8;
-}
-
-.project-browser {
-    display: grid;
-    grid-template-columns: minmax(240px, 32%) minmax(0, 1fr);
-    height: 100%;
-    min-height: 260px;
-}
-
-.project-file-list {
-    display: flex;
-    flex-direction: column;
-    justify-content: flex-start;
-    overflow: auto;
-    border-right: 1px solid var(--rule);
-}
-
-.project-file {
-    display: flex;
-    flex: none;
-    align-items: baseline;
-    gap: 14px;
-    width: 100%;
-    margin: 0;
-    padding: 11px 14px;
-    border: 0;
-    border-bottom: 1px solid var(--rule2);
-    border-radius: 0;
-    background: transparent;
-    color: var(--text);
-    text-align: left;
-    font-family: var(--mono);
-    font-size: 11px;
-}
-
-.project-file > span:first-child {
-    flex: 1;
-    min-width: 0;
-    overflow-wrap: anywhere;
-}
-
-.project-file > span:last-child {
-    flex: none;
-    font-size: 10px;
-}
-
-.project-file:hover,
-.project-file.is-active {
-    background: var(--panel2);
-    color: var(--amb);
-}
-
 .project-preview {
     display: flex;
     flex-direction: column;
-    min-width: 0;
+    height: 100%;
     min-height: 0;
+    margin: 0;
 }
 
 .project-preview-header {
     display: flex;
-    flex: none;
     align-items: center;
-    justify-content: space-between;
-    gap: 16px;
-    padding: 14px 18px;
+    gap: 12px;
+    flex: none;
+    padding: 10px 18px;
     border-bottom: 1px solid var(--rule);
 }
 
 .project-file-path {
+    flex: 1;
     min-width: 0;
-    overflow-wrap: anywhere;
+    overflow: hidden;
+    text-overflow: ellipsis;
     font-family: var(--mono);
     font-size: 12px;
+    white-space: nowrap;
 }
 
 .project-source {
     flex: 1;
+    overflow: auto;
     min-height: 0;
     margin: 0;
-    padding: 20px;
-    overflow: auto;
+    padding: 18px;
+    border: 0;
     border-radius: 0;
     background: var(--bg);
     color: var(--text);
-    line-height: 1.7;
+    font-family: var(--mono);
     font-size: 12px;
 }
 
 .project-source code {
+    display: block;
     padding: 0;
     background: transparent;
     color: inherit;
-    font-family: var(--mono);
+    font: inherit;
 }
 
-.project-preview-note {
-    margin: 0;
-    padding: 12px 20px;
-    border-top: 1px solid var(--rule);
+.project-empty {
+    padding: 18px;
     color: var(--muted);
     font-family: var(--mono);
-    font-size: 11px;
-}
-
-.project-results {
-    flex: none;
-    max-height: 45vh;
-    overflow: auto;
-    padding: 0 18px 12px;
-    border-bottom: 1px solid var(--rule);
-    background: var(--panel);
-}
-
-.project-results-heading {
-    padding: 14px 0 8px;
-    color: var(--amb);
-    font-family: var(--mono);
-    font-size: 11px;
-    letter-spacing: .12em;
-}
-
-.project-result {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    border-bottom: 1px solid var(--rule2);
-}
-
-.project-result-open {
-    display: flex;
-    flex: 1;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 5px;
-    min-width: 0;
-    margin: 0;
-    padding: 13px 0;
-    border: 0;
-    border-radius: 0;
-    background: transparent;
-    color: var(--text);
-    text-align: left;
-}
-
-.project-result-open:hover {
-    color: var(--amb);
-}
-
-.project-result-name {
-    font-size: 16px;
-    font-weight: 600;
-    overflow-wrap: anywhere;
-}
-
-.project-result-description {
-    color: var(--muted);
     font-size: 12px;
 }
 
-.project-result-meta {
-    color: var(--dim);
-    font-family: var(--mono);
-    font-size: 10px;
-    overflow-wrap: anywhere;
+.resource-more {
+    margin: 14px;
 }
 
-.project-view button:focus-visible,
-.project-view a:focus-visible,
-.project-results button:focus-visible {
-    outline: 2px solid var(--amb);
-    outline-offset: 3px;
+.cards-grid > .resource-more {
+    grid-column: 1 / -1;
+    justify-self: start;
+}
+
+.source-actions {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 6px;
+}
+
+.source-actions .btn-tiny {
+    padding: 6px 8px;
+}
+
+.source-removing {
+    color: var(--amb);
+}
+
+.source-remove-confirm {
+    color: var(--red);
+    border-color: var(--red);
 }

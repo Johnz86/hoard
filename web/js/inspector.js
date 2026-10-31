@@ -33,6 +33,26 @@ export function renderInspector(app) {
         );
     }
 
+    if (row.project_id) {
+        return el("aside", { class: "inspector r-git" },
+            el("div", { class: "inspector-head" },
+                el("div", { class: "rail-title", text: "INSPECTOR" }),
+                el("div", { class: "inspector-role" }, el("span", { class: "role-mark role-mark-lg" }),
+                    el("span", { class: "role-code", text: "GIT" })),
+                el("div", { class: "inspector-name", text: row.name }),
+                el("div", { class: "inspector-path", text: row.source })),
+            el("div", { class: "fact-list" }, factRows([
+                { key: "type", value: "Git project" }, { key: "source", value: row.source },
+                { key: "node", value: row.node }, { key: "files", value: row.files },
+                { key: "size", value: row.size_human }, { key: "revision", value: row.revision }
+            ])),
+            el("div", { class: "inspector-actions" },
+                el("button", { class: "btn btn-primary", type: "button", text: "OPEN PROJECT ↵",
+                    onClick: () => app.openRow(row) }),
+                el("button", { class: "btn", type: "button", text: "COPY CLONE",
+                    disabled: row.state !== "local", onClick: () => app.yank(row) })));
+    }
+
     return el(
         "aside",
         { class: `inspector ${roleClass(row.role)}` },

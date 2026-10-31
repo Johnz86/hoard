@@ -3,7 +3,48 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
-## Latest delivery: find, review and clone Git projects
+## Latest delivery: cohesive resource browsing and removable Sources
+
+The first Git delivery passed a narrow acquisition journey but introduced a separate results
+block and oversized project header. The owner rejected the Index and Sources layout changes.
+This correction restores the established surfaces: artifact and Git rows/cards share one
+cursor, inspector, scrollbar, sort and pagination; project detail reuses the existing header,
+tabs, revision bar and right rail. Sources BROWSE navigates to a normal source query instead
+of inserting another browser. Model-only inspection and loadouts retain their established
+behavior; projects have matching neutral actions and facts. Shelf counts include resources.
+
+Sources now removes folders with inline REMOVE / CONFIRM / CANCEL, preserving the original
+files. `sources.disabled.json` persists exclusions alongside `sources.json`; TOML is untouched.
+UI restoration by name overrides that TOML source without rewriting it. Startup completes
+persisted removals before watchers and requests start. The coordinator serializes removal
+with scan execution/admission, prunes queued source requests and their displayed subjects,
+retires only the target source
+through the existing bounded catalog path and refreshes search. Owned tasks retain guards
+even after a caller disconnects. Other sources and shared artifacts remain intact.
+
+Finished scan history can be dismissed or cleared separately. Queued/running scan IDs stay
+protected even when their job row is already marked cancelled. The admission gate covers
+history cleanup and the active-ID snapshot; an internal `jobs.high_water` Setting keeps IDs
+monotonic after cleanup and reopen, including old catalogs without that key. Stored catalog
+shapes and `FORMAT_VERSION` remain unchanged.
+
+The broad browser review compares artifact-only baselines at 1600/1180px across light/dark,
+both densities, inspector on/off and TABLE/CARDS (32 combinations), then exercises mixed
+resource keyboard/cursor/inspector, standard project detail/refs/files, Sources browsing,
+form/confirmation focus through polling, UI/TOML removal, preserved files, watcher exclusion,
+restart, re-add and HTTP cloning. Async removal/navigation and loaded-page return paths are
+also checked. Production, port 8080 and live catalogs are not used for verification.
+
+Final verification on 2026-10-31: formatting and all-target Clippy (`-D warnings`) pass;
+workspace build passes; workspace tests report 1,304 passed, 0 failed and 11 existing ignored
+tests (scale, memory, local-cache and multicast fixtures). No ignored test was introduced.
+All six release asset tests pass, and the documentation build completes without warnings.
+The independent UX review accepts the corrected design.
+The isolated final browser pass covers all 32 display combinations plus resource pagination
+and return scroll, saved-shelf counts, removal during navigation, polling focus, preserved
+files, restart/re-add and actual HTTP cloning, with no browser exceptions.
+
+## Previous delivery: find, review and clone Git projects
 
 Git projects are now resources in the main Index and Sources rather than an incidental Hub
 repository detail page. Main search returns `projects` beside the artifact rows; it matches
@@ -34,10 +75,10 @@ lock before concurrent searches. Project share links use the configured public U
 
 Production services, port 8080 and the live catalog were left untouched. Deploying for LAN
 clients still requires a reachable bind address and `public_url`; this task did not change the
-running node's loopback configuration. Folder removal and completed-scan cleanup remain the
-next work; they are distinct from the Git-project delivery.
+running node's loopback configuration. Folder removal and completed-scan cleanup were
+subsequently delivered in the cohesion correction above.
 
-## Latest review: Sources and repository discovery (2026-10-31)
+## Earlier review: Sources and repository discovery (2026-10-31)
 
 The redesign through `ce1c098` is implemented: preferences replace the top-bar theme control,
 the rail groups model families and spells out roles, shelves live in the search controls,

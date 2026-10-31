@@ -91,10 +91,13 @@ export function initKeys(app) {
             }
             if (app.state.keySheet) return app.hideKeySheet();
             if (app.state.drawerOpen) return app.closeDrawer();
+            if (app.state.view === "sources" && app.state.sourceDeleting) return app.cancelSourceRemoval();
+            if (app.state.view === "project" && app.state.project.path) return app.openProjectFile("");
             if (["detail", "project"].includes(app.state.view)) return app.goIndex();
             return;
         }
         if (typing || event.ctrlKey || event.metaKey || event.altKey) return;
+        if ((event.key === "Enter" || event.key === " ") && event.target.closest?.("button, a")) return;
 
         if (event.key === "/") {
             event.preventDefault();
@@ -109,6 +112,18 @@ export function initKeys(app) {
         if (app.state.keySheet) return;
 
         const key = event.key.toLowerCase();
+
+        if (app.state.view === "project") {
+            if (event.key === "[" || event.key === "]") {
+                event.preventDefault();
+                const tabs = ["README", "FILES", "REFS"];
+                app.selectProjectTab(tabs[(tabs.indexOf(app.state.project.tab) + (event.key === "]" ? 1 : 2)) % 3]);
+            } else if (key === "y") {
+                event.preventDefault();
+                app.copyCommand(app.state.project.detail?.clone_command);
+            }
+            return;
+        }
 
         if (app.state.view === "detail") {
             if (event.key === "[" || event.key === "]") {

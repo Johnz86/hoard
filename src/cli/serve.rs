@@ -25,6 +25,10 @@ pub async fn run(context: Context, bind: Option<String>) -> Result<()> {
 
     let state = AppState::new(config, catalog)
         .map_err(|error| anyhow::anyhow!("building the server state: {}", error.code()))?;
+    state
+        .recover_source_removals()
+        .await
+        .map_err(|error| anyhow::anyhow!("settling removed sources: {}", error.code()))?;
     let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("binding {address}"))?;

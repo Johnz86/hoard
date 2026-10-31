@@ -82,6 +82,7 @@ impl Coordinator {
                 queue: Mutex::new(Queue::default()),
                 wake: Notify::new(),
                 admission: tokio::sync::Mutex::new(()),
+                execution: tokio::sync::Mutex::new(()),
                 stop: Stop::default(),
                 finished: AtomicU64::new(0),
             }),
@@ -96,8 +97,8 @@ impl Coordinator {
     /// A request naming a source the configuration does not have is refused before any job
     /// row is written.
     pub async fn request(&self, request: ScanRequest) -> Result<JobId> {
-        let sources = self.lane.checked(request.sources)?;
         let _admission = self.lane.admission.lock().await;
+        let sources = self.lane.checked(request.sources)?;
         if let Some(merged) = self.lane.merge(sources.as_ref(), request.hash)? {
             return Ok(merged);
         }
@@ -135,6 +136,95 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Stops admitting this source, lets the current scan finish, and removes only its
+    /// catalog records. The caller must persist the exclusion before calling this method.
+    pub async fn remove_source(&self, name: &str) -> Result<()> {
+        let _admission = self.lane.admission.lock().await;
+        let _execution = self.lane.execution.lock().await;
+        self.lane
+            .config
+            .write()
+            .sources
+            .retain(|source| source.name != name);
+        let (dropped, subjects) = {
+            let mut queue = self.lane.queue.lock();
+            let mut dropped = Vec::new();
+            let mut subjects = Vec::new();
+            queue.waiting.retain_mut(|item| {
+                let Some(sources) = &mut item.sources else {
+                    return true;
+                };
+                sources.remove(name);
+                if sources.is_empty() {
+                    dropped.push(item.job);
+                    return false;
+                }
+                if let Some(subject) = subject_of(Some(sources)) {
+                    subjects.push((item.job, subject));
+                }
+                true
+            });
+            (dropped, subjects)
+        };
+        self.lane
+            .drop_jobs(dropped, "source removed before scan started")
+            .await;
+        let catalog = Arc::clone(&self.lane.catalog);
+        let name = name.to_owned();
+        let result = tokio::task::spawn_blocking(move || {
+            catalog.update_scan_subjects(&subjects)?;
+            catalog.remove_source(&name)
+        })
+        .await
+        .map_err(lane_stopped);
+        self.lane.finished.fetch_add(1, Ordering::Release);
+        result?
+    }
+
+    /// Jobs still owned by the scan lane, including cancelled rows whose work has not ended.
+    pub fn active_jobs(&self) -> BTreeSet<JobId> {
+        let queue = self.lane.queue.lock();
+        queue
+            .waiting
+            .iter()
+            .map(|item| item.job)
+            .chain(queue.running)
+            .collect()
+    }
+
+    /// Deletes a finished scan only after scan admission and ownership checks agree. The
+    /// operation survives a cancelled caller until its catalog transaction finishes.
+    pub async fn remove_finished_scan_job(self: &Arc<Self>, id: JobId) -> Result<()> {
+        self.edit_scan_history(move |catalog, protected| {
+            catalog.remove_finished_scan_job(id, protected)
+        })
+        .await
+    }
+
+    /// Clears completed history while preserving every job still owned by this scan lane.
+    pub async fn clear_finished_scan_jobs(self: &Arc<Self>) -> Result<usize> {
+        self.edit_scan_history(|catalog, protected| catalog.clear_finished_scan_jobs(protected))
+            .await
+    }
+
+    async fn edit_scan_history<T, F>(self: &Arc<Self>, edit: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Catalog, &BTreeSet<JobId>) -> Result<T> + Send + 'static,
+    {
+        let coordinator = Arc::clone(self);
+        tokio::spawn(async move {
+            let _admission = coordinator.lane.admission.lock().await;
+            let protected = coordinator.active_jobs();
+            let catalog = Arc::clone(&coordinator.lane.catalog);
+            tokio::task::spawn_blocking(move || edit(&catalog, &protected))
+                .await
+                .map_err(lane_stopped)?
+        })
+        .await
+        .map_err(lane_stopped)?
+    }
+
     fn start(&self) {
         let mut worker = self.worker.lock();
         if worker.is_none() {
@@ -145,7 +235,7 @@ impl Coordinator {
     /// Whether a scan is running or queued.
     pub fn busy(&self) -> bool {
         let queue = self.lane.queue.lock();
-        queue.running || !queue.waiting.is_empty()
+        queue.running.is_some() || !queue.waiting.is_empty()
     }
 
     /// How many scans the lane has run to their end since it was built, whatever the
@@ -171,7 +261,7 @@ impl Coordinator {
             self.lane.wake.notify_one();
             dropped
         };
-        self.lane.drop_jobs(dropped).await;
+        self.lane.drop_jobs(dropped, DROPPED).await;
         let worker = self.worker.lock().take();
         match worker {
             Some(worker) => worker.await.map_err(lane_stopped),
@@ -187,6 +277,7 @@ struct Lane {
     queue: Mutex<Queue>,
     wake: Notify,
     admission: tokio::sync::Mutex<()>,
+    execution: tokio::sync::Mutex<()>,
     stop: Stop,
     finished: AtomicU64,
 }
@@ -194,7 +285,7 @@ struct Lane {
 #[derive(Debug, Default)]
 struct Queue {
     waiting: VecDeque<Queued>,
-    running: bool,
+    running: Option<JobId>,
     closed: bool,
 }
 
@@ -269,14 +360,14 @@ impl Lane {
     }
 
     /// Settles the job rows of the requests the closing lane will never run.
-    async fn drop_jobs(&self, jobs: Vec<JobId>) {
+    async fn drop_jobs(&self, jobs: Vec<JobId>, reason: &'static str) {
         for job in jobs {
             let catalog = Arc::clone(&self.catalog);
             let settled = tokio::task::spawn_blocking(move || {
                 catalog.update_job(
                     job,
                     &JobProgress {
-                        phase: Some(DROPPED.to_owned()),
+                        phase: Some(reason.to_owned()),
                         ..JobProgress::default()
                     },
                 )?;
@@ -284,7 +375,7 @@ impl Lane {
             })
             .await;
             match settled {
-                Ok(Ok(())) => tracing::info!(%job, "the queued scan was dropped by the shutdown"),
+                Ok(Ok(())) => tracing::info!(%job, reason, "the queued scan was dropped"),
                 Ok(Err(error)) => {
                     tracing::error!(%job, %error, "the dropped job could not be settled")
                 }
@@ -308,11 +399,12 @@ impl Lane {
 
 async fn run_lane(lane: Arc<Lane>) {
     loop {
+        let execution = lane.execution.lock().await;
         let next = {
             let mut queue = lane.queue.lock();
             match queue.waiting.pop_front() {
                 Some(item) => {
-                    queue.running = true;
+                    queue.running = Some(item.job);
                     Some(item)
                 }
                 None => {
@@ -327,9 +419,12 @@ async fn run_lane(lane: Arc<Lane>) {
             Some(item) => {
                 lane.run(item).await;
                 lane.finished.fetch_add(1, Ordering::Release);
-                lane.queue.lock().running = false;
+                lane.queue.lock().running = None;
             }
-            None => lane.wake.notified().await,
+            None => {
+                drop(execution);
+                lane.wake.notified().await;
+            }
         }
     }
 }
@@ -481,6 +576,117 @@ mod tests {
     use crate::config::{SourceConfig, SourceKind};
 
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_history_cleanup_keeps_admission_until_its_transaction_finishes() -> Result<()>
+    {
+        let (_directory, catalog, config) = world()?;
+        let coordinator = Arc::new(Coordinator::new(Arc::clone(&catalog), config));
+        let done = catalog.create_job(SCAN_KIND, None)?;
+        catalog.finish_job(done)?;
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let clearing = Arc::clone(&coordinator);
+        let cleanup = tokio::spawn(async move {
+            clearing
+                .edit_scan_history(move |catalog, protected| {
+                    started.send(()).ok();
+                    blocked
+                        .recv_timeout(Duration::from_secs(5))
+                        .map_err(|error| IndexError::Catalog(error.to_string()))?;
+                    catalog.clear_finished_scan_jobs(protected)
+                })
+                .await
+        });
+        ready
+            .await
+            .map_err(|error| IndexError::Catalog(error.to_string()))?;
+        let requesting = Arc::clone(&coordinator);
+        let request =
+            tokio::spawn(async move { requesting.request(over("alpha", HashPolicy::Never)).await });
+        tokio::task::yield_now().await;
+        assert!(!request.is_finished());
+        cleanup.abort();
+        tokio::task::yield_now().await;
+        assert!(
+            !request.is_finished(),
+            "a cancelled HTTP caller must not reopen admission"
+        );
+        release
+            .send(())
+            .map_err(|error| IndexError::Catalog(error.to_string()))?;
+        let job = request.await.map_err(lane_stopped)??;
+        assert!(catalog.job(done)?.is_none());
+        assert!(catalog.job(job)?.is_some());
+        coordinator.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_removal_drops_its_queued_scans_and_prunes_shared_requests() -> Result<()> {
+        let (_directory, catalog, config) = world()?;
+        let coordinator = Arc::new(Coordinator::new(Arc::clone(&catalog), config));
+        let execution = coordinator.lane.execution.lock().await;
+        let single = catalog.create_job(SCAN_KIND, Some("alpha"))?;
+        let shared = catalog.create_job(SCAN_KIND, Some("alpha, beta"))?;
+        let all = catalog.create_job(SCAN_KIND, None)?;
+        for (job, sources) in [
+            (single, BTreeSet::from(["alpha".to_owned()])),
+            (
+                shared,
+                BTreeSet::from(["alpha".to_owned(), "beta".to_owned()]),
+            ),
+        ] {
+            coordinator.lane.enqueue(Queued {
+                job,
+                sources: Some(sources),
+                hash: HashPolicy::Never,
+                origin: Origin::Manual,
+            })?;
+        }
+        coordinator.lane.enqueue(Queued {
+            job: all,
+            sources: None,
+            hash: HashPolicy::Never,
+            origin: Origin::Manual,
+        })?;
+        let removing = Arc::clone(&coordinator);
+        let removal = tokio::spawn(async move { removing.remove_source("alpha").await });
+        while coordinator.lane.admission.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+        drop(execution);
+        removal.await.map_err(lane_stopped)??;
+        assert!(coordinator.config().source("alpha").is_none());
+        assert_eq!(settled(&catalog, single)?.state, JobState::Cancelled);
+        assert_eq!(settled(&catalog, single)?.subject.as_deref(), Some("alpha"));
+        assert_eq!(settled(&catalog, shared)?.subject.as_deref(), Some("beta"));
+        assert_eq!(settled(&catalog, all)?.subject, None);
+        assert_eq!(coordinator.active_jobs(), BTreeSet::from([shared, all]));
+        assert_eq!(
+            coordinator.lane.queue.lock().waiting[0].sources,
+            Some(BTreeSet::from(["beta".to_owned()]))
+        );
+        assert!(
+            coordinator
+                .request(over("alpha", HashPolicy::Never))
+                .await
+                .is_err()
+        );
+        coordinator.start();
+        drained(&coordinator).await;
+        coordinator.shutdown().await?;
+        assert_eq!(settled(&catalog, shared)?.state, JobState::Done);
+        assert_eq!(
+            catalog
+                .sources()?
+                .iter()
+                .map(|source| source.name.as_str())
+                .collect::<Vec<_>>(),
+            ["beta"]
+        );
+        Ok(())
+    }
 
     fn source(path: &Path, name: &str) -> SourceConfig {
         SourceConfig {

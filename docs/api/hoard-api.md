@@ -50,6 +50,16 @@ a column, so the results header names it rather than guessing from what a click 
 for. A request naming neither gets back `name` and `asc`. The name sort orders on a
 lower-cased copy of the name, so `ae.safetensors` precedes `Z-Detail-Slider`.
 
+The UI reads `resources`, a flat array of artifact rows (`resource_kind: "artifact"`) and
+Git-project rows (`resource_kind: "git"`, `project_id`, null `artifact_id`, `role: "git"`,
+`format: "git"`, numeric `size`, revision/node/state/source, file count and clone command).
+The established columns describe both kinds without a separate results block. Ordering is
+global under the selected sort, with stable identities for ties. `resource_total` and
+`resource_next_cursor` describe this combined listing; send the latter as `resource_cursor`
+on the next request. Existing `rows`, `total`, `next_cursor` and `cursor` retain the artifact
+contract. RESOURCE role/format facets include Git, node counts include both kinds, and shared
+size/state/source queries apply consistently. `role:git` is presentation, not a stored Role.
+
 A row's `prefix` is what the UI prints in `--dim` before the name, so the repository a name
 was chosen from is always on screen. It is derived in Rust from the row's qualified `repo`,
 never from `org`: it is `org/` when the name is the repository's own name, and
@@ -267,8 +277,9 @@ Project text search uses the artifact word tokenizer, including camel-case and d
 boundaries, word prefixes and ordered multiword phrases. It indexes project names,
 references, file paths and committed README text from the default revision. README text has
 a total 256 KiB budget per project, with root README files considered first. Metadata
-filters include `source:`, `node:` (`local` included), `repo:`, `org:` and `rev:`; positive
-artifact-only filters such as `role:lora` exclude projects. Other source-file bodies are
+filters include `source:`, `node:` (`local` included), `repo:`, `org:`, `rev:`, `size:` and
+`state:`. `role:git` / `format:git` select projects; positive model filters such as
+`role:lora` exclude them. Other source-file bodies are
 reviewable through previews, rather than indexed as a code-search corpus.
 
 The project index is derived in memory, built lazily with one writer thread and refreshed
@@ -352,8 +363,8 @@ links retain their model inspection and loadout behavior.
 shelves carry `"builtin": true`; `name` may not be empty (400), and deleting a builtin
 shelf is 409, not 404 or 400.
 
-A listed shelf carries `count`, how many artifacts its query answers: the same number
-`GET /api/v1/search` reports as `total` for that query, counted without the facet rail and
+A listed shelf carries `count`, how many resources its query answers: the same number
+`GET /api/v1/search` reports as `resource_total` for that query, counted without the facet rail and
 without a page. `0` means the query answers nothing. `null` means it was not counted, for
 any reason - the query does not compile, the search index is not built yet, the catalog
 refused it - or because the shelf came back from a write, which answers with the row it
@@ -428,8 +439,16 @@ no `dir` at all and always uses the configured root.
   and `hf-cache`; a missing or blank name uses the directory's name. Relative paths, reserved
   names and overlap with managed storage are rejected; duplicate names and overlap with
   existing sources return 409. Configured folders are listed before their first scan.
-  There is currently no source-removal route. Source IDs are positional listing IDs;
-  use the source's name when requesting a scan.
+  Source IDs are positional listing IDs; use the stable source name for scan/removal.
+- `DELETE /api/v1/sources/{name}` returns `{ "name", "removed": true }`. Requires write
+  authorization. Persists an exclusion in `<data_dir>/sources.disabled.json`, stops future
+  scan admission for the source, waits for the current scan, prunes queued requests, retires
+  its catalog entries/repositories and refreshes search. It never removes original files or
+  rescans unrelated folders. The owned workflow survives a disconnected/timed-out caller;
+  startup completes persisted intent before watchers start. Both TOML and UI sources can be
+  removed without rewriting TOML. Re-adding the same name clears the exclusion; a UI override
+  takes precedence over that TOML source on restart. Reserved mirror/pull/peer sources cannot
+  be removed. Other sources, shared artifacts and their counts remain valid.
 - `GET /api/v1/sources`: kind, files, bytes, last scan, `pending_hashes` and the
   `pending_bytes` those files hold. There is no blob count: the catalog counts content by
   artifact rather than by blob, and a column that always read zero is not one.
@@ -443,6 +462,9 @@ no `dir` at all and always uses the configured root.
   whole-configuration rescan, which deletes the source, its repositories, its entries and
   the history it served. A
   client offers the scan action on `can_scan` alone and never on a name it recognises.
+  `can_remove` independently controls folder removal, including abandoned scanned sources;
+  it is false for mirror/pull/peer storage. `browse_query` is the server-built source query
+  BROWSE sends to the existing Index.
 - `POST /api/v1/scan { "source" | null, "hash": "now" | "later" | "never" }` returns
   `{ "job_id" }`. `"background"` is accepted as an alias for `"later"`; omitting `hash`
   also means `"later"`. Every scan under `serve` runs on one lane, one at a time, in the
@@ -457,8 +479,13 @@ no `dir` at all and always uses the configured root.
   `lookup` has subject `civitai` and reports how many hashes of its window it has asked about
   out of how many that window holds; it is failed with the reason when the service rate limits
   it and cancelled when the node stops mid-pass. `GET /api/v1/jobs/{id}`,
-  `POST /api/v1/jobs/{id}/cancel`. Cancellation refuses already-finished jobs with 409;
-  there is currently no deletion route for completed scan history.
+  `POST /api/v1/jobs/{id}/cancel`. Cancellation refuses already-finished jobs with 409.
+- `DELETE /api/v1/jobs/{id}` returns `{ "id", "deleted": true }` for a finished scan job.
+  Active/queued scan IDs remain protected even if their record is marked cancelled; other
+  job kinds are refused. `DELETE /api/v1/jobs?kind=scan` returns `{ "deleted": <count> }`
+  for finished, unprotected scan rows only. Both require write authorization. History
+  deletion changes no source or indexed content, and job IDs remain monotonic across cleanup
+  and reopen. Admission stays locked through the active-ID snapshot and catalog edit.
 
 ## The lookup
 

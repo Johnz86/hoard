@@ -6,18 +6,56 @@ use hoard_core::State;
 
 use crate::catalog::Catalog;
 use crate::catalog::models::{
-    ArtifactDetail, ArtifactRecord, Entry, EntryKey, LocationKey, Repository, Revision,
+    ArtifactDetail, ArtifactRecord, Entry, EntryKey, LocationKey, Manifest, Repository, Revision,
     RevisionText, SearchText, Source, remove_revision_cards,
 };
 use crate::catalog::usage::remove_repo_usage;
 use crate::config::IndexConfig;
-use crate::error::Result;
+use crate::error::{IndexError, Result};
 
 use super::counters::{Counters, log_changes};
 use super::sources::is_scanned_source;
 use super::{CHUNK, RescanReport};
 
 impl Catalog {
+    /// Removes a nominated source and its catalog metadata without touching disk files or
+    /// scanning other sources. Callers must serialize this with scans of the same catalog.
+    pub fn remove_source(&self, name: &str) -> Result<()> {
+        if !is_scanned_source(name) {
+            return Err(IndexError::Config(format!(
+                "source {name} is managed by Hoard"
+            )));
+        }
+        self.settle_interrupted_pass()?;
+        if self
+            .database
+            .r_transaction()?
+            .get()
+            .primary::<Source>(name.to_owned())?
+            .is_none()
+        {
+            self.refresh_search(|_| {})?;
+            return Ok(());
+        }
+        self.open_pass()?;
+        let mut counters = Counters::load(&self.database, self.stored_triage()?)?;
+        self.retire_source(name, &mut counters, &mut RescanReport::default())?;
+        self.sweep_artifacts(&mut counters)?;
+        let transaction = self.database.rw_transaction()?;
+        counters.save(&transaction)?;
+        let mut manifest: Manifest = transaction
+            .get()
+            .primary(0_u8)?
+            .ok_or_else(|| IndexError::Catalog("manifest missing".into()))?;
+        manifest.generation += 1;
+        manifest.counts = super::counts(&transaction)?;
+        manifest.pass_open = false;
+        transaction.upsert(manifest)?;
+        transaction.commit()?;
+        self.refresh_search(|_| {})?;
+        Ok(())
+    }
+
     /// Retires each slot the refiling emptied: a revision no ref reaches and no entry names
     /// keeps its ordinal, because an entry names its revision by that ordinal and nothing
     /// can renumber them, but gives up its name, its commit, its metadata and its card. A

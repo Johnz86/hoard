@@ -202,30 +202,47 @@ shows this node first, then peers with online state, address, indexed size, and 
 ACTIVITY shows running jobs with their subject, phase, progress, rate, and cancel action;
 recent completed jobs are under a collapsible heading. These sections refresh while visible.
 
-Git folders offer BROWSE PROJECTS. Its results appear below the folder section with project
-name, source, node, default revision, file count and COPY CLONE. Opening a result uses the
-Git-project view below. The selected source and project/file/revision routes can be shared.
-Source removal and completed-scan cleanup remain unimplemented; see
-[design status and next work](README.md).
+Each folder's existing action column holds BROWSE / SCAN / REMOVE. BROWSE opens a `source:`
+query in Index, for models or Git projects alike; no second result section appears in Sources.
+REMOVE arms CONFIRM / CANCEL in the same cell and the status reads `Files stay on disk`.
+While removal runs the controls are disabled and status reads `Removing...`. The row vanishes
+on success; other folders retain their scan state. Armed removal and keyboard focus survive
+polling. Escape cancels an armed removal. The add-folder form and its focus survive polling.
+
+Removal is persistent for UI and TOML sources and does not delete disk files. A new add of the
+same name restores it. Finished scan jobs have DISMISS; RECENT JOBS offers CLEAR FINISHED
+SCANS. Active scans and non-scan jobs are protected. History cleanup never removes sources.
 
 ## Git-project resources
 
-Main Index search includes a GIT PROJECTS section alongside artifact results. A project is
-findable by name, committed README text and file path even with zero model artifacts. Model
-filters continue to apply to artifacts; project metadata supports source, node, repo, org
-and revision filters. Project results paginate independently of artifact results.
+Git projects occupy normal Index rows/cards, with one scroll container and the existing
+columns, cursor, inspector, sort controls and pagination. ROLE reads GIT, FORMAT reads git,
+BASE and PREC are absent. The rows are globally sorted with artifacts. Click selects;
+double-click or Enter opens; J/K moves through either kind; Space selects; Y copies a pull
+command for an artifact or a clone command for a project. The project inspector shows project
+facts and OPEN PROJECT / COPY CLONE, without loadout or compatibility actions. L cannot pin a
+project or a stale model selection. TABLE / CARDS changes both resource kinds together.
 
-`#/project/{id}` shows GIT PROJECT, the project name, source and hosting node, file count,
-size, selected revision and commit. COPY CLONE and COPY PROJECT LINK are prominent. The view
-has README and FILES tabs, without model role, compatibility or loadout controls. README
-opens first. A branch/tag selector changes all displayed content to that committed revision.
+A project is findable by name, committed README text and path without any model artifacts.
+Existing ROLE and FORMAT facets include Git project / git; `role:git` and `format:git` are
+presentation filters, not inferred model roles. Shared node, source, repo, org, revision,
+size and state queries include projects. Model-specific base, precision, layout and compat
+filters remain model-specific. Shelf counts describe the resources their queries display.
 
-FILES has a scrollable path list and a separate preview. Clicking a file opens escaped text
-or an explicit binary/oversized message. The list keeps its scrolling offset when a file is
-selected. DOWNLOAD FILE retrieves a committed file up to 16 MiB; larger files remain available
+`#/project/{id}` uses the established detail header (21px title), tab strip, revision bar,
+content panel and 340px right rail. README opens first; FILES and REFS use the existing compact
+row styles. SWITCH opens REFS; clicking a ref changes the viewed commit. The rail holds the
+clone command, COPY CLONE / COPY PROJECT LINK and project facts. There is no separate tall
+form header or model-specific compatibility/loadout control. Brackets cycle README / FILES /
+REFS. Y copies the clone command.
+
+FILES has the standard compact file rows. Selecting a file drills into a full-width escaped
+preview or explicit binary/oversized message; FILES or Escape returns to the remembered list
+position. DOWNLOAD FILE retrieves a committed file up to 16 MiB; larger files remain available
 by cloning. Previews stop at 256 KiB. Relative README documentation links open the file view.
 Missing README, missing revision and unavailable files have explicit states and retry paths.
-Escape and BACK TO INDEX return to search. Shared links retain revision and selected file.
+Escape from the project and the header back button return to the remembered search, including
+loaded pages, cursor and scroll. Shared links retain revision and selected file.
 
 ## Repo detail view
 

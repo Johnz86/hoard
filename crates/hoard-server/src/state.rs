@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use parking_lot::Mutex;
 use secrecy::{ExposeSecret, SecretString};
 
-use hoard_index::catalog::Catalog;
+use hoard_index::catalog::{Catalog, MIRROR_SOURCE, PEER_SOURCE, PULL_SOURCE};
 use hoard_index::coordinate::Coordinator;
 use hoard_index::watch::Watcher;
 use hoard_mirror::MirrorError;
@@ -247,6 +247,58 @@ impl AppState {
         }
         crate::restart_watcher(self).await;
         Ok(())
+    }
+
+    /// Completes persisted source removals before this node accepts requests or starts
+    /// watching folders, including removals interrupted by a previous process stopping.
+    pub async fn recover_source_removals(&self) -> Result<(), ApiError> {
+        let config = self.inner.config.clone();
+        let disabled = tokio::task::spawn_blocking(move || config.disabled_sources())
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))??;
+        for name in disabled {
+            self.coordinator().remove_source(&name).await?;
+        }
+        Ok(())
+    }
+
+    /// Persists removal and finishes it in an owned task, so a dropped HTTP request cannot
+    /// release the source-update and scan-execution gates before retirement finishes.
+    pub async fn remove_source(&self, name: String) -> Result<(), ApiError> {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let _update = state.inner.source_update.lock().await;
+            let configured = state.coordinator().config().source(&name).is_some();
+            let config = state.inner.config.clone();
+            let catalog = Arc::clone(state.catalog());
+            let stored_name = name.clone();
+            tokio::task::spawn_blocking(move || {
+                if stored_name == MIRROR_SOURCE
+                    || stored_name == PULL_SOURCE
+                    || stored_name.starts_with(PEER_SOURCE)
+                {
+                    return Err(ApiError::conflict("this storage is managed by Hoard"));
+                }
+                let stored = catalog
+                    .sources()?
+                    .iter()
+                    .any(|source| source.name == stored_name);
+                if !configured && !stored && !config.disabled_sources()?.contains(&stored_name) {
+                    return Err(ApiError::not_found(format!("source {stored_name}")));
+                }
+                config.disable_source(&stored_name)
+            })
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))??;
+            state.coordinator().remove_source(&name).await?;
+            if let Some(watcher) = state.take_watcher() {
+                watcher.shutdown().await;
+            }
+            crate::restart_watcher(&state).await;
+            Ok(())
+        })
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
     }
 
     /// Records the watcher this node started. [`crate::serve`] joins it before stopping the
