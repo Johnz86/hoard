@@ -98,7 +98,7 @@ export function initKeys(app) {
             return;
         }
         if (typing || event.ctrlKey || event.metaKey || event.altKey) return;
-        if ((event.key === "Enter" || event.key === " ") && event.target.closest?.("button, a")) return;
+        if ((event.key === "Enter" || event.key === " ") && event.target.closest?.("button, a, summary")) return;
 
         if (event.key === "/") {
             event.preventDefault();

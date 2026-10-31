@@ -121,6 +121,36 @@ fn a_lone_shards_row_says_it_is_incomplete() -> Result<()> {
 }
 
 #[test]
+fn a_role_correction_preserves_compatible_subroles_and_clears_incompatible_ones() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let catalog = mystery_catalog(directory.path())?;
+    let mut entry = queued_seed(0x99, "adapter", "adapter.safetensors");
+    let artifact = &mut entry.artifact.as_mut().expect("seeded artifact").artifact;
+    artifact.role = Role::Lora;
+    artifact.sub_role = Some(SubRole::Ipa);
+    let written = catalog.seed(&[seeded_revision(
+        seeded_repo("misc/adapter", RepoType::Models),
+        0x99,
+        vec![entry],
+    )])?;
+    let id = seeded_id(&written, 0x99)?;
+    catalog.rebuild_search(|_| {})?;
+
+    catalog.put_override(id, Some(Role::Lora), None, None)?;
+    assert_eq!(
+        stored_record(&catalog, id)?.artifact.sub_role,
+        Some(SubRole::Ipa)
+    );
+
+    catalog.put_override(id, Some(Role::Ctrl), None, None)?;
+    let corrected = stored_record(&catalog, id)?.artifact;
+    assert_eq!(corrected.role, Role::Ctrl);
+    assert_eq!(corrected.sub_role, None);
+    assert_eq!(three_counts(&catalog)?, (0, 0, 0));
+    Ok(())
+}
+
+#[test]
 fn a_whole_sets_row_is_a_set_and_not_incomplete() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let hub = directory.path().join("hub");

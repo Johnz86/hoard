@@ -1145,7 +1145,7 @@ button.shelf-menu-remove:hover { color: var(--red); }
 
 /* ---------- inspector ---------- */
 
-.inspector-slot { min-width: 0; }
+.inspector-slot { min-width: 0; min-height: 0; }
 
 :root[data-inspector="off"] .inspector-slot { display: none; }
 
@@ -1226,6 +1226,21 @@ button.shelf-menu-remove:hover { color: var(--red); }
     padding: 9px;
     font-size: 11.5px;
 }
+
+.classification-review { font: 11.5px var(--mono); overflow-wrap: anywhere; }
+.classification-review > summary { color: var(--amb); font-size: 10px; letter-spacing: 0.08em; }
+.classification-review p { margin: 10px 0; font-size: 11px; line-height: 1.6; }
+.classification-review fieldset { margin: 12px 0 0; padding: 0; border: 0; }
+.classification-review label { font: 10px var(--mono); color: var(--muted); }
+.classification-review input, .classification-review select {
+    margin: 5px 0 12px; padding: 7px; height: auto; font: 12px var(--mono);
+    background-color: var(--bg); color: var(--text); border: 1px solid var(--rule);
+    border-radius: 0; box-shadow: none;
+}
+.classification-review input:focus, .classification-review select:focus { border-color: var(--amb); }
+.classification-review .btn { display: block; width: 100%; margin: 6px 0; }
+.classification-evidence summary { color: var(--muted); font-size: 10px; }
+.classification-evidence-row { padding: 6px 0; border-bottom: 1px dashed var(--rule); }
 
 .plug {
     font-family: var(--mono);

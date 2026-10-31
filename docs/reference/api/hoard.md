@@ -221,6 +221,9 @@ apart.
   script carries stays one a person can read.
 - `PUT /api/v1/artifacts/{id}/override { "role", "base", "sub_role" }`, at least one of the
   three set or 400. `DELETE` clears.
+  An explicit role change clears an incompatible inferred sub-role and preserves compatible
+  sub-roles. Clearing the override removes the stored decision; existing facts remain until
+  the files are re-inferred.
 - `GET /api/v1/blobs/{sha256}`: `{ "sha256", "size", "size_human", "path_count",
   "first_seen", "hashed_at", "entries" }`, `entries` in the same shape as an artifact's.
 
@@ -441,7 +444,11 @@ rest being counted.
 - `POST /api/v1/loadouts/{id}/validate`: compat violations.
 - `POST /api/v1/loadouts/{id}/apply { "node", "profile" }`: starts a job, answering
   `{ "job_id", "node", "apply_preview" }` with the same `apply_preview` shape as loadout
-  detail, resolved before the pull runs.
+  detail, resolved before the pull runs. This response confirms job creation, not completion;
+  read `GET /api/v1/jobs/{job_id}` for the outcome. A local apply fails if any required link
+  cannot be written. Successful links remain recorded on partial failure, and conflicting
+  regular files are preserved. The job error names the first link failure; retrying can reuse
+  links already written.
 - `GET /api/v1/loadouts/{id}/export?format=toml|hf-script|comfy`. An item carries
   `abs_path`, the path on this node holding the whole artifact, `null` when none does; the
   `comfy` script links that path and writes `# <name>: not on this node` for a line nothing

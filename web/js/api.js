@@ -77,6 +77,9 @@ export const parseQuery = (q) => get("/search/parse", { q });
 export const artifact = (id) => get(`/artifacts/${segment(id)}`);
 export const artifactCompat = (id, limit) => get(`/artifacts/${segment(id)}/compat`, { limit });
 export const pullCommand = (id) => get(`/artifacts/${segment(id)}/pull-command`);
+export const confirmClassification = (id, body) => post(`/triage/${segment(id)}/confirm`, body);
+export const rejectClassification = (id) => post(`/triage/${segment(id)}/reject`);
+export const clearClassification = (id) => del(`/artifacts/${segment(id)}/override`);
 
 export const repo = (type, org, name, artifact) => get(repoBase(type, org, name), { artifact });
 export const repoFiles = (type, org, name, revision, artifact) =>
@@ -113,6 +116,7 @@ export const createSource = (source) => post("/sources", source);
 export const deleteSource = (name) => del(`/sources/${segment(name)}`);
 export const startScan = (source) => post("/scan", { source: source ?? null, hash: "later" });
 export const jobs = (state) => get("/jobs", { state });
+export const job = (id) => get(`/jobs/${segment(id)}`);
 export const cancelJob = (id) => post(`/jobs/${segment(id)}/cancel`);
 export const deleteJob = (id) => del(`/jobs/${segment(id)}`);
 export const clearScanJobs = () => del("/jobs?kind=scan");

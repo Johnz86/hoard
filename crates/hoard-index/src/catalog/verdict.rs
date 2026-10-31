@@ -215,6 +215,10 @@ fn require_record(
 pub(super) fn apply_override(record: &mut ArtifactRecord, verdict: &Override) {
     if let Some(role) = verdict.role {
         record.artifact.role = role;
+        record.artifact.sub_role = record
+            .artifact
+            .sub_role
+            .filter(|sub_role| sub_role.roles().contains(&role));
         record.artifact.role_confidence = 1.0;
     }
     if let Some(sub_role) = verdict.sub_role {

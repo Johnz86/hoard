@@ -1,4 +1,5 @@
 import { el } from "./dom.js";
+import { renderClassification } from "./classification.js";
 import { roleClass, roleCode } from "./table.js";
 
 export function factRows(facts) {
@@ -98,6 +99,7 @@ export function renderInspector(app) {
                 onClick: () => app.yank(row)
             })
         ),
+        detail?.artifact_id === row.artifact_id ? renderClassification(app, detail) : null,
         el(
             "div",
             null,

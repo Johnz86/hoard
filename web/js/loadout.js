@@ -33,10 +33,15 @@ function weightLabel(item) {
 }
 
 function applyLine(app, items) {
-    const preview = (app.state.loadout && app.state.loadout.apply_preview) || null;
-    if (app.state.loadoutApplied) {
-        return `→ done · ${items.length} artifacts resolved, symlinks written for comfyui`;
+    const apply = app.state.loadoutApplies.get(app.state.loadoutId);
+    if (apply) {
+        if (apply.pollError) return `Status unavailable · ${apply.pollError} · checking again…`;
+        if (apply.state === "done") return `Last apply complete · ${apply.phase}`;
+        if (apply.state === "failed") return `Apply failed · ${apply.error}`;
+        if (apply.state === "cancelled") return "Apply cancelled · some links may already exist";
+        return `Applying · ${apply.phase}`;
     }
+    const preview = (app.state.loadout && app.state.loadout.apply_preview) || null;
     if (!preview) return `→ ${items.length} pinned`;
     const rate = preview.rate_bps ? ` (${fmtRate(preview.rate_bps)})` : "";
     return `→ ${preview.present ?? 0} present, ${preview.pulling ?? 0} pulling over LAN${rate}`;
@@ -206,10 +211,12 @@ export function renderDrawer(app) {
                         "div",
                         { class: "code-box" },
                         el("div", { class: "code-comment", text: `$ hoard apply ${name} --node ${node}` }),
-                        el("div", { class: "code-ok", text: applyLine(app, items) })
+                        el("div", { class: "drawer-apply-status", role: "status",
+                            style: { overflowWrap: "anywhere" },
+                            "aria-live": "polite" })
                     ),
                     el("button", {
-                        class: "btn btn-primary btn-wide",
+                        class: "btn btn-primary btn-wide drawer-apply",
                         type: "button",
                         text: `APPLY TO ${node.toUpperCase()}`,
                         disabled: !doc,
@@ -219,16 +226,53 @@ export function renderDrawer(app) {
             )
         )
     );
+    paintApplyStatus(app);
+}
+
+function paintApplyStatus(app) {
+    const root = document.getElementById("drawer-root");
+    const status = root.querySelector(".drawer-apply-status");
+    const button = root.querySelector(".drawer-apply");
+    if (!status || !button) return;
+    const apply = app.state.loadoutApplies.get(app.state.loadoutId);
+    status.textContent = applyLine(app, loadoutItems(app));
+    status.style.color = apply?.state === "failed" ? "var(--red)"
+        : apply?.pollError || apply?.state === "running" || apply?.state === "cancelled"
+            ? "var(--amb)" : "var(--green)";
+    button.disabled = !app.state.loadout || apply?.state === "running";
+    button.textContent = apply?.state === "running" ? "APPLYING…"
+        : `APPLY TO ${app.selfNodeName().toUpperCase()}`;
 }
 
 async function applyNow(app, node) {
-    if (!app.state.loadoutId) return;
+    const id = app.state.loadoutId;
+    if (!id || app.state.loadoutApplies.get(id)?.state === "running") return;
+    const apply = { state: "running", phase: "queuing job…", error: null, pollError: null };
+    app.state.loadoutApplies.set(id, apply);
+    paintApplyStatus(app);
     try {
-        await api.applyLoadout(app.state.loadoutId, node, "comfyui");
-        app.state.loadoutApplied = true;
-        toast(`applied to ${node} · symlinks written for comfyui`);
+        const started = await api.applyLoadout(id, node, "comfyui");
+        apply.phase = "job queued";
+        while (apply.state === "running") {
+            try {
+                const job = await api.job(started.job_id);
+                apply.state = job.state;
+                apply.phase = job.phase || "job queued";
+                apply.error = job.error;
+                apply.pollError = null;
+            } catch (error) {
+                apply.pollError = error.message;
+            }
+            paintApplyStatus(app);
+            if (apply.state === "running") {
+                await new Promise((resolve) => setTimeout(resolve, 1000));
+            }
+        }
+        toast(`apply ${apply.state === "done" ? "complete" : apply.state} on ${node}`);
     } catch (error) {
-        toast(`apply failed · ${error.message}`);
+        apply.state = "failed";
+        apply.error = error.message;
+        toast(`apply failed on ${node}`);
     }
-    app.render();
+    paintApplyStatus(app);
 }

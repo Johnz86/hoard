@@ -50,6 +50,7 @@ const state = {
     searching: false,
     searchedQuery: null,
     cursorArtifact: null,
+    classificationReview: null,
     shelves: null,
     shelvesError: null,
     nodes: null,
@@ -69,7 +70,7 @@ const state = {
     loadoutDeleting: null,
     loadout: null,
     loadoutError: null,
-    loadoutApplied: false,
+    loadoutApplies: new Map(),
     drawerOpen: false,
     keySheet: false,
     prefsOpen: false,
@@ -151,8 +152,9 @@ const app = {
     selfNodeName,
     resultLine,
     render,
-    async refreshIndex() {
-        await Promise.all([runSearch(), loadShelves(app), loadSetup(app)]);
+    paintInspector,
+    async refreshIndex(selected) {
+        await Promise.all([runSearch(selected), loadShelves(app), loadSetup(app)]);
     }
 };
 
@@ -357,7 +359,7 @@ function commitQuery(q, options) {
     runSearch();
 }
 
-async function runSearch() {
+async function runSearch(selected) {
     const query = state.q;
     const version = ++searchVersion;
     state.searching = true;
@@ -381,6 +383,10 @@ async function runSearch() {
         state.sortApplied = data.sort || state.sortApplied;
         state.dirApplied = data.dir || state.dirApplied;
         state.cursor = Math.min(state.cursor, Math.max(state.rows.length - 1, 0));
+        if (selected) {
+            const kept = state.rows.findIndex((row) => rowKey(row) === selected);
+            if (kept >= 0) state.cursor = kept;
+        }
         state.cursorArtifact = null;
         state.searchedQuery = query;
     } catch (error) {
@@ -451,7 +457,29 @@ function scheduleInspector() {
 
 function paintInspector() {
     const slot = document.getElementById("inspector-slot");
-    if (slot) mount(slot, renderInspector(app));
+    if (!slot) return;
+    const key = rowKey(cursorRow());
+    const same = slot.dataset.resource === key;
+    const reviewPanel = slot.querySelector(".classification-review");
+    if (same && reviewPanel && state.classificationReview?.id === key) {
+        state.classificationReview.open = reviewPanel.open;
+        state.classificationReview.evidenceOpen =
+            slot.querySelector(".classification-evidence")?.open || false;
+    }
+    const scroll = same ? slot.querySelector(".inspector")?.scrollTop || 0 : 0;
+    const focused = same && slot.contains(document.activeElement) ? document.activeElement : null;
+    const id = focused?.id;
+    const selection = focused?.tagName === "INPUT"
+        ? [focused.selectionStart, focused.selectionEnd] : null;
+    mount(slot, renderInspector(app));
+    slot.dataset.resource = key || "";
+    const inspector = slot.querySelector(".inspector");
+    if (inspector) inspector.scrollTop = scroll;
+    if (id) {
+        const field = document.getElementById(id);
+        field?.focus({ preventScroll: true });
+        if (selection) field?.setSelectionRange(...selection);
+    }
 }
 
 function paintCursor() {
@@ -617,7 +645,6 @@ async function addToLoadout(row) {
         const answer = await api.addLoadoutItem(state.loadoutId, row.artifact_id);
         state.loadoutId = answer.id;
         updateSettings({ loadoutId: answer.id });
-        state.loadoutApplied = false;
         toast(answer.notice);
         await loadLoadout(app);
     } catch (error) {
@@ -682,7 +709,6 @@ async function removeFromLoadout(item) {
     if (!state.loadoutId || !item.artifact_id) return;
     try {
         await api.removeLoadoutItem(state.loadoutId, item.artifact_id);
-        state.loadoutApplied = false;
         await loadLoadout(app);
     } catch (error) {
         toast(`remove failed · ${error.message}`);

@@ -5,6 +5,139 @@ async fn started(world: &World, name: &str) -> String {
     created["id"].as_str().expect("id").to_owned()
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_successful_apply_creates_and_records_its_link_and_can_be_repeated() {
+    let world = seeded();
+    let id = started(&world, "apply-success").await;
+    post(
+        &world.state,
+        &format!("/api/v1/loadouts/{id}/items"),
+        json!({ "artifact_id": world.ckpt.to_string() }),
+    )
+    .await;
+
+    for _ in 0..2 {
+        let job = post(
+            &world.state,
+            &format!("/api/v1/loadouts/{id}/apply"),
+            json!({ "profile": "comfyui" }),
+        )
+        .await;
+        let finished = settle(&world.state, job["job_id"].as_str().expect("job id")).await;
+
+        assert_eq!(finished["state"], "done");
+        assert_eq!(finished["error"], Value::Null);
+        assert!(
+            finished["phase"]
+                .as_str()
+                .expect("phase")
+                .starts_with("1 links written")
+        );
+        let projections = world
+            .state
+            .catalog()
+            .projections_for_artifact(world.ckpt)
+            .expect("projections");
+        assert_eq!(projections.len(), 1);
+        assert_eq!(
+            std::fs::read_link(&projections[0].link_path).expect("link exists"),
+            Path::new(&projections[0].target_path)
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_apply_with_a_blocked_destination_fails_and_preserves_the_file() {
+    let world = seeded();
+    let id = started(&world, "apply-blocked").await;
+    post(
+        &world.state,
+        &format!("/api/v1/loadouts/{id}/items"),
+        json!({ "artifact_id": world.ckpt.to_string() }),
+    )
+    .await;
+    let root = world.state.projection_root();
+    std::fs::create_dir_all(&root).expect("projection root");
+    let obstruction = root.join("comfyui");
+    std::fs::write(&obstruction, b"existing user file").expect("obstruction");
+
+    let job = post(
+        &world.state,
+        &format!("/api/v1/loadouts/{id}/apply"),
+        json!({ "profile": "comfyui" }),
+    )
+    .await;
+    let finished = settle(&world.state, job["job_id"].as_str().expect("job id")).await;
+
+    assert_eq!(finished["state"], "failed");
+    assert!(
+        finished["error"]
+            .as_str()
+            .expect("error")
+            .contains("comfyui")
+    );
+    assert_eq!(
+        std::fs::read(obstruction).expect("file preserved"),
+        b"existing user file"
+    );
+    assert!(
+        world
+            .state
+            .catalog()
+            .list_projections(None)
+            .expect("projections")
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_partial_apply_fails_but_records_successful_links_and_preserves_conflicts() {
+    let world = seeded();
+    let id = started(&world, "apply-partial").await;
+    for artifact in [world.ckpt, world.lora] {
+        post(
+            &world.state,
+            &format!("/api/v1/loadouts/{id}/items"),
+            json!({ "artifact_id": artifact.to_string() }),
+        )
+        .await;
+    }
+    let loras = world.state.projection_root().join("comfyui/loras");
+    std::fs::create_dir_all(&loras).expect("lora destination");
+    let obstruction = loras.join("film-grain-35mm.safetensors");
+    std::fs::write(&obstruction, b"existing model").expect("obstruction");
+
+    let job = post(
+        &world.state,
+        &format!("/api/v1/loadouts/{id}/apply"),
+        json!({ "profile": "comfyui" }),
+    )
+    .await;
+    let finished = settle(&world.state, job["job_id"].as_str().expect("job id")).await;
+
+    assert_eq!(finished["state"], "failed");
+    assert!(
+        finished["error"]
+            .as_str()
+            .expect("error")
+            .contains("film-grain-35mm")
+    );
+    assert_eq!(
+        std::fs::read(obstruction).expect("model preserved"),
+        b"existing model"
+    );
+    let projections = world
+        .state
+        .catalog()
+        .list_projections(None)
+        .expect("projections");
+    assert_eq!(projections.len(), 1);
+    assert_eq!(projections[0].artifact_id, Some(world.ckpt));
+    assert!(std::fs::read_link(&projections[0].link_path).is_ok());
+}
+
 #[tokio::test]
 async fn a_second_host_replaces_the_first_and_the_answer_names_it() {
     let world = seeded();

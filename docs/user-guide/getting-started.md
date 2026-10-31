@@ -52,6 +52,14 @@ for facts; double-click or press Enter to open it. Search for a project by name,
 README text or file path, or use `role:git` to show Git projects. A project does not need
 model files to appear.
 
+For a model or dataset, select its row and expand **REVIEW CLASSIFICATION** in the inspector.
+Review the recorded evidence, choose a role and model family, and confirm the classification.
+Blank family input keeps the current family. Owner access is required to save changes.
+**CLEAR OVERRIDE** removes a saved decision; facts change when the files are re-inferred.
+**REJECT AS NOISE**, followed by confirmation, skips the artifact's indexed paths on future
+scans without deleting their files. A still-incomplete shard set can remain in triage after
+its classification is confirmed.
+
 Project details offer README, FILES and REFS. Follow relative documentation links, preview
 text and choose a revision before copying a project link or clone command. Escape returns
 from a file preview to the file list, then to Index. A search with no matches offers

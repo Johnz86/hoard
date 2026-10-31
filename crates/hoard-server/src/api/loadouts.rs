@@ -703,7 +703,8 @@ async fn write_links(
     dir: &StdPath,
     lines: &[ReadyLine],
 ) -> ApiResult<usize> {
-    let mut written = Vec::new();
+    let mut written = Vec::with_capacity(lines.len());
+    let mut failure = None;
     for line in lines {
         if line.target.is_empty() {
             continue;
@@ -718,6 +719,9 @@ async fn write_links(
             }),
             Err(error) => {
                 tracing::warn!(link = %link.display(), %error, "an apply link was not written");
+                if failure.is_none() {
+                    failure = Some(error);
+                }
             }
         }
     }
@@ -725,6 +729,9 @@ async fn write_links(
     if count > 0 {
         let catalog = Arc::clone(state.catalog());
         blocking(move || catalog.record_projections(&written)).await?;
+    }
+    if let Some(error) = failure {
+        return Err(error.into());
     }
     Ok(count)
 }

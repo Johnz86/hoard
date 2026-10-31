@@ -191,6 +191,24 @@ blob sha256, plus rank / alpha for lora, context for llm, resolution for ckpt; b
 `OPEN REPO ↵` (amber primary), `ADD TO LOADOUT`, `YANK PULL COMMAND` (outline); PLUGS INTO
 list of up to four compatible artifacts (`role · name`, amber on hover, click opens).
 
+Model and dataset inspectors also offer an expandable REVIEW CLASSIFICATION section after
+the action buttons. It shows the current confidence or why review is needed, the recorded
+role/base evidence, and labeled role and model-family fields. CONFIRM CLASSIFICATION stores
+the decision through the triage API. Blank family input preserves the current family;
+unclassified roles and incomplete sets can remain in triage after confirmation.
+CLEAR OVERRIDE appears when a saved decision exists and explains that clearing removes the
+decision while current facts remain until the files are re-inferred. REJECT AS NOISE requires
+CONFIRM REJECT or CANCEL and explains that future scans skip all indexed paths for the artifact
+without deleting files. These controls do not appear for Git projects.
+
+Mutations disable the review form while saving. Failures retain draft values and show an inline
+error; owner-access errors link to Sources for token entry. Successful changes refresh the
+current search, facets and shelf counts, keeping the selected resource when it still matches.
+Keep draft input, focus, text selection and inspector scroll through unrelated rerenders.
+Switching to another artifact starts a fresh review. Escape closes the review and focuses its
+summary; Enter/Space on summaries retain native behavior. Classification requires the same
+node write token as other catalog changes.
+
 ## Sources view
 
 A bare initial URL opens Sources when `/api/v1/setup` confirms zero configured folders and
@@ -339,16 +357,23 @@ row to start one, or NEW below` when none is; the middle line says what a loadou
 `L` with no loadout creates `loadout-1` and pins into it; `L` on a checkpoint while the
 current loadout has one starts a loadout named after the file and pins it there. The current
 loadout is remembered in the settings record. Footer: terminal box
-`$ hoard apply night-exterior-v3 --node laptop` with result line in green
-(`→ 3 present, 2 pulling over LAN (1.2 GB/s)` then
-`→ done · 5 artifacts resolved, symlinks written for comfyui`), and an amber
-`APPLY TO LAPTOP` button.
+`$ hoard apply night-exterior-v3 --node laptop` with the availability preview in green
+(`→ 3 present, 2 pulling over LAN (1.2 GB/s)`), and an amber `APPLY TO LAPTOP` button.
+Starting an apply disables that loadout's button and displays `Applying` with the actual
+job phase in amber. Poll the returned job until it finishes; acceptance of the start request
+is not completion. A successful job displays `Last apply complete` with its reported phase
+in green. A failed job displays `Apply failed` and its error in red; cancellation is explicit.
+Terminal states enable the button for another apply. Polling failures display `Status
+unavailable` and keep checking with the button disabled. Update only the footer so polling
+preserves draft input, focus and drawer scroll. Status belongs to its loadout and survives
+closing or switching drawers within the current tab; reloading the page clears tracking.
 
 Toast: bottom center, `--panel2` fill, 3px amber left border, mono 12px, 2.4 s, used for
 `+ name pinned at v3`, `replaced vae X with Y`, `new loadout "X": checkpoint pinned`,
 `new loadout "X"`, `renamed to X`, `removed loadout X`, `copied: git clone ...`,
 `served name → http://hoard.lan/org/name`, `checked out ...`,
-`applied to laptop · symlinks written for comfyui`. Every pin toast is the server's own
+`apply complete on laptop` only after the job succeeds, or its failure/cancellation.
+Every pin toast is the server's own
 `notice`, so the drawer decides nothing about what a pin did.
 
 ## Keyboard map

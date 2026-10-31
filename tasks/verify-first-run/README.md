@@ -3,6 +3,17 @@
 Run the browser acceptance journey against an isolated node. It covers empty arrival, explicit
 searches, owner-token access, invalid-path recovery, empty folders, polling focus and form
 position, sharing settings, restart, shared links and removal of the last source.
+It also covers a first model loadout: real link creation, pending-job status, duplicate-submit
+prevention, polling recovery, draft/focus preservation, switching/reopening the drawer, and
+a conflicting file followed by retry. Job polling is temporarily controlled in the browser
+to exercise running and unavailable states deterministically; apply and filesystem results
+use the real isolated server.
+Classification coverage uses an additional unclassified model to verify owner-access recovery,
+draft/focus preservation, confirmation, matching triage/search/shelf totals, persistence through
+rescan and restart, clearing and re-inference, and confirmed noise rejection without file loss.
+The inspector review is captured at 1180/1600px in both themes, both densities, table/cards
+and inspector on/off, checking that scrolling stays within the inspector and the header
+remains visible. Git project controls remain separate from classification controls.
 
 ## Requirements and command
 
@@ -24,7 +35,7 @@ profile in a temporary directory. It binds an available loopback port, disables 
 discovery, limits worker counts and stops only its own processes. It never uses production
 configuration or catalogs.
 
-Successful runs print the evidence directory containing light/dark screenshots at 1180/1600px,
-a verification JSON file and server logs. Failed runs retain evidence for diagnosis. No data
-is written into the checkout. The task is an acceptance check for this workflow, not a
-replacement for [broader UI review](../../docs/contributing/ui-changes.md).
+Successful runs print the evidence directory containing light/dark setup screenshots at
+1180/1600px, loadout screenshots, a verification JSON file and server logs. Failed runs retain
+evidence for diagnosis. No data is written into the checkout. The task is an acceptance check
+for this workflow, not a replacement for [broader UI review](../../docs/contributing/ui-changes.md).
