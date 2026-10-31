@@ -16,3 +16,6 @@ It uses the real application with isolated example resources.
 
 The example listener is local to the recording machine. To share with another machine,
 configure a reachable address and listener and test it from that machine.
+
+Sharing-address changes now apply immediately. The recording's restart step applies to the
+node-name change; changing the listener still requires restarting Hoard.

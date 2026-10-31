@@ -25,6 +25,55 @@ fn project_readme_names_are_case_insensitive_and_include_plain_text() {
     assert!(!api::projects::is_readme("my-readme.md"));
 }
 
+#[tokio::test]
+async fn a_live_address_change_updates_cached_project_search_and_detail_links() {
+    let world = project_world(false, true);
+    let initial = get(&world.state, "/api/v1/projects").await;
+    assert!(
+        initial["rows"][0]["clone_command"]
+            .as_str()
+            .expect("command")
+            .contains("http://hoarder.lan:7099")
+    );
+
+    let (status, setup) = call(
+        &world.state,
+        Method::PUT,
+        "/api/v1/setup",
+        Some(json!({"node_name":world.state.node_name(),"public_url":"http://10.42.0.1:7099"})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{setup}");
+    for (path, field) in [
+        ("/api/v1/projects", "rows"),
+        ("/api/v1/search?q=role:git", "resources"),
+    ] {
+        let result = get(&world.state, path).await;
+        let rows = result[field].as_array().expect("rows");
+        assert!(
+            rows[0]["clone_command"]
+                .as_str()
+                .expect("command")
+                .contains("http://10.42.0.1:7099"),
+            "{result}"
+        );
+    }
+    let project = get(&world.state, &format!("/api/v1/projects/{}", world.id)).await;
+    assert!(
+        project["project_url"]
+            .as_str()
+            .expect("project URL")
+            .starts_with("http://10.42.0.1:7099")
+    );
+    assert!(
+        project["clone_command"]
+            .as_str()
+            .expect("command")
+            .contains("http://10.42.0.1:7099")
+    );
+}
+
 fn git_project(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .current_dir(dir)

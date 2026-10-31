@@ -227,7 +227,7 @@ pub async fn pull_command(
     artifact.companion = companion_of(&subject.row, &subject.rows).map(|row| row.path.as_str());
     let path = shown_path(&subject.row).or_else(|| Some(subject.row.path.clone()));
     Ok(Json(pull_commands(
-        state.public_url(),
+        &state.public_url(),
         PullSubject {
             repo: &subject.repo,
             kind: subject.kind,

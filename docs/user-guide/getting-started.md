@@ -70,8 +70,9 @@ from a file preview to the file list, then to Index. A search with no matches of
 Open **SHARING & SETUP** in Sources. Review the active address and listener. Set a node name
 and an HTTP or HTTPS address other machines can reach, for example
 `http://workstation.lan:7099`, then choose **SAVE SETTINGS**. These values persist in
-`<data_dir>/node.json`; pending changes are shown separately from the active address.
-Restart Hoard to apply them. Saving does not restart the process or change its listener.
+`<data_dir>/node.json`. Sharing-address changes apply immediately to generated links and
+download commands. Only a changed node name remains pending until restart. Saving does not
+restart the process, change its listener or change network settings.
 
 If you started with a loopback listener, configure `[server] bind = "0.0.0.0:7099"` in
 `hoard.toml`, or supply that bind address when restarting. Keep the same working directory

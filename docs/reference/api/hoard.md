@@ -381,10 +381,13 @@ query, fragment or a wildcard/unspecified host. Invalid input returns 400 withou
 the saved settings. Loopback addresses are allowed for local use.
 
 The write persists `<data_dir>/node.json` without rewriting TOML, rebinding the listener or
-restarting the service. On startup it overrides the TOML node name and public URL. Different
-saved values appear as `pending: { "node_name", "public_url" }` with `restart_required: true`;
-active fields and generated links remain unchanged until restart. Saving the active values
-cancels a pending change. Deleting `node.json` returns control to TOML/default values.
+restarting the service. On startup it overrides the TOML node name and public URL. Saved
+sharing addresses become active immediately for generated links, clone/download commands,
+Git LFS URLs, and the local node view. Discovery receives address updates in the background.
+Only a changed node name appears as `pending: { "node_name", "public_url" }` with
+`restart_required: true`; the pending object's URL is already active. Saving the active name
+cancels its pending change. Failed saves leave the active address unchanged. Deleting
+`node.json` returns control to TOML/default values on the next startup.
 Listener changes remain process/configuration settings. No token is stored in this file.
 
 Reads and resource downloads remain public to clients that can reach the node. A configured

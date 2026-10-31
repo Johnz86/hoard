@@ -784,6 +784,7 @@ pub struct GossipConfig {
     pub digest_limit: u32,
     /// Sent as a bearer token to peers that require one even for reads.
     pub token: Option<String>,
+    url_updates: Option<watch::Receiver<Arc<String>>>,
 }
 
 impl GossipConfig {
@@ -795,6 +796,7 @@ impl GossipConfig {
             interval: DEFAULT_INTERVAL,
             digest_limit: DEFAULT_LIMIT,
             token: None,
+            url_updates: None,
         }
     }
 
@@ -816,6 +818,17 @@ impl GossipConfig {
     pub fn with_token(mut self, token: Option<String>) -> Self {
         self.token = token;
         self
+    }
+
+    /// Follows sharing URL changes without restarting peer polling or the HTTP server.
+    pub fn with_url_updates(mut self, updates: watch::Receiver<Arc<String>>) -> Self {
+        self.url_updates = Some(updates);
+        self
+    }
+
+    fn set_public_url(&mut self, url: &str) -> Result<()> {
+        self.identity = NodeIdentity::new(self.identity.id().clone(), self.identity.name(), url)?;
+        Ok(())
     }
 }
 
@@ -849,10 +862,11 @@ impl GossipHandle {
 ///
 /// Nothing in here can fail the server: a machine with no multicast route, no peers, or no
 /// network at all logs and carries on serving.
-pub fn spawn(catalog: Arc<Catalog>, config: GossipConfig) -> GossipHandle {
+pub fn spawn(catalog: Arc<Catalog>, mut config: GossipConfig) -> GossipHandle {
     let (stop, mut stopped) = watch::channel(false);
     let task = tokio::spawn(async move {
-        let (discovery, mut arrivals) =
+        let mut url_updates = config.url_updates.take();
+        let (mut discovery, mut arrivals) =
             Discovery::start(&config.identity, config.discovery, &config.statics);
         tracing::info!(
             node = %config.identity.name(),
@@ -868,6 +882,28 @@ pub fn spawn(catalog: Arc<Catalog>, config: GossipConfig) -> GossipHandle {
         loop {
             let stop_now = tokio::select! {
                 changed = stopped.changed() => changed.is_err() || *stopped.borrow(),
+                changed = async {
+                    match url_updates.as_mut() {
+                        Some(updates) => updates.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_err() {
+                        url_updates = None;
+                    } else if let Some(updates) = &mut url_updates {
+                        let url = Arc::clone(&updates.borrow_and_update());
+                        match config.set_public_url(&url) {
+                            Ok(()) => {
+                                discovery.stop();
+                                (discovery, arrivals) = Discovery::start(
+                                    &config.identity, config.discovery, &config.statics,
+                                );
+                            }
+                            Err(error) => tracing::warn!(%error, "sharing address was not advertised"),
+                        }
+                    }
+                    false
+                },
                 event = arrivals.recv() => match event {
                     Some(event) => {
                         unless_stopped(&mut cancel, on_event(&catalog, &config, &mut peers, event))
@@ -1948,6 +1984,42 @@ mod tests {
             )
             .expect("identity builds"),
         )
+    }
+
+    #[test]
+    fn a_sharing_url_update_preserves_identity_and_rejects_invalid_addresses() {
+        let mut config = gossip_config();
+        let before = config.identity.clone();
+
+        config
+            .set_public_url("http://10.42.0.1:7100")
+            .expect("new URL");
+
+        assert_eq!(config.identity.id(), before.id());
+        assert_eq!(config.identity.name(), before.name());
+        assert_eq!(config.identity.url().as_str(), "http://10.42.0.1:7100/");
+        assert_eq!(config.identity.port(), 7100);
+        let changed = config.identity.clone();
+        assert!(config.set_public_url("http://[").is_err());
+        assert_eq!(config.identity, changed);
+    }
+
+    #[tokio::test]
+    async fn a_closed_sharing_url_channel_does_not_stop_gossip_or_prevent_shutdown() {
+        let root = TempDir::new().expect("temp dir");
+        let catalog = catalog_with_local(&root);
+        let (sender, receiver) = watch::channel(Arc::new("http://127.0.0.1:7099".to_owned()));
+        let config = gossip_config()
+            .with_discovery(DiscoveryMode::None)
+            .with_url_updates(receiver);
+        let handle = spawn(catalog, config);
+        sender.send_replace(Arc::new("http://10.42.0.1:7099".to_owned()));
+        drop(sender);
+        tokio::task::yield_now().await;
+        assert!(!handle.is_finished());
+        tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
+            .await
+            .expect("gossip shuts down promptly");
     }
 
     #[tokio::test]

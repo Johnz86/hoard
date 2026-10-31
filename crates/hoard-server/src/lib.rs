@@ -43,17 +43,23 @@ pub async fn start_gossip(state: &AppState) -> Option<hoard_net::GossipHandle> {
             return None;
         }
     };
-    let identity = match hoard_net::NodeIdentity::new(
-        local.node_id,
-        &config.node.name,
-        &config.server.discovery_url(),
-    ) {
-        Ok(identity) => identity,
-        Err(error) => {
-            tracing::warn!(%error, "this node cannot advertise itself; federation is off");
-            return None;
-        }
+    let updates = state.public_url_updates();
+    let public_url = state.public_url();
+    let discovery_url = if config.server.public_url.is_some()
+        || public_url.as_str() != config.server.resolved_public_url()
+    {
+        public_url.as_str().to_owned()
+    } else {
+        config.server.discovery_url()
     };
+    let identity =
+        match hoard_net::NodeIdentity::new(local.node_id, &config.node.name, &discovery_url) {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::warn!(%error, "this node cannot advertise itself; federation is off");
+                return None;
+            }
+        };
     let mode = match config.node.discovery {
         config::Discovery::Mdns => hoard_net::DiscoveryMode::Mdns,
         config::Discovery::Static => hoard_net::DiscoveryMode::Static,
@@ -63,6 +69,7 @@ pub async fn start_gossip(state: &AppState) -> Option<hoard_net::GossipHandle> {
         .ok()
         .filter(|value| !value.is_empty());
     let gossip = hoard_net::GossipConfig::new(identity)
+        .with_url_updates(updates)
         .with_discovery(mode)
         .with_statics(config.peers.statics.clone())
         .with_token(token);

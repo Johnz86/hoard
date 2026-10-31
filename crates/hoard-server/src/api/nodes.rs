@@ -58,6 +58,7 @@ pub struct PeerBody {
 
 pub async fn list(State(state): State<AppState>) -> ApiResult<Json<Vec<NodeView>>> {
     let catalog = Arc::clone(state.catalog());
+    let public_url = state.public_url();
     let rows = blocking(move || {
         let held = catalog.totals()?.indexed_bytes;
         Ok(catalog
@@ -68,6 +69,7 @@ pub async fn list(State(state): State<AppState>) -> ApiResult<Json<Vec<NodeView>
                 let mut view = NodeView::from(row);
                 if is_self {
                     view.indexed_bytes = held;
+                    view.url = Some(public_url.as_str().to_owned());
                 }
                 view
             })

@@ -222,8 +222,10 @@ model query example. Background scans refresh an empty Index until resources app
 
 SHARING & SETUP remains a collapsible section in Sources after resources appear. It shows
 the active address/listener, node name/address fields and honest local-only or unverified
-sharing status. Saved settings show a restart requirement without changing active labels.
-Do not silently restart or rebind. Token-protected nodes offer password input for owner
+sharing status. Saving an address updates the active address and generated commands immediately;
+only a changed node name shows a restart requirement. Explain that the sharing address is used
+in copied links and commands. Do not silently restart or rebind. Token-protected nodes offer
+password input for owner
 access, held only in tab memory; explain that reads remain public. Preserve unsaved form
 input, focus and expanded state through polling. Paths in the add-folder form explicitly
 refer to the machine running Hoard, with files left in place.

@@ -12,7 +12,7 @@ its example source entries before adapting it to your own machine.
 | `hoard.toml` | Listener, data directory, sources, mirror, discovery and indexing policy | Edit the selected configuration and restart |
 | `<data_dir>/sources.json` | Folders added through the web UI | Sources ADD FOLDER |
 | `<data_dir>/sources.disabled.json` | Persistent exclusions for removed sources | Sources REMOVE; adding the name again clears its exclusion |
-| `<data_dir>/node.json` | Managed node name and public URL overrides | Sources SHARING & SETUP; restart applies saved values |
+| `<data_dir>/node.json` | Managed node name and public URL overrides | Sources SHARING & SETUP; address applies immediately, node name after restart |
 | Server environment or `.env` | Tokens and other sensitive values | Operator-managed; never commit credentials |
 
 Managed node values override TOML name/public URL on startup. Deleting `node.json` returns
@@ -31,8 +31,10 @@ operate those locations explicitly.
 local command URL uses loopback. LAN discovery retains its hostname resolution for wildcard
 listeners. A loopback listener accepts connections only from that machine.
 
-Sharing settings show active versus pending values. Saving a node name/address does not
-rebind or restart the service. After restart, test the address from a receiving machine.
+Saving a sharing address updates generated links and commands immediately and notifies
+discovery in the background. It does not rebind or restart the service or change network
+settings. A saved node name remains pending until restart. Test a changed address from a
+receiving machine; saving it does not establish reachability.
 
 ## Access and network behavior
 

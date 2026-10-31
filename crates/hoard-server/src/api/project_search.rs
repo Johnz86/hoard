@@ -33,6 +33,24 @@ pub struct ProjectRow {
     pub available: bool,
 }
 
+impl ProjectRow {
+    fn with_public_url(&self, public_url: &str) -> Self {
+        Self {
+            id: self.id,
+            name: self.name.clone(),
+            reference: self.reference.clone(),
+            source: self.source.clone(),
+            node: self.node.clone(),
+            revision: self.revision.clone(),
+            files: self.files,
+            bytes: self.bytes,
+            bytes_human: self.bytes_human.clone(),
+            clone_command: clone_command(public_url, self.id, &self.name),
+            available: self.available,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ProjectList {
     pub rows: Vec<ProjectRow>,
@@ -125,7 +143,7 @@ impl CachedProjects {
                 files,
                 bytes,
                 bytes_human: format_size(bytes),
-                clone_command: clone_command(state.public_url(), record.id, record.repo.name()),
+                clone_command: clone_command(&state.public_url(), record.id, record.repo.name()),
                 available: git.is_some(),
             });
             Ok(document)
@@ -168,13 +186,14 @@ pub async fn find(
     let state = state.clone();
     tokio::task::spawn_blocking(move || {
         let cache = cached(&state)?;
+        let public_url = state.public_url();
         let found = cache
             .index
             .search(&raw, source.as_deref(), offset as usize, limit as usize)?;
         let rows: Vec<ProjectRow> = found
             .slots
             .iter()
-            .map(|slot| cache.rows[*slot].clone())
+            .map(|slot| cache.rows[*slot].with_public_url(&public_url))
             .collect();
         Ok(ProjectList {
             next_cursor: next_cursor(
@@ -201,6 +220,7 @@ pub(crate) async fn sorted_prefix(
     let state = state.clone();
     tokio::task::spawn_blocking(move || {
         let cache = cached(&state)?;
+        let public_url = state.public_url();
         let slots = cache.index.matching_slots(&raw, None)?;
         let total = slots.len() as u64;
         let mut matches: Vec<_> = slots
@@ -233,7 +253,7 @@ pub(crate) async fn sorted_prefix(
         Ok(ProjectList {
             rows: matches
                 .into_iter()
-                .map(|(_, _, slot)| cache.rows[slot].clone())
+                .map(|(_, _, slot)| cache.rows[slot].with_public_url(&public_url))
                 .collect(),
             total,
             next_cursor: None,

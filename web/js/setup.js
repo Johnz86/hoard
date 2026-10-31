@@ -40,7 +40,7 @@ export function renderWelcome(app) {
 }
 
 function sharingStatus(setup) {
-    if (setup.restart_required) return "Settings saved. Restart Hoard to apply them. The active address below is unchanged.";
+    if (setup.restart_required) return "Sharing address is active. Restart Hoard to apply the saved node name.";
     return setup.address_message;
 }
 
@@ -58,10 +58,10 @@ function sharingForm(app) {
         button.disabled = true;
         message.hidden = true;
         try {
-            await api.saveSetup({ node_name: name.value.trim(), public_url: url.value.trim() });
-            await loadSetup(app);
+            app.state.setup = await api.saveSetup({ node_name: name.value.trim(), public_url: url.value.trim() });
+            await app.refreshIndex();
             message.textContent = app.state.setup.restart_required
-                ? "Saved. Restart Hoard to use these settings." : "Settings saved.";
+                ? "Address applied. Restart Hoard to use the saved node name." : "Sharing address saved and applied.";
             message.classList.remove("source-form-error");
             message.classList.add("mono-dim");
         } catch (error) {
@@ -75,7 +75,7 @@ function sharingForm(app) {
         el("div", { class: "sharing-fields" },
             el("label", null, el("span", { text: "NODE NAME" }), name),
             el("label", null, el("span", { text: "SHARING ADDRESS" }), url)),
-        el("p", { class: "setup-note", text: "Use the host name or IP address other machines can reach, including the port. Saving does not change the listening address or restart the server." }),
+        el("p", { class: "setup-note", text: "This address is used in copied links and download commands. Changes apply immediately. Node name changes require a restart. Saving does not change the listening address or network settings." }),
         el("div", { class: "source-form-foot" }, message,
             el("button", { class: "btn btn-tiny", type: "submit", text: "SAVE SETTINGS" })));
 }

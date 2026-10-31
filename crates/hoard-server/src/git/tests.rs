@@ -355,6 +355,39 @@ async fn the_lfs_batch_points_at_the_hub_resolve_route() {
 }
 
 #[tokio::test]
+async fn lfs_download_urls_follow_live_sharing_address_changes() {
+    let world = seeded();
+    world
+        .state
+        .save_node_settings(crate::config::NodeSettings {
+            node_name: world.state.node_name().to_owned(),
+            public_url: "http://10.42.0.1:7099".to_owned(),
+        })
+        .await
+        .expect("sharing address saves");
+    let answer = post(
+        &world.state,
+        "/org/clone.git/info/lfs/objects/batch",
+        json!({
+            "operation":"download", "objects":[{
+                "oid":Sha256::from_bytes(LFS_SHA256).to_hex(), "size":LFS_SIZE
+            }]
+        })
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+
+    assert_eq!(answer.status, StatusCode::OK);
+    assert!(
+        answer.json()["objects"][0]["actions"]["download"]["href"]
+            .as_str()
+            .expect("download URL")
+            .starts_with("http://10.42.0.1:7099/")
+    );
+}
+
+#[tokio::test]
 async fn an_upload_batch_is_refused_object_by_object() {
     let world = seeded();
     let body = json!({

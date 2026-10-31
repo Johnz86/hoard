@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use parking_lot::Mutex;
 use secrecy::{ExposeSecret, SecretString};
+use tokio::sync::watch;
 
 use hoard_index::catalog::{Catalog, MIRROR_SOURCE, PEER_SOURCE, PULL_SOURCE};
 use hoard_index::coordinate::Coordinator;
@@ -115,14 +116,14 @@ struct Inner {
     watch: Mutex<Watch>,
     upstream_health: AtomicU8,
     local_node_name: String,
-    public_url: String,
+    public_url: watch::Sender<Arc<String>>,
 }
 
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
             .field("node", &self.inner.local_node_name)
-            .field("public_url", &self.inner.public_url)
+            .field("public_url", &self.public_url())
             .field("offline", &self.inner.mirror_config.offline)
             .finish_non_exhaustive()
     }
@@ -165,7 +166,7 @@ impl AppState {
             .map(SecretString::from);
         let coordinator = Arc::new(Coordinator::new(Arc::clone(&catalog), config.index.clone()));
         let local_node_name = config.node.name.clone();
-        let public_url = config.server.resolved_public_url();
+        let (public_url, _) = watch::channel(Arc::new(config.server.resolved_public_url()));
         let health = match mirror_config.offline {
             true => UpstreamHealth::Offline,
             false => UpstreamHealth::Reachable,
@@ -342,9 +343,19 @@ impl AppState {
         tokio::spawn(async move {
             let _update = state.inner.source_update.lock().await;
             let config = state.inner.config.clone();
-            tokio::task::spawn_blocking(move || config.save_node_settings(&settings))
-                .await
-                .map_err(|error| ApiError::internal(error.to_string()))?
+            let saved = tokio::task::spawn_blocking(move || {
+                config.save_node_settings(&settings)?;
+                Ok::<_, ApiError>(settings)
+            })
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))??;
+            if state.public_url().as_str() != saved.public_url {
+                state
+                    .inner
+                    .public_url
+                    .send_replace(Arc::new(saved.public_url));
+            }
+            Ok(())
         })
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?
@@ -382,9 +393,13 @@ impl AppState {
         &self.inner.local_node_name
     }
 
-    /// The URL printed in `git clone` and `HF_ENDPOINT` pull commands.
-    pub fn public_url(&self) -> &str {
-        &self.inner.public_url
+    /// A snapshot of the active sharing URL; saving node settings replaces it immediately.
+    pub fn public_url(&self) -> Arc<String> {
+        Arc::clone(&self.inner.public_url.borrow())
+    }
+
+    pub(crate) fn public_url_updates(&self) -> watch::Receiver<Arc<String>> {
+        self.inner.public_url.subscribe()
     }
 
     pub fn offline(&self) -> bool {
@@ -525,6 +540,6 @@ mod tests {
     #[test]
     fn the_public_url_is_what_pull_commands_print() {
         let (_dir, state) = state();
-        assert_eq!(state.public_url(), "http://127.0.0.1:7099");
+        assert_eq!(state.public_url().as_str(), "http://127.0.0.1:7099");
     }
 }

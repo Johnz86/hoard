@@ -3,6 +3,9 @@
 Run the browser acceptance journey against an isolated node. It covers empty arrival, explicit
 searches, owner-token access, invalid-path recovery, empty folders, polling focus and form
 position, sharing settings, restart, shared links and removal of the last source.
+Sharing checks include immediate address changes, continued access through the original
+listener without restarting, refreshed cached clone commands, and node-name-only restart
+requirements. Address-only saves are captured at both widths and themes.
 It also covers a first model loadout: real link creation, pending-job status, duplicate-submit
 prevention, polling recovery, draft/focus preservation, switching/reopening the drawer, and
 a conflicting file followed by retry. Job polling is temporarily controlled in the browser

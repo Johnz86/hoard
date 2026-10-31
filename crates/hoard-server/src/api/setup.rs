@@ -53,11 +53,9 @@ pub async fn get(State(state): State<AppState>) -> ApiResult<Json<SetupView>> {
     )?;
     let resource_count = artifacts.saturating_add(projects.total);
     let configured_sources = state.coordinator().config().sources.len();
-    let pending = saved.filter(|settings| {
-        settings.node_name != state.node_name()
-            || settings.public_url.trim_end_matches('/') != state.public_url().trim_end_matches('/')
-    });
-    let address_state = address_state(&state);
+    let public_url = state.public_url();
+    let pending = saved.filter(|settings| settings.node_name != state.node_name());
+    let address_state = address_state(&state, &public_url);
     let address_message = match address_state {
         AddressState::LocalOnly => {
             "The current address works on this machine. Set a reachable address and a LAN listener to share with other machines."
@@ -77,7 +75,7 @@ pub async fn get(State(state): State<AppState>) -> ApiResult<Json<SetupView>> {
         scanning: state.coordinator().busy(),
         node_name: state.node_name().to_owned(),
         bind: state.config().server.bind.to_string(),
-        public_url: state.public_url().to_owned(),
+        public_url: public_url.as_str().to_owned(),
         address_state,
         address_message,
         write_token_required,
@@ -101,8 +99,8 @@ pub async fn put(
     get(State(state)).await
 }
 
-fn address_state(state: &AppState) -> AddressState {
-    let Ok(url) = Url::parse(state.public_url()) else {
+fn address_state(state: &AppState, public_url: &str) -> AddressState {
+    let Ok(url) = Url::parse(public_url) else {
         return AddressState::Unusable;
     };
     if !matches!(url.scheme(), "http" | "https")

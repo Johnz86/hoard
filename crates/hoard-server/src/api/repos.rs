@@ -309,9 +309,9 @@ pub async fn detail(
 ) -> ApiResult<Json<RepoView>> {
     let repo = repo_id(&repo_type, &org, &name)?;
     let host = state.node_name().to_owned();
-    let public = public_host(state.public_url());
+    let url = state.public_url();
+    let public = public_host(&url);
     let now = Timestamp::now();
-    let url = state.public_url().to_owned();
     let catalog = Arc::clone(state.catalog());
     let view = blocking(move || {
         describe(
@@ -501,7 +501,7 @@ pub async fn readme(
         Some(text) => (text, false),
         None => (
             generated_card(
-                state.public_url(),
+                &state.public_url(),
                 &repo,
                 card.kind,
                 card.bin,

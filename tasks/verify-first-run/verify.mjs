@@ -159,14 +159,34 @@ try {
     await evaluate('document.querySelector("[name=public_url]").value="http://0.0.0.0:7099";document.querySelector(".sharing-form").requestSubmit()');
     await wait('!document.querySelector(".sharing-form button[type=submit]").disabled');
     assert.equal((await(await fetch(origin+'/api/v1/setup')).json()).restart_required,false);
+    const liveOrigin=origin.replace('127.0.0.1','localhost');
+    const servingPid=server.pid;
+    await evaluate('document.querySelector("[name=node_name]").value="first-run";document.querySelector("[name=public_url]").value='+JSON.stringify(liveOrigin)+';document.querySelector(".sharing-form").requestSubmit()');
+    await wait('document.querySelector(".sharing-address").textContent.includes('+JSON.stringify(liveOrigin)+')&&!document.querySelector(".sharing-form button[type=submit]").disabled');
+    const liveSetup=await(await fetch(origin+'/api/v1/setup')).json();
+    assert.equal(liveSetup.public_url,liveOrigin);assert.equal(liveSetup.pending,null);assert.equal(liveSetup.restart_required,false);
+    assert.equal(liveSetup.bind,'127.0.0.1:'+port);assert.equal(server.pid,servingPid);assert.equal(server.exitCode,null);
+    assert((await fetch(liveOrigin+'/healthz')).ok);assert((await fetch(origin+'/healthz')).ok);
+    for(const width of [1180,1600])for(const theme of ['light','dark']){
+        await send('Emulation.setDeviceMetricsOverride',{width,height:1000,deviceScaleFactor:1,mobile:false});
+        await evaluate('import("/js/theme.js").then(m=>m.updateSettings('+JSON.stringify({theme})+'))');
+        await pause(250);await screenshot('live-sharing-'+width+'-'+theme);
+    }
+    await evaluate('document.querySelector("[name=node_name]").value="Studio"');
     await evaluate('document.querySelector("[name=public_url]").value='+JSON.stringify(origin)+';document.querySelector(".sharing-form").requestSubmit()');
     await wait('document.querySelector(".sharing-status").textContent.includes("Restart")');
-    const savedSetup=await(await fetch(origin+'/api/v1/setup')).json();assert.equal(savedSetup.node_name,'first-run');assert.equal(savedSetup.pending.node_name,'Studio');
+    const savedSetup=await(await fetch(origin+'/api/v1/setup')).json();assert.equal(savedSetup.node_name,'first-run');assert.equal(savedSetup.pending.node_name,'Studio');assert.equal(savedSetup.public_url,origin);
     await evaluate('document.querySelector(".operations-top button").click()');
     await evaluate('document.querySelector("#source-path").value='+JSON.stringify(source)+';document.querySelector("[name=name]").value="projects";document.querySelector("[name=kind]").value="git";document.querySelector(".source-add-form").requestSubmit()');
     await wait('document.querySelectorAll(".source-grid.panel-row").length===2');
     await wait('!document.querySelector("#source-welcome")');
     await navigate('/index?q=pose');await wait('document.querySelectorAll(".trow").length===1');
+    await navigate('/sources');await wait('!!document.querySelector(".sharing-form")');
+    await evaluate('document.querySelector("#source-sharing").open=true;document.querySelector("[name=public_url]").value='+JSON.stringify(liveOrigin)+';document.querySelector(".sharing-form").requestSubmit()');
+    await wait('document.querySelector(".sharing-address").textContent.includes('+JSON.stringify(liveOrigin)+')&&!document.querySelector(".sharing-form button[type=submit]").disabled');
+    await navigate('/index?q=pose');await wait('document.querySelector(".trow")?.textContent.includes("pose")');
+    await evaluate('document.querySelector(".inspector-actions button:nth-child(2)").click()');
+    await wait('document.querySelector("#toast-root").textContent.includes('+JSON.stringify(liveOrigin)+')');
     await evaluate('document.querySelector(".trow").dispatchEvent(new MouseEvent("dblclick",{bubbles:true}))');
     await wait('document.querySelector(".project-document")?.textContent.includes("animation toolkit")');
     const projectHash=await evaluate('location.hash');
@@ -366,7 +386,7 @@ try {
     assert.equal((await(await fetch(origin+'/api/v1/setup')).json()).first_run,true);
     await access(join(source,'README.md'));
     assert.equal(exceptions.length,0,JSON.stringify(exceptions));
-    await writeFile(join(scratch,'verification.json'),JSON.stringify({passed:true,checks:['fresh-route','explicit-empty-query','empty-catalog-action','owner-access','invalid-path-recovery','empty-folder','sharing-form-polling-focus','folder-form-position-during-background-indexing','URL-validation','pending-vs-active','project-add-and-review','deep-link-reload','token-not-persisted','restart-config-and-resources','existing-node-index','loadout-job-status','loadout-polling-recovery','loadout-input-focus','loadout-switch-and-reopen','loadout-real-links','loadout-failure-and-retry','classification-owner-recovery','classification-draft-focus','classification-confirm-counts','classification-rescan-restart','classification-clear-and-reinfer','classification-reject-cancel','classification-noise-preserved','project-without-model-controls','remove-last-source'],screenshots},null,2));
+    await writeFile(join(scratch,'verification.json'),JSON.stringify({passed:true,checks:['fresh-route','explicit-empty-query','empty-catalog-action','owner-access','invalid-path-recovery','empty-folder','sharing-form-polling-focus','folder-form-position-during-background-indexing','URL-validation','live-sharing-address-without-restart','listener-and-server-preserved','live-cached-clone-command','pending-vs-active','project-add-and-review','deep-link-reload','token-not-persisted','restart-config-and-resources','existing-node-index','loadout-job-status','loadout-polling-recovery','loadout-input-focus','loadout-switch-and-reopen','loadout-real-links','loadout-failure-and-retry','classification-owner-recovery','classification-draft-focus','classification-confirm-counts','classification-rescan-restart','classification-clear-and-reinfer','classification-reject-cancel','classification-noise-preserved','project-without-model-controls','remove-last-source'],screenshots},null,2));
     process.stdout.write(JSON.stringify({passed:true,scratch})+'\n');
 } finally {
     socket?.close();await stop(browser);await stop(server);

@@ -130,7 +130,7 @@ pub(crate) async fn batch(
     wanted.sort_unstable();
     wanted.dedup();
     let located = locate_contents(state.catalog(), wanted).await?;
-    let answer = build_batch_response(&request, state.public_url(), &|oid| {
+    let answer = build_batch_response(&request, &state.public_url(), &|oid| {
         located.get(oid).cloned()
     });
     let body = serde_json::to_vec(&answer).map_err(|_| HubError::proxy_invalid_data())?;

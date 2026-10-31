@@ -111,7 +111,7 @@ async fn setup_counts_all_resources_including_projects_and_peers_independent_of_
 }
 
 #[tokio::test]
-async fn sharing_settings_are_pending_until_restart_and_survive_reloading_configuration() {
+async fn sharing_address_is_live_while_node_name_waits_for_restart() {
     let (_directory, mut config, state) = empty_setup_world();
     let body = json!({"node_name":" Studio ","public_url":" http://studio.lan:7099/ "});
     let (status, response) = call(&state, Method::PUT, "/api/v1/setup", Some(body)).await;
@@ -123,7 +123,7 @@ async fn sharing_settings_are_pending_until_restart_and_survive_reloading_config
         json!({"node_name":"Studio","public_url":"http://studio.lan:7099"})
     );
     assert_eq!(response["node_name"], state.node_name());
-    assert_eq!(response["public_url"], "http://127.0.0.1:7099");
+    assert_eq!(response["public_url"], "http://studio.lan:7099");
     assert_ne!(state.node_name(), "Studio");
     assert!(config.server.data_dir.join("node.json").is_file());
 
@@ -143,12 +143,122 @@ async fn sharing_settings_are_pending_until_restart_and_survive_reloading_config
 }
 
 #[tokio::test]
+async fn sharing_address_changes_are_immediate_persistent_and_do_not_rebind() {
+    let (_directory, mut config, state) = empty_setup_world();
+    let snapshot = state.public_url();
+    let cloned = state.clone();
+    let mut updates = state.public_url_updates();
+    let bind = state.config().server.bind;
+
+    let (status, response) = call(
+        &state,
+        Method::PUT,
+        "/api/v1/setup",
+        Some(json!({"node_name":state.node_name(),"public_url":"http://hotspot.lan:7099"})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["public_url"], "http://hotspot.lan:7099");
+    assert_eq!(response["pending"], Value::Null);
+    assert_eq!(response["restart_required"], false);
+    assert_eq!(cloned.public_url().as_str(), "http://hotspot.lan:7099");
+    assert_eq!(snapshot.as_str(), "http://127.0.0.1:7099");
+    assert_eq!(state.config().server.bind, bind);
+    assert!(updates.has_changed().expect("watch stays open"));
+    assert_eq!(
+        updates.borrow_and_update().as_str(),
+        "http://hotspot.lan:7099"
+    );
+    config
+        .load_managed_sources()
+        .expect("managed settings load");
+    let restarted = AppState::new(config, Arc::clone(state.catalog())).expect("state builds");
+    assert_eq!(restarted.public_url().as_str(), "http://hotspot.lan:7099");
+}
+
+#[tokio::test]
+async fn a_failed_settings_write_does_not_change_the_active_address_or_notify_discovery() {
+    let (_directory, config, state) = empty_setup_world();
+    std::fs::create_dir_all(config.server.data_dir.join("node.json")).expect("blocked settings");
+    let updates = state.public_url_updates();
+    let (status, _) = call(
+        &state,
+        Method::PUT,
+        "/api/v1/setup",
+        Some(json!({"node_name":state.node_name(),"public_url":"http://new.lan:7099"})),
+    )
+    .await;
+
+    assert!(!status.is_success());
+    assert_eq!(state.public_url().as_str(), "http://127.0.0.1:7099");
+    assert!(!updates.has_changed().expect("watch stays open"));
+}
+
+#[tokio::test]
+async fn active_sharing_address_updates_model_commands_loadout_exports_and_the_local_node() {
+    let world = seeded();
+    let endpoint = format!("/api/v1/artifacts/{}/pull-command", world.lora);
+    let previous = get(&world.state, &endpoint).await;
+    assert!(
+        previous["hf"]
+            .as_str()
+            .expect("command")
+            .contains("http://hoard.lan:7099")
+    );
+    let loadout = post(&world.state, "/api/v1/loadouts", json!({"name":"share"})).await;
+    let id = loadout["id"].as_str().expect("loadout id");
+    post(
+        &world.state,
+        &format!("/api/v1/loadouts/{id}/items"),
+        json!({"artifact_id":world.lora.to_string()}),
+    )
+    .await;
+
+    let (status, setup) = call(
+        &world.state,
+        Method::PUT,
+        "/api/v1/setup",
+        Some(json!({"node_name":world.state.node_name(),"public_url":"http://10.42.0.1:7099"})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{setup}");
+    let command = get(&world.state, &endpoint).await;
+    assert!(
+        command["hf"]
+            .as_str()
+            .expect("command")
+            .contains("http://10.42.0.1:7099")
+    );
+    let script = get(
+        &world.state,
+        &format!("/api/v1/loadouts/{id}/export?format=hf-script"),
+    )
+    .await;
+    assert!(
+        script["text"]
+            .as_str()
+            .expect("script")
+            .contains("http://10.42.0.1:7099")
+    );
+    let nodes = get(&world.state, "/api/v1/nodes").await;
+    let own = nodes
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .find(|node| node["self"] == true)
+        .expect("local node");
+    assert_eq!(own["url"], "http://10.42.0.1:7099");
+}
+
+#[tokio::test]
 async fn saving_the_current_configuration_cancels_pending_changes_without_restarting() {
     let (_directory, _config, state) = empty_setup_world();
     let changed = json!({"node_name":"Other","public_url":"http://other.lan:7099"});
     let (status, _) = call(&state, Method::PUT, "/api/v1/setup", Some(changed)).await;
     assert_eq!(status, StatusCode::OK);
-    let current = json!({"node_name":state.node_name(),"public_url":state.public_url()});
+    let current = json!({"node_name":state.node_name(),"public_url":state.public_url().as_str()});
     let (status, response) = call(&state, Method::PUT, "/api/v1/setup", Some(current)).await;
 
     assert_eq!(status, StatusCode::OK);
@@ -196,6 +306,7 @@ async fn setup_is_readable_without_the_owner_token_but_changes_require_it_and_ne
 #[tokio::test]
 async fn invalid_sharing_configuration_is_rejected_without_writing_a_pending_file() {
     let (_directory, config, state) = empty_setup_world();
+    let updates = state.public_url_updates();
     for body in [
         json!({"node_name":" ","public_url":"http://studio.lan"}),
         json!({"node_name":"Studio","public_url":"http://0.0.0.0:7099"}),
@@ -208,6 +319,8 @@ async fn invalid_sharing_configuration_is_rejected_without_writing_a_pending_fil
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
     assert!(!config.server.data_dir.join("node.json").exists());
+    assert_eq!(state.public_url().as_str(), "http://127.0.0.1:7099");
+    assert!(!updates.has_changed().expect("watch stays open"));
 }
 
 #[tokio::test]
