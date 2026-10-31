@@ -148,6 +148,7 @@ pub struct RefView {
 /// The repository detail header, its refs and everything the right rail prints.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RepoView {
+    pub project_id: Option<RepoRowId>,
     pub repo: String,
     #[serde(rename = "type")]
     pub repo_type: RepoType,
@@ -364,6 +365,7 @@ fn describe(
     };
     let path = primary.and_then(shown_path);
     Ok(RepoView {
+        project_id: (record.kind == SourceKind::Git).then_some(record.id),
         repo: record.repo.qualified(),
         repo_type: record.repo.repo_type(),
         org: record.repo.org().map(str::to_owned),

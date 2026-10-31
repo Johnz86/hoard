@@ -10,7 +10,7 @@ pub(in crate::catalog) const WORD_TOKENIZER: &str = "hoard_words";
 pub(in crate::catalog) const LONGEST_WORD: usize = 40;
 
 /// The analyzer the `text` field is indexed with and every free-text query is cut by.
-pub(in crate::catalog) fn text_analyzer() -> TextAnalyzer {
+pub(crate) fn text_analyzer() -> TextAnalyzer {
     TextAnalyzer::builder(WordTokenizer::default())
         .filter(RemoveLongFilter::limit(LONGEST_WORD))
         .filter(LowerCaser)

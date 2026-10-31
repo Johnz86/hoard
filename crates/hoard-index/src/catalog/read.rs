@@ -204,6 +204,42 @@ pub struct TriageItem {
 }
 
 impl Catalog {
+    /// Resolves one catalog identity without choosing between sources with the same name.
+    pub fn repository_by_id(&self, id: RepoRowId) -> Result<Option<RepositoryDetail>> {
+        let snapshot = self.database.r_transaction()?;
+        let Some(repository) = snapshot.get().primary::<Repository>(id.get())? else {
+            return Ok(None);
+        };
+        let source: Option<Source> = snapshot.get().primary(repository.source.as_str())?;
+        let kind = source.map_or(SourceKind::Loose, |source| source.resolved_kind);
+        let names = self.node_names(&snapshot)?;
+        Ok(Some(repository_detail(&repository, kind, &names)))
+    }
+
+    pub fn git_repositories(&self) -> Result<Vec<RepositoryDetail>> {
+        let snapshot = self.database.r_transaction()?;
+        let names = self.node_names(&snapshot)?;
+        let mut repositories = Vec::new();
+        for source in snapshot.scan().primary::<Source>()?.all()? {
+            let source = source?;
+            if source.resolved_kind != SourceKind::Git {
+                continue;
+            }
+            for repository in snapshot
+                .scan()
+                .secondary::<Repository>(RepositoryKey::key)?
+                .start_with(source_prefix(&source.name))?
+            {
+                let repository = repository?;
+                if repository.git_dir.is_some() {
+                    repositories.push(repository_detail(&repository, source.resolved_kind, &names));
+                }
+            }
+        }
+        repositories.sort_unstable_by_key(|repository| repository.id);
+        Ok(repositories)
+    }
+
     /// Every source this catalog holds, ordered by name, with the files each still owes a
     /// content hash. A peer's namespace is one of them: it is not a root of files on this
     /// node, and what may be done to it is the caller's to decide from its name.

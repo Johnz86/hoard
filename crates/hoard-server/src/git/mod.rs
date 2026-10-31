@@ -19,7 +19,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 
-use hoard_core::{RepoId, RepoType, Sha256, clean_repo_path};
+use hoard_core::{RepoId, RepoRowId, RepoType, Sha256, clean_repo_path};
 use hoard_mirror::git::{
     ADVERTISEMENT_CONTENT_TYPE, BatchRequest, CACHE_CONTROL, GitService, PUSH_REFUSED,
     RESULT_CONTENT_TYPE, advertise_refs, build_batch_response, is_clonable, lfs_batch,
@@ -45,6 +45,13 @@ const MAX_BATCH_OBJECTS: usize = 1_000;
 /// Every git face route, for both the `org/repo` and the orgless spelling of a clone URL.
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/git/projects/{project}/info/refs", get(advertise))
+        .route("/git/projects/{project}/git-upload-pack", post(fetch))
+        .route("/git/projects/{project}/git-receive-pack", post(push))
+        .route(
+            "/git/projects/{project}/info/lfs/objects/batch",
+            post(batch),
+        )
         .route("/{p1}/info/refs", get(advertise))
         .route("/{p1}/{p2}/info/refs", get(advertise))
         .route("/{p1}/git-upload-pack", post(fetch))
@@ -113,8 +120,7 @@ pub(crate) async fn batch(
     RoutePath(params): RoutePath<HashMap<String, String>>,
     body: Bytes,
 ) -> HubResult<Response> {
-    let repo = repo_of(&params)?;
-    require_repo(&state, &repo).await?;
+    clone_dir(&state, &params).await?;
     let request: BatchRequest =
         serde_json::from_slice(&body).map_err(|_| HubError::unprocessable("invalid batch body"))?;
     if request.objects.len() > MAX_BATCH_OBJECTS {
@@ -158,9 +164,26 @@ fn repo_of(params: &HashMap<String, String>) -> HubResult<RepoId> {
 
 /// The clone directory of a git-source repository this node holds.
 async fn clone_dir(state: &AppState, params: &HashMap<String, String>) -> HubResult<PathBuf> {
+    if let Some(project) = params.get("project") {
+        return project_dir(state, project).await;
+    }
     let repo = repo_of(params)?;
     require_repo(state, &repo)
         .await?
+        .ok_or_else(HubError::page_not_found)
+}
+
+async fn project_dir(state: &AppState, raw: &str) -> HubResult<PathBuf> {
+    let id = strip_git_suffix(raw)
+        .parse::<RepoRowId>()
+        .map_err(|_| HubError::page_not_found())?;
+    let record = on_catalog(state.catalog(), move |catalog| catalog.repository_by_id(id))
+        .await?
+        .filter(|record| is_clonable(record.kind))
+        .ok_or_else(HubError::page_not_found)?;
+    record
+        .git_dir
+        .map(PathBuf::from)
         .ok_or_else(HubError::page_not_found)
 }
 

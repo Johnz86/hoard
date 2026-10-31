@@ -103,6 +103,7 @@ pub struct AppState {
 
 struct Inner {
     config: HoardConfig,
+    project_index: Mutex<Option<Arc<crate::api::project_search::CachedProjects>>>,
     source_update: tokio::sync::Mutex<()>,
     mirror_config: Arc<MirrorConfig>,
     catalog: Arc<Catalog>,
@@ -128,6 +129,12 @@ impl std::fmt::Debug for AppState {
 }
 
 impl AppState {
+    pub(crate) fn project_index(
+        &self,
+    ) -> &Mutex<Option<Arc<crate::api::project_search::CachedProjects>>> {
+        &self.inner.project_index
+    }
+
     /// Builds the shared state. The node write token is read from the environment only,
     /// never from `hoard.toml`, so a config file can be committed without leaking it. The
     /// native catalog is opened by the caller, which is the only place that knows whether a
@@ -166,6 +173,7 @@ impl AppState {
         Ok(Self {
             inner: Arc::new(Inner {
                 config,
+                project_index: Mutex::new(None),
                 source_update: tokio::sync::Mutex::new(()),
                 mirror_config,
                 usage: UsageSink::spawn(

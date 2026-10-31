@@ -17,6 +17,7 @@ parquet arrow jsonl csv readme config unknown`.
 
 ```json
 {
+  "projects": { "rows": [], "total": 0, "next_cursor": null },
   "query": { "raw": "role:lora base:sdxl size:<400mb film grain",
              "tokens": [ { "key": "role", "value": "lora", "kind": "role", "raw": "role:lora" },
                          { "key": "size", "op": "<", "value": 400000000, "kind": "size", "raw": "size:<400mb" },
@@ -248,7 +249,59 @@ apart.
   answers `{ "id", "removed", "artifact_id" }`, `artifact_id` being the artifact it restored
   or `null`, and 404s for an id that was no row.
 
+## Git projects
+
+Git projects are resources independent of model artifacts. Their internal Hub repository
+namespace is not a project classification. The main search response includes a separate
+`projects: { "rows": [...], "total", "next_cursor" }`; existing `rows`, `total`, `nodes`
+and facets still describe artifacts. Projects may be present when artifact `total` is zero.
+
+`GET /api/v1/projects?q=<query>&source=<exact-source-name>&cursor=<opaque>&limit=100`
+returns the same project page. Each row has `id`, `name`, `reference` (without a Hub type),
+`source`, `node`, default `revision`, `files`, `bytes_human`, `clone_command`, and `available`.
+The source parameter preserves source-name case and scopes the request to one nominated
+root. Cursors are bound to both query and source. Bare clones are listed even with no
+present worktree files.
+
+Project text search uses the artifact word tokenizer, including camel-case and digit
+boundaries, word prefixes and ordered multiword phrases. It indexes project names,
+references, file paths and committed README text from the default revision. README text has
+a total 256 KiB budget per project, with root README files considered first. Metadata
+filters include `source:`, `node:` (`local` included), `repo:`, `org:` and `rev:`; positive
+artifact-only filters such as `role:lora` exclude projects. Other source-file bodies are
+reviewable through previews, rather than indexed as a code-search corpus.
+
+The project index is derived in memory, built lazily with one writer thread and refreshed
+when a scan finishes. It streams one project document at a time and concurrent searches
+share an immutable cached index. No catalog format change or rescan is required for
+already-indexed Git projects to appear after deploying this build.
+
+| Route | Response |
+| --- | --- |
+| `GET /api/v1/projects/{id}?revision=` | Project identity, source/node, selected revision and commit, refs, file/byte counts, clone command |
+| `GET /api/v1/projects/{id}/files?revision=` | `{ "revision", "rows": [{ "path", "size", "size_human", "kind" }] }` |
+| `GET /api/v1/projects/{id}/readme?revision=` | Rendered committed README, frontmatter, path, meta, revision and explicit `missing`/`message` states; never a generated model card |
+| `GET /api/v1/projects/{id}/file?revision=&path=` | Escaped-by-client text or binary/oversized metadata, size, revision and message |
+| `GET /api/v1/projects/{id}/raw?revision=&path=` | Committed bytes as a `nosniff` attachment; 413 over 16 MiB |
+
+All project routes are local, read-only and Git-only. The default revision is the scanned
+default branch; named branches, tags and cataloged commit SHAs are accepted. Invalid IDs,
+revisions and files return errors; traversal paths are refused. Text/README previews check
+the Git object header before allocating a body and stop at 256 KiB. LFS pointers are shown
+as committed pointers; cloning is the repository transfer path. Content comes from the
+selected commit, including in bare clones, and excludes dirty working-tree edits.
+
+Clone commands use `public_url` and `/git/projects/{id}.git`, safely shell-quote the URL and
+destination, and clone the repository's default branch. Shared project links retain the
+selected revision and file, based on the detail response's `project_url` using `public_url`.
+A LAN deployment must configure a reachable server bind and
+public URL.
+
 ## Repos and README
+
+Repository details include `project_id` for Git sources and null otherwise. The web UI
+opens that neutral project page when no artifact was requested; artifact-specific detail
+links retain their model inspection and loadout behavior.
 
 - `GET /api/v1/repos?q=&type=&cursor=`: `{ rows, next_cursor, total }`, paged by an
   opaque row cursor.

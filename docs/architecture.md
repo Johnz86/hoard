@@ -74,6 +74,13 @@ Not chosen and why:
 
 ## Frontend stack
 
+Git projects are first-class resources alongside inferred artifacts. Main search includes
+project matches, Sources links to projects discovered in each Git folder, and neutral
+project pages expose committed README/files, revision selection and clone/share controls.
+Project identity uses the catalog row ID rather than a Hub model/dataset classification.
+The project APIs read Git objects on blocking workers with bounded previews; canonical
+`/git/projects/{id}.git` routes provide the repository transfer.
+
 - Pico CSS 2.1.1 vendored at `web/vendor/pico.min.css`.
 - `web/css/tokens.css` holds every color, font and dimension from `docs/design/ui-spec.md`,
   light-first with dark overrides; `web/css/hoard.css` styles components with those tokens.

@@ -31,8 +31,7 @@ pub(super) use self::schema::{
 };
 #[cfg(test)]
 pub(super) use self::tally::BASE_RAIL;
-#[cfg(test)]
-pub(super) use self::tokens::text_analyzer;
+pub(crate) use self::tokens::text_analyzer;
 
 /// One query of Hoard's own grammar, the one the search bar, `hoard ls` and shelves speak.
 /// The context carries what the text does not: the shelves, the local node alias and the

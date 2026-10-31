@@ -1,9 +1,8 @@
 # Design status and next work
 
-Reviewed on 2026-10-31 against `ce1c098` and the running local server. The UI redesign is
-partly delivered. The navigation, family rail, shelves, preferences and combined Sources
-view are implemented; source removal, completed-job cleanup and repository browsing from
-Sources are still missing.
+Reviewed on 2026-10-31, initially against `ce1c098`, then against the Git-project delivery.
+The navigation, family rail, shelves, preferences, combined Sources view and Git-project
+search and browsing are implemented. Source removal and completed-job cleanup remain open.
 
 ## Current references
 
@@ -27,15 +26,15 @@ stated commits, not to today's application.
 | Add a folder | `api/jobs.rs`, `state.rs`, `config.rs` | Saves UI sources in `sources.json`, queues a scan, restarts the watcher |
 | Remove a folder | No route or UI action | Missing |
 | Clear completed scans | Jobs support listing and cancellation only | Missing |
-| Repository listing | `GET /api/v1/repos` | API exists; the web UI never requests it |
-| Git serving | `hoard-server/src/git/` | Indexed Git repositories can already be cloned over HTTP |
+| Git projects | `GET /api/v1/projects`, `web/js/projects.js` | Main search and Sources lead to README, files, revisions and clone/share controls |
+| Git serving | `hoard-server/src/git/` | Canonical `/git/projects/{id}.git` clones projects independently of Hub namespaces |
 
 Rust paths in this table are under `crates/`; the folder-management files are under
 `crates/hoard-server/src/`.
 
-## The reported Git repository
+## Original findings for the reported Git repository
 
-Read-only checks against `http://127.0.0.1:7099` found:
+The review before implementation used read-only checks against `http://127.0.0.1:7099`:
 
 - Sources lists `/home/johnz86/GIT/pose-character`, resolved layout `git`, 41 files.
 - `GET /api/v1/repos?q=pose-character` returns `models/pose-character`, default ref `master`.
@@ -55,13 +54,40 @@ git clone http://127.0.0.1:7099/pose-character.git
 Its existing detail page can be opened directly at
 `http://127.0.0.1:7099/#/repo/models/-/pose-character`. The `-` is significant: the API
 requires an org segment and `api/common.rs::repo_id` accepts `-` or `_` for an orgless repo.
-The UI's `app.js::repoPathOf` emits an empty org segment and `api.js::repoBase` omits it,
-producing an API path that returns 404. Repository browsing must fix this spelling across
-detail, files, card, compat and usage requests; adding a list alone would leave this case
-broken.
+The UI's URL builders originally emitted or omitted an empty org segment, producing an API
+path that returned 404. The implementation now consistently uses `-` on artifact repository
+routes. Projects use neutral `#/project/{id}` routes and do not expose a model namespace.
 
 Git verification was limited to the ref advertisement; no clone, scan, download or production
 mutation was performed during this review.
+
+## Git-project delivery
+
+A prospective-user agent reviewed the find, review and clone journey and accepted the final
+implementation after the browser checks. This is a resource catalog and read-only sharing
+interface; it adds no forge, editing, issues or pull-request features.
+
+- Main search returns a separate Git-project group, even when there are no model artifacts.
+  Name, reference, source, default-revision file paths and committed README text are indexed.
+  The transient Tantivy index is built lazily and refreshed after the scan lane finishes;
+  searches do not reread Git objects on each keystroke.
+- Sources offers BROWSE PROJECTS, scoped to the selected Git folder. Project results paginate.
+- `#/project/{id}` opens a neutral Git-project view with source, node, file count, revision,
+  README, FILES, COPY CLONE and COPY PROJECT LINK. Text previews are escaped; README rendering
+  disables unsafe URL schemes. Relative README file links open the file browser.
+- README and file views read the selected commit's objects, including from bare repositories.
+  Dirty working-tree changes are excluded. Binary and oversized files have explicit states;
+  previews are limited to 256 KiB and individual downloads to 16 MiB. Clone transfers the repo.
+- The canonical clone endpoint uses the catalog repository ID, so ordinary Git projects do
+  not depend on the internal Hub namespace. Clone commands quote the URL and destination.
+- The stored catalog format remains 19. Existing scanned Git repositories need no rebuild.
+
+The isolated browser test covered project-name and README searches, README rendering, a
+relative documentation link, nested text, binary and oversized files, file-list scrolling,
+branch changes, shared-link reload, Sources navigation and an actual HTTP clone. Regression
+tests also cover bare repositories, safe paths, shell quoting and refresh after a rescan.
+No production service, configuration or live catalog was modified. LAN sharing uses the
+configured reachable `public_url`; the local deployment's loopback setting was left intact.
 
 ## Next implementation, in priority order
 
@@ -79,16 +105,7 @@ mutation was performed during this review.
    indexed files or catalog contents. Refuse deletion of running or queued jobs; retain their
    existing cancel action. Persist the cleanup and test final-state checks, authentication
    and repeated requests. The owner explicitly requested both this and folder removal.
-3. **Browse repositories from Sources and copy a clone command.** Expose the existing
-   paginated repository listing, with a Git-only filter supported by Rust, repository name,
-   source, default branch, file count, OPEN and COPY CLONE. Generate commands on the server
-   from `public_url` and actual Git clonability. A code repository must be reachable with
-   zero model artifacts, and an added folder must lead to the repositories it discovered.
-   Use the API's `-` org placeholder consistently, including links for orgless artifacts
-   already reachable from Index.
-   Non-Git sources must not offer a Git clone command. Ensure repositories with no present
-   worktree files remain discoverable when their Git object database is clonable.
-4. **Retest the complete journey using synthetic repositories.** Add a folder, wait for its
+3. **Extend the removal acceptance journey using synthetic repositories.** Add a folder, wait for its
    scan, find its repository, open it and clone through an isolated server. Remove the source,
    verify that source-specific catalog rows and serving disappear, then restart and verify
    it stays removed. Cover shared artifacts, a queued scan, authentication and stale requests.

@@ -1,6 +1,6 @@
 //! Model card documents: YAML frontmatter split from the body, the body rendered to HTML.
 
-use pulldown_cmark::{Event, Options, Parser, html};
+use pulldown_cmark::{Event, Options, Parser, Tag, html};
 use serde_yaml_ng::Value;
 
 /// How much frontmatter is parsed as YAML.
@@ -24,7 +24,8 @@ pub struct ReadmeDoc {
 
 /// Splits frontmatter from the body and renders the body. Raw HTML in the source is
 /// dropped rather than passed through, so a downloaded card cannot inject markup into the
-/// UI.
+/// UI. Links and images accept relative destinations or HTTP, HTTPS and mailto URLs;
+/// other schemes, control characters and ambiguous network paths are disabled.
 pub fn parse_readme(text: &str) -> ReadmeDoc {
     let document = text.strip_prefix('\u{feff}').unwrap_or(text);
     let (frontmatter, body) = split_frontmatter(document);
@@ -103,11 +104,41 @@ fn render(body: &str) -> String {
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_FOOTNOTES);
-    let events = Parser::new_ext(body, options)
-        .filter(|event| !matches!(event, Event::Html(_) | Event::InlineHtml(_)));
+    let events = Parser::new_ext(body, options).filter_map(|mut event| {
+        match &mut event {
+            Event::Html(_) | Event::InlineHtml(_) => return None,
+            Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. })
+                if !safe_destination(dest_url) =>
+            {
+                *dest_url = "#".into();
+            }
+            _ => {}
+        }
+        Some(event)
+    });
     let mut rendered = String::with_capacity(body.len());
     html::push_html(&mut rendered, events);
     rendered
+}
+
+fn safe_destination(destination: &str) -> bool {
+    let destination = destination.trim();
+    if destination.chars().any(char::is_control)
+        || destination.contains('\\')
+        || destination.starts_with("//")
+    {
+        return false;
+    }
+    let prefix = destination
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    match prefix.split_once(':') {
+        None => true,
+        Some((scheme, _)) => ["http", "https", "mailto"]
+            .iter()
+            .any(|allowed| scheme.eq_ignore_ascii_case(allowed)),
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +202,60 @@ mod tests {
         let readme = parse_readme("<script>alert(1)</script>\n\nsafe\n");
         assert!(!readme.html.contains("<script>"));
         assert!(readme.html.contains("safe"));
+    }
+
+    #[test]
+    fn unsafe_markdown_destinations_keep_the_label_but_disable_navigation() {
+        for destination in [
+            "javascript:alert(1)",
+            "JaVaScRiPt:alert(1)",
+            "data:text/html,script",
+            "vbscript:msgbox(1)",
+            "file:///etc/passwd",
+            "//example.invalid/tracker",
+        ] {
+            let readme = parse_readme(&format!("[label](<{destination}>)"));
+            assert!(readme.html.contains("href=\"#\""), "{destination}");
+            assert!(readme.html.contains(">label</a>"));
+            assert!(!readme.html.contains(destination));
+        }
+        let image = parse_readme("![label](data:image/svg+xml,payload)");
+        assert!(image.html.contains("src=\"#\""));
+        assert!(!image.html.contains("data:"));
+    }
+
+    #[test]
+    fn ordinary_links_and_project_relative_paths_are_preserved() {
+        for destination in [
+            "https://example.invalid/docs",
+            "http://hoard.lan/project",
+            "mailto:help@example.invalid",
+            "docs/setup.md",
+            "../README.md#usage",
+            "/assets/logo.png",
+            "#usage",
+            "docs/file:name.md",
+        ] {
+            let readme = parse_readme(&format!("[label](<{destination}>)"));
+            assert!(readme.html.contains(&format!("href=\"{destination}\"")));
+        }
+        let image = parse_readme("![diagram](docs/diagram.png)");
+        assert!(image.html.contains("src=\"docs/diagram.png\""));
+    }
+
+    #[test]
+    fn destination_validation_rejects_browser_scheme_obfuscation() {
+        for destination in [
+            " javaSCRIPT:alert(1) ",
+            "java\tscript:alert(1)",
+            "java\nscript:alert(1)",
+            "\\\\example.invalid/path",
+            "/\\example.invalid/path",
+        ] {
+            assert!(!safe_destination(destination), "{destination:?}");
+        }
+        assert!(safe_destination("HTTPS://example.invalid/path"));
+        assert!(safe_destination(""));
     }
 
     #[test]

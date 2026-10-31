@@ -54,6 +54,13 @@ filesystem. Hoard saves them in `<data_dir>/sources.json` and loads them alongsi
 `[[index.sources]]` entries in `hoard.toml` on the next start.
 
 See [design status and next work](docs/design/README.md) for the redesign review and the
-remaining source-removal, completed-scan cleanup and repository-browsing work. Git repositories
-without model artifacts are currently available through the repository API and Git face,
-but have no listing in the web UI.
+remaining source-removal and completed-scan cleanup work.
+
+Git projects appear in the main Index alongside artifacts. Search by project name, committed
+README text or file path, then open a project to read its README, browse files and select a
+branch or tag. Sources also offers BROWSE PROJECTS for Git folders. COPY CLONE uses the
+Hoard server's read-only Git endpoint; COPY PROJECT LINK shares the current revision and file.
+Git projects do not need model artifacts or triage before they can be found and shared.
+
+For other machines to use those links, configure `[server] bind` and `public_url` with a
+reachable LAN address, as in `hoard.example.toml`. A loopback address works on its own machine.

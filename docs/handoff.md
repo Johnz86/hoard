@@ -3,6 +3,40 @@
 The state of the repository, how work is run on it, and what is left. Read `CLAUDE.md`
 first; this document assumes it.
 
+## Latest delivery: find, review and clone Git projects
+
+Git projects are now resources in the main Index and Sources rather than an incidental Hub
+repository detail page. Main search returns `projects` beside the artifact rows; it matches
+project names, source/reference, committed README text and file paths. The derived in-memory
+Tantivy index lives behind the server state, is built lazily, and refreshes when the scan lane
+finishes. It adds no stored record or catalog format bump (`FORMAT_VERSION` remains 19).
+
+`web/js/projects.js` renders neutral `#/project/{id}` pages: README, file browser, escaped text
+preview, revision selector and clone/share controls. The new `/api/v1/projects` route family
+reads committed blobs through `GitRepo::committed_blob`, including bare repos, and never reads
+dirty worktree content. Preview and download bounds are 256 KiB and 16 MiB respectively.
+The canonical `/git/projects/{id}.git` face supports any indexed Git repository without
+implying it is a model or dataset. The old artifact repo URL builders now agree on `-` for
+an absent org. Markdown rendering disables unsafe link and image schemes.
+
+The user-agent accepted the implemented journey. An isolated headless browser exercised
+search, README, relative documentation links, nested/binary/oversized files, long-list scroll,
+revision changes, shared-link reload, Sources navigation and actual HTTP cloning. Durable API
+tests verify committed content, bare repos, branch/tag cloning and search refresh after a
+completed source scan. Every fixture uses temporary data and ephemeral loopback ports.
+
+Validation passed: workspace tests, all-target Clippy with warnings denied, formatting,
+workspace build, all six release asset tests and the documentation build without warnings.
+The final browser pass also covered legacy repository-link redirection and delayed search
+responses. Review fixes preserve case-sensitive source drilldowns, reuse artifact word and
+phrase rules, bound aggregate README text, stream project documents and release the cache
+lock before concurrent searches. Project share links use the configured public URL.
+
+Production services, port 8080 and the live catalog were left untouched. Deploying for LAN
+clients still requires a reachable bind address and `public_url`; this task did not change the
+running node's loopback configuration. Folder removal and completed-scan cleanup remain the
+next work; they are distinct from the Git-project delivery.
+
 ## Latest review: Sources and repository discovery (2026-10-31)
 
 The redesign through `ce1c098` is implemented: preferences replace the top-bar theme control,

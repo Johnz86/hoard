@@ -23,6 +23,11 @@ async function fetchInto(app, slot, loader) {
     detail.errors[slot] = null;
     try {
         detail[slot] = await loader();
+        if (slot === "repo" && app.state.view === "detail" && app.state.detail === detail && !detail.aid
+            && detail.repo.project_id) {
+            app.openProject(detail.repo.project_id, detail.rev);
+            return;
+        }
     } catch (error) {
         detail.loaded[slot] = null;
         detail.errors[slot] = error;

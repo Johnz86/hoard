@@ -80,6 +80,13 @@ pub struct BlobRef {
     pub source: BlobSource,
 }
 
+/// A committed blob whose bytes are omitted when its stored size exceeds the caller's limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedBlob {
+    pub size: u64,
+    pub data: Option<Vec<u8>>,
+}
+
 /// One commit of a revision's history, newest first as the REFS tab shows them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitInfo {
@@ -236,6 +243,24 @@ impl GitRepo {
         }
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(entries)
+    }
+
+    /// Reads the committed object without following LFS pointers or worktree symlinks.
+    /// The object header is checked before its body is allocated.
+    pub fn committed_blob(&self, sha: CommitSha, path: &str, limit: u64) -> Result<BoundedBlob> {
+        let repo = self.repo.to_thread_local();
+        let entry = file_entry(&repo, sha, path)?;
+        if !matches!(
+            entry.mode().kind(),
+            GitEntryKind::Blob | GitEntryKind::BlobExecutable | GitEntryKind::Link
+        ) {
+            return Err(MirrorError::EntryNotFound(path.to_owned()));
+        }
+        let size = object_size(&repo, entry.object_id())?;
+        let data = (size <= limit)
+            .then(|| blob_data(&repo, entry.object_id()))
+            .transpose()?;
+        Ok(BoundedBlob { size, data })
     }
 
     /// Resolves one file of a revision, following an LFS pointer into the LFS store.
@@ -690,6 +715,27 @@ mod tests {
             repo.blob(sha, "config"),
             Err(MirrorError::EntryNotFound(_))
         ));
+    }
+
+    #[test]
+    fn committed_blob_checks_size_before_reading_and_ignores_worktree_changes() {
+        let dir = sample_repo();
+        let repo = open(&dir);
+        let sha = repo.resolve("main").expect("revision resolves");
+        write(dir.path(), "README.md", "dirty worktree\n");
+
+        let omitted = repo
+            .committed_blob(sha, "README.md", 1)
+            .expect("header reads");
+        let held = repo
+            .committed_blob(sha, "README.md", 9)
+            .expect("blob reads");
+
+        assert_eq!(omitted.size, 9);
+        assert_eq!(omitted.data, None);
+        assert_eq!(held.data.as_deref(), Some(b"# sample\n".as_slice()));
+        assert!(repo.committed_blob(sha, "absent", 1024).is_err());
+        assert!(repo.committed_blob(sha, "config", 1024).is_err());
     }
 
     #[test]

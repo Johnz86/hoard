@@ -892,6 +892,22 @@ button.shelf-menu-remove:hover { color: var(--red); }
     display: flex;
 }
 
+.resource-results {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow: auto;
+}
+
+.resource-results > .table-scroll {
+    overflow: visible;
+}
+
+.source-browse {
+    align-self: flex-start;
+    margin-top: 4px;
+}
+
 .table-scroll {
     flex: 1;
     overflow: auto;
@@ -2277,4 +2293,313 @@ input.field.drawer-rename:focus {
     color: var(--muted);
     margin-bottom: 14px;
     line-height: 1.7;
+}
+
+.project-view {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    margin: 0;
+    padding: 0;
+    flex-direction: column;
+    border-radius: 0;
+    background: var(--bg);
+    box-shadow: none;
+}
+
+.view-panel-host.project-host {
+    display: flex;
+    overflow: hidden;
+}
+
+.project-header {
+    flex: none;
+    padding: 22px 26px 14px;
+    border-bottom: 1px solid var(--rule);
+}
+
+.project-title-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 24px;
+}
+
+.project-heading {
+    min-width: 0;
+}
+
+.project-kind {
+    color: var(--amb);
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: .12em;
+}
+
+.project-heading h1 {
+    margin: 4px 0 6px;
+    font-size: 26px;
+    overflow-wrap: anywhere;
+}
+
+.project-heading p {
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+.project-share {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 20px 0 14px;
+}
+
+.project-clone {
+    flex: 1;
+    min-width: 120px;
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+.project-revision {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+.project-revision > span:first-child {
+    color: var(--dim);
+    letter-spacing: .1em;
+}
+
+.project-revision select {
+    width: auto;
+    max-width: 360px;
+    height: 34px;
+    margin: 0;
+    padding: 4px 30px 4px 10px;
+    font-size: 12px;
+}
+
+.project-tabs {
+    display: flex;
+    flex: none;
+    gap: 8px;
+    padding: 12px 26px;
+    border-bottom: 1px solid var(--rule);
+}
+
+.project-tabs .is-active {
+    color: var(--amb);
+    border-color: var(--amb);
+}
+
+.project-content {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+}
+
+.project-document {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 24px;
+}
+
+.project-document .card-wrap {
+    padding: 0;
+}
+
+.project-document .prose {
+    overflow-wrap: anywhere;
+}
+
+.project-document .prose img {
+    max-width: 100%;
+    height: auto;
+}
+
+.project-empty {
+    padding: 36px 24px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.8;
+}
+
+.project-browser {
+    display: grid;
+    grid-template-columns: minmax(240px, 32%) minmax(0, 1fr);
+    height: 100%;
+    min-height: 260px;
+}
+
+.project-file-list {
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-start;
+    overflow: auto;
+    border-right: 1px solid var(--rule);
+}
+
+.project-file {
+    display: flex;
+    flex: none;
+    align-items: baseline;
+    gap: 14px;
+    width: 100%;
+    margin: 0;
+    padding: 11px 14px;
+    border: 0;
+    border-bottom: 1px solid var(--rule2);
+    border-radius: 0;
+    background: transparent;
+    color: var(--text);
+    text-align: left;
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+.project-file > span:first-child {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.project-file > span:last-child {
+    flex: none;
+    font-size: 10px;
+}
+
+.project-file:hover,
+.project-file.is-active {
+    background: var(--panel2);
+    color: var(--amb);
+}
+
+.project-preview {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+}
+
+.project-preview-header {
+    display: flex;
+    flex: none;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--rule);
+}
+
+.project-file-path {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+.project-source {
+    flex: 1;
+    min-height: 0;
+    margin: 0;
+    padding: 20px;
+    overflow: auto;
+    border-radius: 0;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    font-size: 12px;
+}
+
+.project-source code {
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    font-family: var(--mono);
+}
+
+.project-preview-note {
+    margin: 0;
+    padding: 12px 20px;
+    border-top: 1px solid var(--rule);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+.project-results {
+    flex: none;
+    max-height: 45vh;
+    overflow: auto;
+    padding: 0 18px 12px;
+    border-bottom: 1px solid var(--rule);
+    background: var(--panel);
+}
+
+.project-results-heading {
+    padding: 14px 0 8px;
+    color: var(--amb);
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: .12em;
+}
+
+.project-result {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    border-bottom: 1px solid var(--rule2);
+}
+
+.project-result-open {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 5px;
+    min-width: 0;
+    margin: 0;
+    padding: 13px 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    color: var(--text);
+    text-align: left;
+}
+
+.project-result-open:hover {
+    color: var(--amb);
+}
+
+.project-result-name {
+    font-size: 16px;
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+.project-result-description {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.project-result-meta {
+    color: var(--dim);
+    font-family: var(--mono);
+    font-size: 10px;
+    overflow-wrap: anywhere;
+}
+
+.project-view button:focus-visible,
+.project-view a:focus-visible,
+.project-results button:focus-visible {
+    outline: 2px solid var(--amb);
+    outline-offset: 3px;
 }

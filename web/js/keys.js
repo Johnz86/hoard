@@ -91,7 +91,7 @@ export function initKeys(app) {
             }
             if (app.state.keySheet) return app.hideKeySheet();
             if (app.state.drawerOpen) return app.closeDrawer();
-            if (app.state.view === "detail") return app.goIndex();
+            if (["detail", "project"].includes(app.state.view)) return app.goIndex();
             return;
         }
         if (typing || event.ctrlKey || event.metaKey || event.altKey) return;

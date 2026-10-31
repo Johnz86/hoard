@@ -11,6 +11,8 @@ pub mod jobs;
 pub mod link;
 pub mod loadouts;
 pub mod nodes;
+pub(crate) mod project_search;
+pub mod projects;
 pub mod repos;
 pub mod search;
 pub mod shelves;
@@ -38,6 +40,12 @@ pub fn routes() -> Router<AppState> {
         .route("/healthz", get(system::healthz))
         .route("/api/v1/search", get(search::search))
         .route("/api/v1/search/parse", get(search::parse_query))
+        .route("/api/v1/projects", get(project_search::list))
+        .route("/api/v1/projects/{id}", get(projects::detail))
+        .route("/api/v1/projects/{id}/files", get(projects::files))
+        .route("/api/v1/projects/{id}/readme", get(projects::readme))
+        .route("/api/v1/projects/{id}/file", get(projects::file))
+        .route("/api/v1/projects/{id}/raw", get(projects::raw))
         .route("/api/v1/artifacts/{id}", get(artifacts::detail))
         .route("/api/v1/artifacts/{id}/compat", get(artifacts::compat))
         .route(

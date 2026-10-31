@@ -202,8 +202,30 @@ shows this node first, then peers with online state, address, indexed size, and 
 ACTIVITY shows running jobs with their subject, phase, progress, rate, and cancel action;
 recent completed jobs are under a collapsible heading. These sections refresh while visible.
 
-Source removal, completed-scan cleanup and repository browsing are not implemented yet.
-See [design status and next work](README.md) for the reviewed gaps and next priorities.
+Git folders offer BROWSE PROJECTS. Its results appear below the folder section with project
+name, source, node, default revision, file count and COPY CLONE. Opening a result uses the
+Git-project view below. The selected source and project/file/revision routes can be shared.
+Source removal and completed-scan cleanup remain unimplemented; see
+[design status and next work](README.md).
+
+## Git-project resources
+
+Main Index search includes a GIT PROJECTS section alongside artifact results. A project is
+findable by name, committed README text and file path even with zero model artifacts. Model
+filters continue to apply to artifacts; project metadata supports source, node, repo, org
+and revision filters. Project results paginate independently of artifact results.
+
+`#/project/{id}` shows GIT PROJECT, the project name, source and hosting node, file count,
+size, selected revision and commit. COPY CLONE and COPY PROJECT LINK are prominent. The view
+has README and FILES tabs, without model role, compatibility or loadout controls. README
+opens first. A branch/tag selector changes all displayed content to that committed revision.
+
+FILES has a scrollable path list and a separate preview. Clicking a file opens escaped text
+or an explicit binary/oversized message. The list keeps its scrolling offset when a file is
+selected. DOWNLOAD FILE retrieves a committed file up to 16 MiB; larger files remain available
+by cloning. Previews stop at 256 KiB. Relative README documentation links open the file view.
+Missing README, missing revision and unavailable files have explicit states and retry paths.
+Escape and BACK TO INDEX return to search. Shared links retain revision and selected file.
 
 ## Repo detail view
 

@@ -2,6 +2,7 @@ import * as api from "./api.js";
 import { el, errorPanel, fmtAge, fmtBytes, fmtRate, loadingPanel, mount, toast } from "./dom.js";
 import { loadJobs, loadSources } from "./jobs.js";
 import { loadNodes } from "./nodes.js";
+import { renderProjectResults } from "./projects.js";
 
 function section(title, content, id) {
     return el("section", { class: "operations-section", id },
@@ -34,7 +35,10 @@ function folderRow(app, source) {
     return el("div", { class: "panel-row source-grid" },
         el("div", { class: "source-identity" },
             el("span", { class: "source-name", text: source.name }),
-            el("span", { class: "source-path", text: source.path, title: source.path })),
+            el("span", { class: "source-path", text: source.path, title: source.path }),
+            source.kind === "git" ? el("button", { class: "btn btn-tiny source-browse",
+                type: "button", text: "BROWSE PROJECTS",
+                onClick: () => app.browseProjects(source.name) }) : null),
         el("span", { class: "mono-dim", text: source.kind }),
         el("span", { class: "align-right", text: String(source.files ?? 0) }),
         el("span", { class: "align-right", text: fmtBytes(source.bytes) }),
@@ -201,6 +205,20 @@ function addFolderForm(app) {
             el("button", { class: "btn btn-amber", type: "submit", text: "ADD & SCAN" })));
 }
 
+function projectResults(app) {
+    const source = app.state.sourceProjectName;
+    if (!source) return el("div", { id: "source-projects", hidden: true });
+    const contents = app.state.sourceProjectsError
+        ? errorPanel(app.state.sourceProjectsError, () => app.loadSourceProjects())
+        : app.state.sourceProjects
+            ? renderProjectResults(app, app.state.sourceProjects) || el("div", {
+                class: "operations-empty", text: "No Git projects found yet. Wait for the scan to finish or scan this folder again." })
+            : loadingPanel("reading Git projects...");
+    return section(`PROJECTS IN ${source}`, el("div", null,
+        el("button", { class: "btn btn-tiny", type: "button", text: "CLOSE PROJECTS",
+            onClick: () => app.browseProjects(null) }), contents), "source-projects");
+}
+
 function renderSourcesView(app) {
     const count = (app.state.sources || []).filter((source) => source.can_scan).length;
     const active = (app.state.jobs || []).filter((job) => !job.finished).length;
@@ -217,7 +235,7 @@ function renderSourcesView(app) {
                     if (app.state.sourceFormOpen) document.getElementById("source-path").focus();
                 } })),
         app.state.sourceFormOpen ? addFolderForm(app) : null,
-        folders(app), managedStorage(app), nodes(app), activity(app));
+        folders(app), projectResults(app), managedStorage(app), nodes(app), activity(app));
 }
 
 function sourcesSnapshot(app) {
@@ -226,6 +244,8 @@ function sourcesSnapshot(app) {
     const activeScans = (app.state.jobs || []).filter((job) =>
         job.kind === "scan" && !job.finished);
     return {
+        projects: JSON.stringify([app.state.sourceProjectName, app.state.sourceProjects,
+            app.state.sourceProjectsError?.message]),
         folders: JSON.stringify([sources, activeScans, minute]),
         managed: sources,
         nodes: JSON.stringify([app.state.nodes, app.state.nodesError?.message, minute]),
@@ -258,6 +278,9 @@ export function paintSourcesView(app, panel) {
 
     const next = sourcesSnapshot(app);
     const previous = view.sourcesSnapshot;
+    if (next.projects !== previous.projects) {
+        view.querySelector("#source-projects").replaceWith(projectResults(app));
+    }
     if (next.folders !== previous.folders) {
         view.querySelector("#source-folders").replaceWith(folders(app));
     }

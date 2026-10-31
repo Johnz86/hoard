@@ -9,6 +9,7 @@ import { loadLoadout, loadoutItems, renderDrawer } from "./loadout.js";
 import { loadNodes, renderNodePulse } from "./nodes.js";
 import { loadJobs, loadSources } from "./jobs.js";
 import { paintSourcesView } from "./sources.js";
+import { loadProject, renderProject, renderProjectResults } from "./projects.js";
 import { initSearch, renderTokenStrip, setSearchValue } from "./search.js";
 import { initShelfActions, loadShelves, openShelfMenu } from "./shelves.js";
 import { renderTable, revealCursor } from "./table.js";
@@ -27,6 +28,12 @@ const state = {
     q: "",
     query: null,
     rows: [],
+    projects: { rows: [], total: 0 },
+    projectsLoading: false,
+    project: null,
+    sourceProjectName: null,
+    sourceProjects: null,
+    sourceProjectsError: null,
     facets: {},
     total: 0,
     nodeCount: 0,
@@ -85,6 +92,7 @@ function emptyDetail() {
 let inspectorTimer = null;
 let suppressHashChange = false;
 let refreshingSources = false;
+let searchVersion = 0;
 
 const app = {
     state,
@@ -99,6 +107,13 @@ const app = {
     cursorRow,
     openRow,
     openArtifact,
+    openProject,
+    openProjectFile,
+    selectProjectRevision,
+    selectProjectTab,
+    browseProjects,
+    loadSourceProjects,
+    loadMoreProjects,
     addToLoadout,
     removeFromLoadout,
     switchLoadout,
@@ -137,7 +152,9 @@ function selfNodeName() {
 }
 
 function resultLine() {
-    return `${state.total} ARTIFACTS · ${state.nodeCount} NODES`;
+    return state.projects.total
+        ? `${state.total} ARTIFACTS · ${state.projects.total} GIT PROJECTS`
+        : `${state.total} ARTIFACTS · ${state.nodeCount} NODES`;
 }
 
 function exampleQuery() {
@@ -152,6 +169,15 @@ function sortLabel() {
 }
 
 function buildHash() {
+    if (state.view === "project") {
+        const project = state.project;
+        const params = new URLSearchParams();
+        if (project.revision) params.set("rev", project.revision);
+        if (project.path) params.set("path", project.path);
+        if (project.tab !== "README") params.set("tab", project.tab);
+        const query = params.toString();
+        return `#/project/${encodeURIComponent(project.id)}${query ? `?${query}` : ""}`;
+    }
     if (state.view === "detail") {
         const detail = state.detail;
         const params = new URLSearchParams();
@@ -160,6 +186,9 @@ function buildHash() {
         if (detail.aid) params.set("aid", detail.aid);
         const path = [detail.type, detail.org, detail.name].map(encodeURIComponent).join("/");
         return `#/repo/${path}?${params.toString()}`;
+    }
+    if (state.view === "sources" && state.sourceProjectName) {
+        return `#/sources?${new URLSearchParams({ source: state.sourceProjectName })}`;
     }
     if (state.view !== "index") return `#/${state.view}`;
     const params = new URLSearchParams();
@@ -192,6 +221,22 @@ function readHash() {
     const params = new URLSearchParams(search || "");
     const parts = path.split("/").filter(Boolean);
     const head = parts[0] || "index";
+    if (head === "project" && parts[1]) {
+        const id = decodeURIComponent(parts[1]);
+        const revision = params.get("rev") || "";
+        const path = params.get("path") || "";
+        const tab = path || params.get("tab") === "FILES" ? "FILES" : "README";
+        if (state.project?.id !== id || state.project.revision !== revision) {
+            state.project = { id, revision, path, tab };
+        } else {
+            state.project.path = path;
+            state.project.tab = tab;
+        }
+        state.view = "project";
+        render();
+        loadProject(app);
+        return;
+    }
     if (!["sources", "nodes", "scans", "jobs"].includes(head)) state.sourceFormOpen = false;
     const repoMatch = /^\/repo\/([^/]*)\/([^/]*)\/(.+)$/.exec(path);
 
@@ -231,11 +276,24 @@ function readHash() {
 
     if (["sources", "nodes", "scans", "jobs"].includes(head)) {
         state.view = "sources";
+        if (state.sourceProjectName !== params.get("source")) state.sourceProjects = null;
+        state.sourceProjectName = params.get("source");
         if (head !== "sources") syncHash();
         render();
         if (!state.nodes) loadNodes(app);
         if (!state.sources) loadSources(app);
         loadJobs(app);
+        if (state.sourceProjectName) {
+            loadSourceProjects();
+            requestAnimationFrame(() => {
+                const section = document.getElementById("source-projects");
+                if (section) {
+                    section.tabIndex = -1;
+                    section.focus({ preventScroll: true });
+                    section.scrollIntoView({ block: "start" });
+                }
+            });
+        }
         return;
     }
 
@@ -250,7 +308,7 @@ function readHash() {
     state.sort = sort;
     state.dir = dir;
     setSearchValue(q);
-    if (!state.searching && (changed || !state.rows.length)) runSearch();
+    if (changed || (!state.searching && !state.rows.length && !state.projects.rows.length)) runSearch();
     else render();
 }
 
@@ -281,6 +339,7 @@ function commitQuery(q, options) {
 
 async function runSearch() {
     const query = state.q;
+    const version = ++searchVersion;
     state.searching = true;
     state.searchError = null;
     render();
@@ -291,7 +350,9 @@ async function runSearch() {
             dir: state.sort ? state.dir : null,
             limit: SEARCH_LIMIT
         });
+        if (version !== searchVersion) return;
         state.rows = data.rows || [];
+        state.projects = data.projects || { rows: [], total: 0 };
         state.facets = data.facets || {};
         state.query = data.query || null;
         state.total = data.total ?? state.rows.length;
@@ -302,9 +363,11 @@ async function runSearch() {
         state.cursorArtifact = null;
         state.searchedQuery = query;
     } catch (error) {
+        if (version !== searchVersion) return;
         state.searchError = error;
         state.searchedQuery = null;
         state.rows = [];
+        state.projects = { rows: [], total: 0 };
         state.facets = {};
         state.query = { raw: state.q, tokens: [], warnings: [] };
         state.total = 0;
@@ -409,7 +472,76 @@ function repoPathOf(row) {
             : parts.length === 2
               ? [parts[0], "", parts[1]]
               : [repoTypeOf(row), row.org || "", row.name || ""];
-    return [type, org, name].map(encodeURIComponent).join("/");
+    return [type, org || "-", name].map(encodeURIComponent).join("/");
+}
+
+function openProject(id, revision = "") {
+    const query = revision ? `?${new URLSearchParams({ rev: revision })}` : "";
+    navigate(`#/project/${encodeURIComponent(id)}${query}`);
+}
+
+function openProjectFile(path) {
+    state.project.path = path;
+    state.project.tab = "FILES";
+    syncHash();
+    render();
+    loadProject(app);
+}
+
+function selectProjectRevision(revision) {
+    state.project.revision = revision;
+    syncHash();
+    loadProject(app);
+    render();
+}
+
+function selectProjectTab(tab) {
+    state.project.tab = tab;
+    if (tab === "README") state.project.path = "";
+    syncHash();
+    render();
+    loadProject(app);
+}
+
+function browseProjects(source) {
+    navigate(source ? `#/sources?${new URLSearchParams({ source })}` : "#/sources");
+}
+
+async function loadSourceProjects() {
+    const source = state.sourceProjectName;
+    state.sourceProjectsError = null;
+    try {
+        const projects = await api.projects({ source, limit: SEARCH_LIMIT });
+        if (source !== state.sourceProjectName) return;
+        state.sourceProjects = projects;
+    } catch (error) {
+        if (source !== state.sourceProjectName) return;
+        state.sourceProjectsError = error;
+    }
+    if (state.view === "sources") render();
+}
+
+async function loadMoreProjects() {
+    if (state.projectsLoading) return;
+    const sources = state.view === "sources";
+    const listing = sources ? state.sourceProjects : state.projects;
+    if (!listing?.next_cursor) return;
+    const query = state.q;
+    const source = state.sourceProjectName;
+    state.projectsLoading = true;
+    try {
+        const next = await api.projects({ q: sources ? null : query,
+            source: sources ? source : null, cursor: listing.next_cursor, limit: SEARCH_LIMIT });
+        if ((sources && source !== state.sourceProjectName) || (!sources && query !== state.q)) return;
+        const merged = { ...next, rows: [...listing.rows, ...next.rows] };
+        if (sources) state.sourceProjects = merged;
+        else state.projects = merged;
+    } catch (error) {
+        toast(`projects could not be loaded · ${error.message}`);
+    } finally {
+        state.projectsLoading = false;
+        render();
+    }
 }
 
 function openRow(row) {
@@ -658,7 +790,7 @@ function paintNav() {
 }
 
 function routeMatches(route) {
-    if (route === "/index") return state.view === "index" || state.view === "detail";
+    if (route === "/index") return ["index", "detail", "project"].includes(state.view);
     return `/${state.view}` === route;
 }
 
@@ -717,8 +849,13 @@ function paintIndex() {
     const offset = scroller ? scroller.scrollTop : 0;
     if (state.searchError) mount(body, errorPanel(state.searchError, () => runSearch()));
     else if (state.searching && !state.rows.length) mount(body, loadingPanel("searching the index…"));
-    else if (state.viewMode === "CARDS") mount(body, renderCards(app));
-    else mount(body, renderTable(app, exampleQuery()));
+    else {
+        const projects = renderProjectResults(app, state.projects);
+        const artifacts = state.rows.length || !projects
+            ? (state.viewMode === "CARDS" ? renderCards(app) : renderTable(app, exampleQuery()))
+            : null;
+        mount(body, el("div", { class: "resource-results" }, projects, artifacts));
+    }
     const next = body.firstElementChild;
     if (next && offset) next.scrollTop = offset;
 
@@ -735,6 +872,7 @@ function render() {
     const index = document.getElementById("view-index");
     const detail = document.getElementById("view-detail");
     const panel = document.getElementById("view-panel");
+    panel.classList.toggle("project-host", state.view === "project");
     index.hidden = state.view !== "index";
     detail.hidden = state.view !== "detail";
     panel.hidden = ["index", "detail"].includes(state.view);
@@ -742,10 +880,41 @@ function render() {
     if (state.view === "index") paintIndex();
     else if (state.view === "detail") mount(detail, renderDetail(app));
     else if (state.view === "sources") paintSourcesView(app, panel);
+    else if (state.view === "project") paintProject(panel);
 
     renderDrawer(app);
     renderKeySheet(app);
     paintPrefs();
+}
+
+function paintProject(panel) {
+    const project = state.project;
+    const key = `${project.id}@${project.revision}`;
+    const same = panel.dataset.projectKey === key;
+    const scroll = (selector) => panel.querySelector(selector)?.scrollTop || 0;
+    const listOffset = same ? scroll(".project-file-list") : 0;
+    const previewOffset = same && panel.dataset.projectPath === project.path
+        ? scroll(".project-source") : 0;
+    const contentOffset = same && panel.dataset.projectTab === project.tab
+        ? scroll(".project-content") : 0;
+    const focused = panel.contains(document.activeElement)
+        ? document.activeElement.closest(".project-file")?.getAttribute("title") : null;
+    mount(panel, renderProject(app));
+    const restore = (selector, offset) => {
+        const node = panel.querySelector(selector);
+        if (node) node.scrollTop = offset;
+    };
+    restore(".project-file-list", listOffset);
+    restore(".project-source", previewOffset);
+    restore(".project-content", contentOffset);
+    if (focused) {
+        const file = [...panel.querySelectorAll(".project-file")].find(
+            (node) => node.getAttribute("title") === focused);
+        file?.focus({ preventScroll: true });
+    }
+    panel.dataset.projectKey = key;
+    panel.dataset.projectPath = project.path;
+    panel.dataset.projectTab = project.tab;
 }
 
 function paintPrefs() {
@@ -833,12 +1002,17 @@ function start() {
         if (state.view !== "sources" || refreshingSources) return;
         refreshingSources = true;
         try {
+            const previousScan = (state.sources || []).find(
+                (source) => source.name === state.sourceProjectName)?.last_scan;
             await Promise.all([
                 loadSources(app, false),
                 loadJobs(app, false),
                 loadNodes(app, false)
             ]);
             if (state.view === "sources") {
+                const scanned = (state.sources || []).find(
+                    (source) => source.name === state.sourceProjectName)?.last_scan;
+                if (state.sourceProjectName && previousScan !== scanned) await loadSourceProjects();
                 paintSourcesView(app, document.getElementById("view-panel"));
             }
         } finally {

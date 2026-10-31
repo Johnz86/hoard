@@ -378,3 +378,118 @@ async fn an_upload_batch_is_refused_object_by_object() {
         })
     );
 }
+
+#[tokio::test]
+async fn canonical_project_clone_serves_refs_packs_and_lfs_without_a_hub_namespace() {
+    let world = seeded();
+    let record = world
+        .state
+        .catalog()
+        .repository(&RepoId::parse_ref(RepoType::Models, CLONE_REPO).expect("repo"))
+        .expect("repository reads")
+        .expect("clone exists");
+    let path = format!("/git/projects/{}.git", record.id);
+    let refs = get(
+        &world.state,
+        &format!("{path}/info/refs?service=git-upload-pack"),
+    )
+    .await;
+    assert_eq!(refs.status, StatusCode::OK);
+    assert!(refs.body.starts_with(SERVICE_HEADER));
+    let mut request = hoard_mirror::git::pkt_line(
+        format!(
+            "want {} multi_ack_detailed side-band-64k ofs-delta\n",
+            world.head
+        )
+        .as_bytes(),
+    )
+    .expect("want line");
+    request.extend_from_slice(b"0000");
+    request.extend_from_slice(&hoard_mirror::git::pkt_line(b"done\n").expect("done line"));
+    let pack = post(&world.state, &format!("{path}/git-upload-pack"), request).await;
+    assert_eq!(pack.status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&pack.body).contains("NAK"));
+    let body = json!({"operation":"download","objects":[{"oid":Sha256::from_bytes(LFS_SHA256).to_hex(),"size":LFS_SIZE}]});
+    let batch = post(
+        &world.state,
+        &format!("{path}/info/lfs/objects/batch"),
+        body.to_string().into_bytes(),
+    )
+    .await;
+    assert_eq!(batch.status, StatusCode::OK);
+    assert!(
+        batch.json()["objects"][0]["actions"]["download"]["href"]
+            .as_str()
+            .expect("download URL")
+            .starts_with(PUBLIC_URL)
+    );
+    let push = post(
+        &world.state,
+        &format!("{path}/git-receive-pack"),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(push.status, StatusCode::FORBIDDEN);
+    let unknown = get(
+        &world.state,
+        "/git/projects/r_999999.git/info/refs?service=git-upload-pack",
+    )
+    .await;
+    assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn canonical_git_project_clone_does_not_depend_on_the_internal_hub_type() {
+    let world = seeded();
+    let original = world
+        .state
+        .catalog()
+        .repository(&RepoId::parse_ref(RepoType::Models, CLONE_REPO).expect("repo"))
+        .expect("repository reads")
+        .expect("clone exists");
+    let repo = RepoId::parse_ref(RepoType::Datasets, "org/project").expect("repo");
+    world
+        .state
+        .catalog()
+        .seed(&[SeedRepository {
+            repo: repo.clone(),
+            source: "clones".to_owned(),
+            kind: SourceKind::Git,
+            root_path: Path::new(&original.root_path).to_path_buf(),
+            git_dir: original.git_dir.map(std::path::PathBuf::from),
+            tool_layout: None,
+            revisions: Vec::new(),
+        }])
+        .expect("project seeds");
+    let project = world
+        .state
+        .catalog()
+        .repository(&repo)
+        .expect("repository reads")
+        .expect("project exists");
+    let refs = get(
+        &world.state,
+        &format!(
+            "/git/projects/{}.git/info/refs?service=git-upload-pack",
+            project.id
+        ),
+    )
+    .await;
+    assert_eq!(refs.status, StatusCode::OK);
+    assert!(refs.body.starts_with(SERVICE_HEADER));
+    let cache = world
+        .state
+        .catalog()
+        .repository(&RepoId::parse_ref(RepoType::Models, CACHE_REPO).expect("repo"))
+        .expect("repository reads")
+        .expect("cache exists");
+    let refused = get(
+        &world.state,
+        &format!(
+            "/git/projects/{}.git/info/refs?service=git-upload-pack",
+            cache.id
+        ),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::NOT_FOUND);
+}

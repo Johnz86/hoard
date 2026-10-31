@@ -133,6 +133,12 @@ are proxied as in olah. Hoard strips `x-xet-hash` from resolve responses it serv
 
 ### Git smart HTTP face
 
+Git projects also have a resource-specific clone identity, `/git/projects/{id}.git`, where
+`id` is the catalog repository row ID. The same `info/refs`, `git-upload-pack`, push-refusal
+and LFS batch behavior applies below this path. These routes accept any locally indexed Git
+source, independently of the internal Hub namespace; they are what project UI clone commands
+use. Legacy name-based paths below continue to imply the Hub `models` namespace.
+
 `GET /{org}/{repo}[.git]/info/refs?service=git-upload-pack`,
 `POST /{org}/{repo}[.git]/git-upload-pack` and
 `POST /{org}/{repo}[.git]/info/lfs/objects/batch` serve `git clone` and `git-lfs` over the

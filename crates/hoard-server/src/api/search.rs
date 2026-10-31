@@ -81,6 +81,7 @@ impl From<DiskPressure> for DiskPressureView {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchResponse {
+    pub projects: crate::api::project_search::ProjectList,
     pub query: ParsedQuery,
     pub facets: FacetsView,
     pub rows: Vec<RowView>,
@@ -115,11 +116,12 @@ pub async fn search(
         true => "desc",
         false => "asc",
     };
-    let page = run_query(&state, raw, sort, limit, offset).await?;
+    let page = run_query(&state, raw.clone(), sort, limit, offset).await?;
     if page.stale {
         tracing::debug!("the search index is behind the catalog and is being refreshed");
     }
     Ok(Json(SearchResponse {
+        projects: crate::api::project_search::find(&state, raw, None, 0, limit).await?,
         facets: facets(&page.facets, &page.query),
         rows: page.rows.iter().map(RowView::from).collect(),
         next_cursor: next_cursor(offset, limit, walked(&page), page.total, &key),

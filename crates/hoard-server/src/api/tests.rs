@@ -23,6 +23,7 @@ use hoard_index::discover::RefKind;
 
 mod loadouts;
 mod opened;
+mod projects;
 
 use crate::api;
 use crate::config::HoardConfig;

@@ -184,6 +184,13 @@ session are excluded. Temporary checkouts and generated data have been removed.
 
 ## Compatibility
 
+Git-project search adds no persisted record or format bump. `Catalog::git_repositories` and
+`repository_by_id` expose existing source/repository metadata. The server builds a transient
+`hoard_index::projects::ProjectIndex` over names, paths and bounded committed README text,
+streams documents into a single in-memory Tantivy writer, and shares the resulting immutable
+index between readers. A finished scan invalidates that cache. Artifact search and its
+published on-disk Tantivy directory keep their existing layout and counters.
+
 Read the "Compatibility" section of `CLAUDE.md`. It is the only statement of the policy;
 nothing here restates it.
 
