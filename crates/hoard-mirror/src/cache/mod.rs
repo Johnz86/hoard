@@ -1,7 +1,7 @@
 //! The olah-format block cache: entry layout, the `meta.bin` header, block IO and eviction.
 //!
-//! The on-disk format is the one `docs/api/hub-compat.md` tabulates, so an existing olah
-//! `repos/` directory can be served unchanged.
+//! The on-disk format is the one `docs/reference/api/hugging-face.md` tabulates, so an
+//! existing olah `repos/` directory can be served unchanged.
 
 pub mod block;
 pub mod entry;

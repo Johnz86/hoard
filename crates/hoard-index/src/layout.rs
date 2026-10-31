@@ -11,7 +11,7 @@ const GIT_CLONE: &str = "git clone";
 const UNPLACED: &str = "(unplaced)";
 /// Folder spelling on disk, the layout it names, and which tool's tree the folder is taken
 /// as evidence for. ComfyUI's own aliases and the A1111 spellings fold onto one layout each,
-/// per `docs/design/comfyui-model-taxonomy.md`.
+/// per `docs/reference/source-layouts.md`.
 ///
 /// A folder is a [`Marker`] only when its presence is distinctive enough to recognize a tree
 /// by, which is a narrower question than which tool registers it: `discover::loose::layout`

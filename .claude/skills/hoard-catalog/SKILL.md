@@ -9,7 +9,8 @@ read and write it, and nothing else persists what hoard knows about a file. It l
 `crates/hoard-index/src/catalog/`, opens at `<data_dir>/native`, and holds `catalog.redb`
 plus one published `search-v1-<nanos>/` Tantivy directory.
 
-Read `docs/native-catalog.md` for the current state and the measured numbers. This skill is
+Read `docs/reference/native-catalog.md` for storage and write contracts; historical measurements live in
+`docs/performance/catalog-measurements.md`. This skill is
 the part that is not in the code and is easy to get wrong.
 
 ## Compatibility
@@ -92,7 +93,7 @@ Every writer of an entry commits through `scan::Counters`:
 - A pass that commits more than once sets `Manifest.pass_open` before its first commit and
   clears it in its last, because the totals and each scanned source's files and bytes are what
   a pass settles at its end. A run that finds the mark set counts both again first.
-  `docs/native-catalog.md` under "Recovery" says what a kill at each stage leaves and what is
+  `docs/reference/native-catalog.md` under "Recovery" says what a kill at each stage leaves and what is
   accepted.
 - A transaction that takes an artifact's last path calls `sweep_artifact` for it before it
   commits, so no committed state counts a path no entry backs. The sweep at the end of the
@@ -106,7 +107,7 @@ record that it is.
 
 ## native_db 0.8.2 semantics
 
-The local clone at `/home/johnz86/GIT/native_db` settles any question about the API. These
+Consult the workspace-pinned native_db source for API semantics. These
 are the facts that have caught agents out:
 
 - A **secondary-key scan materialises every matching primary key** before yielding, and
@@ -151,5 +152,5 @@ are the facts that have caught agents out:
 
 ## Before you change anything here
 
-Grep for every symbol you intend to touch and read its callers. `docs/native-catalog.md`
+Grep for every symbol you intend to touch and read its callers. `docs/reference/native-catalog.md`
 describes the state at a named commit and goes stale; the code does not.

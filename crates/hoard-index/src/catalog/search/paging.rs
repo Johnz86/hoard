@@ -25,7 +25,7 @@ const SAMPLE_FLOOR: usize = 64;
 /// How much deeper a numeric window has to be than a text one before a rank selection pays
 /// for itself. A term key spells a term for every row the heap holds and a numeric key only
 /// compares integers, so the two cross over an order of magnitude apart. Both crossings were
-/// measured at 1M; the table is under "Thresholds" in `docs/native-catalog.md`.
+/// measured at 1M; the table is under "Thresholds" in `docs/performance/catalog-measurements.md`.
 const NUMERIC_SHALLOW: usize = 8;
 
 /// The requested page of the kept rows, ordered by the sort column and then by artifact id

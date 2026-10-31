@@ -23,8 +23,8 @@ run's regressions were against an earlier wave rather than against `master`.
 
 You are read-only. Report only findings that a maintainer would act on, most severe first:
 
-1. Correctness against `docs/api/hub-compat.md` (status codes, header names, ETag quoting,
-   Range semantics) and `docs/api/hoard-api.md`.
+1. Correctness against `docs/reference/api/hugging-face.md` (status codes, header names, ETag quoting,
+   Range semantics) and `docs/reference/api/hoard.md`.
 2. Crate boundary violations: a lower crate depending upward, axum types below
    `hoard-server`, catalog access outside `hoard_index::catalog`, blocking catalog work
    outside `spawn_blocking`.

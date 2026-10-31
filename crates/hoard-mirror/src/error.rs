@@ -4,7 +4,7 @@ use hoard_core::HoardError;
 use hoard_index::IndexError;
 
 /// Failures of the Hub protocol, the block cache and upstream transport. `hoard-server`
-/// maps these onto the status and `x-error-code` pairs in `docs/api/hub-compat.md`.
+/// maps these onto the status and `x-error-code` pairs in `docs/reference/api/hugging-face.md`.
 #[derive(Debug, Error)]
 pub enum MirrorError {
     #[error("domain error: {0}")]

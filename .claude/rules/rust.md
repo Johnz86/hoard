@@ -16,5 +16,5 @@ paths:
   in this workspace, whatever AGENTS.md's generic guidance calls it. No `unwrap`.
 - Blocking work (the catalog, hashing, header parsing) runs in `spawn_blocking` or `rayon`.
 - Streaming bodies: never buffer a file; stream from the block cache.
-- Header names in Hub responses are lower-case and must match `docs/api/hub-compat.md`.
-- Every new module is listed in `docs/architecture.md` under the crate tree.
+- Header names in Hub responses are lower-case and must match `docs/reference/api/hugging-face.md`.
+- Every new module is listed in `docs/reference/architecture.md` under the crate tree.

@@ -244,7 +244,7 @@ impl FileAnswer {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServedResponse {
     pub status: u16,
-    /// Lower-case names, in the order `docs/api/hub-compat.md` tabulates them.
+    /// Lower-case names, in the order `docs/reference/api/hugging-face.md` tabulates them.
     pub headers: Vec<(String, String)>,
     pub content_length: u64,
     pub outcome: RangeOutcome,

@@ -9,8 +9,8 @@ paths:
 - Use tokens from `web/css/tokens.css`; never hardcode an oklch value in `hoard.css` or JS.
 - Match `docs/design/ui-spec.md` exactly: column widths, paddings, font sizes,
   letter-spacing, state colors, keyboard map. Follow the UI change workflow in
-  `docs/design/README.md`. Later accepted changes recorded in the current specification
-  supersede the imported handoff; use its HTML for unspecified visual details.
+  `docs/contributing/ui-changes.md`. Later accepted changes recorded in the current specification
+  supersede the imported prototypes; use its HTML for unspecified visual details.
 - Extend the existing table/cards, inspector, detail tabs/right rail and inline row actions.
   A new resource type does not by itself justify a separate results section or page layout.
   Check both the new journey and unchanged resource types against before/after screenshots.

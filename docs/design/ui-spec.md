@@ -1,21 +1,18 @@
 # Hoard UI specification
 
-Extracted from the Claude Design handoff in `docs/design/handoff/project/` (`Hoard App.dc.html` is the
-product screen, `Hoard Proposal.dc.html` is the narrative deck). This specification records
-the current accepted UI, including later changes described in the
-[design status](README.md). Explicit later user decisions recorded here supersede the
-imported prototypes and historical plans. For details not changed by those decisions, the
-App prototype supplies dimensions, colors and behavior and takes precedence over the
-proposal deck. Keep the imported handoff unchanged.
+This is the current accepted interface contract. The [product design](README.md) describes
+its scope. Original HTML in `docs/design/prototypes/project/` supplies unspecified visual
+details; explicit accepted behavior here takes precedence over those prototypes. Preserve
+the HTML and support assets when changing application code.
 
 Implementation target: `web/` vanilla JS modules plus `web/css/hoard.css` over Pico CSS.
 All values below are already declared as custom properties in `web/css/tokens.css`.
 Before changing a screen or adding a resource type, follow the
-[UI change workflow](README.md#ui-change-workflow).
+[UI change workflow](../contributing/ui-changes.md).
 
 ## Palette (oklch)
 
-Dark surface, the product default:
+Dark palette, used when the dark theme is selected:
 
 | Token | Value | Use |
 | --- | --- | --- |
@@ -38,7 +35,7 @@ Dark surface, the product default:
 | selection | `oklch(0.5 0.14 55)` bg, `oklch(0.98 0 0)` fg | `::selection` |
 | card body text | `oklch(0.84 0.008 80)` | README paragraphs |
 
-Paper surface, used by the proposal deck and the light theme:
+Paper palette, used by the light theme:
 
 | Token | Value |
 | --- | --- |
@@ -374,7 +371,7 @@ removes a line.
 Mouse: row click sets cursor, double-click opens, facet click toggles its token in the
 query, shelf click replaces the query, column header click sorts, tab click switches.
 
-## Query grammar as prototyped
+## Query grammar
 
 Tokenizer: split on whitespace, quoted strings kept whole (`trigger:"film grain"`).
 `key:value` when a colon is present, otherwise free text. Leading `-` negates a token.
@@ -422,11 +419,11 @@ compatible(host, other):
 ## Props exposed by the prototype
 
 `density` Condensed | Roomy, `roleColorMode` Color-coded | Monochrome, `showInspector`
-boolean. These become user settings persisted in `localStorage`.
+boolean. These settings are persisted in `localStorage`.
 
-## Not in the prototype, named in the proposal
+## Additional application behavior
 
-TREE and DISK views; `?` key sheet; the
-`used:` and `trigger:` keys; DISK PRESSURE facet; git-over-HTTP face; filesystem
-projection `hoard link --profile comfyui ./models`; peer discovery and gossip. See
-`docs/feature-plan.md` for where each lands.
+The key sheet, usage/trigger queries, disk-pressure summary, Git serving, filesystem
+projection and peer discovery are implemented behavior beyond the original visual prototype.
+TREE and DISK views are not implemented. See [product scope](product-scope.md) and the
+[API reference](../reference/api/hoard.md) for supported behavior.

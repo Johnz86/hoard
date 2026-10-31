@@ -1,6 +1,6 @@
 ---
 name: hoard-measure
-description: The measurement protocol for hoard performance work - the synthetic tree, the fixed route list, the scale harness at 100k and 1M, the like-for-like rule, and the shape of the numbers that go into docs/native-catalog.md.
+description: The measurement protocol for hoard performance work - the synthetic tree, the fixed route list, the scale harness at 100k and 1M, the like-for-like rule, and the shape of the numbers that go into docs/performance/catalog-measurements.md.
 allowed-tools: Bash, Read, Grep, Glob, Edit, Write
 ---
 
@@ -13,7 +13,7 @@ is not a comparison.
 **Measure before and after in one session, on one machine, over one tree.** A reviewer or an
 implementer who needs a "before" number rebuilds the previous commit in a scratch clone under
 the scratchpad and measures both runs back to back. Never compare a fresh run against a
-number already written in `docs/native-catalog.md`; quote that number as history and say
+number already written in `docs/performance/catalog-measurements.md`; quote that number as history and say
 which machine and commit it came from.
 
 State the commit for every column. A table without commits is not reproducible. **Cite a
@@ -47,11 +47,13 @@ after column is the wave commit itself, named by its subject until it has a hash
 
   This is what a concurrency reading of 632 ms at `0935fde` turned out to be: not a lock and
   not bandwidth, but eight queries landing across both classes. The curve that settled it is
-  in `docs/native-catalog.md` under "Query latency against concurrent thread count".
+  in `docs/performance/catalog-measurements.md` under "Query latency against concurrent thread count".
 - Everything temporary - synthetic trees, scratch clones, the before and after files - goes
   under the scratchpad directory the harness names in your system prompt, never inside the
   repository. Delete a large tree when you are done with it. `git status` must be clean when
   you are done.
+
+Use `tasks/benchmark-catalog/README.md` for the current entry point and isolation rules.
 
 ## The synthetic tree
 
@@ -62,7 +64,7 @@ tensor entry. Vary the key family and the shape across files so inference has so
 do.
 
 Two things belong beside the tree because the fixed route list below needs them, and the
-numbers in `docs/native-catalog.md` were taken with them:
+numbers in `docs/performance/catalog-measurements.md` were taken with them:
 
 - **A git clone source**, one small repository with a commit, added as a second
   `[[index.sources]]` with `kind = "git"`. A loose repository has no revision sha, so
@@ -216,7 +218,7 @@ Say which thresholds the run meets and which it misses, with the number.
 Only a wave that is allowed to write does this. A read-only reviewer reports its numbers and
 touches no file in the repository; the before and after files stay in the scratchpad.
 
-Add or replace a section in `docs/native-catalog.md` under "Measured" or "Scale". One table
+Add or replace a section in `docs/performance/catalog-measurements.md` under "Measured" or "Scale". One table
 per scale. Every column names the commit it was measured at. Prose after the table says
 which rows are the change, which moved by less than the spread of their own three runs, and
 which rows are not comparable and why. A row that moved for a reason the change did not touch

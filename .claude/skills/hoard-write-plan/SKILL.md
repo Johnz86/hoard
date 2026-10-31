@@ -11,8 +11,6 @@ otherwise have to ask for is in the file.
 ## Before you write a plan at all
 
 Answer these three in the plan's header, in one sentence each, or do not write the plan.
-The run of 2026-09-07 failed on every one of them and is reverted; see
-`docs/superpowers/history/2026-09-07-predictable-memory-reverted.md`.
 
 1. **What number says this problem exists?** For a performance or memory wave this is a
    measurement taken before the plan, on a workload that reaches the code being changed. "The
@@ -21,8 +19,6 @@ The run of 2026-09-07 failed on every one of them and is reverted; see
 2. **What number will say this wave worked?** Name the row and the fixture. **If no
    measurement available today can show the change, the wave does not ship** - build the
    fixture first, in its own wave, and let it tell you whether the change is worth making.
-   Three of the reverted run's four waves could not be shown by any fixture that existed, and
-   two of those turned out not to be worth doing.
 3. **What is the smallest change that gets that number?** A wave that touches more than one
    subsystem is two waves. A wave that is about the scan does not change the mirror's write
    path.
@@ -33,11 +29,11 @@ A wave runs in its own worktree on its own branch, and lands on `master` as one 
 commit. The dispatcher creates both before writing the plan:
 
 ```sh
-git -C /home/johnz86/GIT/hoard worktree add ../hoard-<name> -b wave/<name>
+git worktree add ../hoard-<name> -b wave/<name>
 ```
 
-Write the plan to `<worktree>/docs/superpowers/plans/<name>.md`. It is **never committed**:
-it stays untracked in the worktree and is deleted with it when the wave lands. Do not write a
+Write the plan to `<scratch>/plans/<name>.md`. It is **never committed**:
+it stays outside the checkout and is removed after the task is accepted. Do not write a
 task that commits or removes the plan file.
 
 ## The skeleton
@@ -94,8 +90,8 @@ bullets carry only what changes per wave.
 
 1. **The gate.** Where to work, which branch, the preflight command, and the stop condition:
 
-   > Work in `/home/johnz86/GIT/hoard-<name>` on branch `wave/<name>`. First command:
-   > `cd /home/johnz86/GIT/hoard-<name> && git status --short && git branch --show-current && git log --oneline -1`;
+   > Work in `<worktree>` on branch `wave/<name>`. First command:
+   > `cd <worktree> && git status --short && git branch --show-current && git log --oneline -1`;
    > proceed only if the tree is clean apart from this plan file, the branch is `wave/<name>`
    > and the top commit is `<hash>` "<its subject>". Never push, merge or rebase.
 
@@ -208,7 +204,7 @@ If the wave is about performance, Task 0 is the before measurement and the last 
 after measurement plus the doc. Do not restate the protocol in the plan: point at
 `.claude/skills/hoard-measure/SKILL.md` and name only what is specific - the routes added to
 the fixed list, the fixture to seed, the previous numbers to beat, the section heading in
-`docs/native-catalog.md` to write under.
+`docs/reference/native-catalog.md` to write under.
 
 Require the verdict to state each threshold as met or missed **with the number**, and add the
 anti-softening rule: *do not soften a miss; name the largest remaining cost you can identify

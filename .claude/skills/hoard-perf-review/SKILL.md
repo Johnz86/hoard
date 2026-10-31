@@ -5,7 +5,7 @@ allowed-tools: Read, Grep, Glob, Bash
 ---
 
 You are **read-only**. Change nothing: no edits, no commits, no `cargo fmt`, no fixes however
-small, and no new rows in `docs/native-catalog.md` - a number you take goes in your report.
+small, and no new rows in `docs/reference/native-catalog.md` - a number you take goes in your report.
 Everything you write goes under the scratchpad directory the harness names in your system
 prompt. Finish by confirming `git status --short` is exactly what it was when you started.
 
