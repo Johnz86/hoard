@@ -18,15 +18,19 @@ Membership does not copy files, launch inference, configure a tool, or write ser
    current collection. ADD TO LOADOUT or L opens a chooser for the current model or selected
    models; confirm ADD TO THIS LOADOUT, or create a named collection to add them to. Adding a
    second VAE, checkpoint or encoder appends it; exact duplicate members are idempotent.
-4. The drawer has a named collection selector, a name field with explicit SAVE, and a
-   vertically scrolling member list. Each member shows its source, size/availability, an
-   editable download path relative to the client's chosen root, explicit SAVE PATH, and a
-   labeled REMOVE button. Removing membership never removes model files. All model roles
-   are supported. Existing legacy loadouts remain readable and editable.
+4. The drawer starts with one compact collection selector and NEW action. The member count,
+   selected bytes, RENAME and DELETE share a management strip. RENAME reveals the name
+   editor with explicit SAVE/CANCEL; an existing name is not repeated in a permanent field.
+   Each model occupies one condensed row: role marker, truncated filename, size and native
+   disclosure. Click or keyboard activation expands its full source, role, availability,
+   editable relative download path, SAVE PATH and REMOVE action. Tooltips expose the full
+   filename and destination without expansion; no essential action requires hovering.
+   Removing membership never removes model files. All model roles are supported. Existing
+   legacy loadouts remain readable and editable.
 5. DOWNLOAD ON YOUR COMPUTER replaces server-side Apply. Show the exact relative directory
    tree, total selected bytes and unavailable members. The client root defaults to `./models`
    (run from ComfyUI), and is editable; Windows users may enter an absolute path. Choose
-   PowerShell or POSIX shell, then COPY DOWNLOAD SCRIPT or SAVE SCRIPT. The generated script
+   PowerShell or POSIX shell, then COPY SCRIPT or SAVE SCRIPT. The generated script
    uses the existing `hf` CLI against this server and requests only the collection's pinned
    files. Destination paths are explicit, not inferred again at download time. No background
    server apply job or second node is involved.
@@ -47,6 +51,12 @@ Membership does not copy files, launch inference, configure a tool, or write ser
 Reuse the existing 520px drawer, Pico native form controls, typefaces, spacing, tokens, shared
 Index renderers, inspector facts/actions and keyboard hints. Keep all deep work in Rust.
 The list body owns scrolling; the download footer remains reachable on short viewports.
+Controls in each form row have equal heights, with a 30px condensed control target. Closed
+model rows take about 32px rather than several lines. Their expanded state and input drafts
+survive background updates. Collapsed rows retain visible UNSAVED and UNAVAILABLE notices
+when applicable. The footer keeps the destination and script actions compact;
+help, layout and script previews expand on demand. The shared Index ROLE column reserves
+space for LOADOUT plus an explicit gap before NAME in both densities.
 Use native buttons for collection selection and member actions, associated labels for form
 fields, visible focus and polite inline status. Opening focuses CLOSE; closing restores the
 invoking control and prior text selection. Escape blurs an input before closing the drawer.
@@ -97,3 +107,7 @@ nodes, authentication redesign, archive streaming and network configuration chan
   during edits, Index refreshes, delayed requests and failures. Exercise keyboard and mouse.
 - Review 1180/1600px, both themes/densities, table/cards and inspector on/off. Existing model
   classification, Git project acquisition, sources and sharing journeys continue to work.
+- With twenty members, collapsed rows remain single-line and many fit above the footer;
+  measure visible capacity at 1000px and 720px viewport heights. Verify disclosure using
+  keyboard and mouse, matching form-control heights, full filename/path access and a gap
+  after the LOADOUT role label.

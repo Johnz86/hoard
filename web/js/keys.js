@@ -10,22 +10,22 @@ const SHEET = [
     ["INDEX", [
         ["J  ↓", "move the cursor down"],
         ["K  ↑", "move the cursor up"],
-        ["↵", "open the repo under the cursor"],
+        ["↵", "open the resource under the cursor"],
         ["SPC", "toggle selection"],
-        ["L", "pin into the current loadout; a second checkpoint starts a loadout named after it"],
+        ["L", "choose a loadout for the current or selected models"],
         ["Y", "yank the pull command"]
     ]],
     ["DETAIL", [
         ["[  ]", "cycle FILES / REFS / CARD / COMPAT / USAGE"],
-        ["L", "pin the opened file into the current loadout"],
+        ["L", "choose a loadout for the opened model"],
         ["ESC", "back to the index"]
     ]],
     ["LOADOUT DRAWER", [
-        ["LOADOUT n", "open the drawer on the current loadout"],
-        ["NAME", "edit the name in the header; Enter or leaving the field renames"],
-        ["NEW", "start an empty loadout, named as typed or loadout-N"],
-        ["LIST", "click a loadout to switch; DELETE then CONFIRM removes it"],
-        ["×", "remove the line"]
+        ["LOADOUTS", "open the collection picker"],
+        ["RENAME", "show the name editor; save explicitly or cancel"],
+        ["NEW", "create a named collection"],
+        ["MODEL", "expand its row for source details, download path and Remove"],
+        ["DELETE", "confirm collection deletion; model files remain untouched"]
     ]]
 ];
 

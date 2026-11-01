@@ -38,6 +38,13 @@ const dataDir = join(scratch,'data','managed-model-links-'+'long-path-'.repeat(1
 await writeFile(config, `[server]\nbind="127.0.0.1:${port}"\npublic_url="${origin}"\ndata_dir="${dataDir}"\n[node]\nname="first-run"\ndiscovery="none"\n[index]\nhash_policy="now"\nhash_threads=2\nwatch=true\nreconcile_interval_secs=0\n[mirror]\noffline=true\n`);
 let server, browser, socket;
 let serverLog = '';
+const closeBrowser = () => {
+    if (socket?.readyState === WebSocket.OPEN) {
+        socket.onmessage = null;
+        socket.send(JSON.stringify({ id: 0, method: 'Browser.close' }));
+    }
+    socket?.close();
+};
 const exceptions = [];
 const startServer = async () => {
     server=spawn('nice',['-n','10',join(root,'target/debug/hoard'),'serve','--config',config],{cwd:scratch,env,stdio:['ignore','pipe','pipe']});
@@ -55,7 +62,7 @@ const stop = async child => {
 };
 for (const signal of ['SIGINT', 'SIGTERM']) {
     process.once(signal, async () => {
-        socket?.close();
+        closeBrowser();
         await Promise.allSettled([stop(browser), stop(server)]);
         process.exit(130);
     });
@@ -148,6 +155,7 @@ try {
     await wait('document.querySelector(".loadout-pending-label")?.textContent.includes("4 selected")');
     await evaluate('document.querySelector("#loadout-new-name").value="Qwen Image 2.1 Text to Video";document.querySelector(".drawer-new button").click()');
     await wait('document.querySelectorAll(".loadout-member").length===4&&!document.querySelector("#loadout-copy").disabled');
+    await writeFile(join(scratch,'collection-metrics.json'),JSON.stringify(await evaluate('(()=>{const body=document.querySelector(".drawer-body").getBoundingClientRect();const rows=[...document.querySelectorAll(".loadout-member")].map(row=>row.getBoundingClientRect());return {viewport:[innerWidth,innerHeight],rowHeights:rows.map(row=>row.height),fullyVisible:rows.filter(row=>row.top>=body.top&&row.bottom<=body.bottom).length,bodyHeight:body.height}})()'),null,2));
     const collection=(await readApi('/loadouts'))[0];
     const doc=await readApi('/loadouts/'+collection.id);
     assert.equal(doc.items.length,4);
@@ -157,21 +165,26 @@ try {
         assert.equal(item.destination,folder+'/'+item.name);
     }
     assert(!(await evaluate('!!document.querySelector(".drawer-apply")')));
-    await evaluate('window.collectionShell=document.querySelector(".drawer");window.collectionInput=document.querySelector("#loadout-name");window.pathInput=document.querySelector(".loadout-member input");window.pathDraft="diffusion_models/unsaved.safetensors";window.pathInput.value=window.pathDraft;window.pathInput.dispatchEvent(new Event("input"));window.pathInput.focus();window.pathInput.setSelectionRange(2,8);document.querySelector(".drawer-body").scrollTop=100');
+    await evaluate('document.querySelector("#loadout-rename").click();document.querySelector(".loadout-member").open=true;document.querySelector(".drawer-body").style.maxHeight="200px";window.collectionShell=document.querySelector(".drawer");window.collectionInput=document.querySelector("#loadout-name");window.pathInput=document.querySelector(".loadout-member input");window.pathDraft="diffusion_models/unsaved.safetensors";window.pathInput.value=window.pathDraft;window.pathInput.dispatchEvent(new Event("input"));window.pathInput.focus();window.pathInput.setSelectionRange(2,8);document.querySelector(".drawer-body").scrollTop=80;window.collectionScroll=document.querySelector(".drawer-body").scrollTop');
     assert(await evaluate('document.querySelector("#loadout-copy").disabled'));
+    await evaluate('document.querySelector(".loadout-member").open=false');
+    assert(await evaluate('document.querySelector(".loadout-member summary").textContent.includes("UNSAVED")'));
+    await evaluate('document.querySelector(".loadout-member").open=true;window.pathInput.focus();window.pathInput.setSelectionRange(2,8);document.querySelector(".drawer-body").scrollTop=window.collectionScroll');
     await evaluate('document.querySelector("#loadout-name").value="Qwen Image 2.1 collection";document.querySelector("#loadout-name").dispatchEvent(new Event("input"));[...document.querySelectorAll(".loadout-name-form button")][0].click()');
     await wait('document.querySelector("#loadout-name").value==="Qwen Image 2.1 collection"&&!document.querySelector(".loadout-name-form button").disabled');
     assert(await evaluate('window.collectionShell===document.querySelector(".drawer")&&window.collectionInput===document.querySelector("#loadout-name")&&window.pathInput===document.querySelector(".loadout-member input")'));
     assert.equal(await evaluate('window.pathInput.value'),'diffusion_models/unsaved.safetensors');
     assert.equal(await evaluate('document.activeElement===window.pathInput'),true);
     assert.equal(await evaluate('window.pathInput.selectionStart'),2);
-    assert.equal(await evaluate('document.querySelector(".drawer-body").scrollTop'),100);
+    assert.equal(await evaluate('document.querySelector(".drawer-body").scrollTop'),await evaluate("window.collectionScroll"));
+    assert(await evaluate("window.collectionScroll>0"));
     await evaluate('window.pathInput.value="../escape";window.pathInput.dispatchEvent(new Event("input"));document.querySelector(".loadout-path-form button").click()');
     await wait('document.querySelector(".loadout-error").textContent.includes("portable relative")');
     assert.equal(await evaluate('window.pathInput.value'),'../escape');
     const original=doc.items[0].destination;
     await evaluate('window.pathInput.value='+JSON.stringify(original)+';window.pathInput.dispatchEvent(new Event("input"));document.querySelector(".loadout-path-form button").click()');
     await wait('!document.querySelector(".loadout-path-form button").disabled&&!document.querySelector(".loadout-error").textContent');
+    await evaluate('document.querySelector(".drawer-body").style.maxHeight="";if(!document.querySelector(".loadout-rename").hidden)[...document.querySelectorAll(".loadout-name-form button")].find(button=>button.textContent==="CANCEL").click()');
     const clientRoot=join(scratch,"client models user's files");
     await evaluate('document.querySelector("#loadout-download-root").value='+JSON.stringify(clientRoot)+';document.querySelector("#loadout-download-root").dispatchEvent(new Event("input"));document.querySelector("#loadout-script-format").value="shell";document.querySelector("#loadout-script-format").dispatchEvent(new Event("change"))');
     await wait('!document.querySelector("#loadout-copy").disabled');
@@ -190,7 +203,7 @@ try {
     assert.equal(await readFile(join(clientRoot,doc.items[0].destination),'utf8'),'existing client model');
     for(const [folder,name] of names)assert.deepEqual(await readFile(join(fixtureRoot,folder,name)),fixtures.get(name));
     await assert.rejects(access(join(dataDir,'profiles')));
-    await evaluate('document.querySelectorAll(".loadout-member button")[0].click()');
+    await evaluate('document.querySelector(".loadout-member .loadout-remove").click()');
     await wait('document.querySelectorAll(".loadout-member").length===3');
     const removed=doc.items[0];
     await evaluate('document.querySelector("#loadout-close").click()');
@@ -205,6 +218,7 @@ try {
         await evaluate('import("/js/theme.js").then(m=>m.updateSettings('+JSON.stringify({theme})+'))');
         await evaluate('document.querySelector("#loadout-script-format").value="powershell";document.querySelector("#loadout-script-format").dispatchEvent(new Event("change"));document.querySelector(".drawer-body").scrollTop=0');
         await wait('!document.querySelector("#loadout-copy").disabled');
+        await evaluate('document.querySelectorAll(".loadout-member").forEach(row=>row.open=false)');
         await screenshot('collection-'+width+'-'+theme);
         assert(await evaluate('document.querySelector(".drawer").scrollWidth<=document.querySelector(".drawer").clientWidth'));
         assert(await evaluate('document.querySelector("#loadout-copy").getBoundingClientRect().bottom<=innerHeight'));
@@ -218,7 +232,67 @@ try {
     assert(savedBytes,'downloaded PowerShell script missing');
     assert.deepEqual(savedBytes.subarray(0,3),Buffer.from([0xef,0xbb,0xbf]));
     assert.equal(savedBytes.subarray(3).toString('utf8'),savedScript.text);
+    await evaluate('document.querySelectorAll(".loadout-member").forEach(row=>row.open=row.item.name.startsWith("qwen3.5_9b"));document.querySelector(".drawer-body").scrollTop=0');
+    assert(await evaluate('document.querySelector(".loadout-member[open] .loadout-member-source").textContent.includes("nested/qwen3.5_9b")'));
+    await screenshot('collection-model-expanded');
+    await evaluate('document.querySelectorAll(".loadout-member").forEach(row=>row.open=false)');
+    await evaluate('window.renameFetch=window.fetch;window.fetch=(input,options)=>String(input).startsWith("/api/v1/loadouts/")&&options?.method==="PUT"?new Promise(resolve=>window.finishRename=async()=>resolve(await window.renameFetch(input,options))):window.renameFetch(input,options);document.querySelector("#loadout-rename").click();document.querySelector("#loadout-name").value="Qwen Image 2.1 collection (saved)";document.querySelector("#loadout-name").dispatchEvent(new Event("input"));document.querySelector(".loadout-name-form button").click()');
+    await wait('typeof window.finishRename==="function"');
+    await evaluate('document.querySelector("#loadout-close").click();window.finishRename();window.fetch=window.renameFetch');
+    assert(!(await evaluate('!!document.querySelector(".drawer")')));
+    for(let i=0;i<100;i++){if((await readApi('/loadouts/'+collection.id)).name.endsWith('(saved)'))break;await pause(100);}
+    assert.equal((await readApi('/loadouts/'+collection.id)).name,'Qwen Image 2.1 collection (saved)');
+    await evaluate('document.querySelector("#loadout-btn").click()');
+    await wait('document.querySelectorAll(".loadout-member").length===4&&!document.querySelector("#loadout-rename").disabled');
+    assert.equal(exceptions.length,0,JSON.stringify(exceptions));
+    const capacityNames=[];
+    await mkdir(join(fixtureRoot,'capacity'));
+    for(let i=0;i<20;i++){
+        const name='capacity_model_'+String(i+1).padStart(2,'0')+'.safetensors';
+        const bytes=Buffer.from(fixtures.values().next().value);bytes[bytes.length-1]=i+30;
+        await writeFile(join(fixtureRoot,'capacity',name),bytes);capacityNames.push(name);
+    }
+    await writeApi('/scan',{source:'models',hash:'now'});
+    let capacityModels=[];
+    for(let i=0;i<150;i++){
+        capacityModels=(await readApi('/search?q=capacity_model&limit=30')).resources.filter(row=>row.artifact_id);
+        if(capacityModels.length===20)break;await pause(100);
+    }
+    assert.equal(capacityModels.length,20);
+    const capacity=await writeApi('/loadouts',{name:'Condensed capacity collection'});
+    await writeApi('/loadouts/'+capacity.id+'/members',{artifact_ids:capacityModels.map(row=>row.artifact_id)});
     await evaluate('document.querySelector("#loadout-close").click()');
+    await navigate('/loadout/'+capacity.id);await wait('document.querySelectorAll(".loadout-member").length===20');
+    assert(await evaluate('document.querySelector(".loadout-rename").hidden'));
+    assert(await evaluate('document.querySelector(".loadout-create").hidden'));
+    const capacityMetrics=[];
+    for(const height of [1000,768,720])for(const theme of ['light','dark']){
+        await send('Emulation.setDeviceMetricsOverride',{width:1180,height,deviceScaleFactor:1,mobile:false});
+        await evaluate('import("/js/theme.js").then(m=>m.updateSettings('+JSON.stringify({theme,density:'Condensed'})+'))');
+        const metrics=await evaluate('(()=>{const body=document.querySelector(".drawer-body");body.scrollTop=0;const bounds=body.getBoundingClientRect();const rows=[...document.querySelectorAll(".loadout-member")].map(row=>row.getBoundingClientRect());return {height:innerHeight,rowHeights:rows.map(row=>row.height),visible:rows.filter(row=>row.top>=bounds.top&&row.bottom<=bounds.bottom).length,copyVisible:document.querySelector("#loadout-copy").getBoundingClientRect().bottom<=innerHeight}})()');
+        assert(metrics.rowHeights.every(value=>value<=34));
+        assert(metrics.visible>=(height===1000?20:height===768?12:10),JSON.stringify(metrics));assert(metrics.copyVisible);
+        capacityMetrics.push({...metrics,theme});await screenshot('collection-capacity-'+height+'-'+theme);
+    }
+    await writeFile(join(scratch,'capacity-metrics.json'),JSON.stringify(capacityMetrics,null,2));
+    await evaluate('document.querySelector(".loadout-member summary").focus()');await press('Enter');
+    assert(await evaluate('document.querySelector(".loadout-member").open'));
+    assert(await evaluate('document.querySelector(".loadout-member-source").getBoundingClientRect().height>0'));
+    assert(await evaluate('document.querySelector(".loadout-member summary").title.includes("Download:")'));
+    assert(await evaluate('Math.abs(document.querySelector(".loadout-path-form input").getBoundingClientRect().height-document.querySelector(".loadout-path-form button").getBoundingClientRect().height)<1'));
+    await screenshot('collection-capacity-expanded');
+    await press('Enter');assert(!(await evaluate('document.querySelector(".loadout-member").open')));
+    await evaluate('document.querySelector("#loadout-rename").click()');
+    assert(await evaluate('document.activeElement.id==="loadout-name"'));
+    assert(await evaluate('Math.abs(document.querySelector("#loadout-name").getBoundingClientRect().height-document.querySelector(".loadout-name-form button").getBoundingClientRect().height)<1'));
+    await evaluate('[...document.querySelectorAll(".loadout-name-form button")].find(button=>button.textContent==="CANCEL").click()');
+    assert(await evaluate('document.querySelector(".loadout-rename").hidden&&document.activeElement.id==="loadout-rename"'));
+    await evaluate('document.querySelector("#loadout-delete").click();document.querySelector(".loadout-delete-confirm button").click()');
+    await wait('document.querySelectorAll(".loadout-member").length===4');
+    assert(!(await readApi("/loadouts")).some(row=>row.id===capacity.id));
+    for(const name of capacityNames)await access(join(fixtureRoot,'capacity',name));
+    await evaluate('document.querySelector("#loadout-close").click()');
+    await send('Emulation.setDeviceMetricsOverride',{width:1600,height:1000,deviceScaleFactor:1,mobile:false});
     await navigate("/index?q=qwen");
     await wait('document.querySelectorAll(".trow").length===5');
     for(const width of [1180,1600])for(const theme of ['light','dark'])
@@ -229,6 +303,7 @@ try {
         await evaluate('[...document.querySelectorAll(".view-tab")].find(tab=>tab.textContent==='+JSON.stringify(view)+').click()');
         await screenshot('index-collections-'+width+'-'+theme+'-'+density+'-'+showInspector+'-'+view);
         assert.equal(await evaluate('document.querySelectorAll(".trow.r-loadout,.card.r-loadout").length'),1);
+        if(view==='TABLE')assert(await evaluate('(()=>{const row=document.querySelector(".trow.r-loadout");return row.querySelector(".cell-name").getBoundingClientRect().left-row.querySelector(".role-code").getBoundingClientRect().right>=10})()'));
         assert(await evaluate('document.documentElement.scrollWidth<=innerWidth&&document.querySelector(".topbar").getBoundingClientRect().top>=0'));
     }
     await evaluate('import("/js/theme.js").then(m=>m.updateSettings({theme:"dark",density:"Condensed",showInspector:true}))');
@@ -274,9 +349,9 @@ try {
     assert.deepEqual((await readApi("/artifacts/"+ids[0])).loadouts,[]);
     for(const [folder,name] of names)assert.deepEqual(await readFile(join(fixtureRoot,folder,name)),fixtures.get(name));
     assert.equal(exceptions.length,0,JSON.stringify(exceptions));
-    await writeFile(join(scratch,'verification.json'),JSON.stringify({passed:true,screenshots,checks:['four-file-Qwen-collection','two-encoders-retained','multi-selection-add','stable-shell-inputs-focus-scroll','explicit-rename-and-path-save','unsafe-path-recovery','real-hf-client-download','nested-source-flattening','only-selected-files','existing-client-files-preserved','server-originals-preserved','no-server-projections','search-by-name-and-member','loadout-role-filter','related-collection-discovery','deep-link-reload','related-collection-in-model-detail','32-index-layout-combinations','owner-access-recovery','remove-and-readd-member','unsaved-path-blocks-copy','powershell-script-save-utf8-bom','delete-cancel-and-confirm']},null,2));
+    await writeFile(join(scratch,'verification.json'),JSON.stringify({passed:true,screenshots,checks:['four-file-Qwen-collection','twenty-model-condensed-capacity','collapsed-unsaved-path-notice','pending-rename-close-recovery','native-keyboard-disclosure','matching-control-heights','loadout-role-column-gap','two-encoders-retained','multi-selection-add','stable-shell-inputs-focus-scroll','explicit-rename-and-path-save','unsafe-path-recovery','real-hf-client-download','nested-source-flattening','only-selected-files','existing-client-files-preserved','server-originals-preserved','no-server-projections','search-by-name-and-member','loadout-role-filter','related-collection-discovery','deep-link-reload','related-collection-in-model-detail','32-index-layout-combinations','owner-access-recovery','remove-and-readd-member','unsaved-path-blocks-copy','powershell-script-save-utf8-bom','delete-cancel-and-confirm']},null,2));
     process.stdout.write(JSON.stringify({passed:true,scratch})+'\n');
 } finally {
-    socket?.close();await stop(browser);await stop(server);
+    closeBrowser();await stop(browser);await stop(server);
     await writeFile(join(scratch,'server.log'),serverLog);
 }

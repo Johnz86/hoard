@@ -2363,60 +2363,97 @@ button.shelf-menu-remove:hover { color: var(--red); }
 .catalog-empty { flex: 1; }
 .setup-empty-actions { display: flex; gap: 12px; justify-content: center; margin-top: 20px; }
 
-.drawer-foot select.field {
-    width: 100%;
-    margin: 6px 0 10px;
-    padding: 7px 32px 7px 10px;
-    color: var(--text);
-    background-color: var(--bg);
-    border: 1px solid var(--rule);
-    border-radius: 0;
-    font: 12px var(--mono);
-}
-
 .r-loadout { --role-color: var(--amb); }
-.loadout-help { margin: 8px 0 14px; color: var(--muted); font-size: 12px; line-height: 1.6; }
-.drawer-head .btn-close { margin-left: auto; }
-.drawer-body > select.field, .drawer-foot select.field,
-.drawer-body input.field, .drawer-foot input.field {
+.cell-role { min-width: 0; padding-right: 12px; }
+.th:first-child { padding-right: 12px; }
+.drawer-head { align-items: center; padding: 10px 16px; }
+.drawer-title { font-size: 17px; }
+.drawer-body { padding: 10px 16px; }
+.drawer-foot { padding: 10px 16px; }
+.drawer .field, .drawer select.field, .drawer input.field {
+    width: 100%;
+    min-width: 0;
+    height: 30px;
+    min-height: 30px;
+    padding: 4px 7px;
+    margin: 0;
     color: var(--text);
     background-color: var(--bg);
     border: 1px solid var(--rule);
     border-radius: 0;
-    font: 12px var(--mono);
-    min-height: 34px;
-    margin: 6px 0 10px;
+    font: 11px var(--mono);
+    line-height: 20px;
 }
-.drawer-body .rail-title, .drawer-foot label.rail-title { display: block; margin: 12px 0 0; }
-.drawer-new { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 8px; }
-.drawer-new label { grid-column: 1 / -1; }
-.drawer-new .btn { align-self: center; }
-.loadout-name-form, .loadout-path-form { display: flex; align-items: center; gap: 8px; }
-.loadout-name-form input, .loadout-path-form input { min-width: 0; flex: 1; }
-.loadout-name-form .btn, .loadout-path-form .btn { flex-shrink: 0; }
-.loadout-member { padding: 14px 0; border-bottom: 1px solid var(--rule); }
-.loadout-member-head { display: flex; align-items: center; gap: 8px; }
-.loadout-member-name { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
-.loadout-member-source { font: 10px var(--mono); overflow-wrap: anywhere; line-height: 1.7; margin-top: 6px; }
-.loadout-member .btn { padding: 5px 7px; font-size: 10px; }
-.loadout-member-summary { padding-top: 12px; }
-.loadout-pending { padding: 12px; margin-top: 12px; border: 1px solid var(--amb); font-size: 12px; }
-.loadout-pending .btn + .btn { margin-left: 8px; }
+.drawer select.field { padding-right: 28px; }
+.drawer .btn { height: 30px; padding: 4px 8px; font-size: 10px; flex-shrink: 0; }
+.drawer .rail-title { margin: 0; font-size: 9px; }
+.drawer label.rail-title { display: block; margin: 8px 0 4px; }
+.drawer-head .btn-close { margin-left: auto; }
+.loadout-toolbar, .loadout-name-form, .loadout-path-form, .loadout-new-form,
+.loadout-destination-row { display: flex; align-items: center; gap: 6px; }
+.loadout-toolbar .field, .loadout-name-form .field, .loadout-path-form .field,
+.loadout-new-form .field, .loadout-destination-row .field { flex: 1; }
+.loadout-create, .loadout-rename { margin-bottom: 8px; }
+.loadout-management { display: flex; align-items: center; gap: 6px; min-height: 40px; }
+.loadout-member-summary { flex: 1; min-width: 0; line-height: 1.4; }
+.loadout-management .btn { height: 24px; padding: 2px 6px; font-size: 9px; }
+.drawer .loadout-member { margin: 0; padding: 0; border-bottom: 1px solid var(--rule2); }
+.loadout-member > summary {
+    display: grid;
+    grid-template-columns: 3px minmax(0, 1fr) auto auto 8px;
+    align-items: center;
+    column-gap: 7px;
+    height: 32px;
+    padding: 0 5px;
+    margin: 0;
+    list-style: none;
+    color: var(--text);
+    cursor: pointer;
+}
+.loadout-member > summary:hover, .loadout-member[open] > summary { background: var(--panel2); }
+.loadout-member > summary:focus-visible { outline: 1px solid var(--amb); outline-offset: -1px; color: var(--text); background: var(--panel2); }
+.loadout-member > summary::-webkit-details-marker { display: none; }
+.loadout-member > summary::after {
+    content: ">";
+    grid-column: 5;
+    width: 8px;
+    height: auto;
+    margin: 0;
+    background: none;
+    font: 11px var(--mono);
+    color: var(--dim);
+    transform: none;
+}
+.loadout-member[open] > summary::after { transform: rotate(90deg); }
+.loadout-member-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 11px var(--mono); }
+.loadout-member-size { grid-column: 4; color: var(--muted); font: 10px var(--mono); white-space: nowrap; }
+.loadout-member-unavailable { grid-column: 3; color: var(--red); font: 8px var(--mono); }
+.loadout-member-unavailable.is-unsaved { color: var(--amb); }
+.loadout-member-detail { padding: 8px 6px 10px 15px; }
+.loadout-member-source { font: 10px/1.6 var(--mono); overflow-wrap: anywhere; white-space: pre-wrap; }
+.loadout-member .loadout-remove { height: 24px; margin-top: 8px; padding: 2px 6px; font-size: 9px; }
+.loadout-pending { display: flex; align-items: center; gap: 6px; padding: 6px; margin-top: 8px; border: 1px solid var(--amb); }
+.loadout-pending-label { flex: 1; font: 10px var(--mono); }
 .loadout-error, .loadout-download-status.is-error { color: var(--red); }
-.loadout-error, .loadout-read-status, .loadout-download-status { font-size: 12px; overflow-wrap: anywhere; }
-.loadout-delete-confirm { padding: 12px 0; font-size: 12px; }
-.loadout-delete-confirm .btn + .btn { margin-left: 8px; }
-#loadout-delete { margin-top: 16px; }
-.loadout-download-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-.loadout-download-actions .btn { white-space: normal; }
-.loadout-script-review { margin: 10px 0 0; }
-.loadout-script-review summary { font: 10px var(--mono); color: var(--muted); }
-.loadout-script { max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 10px; }
+.loadout-error, .loadout-read-status, .loadout-download-status { font-size: 11px; overflow-wrap: anywhere; line-height: 1.5; }
+.loadout-error:empty, .loadout-read-status:empty, .loadout-owner:empty { display: none; }
+.loadout-error:not(:empty), .loadout-read-status:not(:empty) { margin: 6px 0; }
+.loadout-delete-confirm { padding: 8px 0; font-size: 11px; }
+.loadout-delete-confirm p { margin: 0 0 8px; }
+.loadout-delete-confirm .btn + .btn { margin-left: 6px; }
+.loadout-destination-row label.rail-title { flex: 0 0 78px; margin: 0; line-height: 1.4; }
+.loadout-download-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
+.loadout-download-actions select.field { flex: 1; width: auto; min-width: 135px; }
+.loadout-download-status { margin-top: 6px; }
+.loadout-preview-options { display: flex; flex-wrap: wrap; gap: 0 14px; margin-top: 5px; }
+.loadout-preview-options > details { margin: 0; }
+.loadout-preview-options > details[open] { flex-basis: 100%; }
+.loadout-preview-options summary, .loadout-owner summary { font: 9px var(--mono); color: var(--muted); margin: 0; padding: 5px 0; }
+.loadout-preview-options summary::after { margin-left: 6px; width: 10px; height: 10px; }
+.loadout-owner { margin-top: 6px; }
+.loadout-owner .owner-access { margin: 4px 0; border: 0; }
+.loadout-owner .owner-access-fields { flex-wrap: wrap; gap: 6px; margin: 0; }
+.loadout-help { margin: 6px 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.loadout-script, .loadout-layout-text { max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 10px var(--mono); }
+.loadout-visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .related-loadout { display: block; width: 100%; white-space: normal; overflow-wrap: anywhere; text-align: left; margin-top: 6px; }
-
-.loadout-owner summary, .loadout-create summary, .loadout-layout summary {
-    font: 10px var(--mono); color: var(--muted); margin: 12px 0;
-}
-.loadout-owner .owner-access { margin: 8px 0; border: 0; }
-.loadout-owner .owner-access-fields { flex-wrap: wrap; }
-.loadout-layout-text { max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 10px var(--mono); }

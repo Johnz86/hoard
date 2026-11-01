@@ -27,6 +27,11 @@ cancels then confirms deletion while preserving model files. It checks related l
 detail, inline owner-access recovery, unsaved-path download blocking and saved PowerShell
 encoding. It captures both themes at 1180/1600px, including the shared Index in both densities,
 table/cards and inspector on/off, and checks overflow and download-button visibility.
+An additional collection of twenty distinct model fixtures measures collapsed row height
+and visible capacity at 1000/768/720px, tests native keyboard disclosure, compares input/button
+heights and checks the gap between the LOADOUT role and the next table column.
+It also verifies collapsed unsaved-path notices and closing the drawer while a delayed
+rename completes, without losing the saved name or producing browser errors.
 
 Successful runs print the evidence directory containing screenshots, a verification JSON,
 download logs and server logs. Failed runs retain evidence for diagnosis. Run the broader

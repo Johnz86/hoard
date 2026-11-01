@@ -53,9 +53,16 @@ const stop = async child => {
     if(!child || child.exitCode!==null || child.signalCode)return;
     await new Promise(resolve=>{const timer=setTimeout(()=>child.kill('SIGKILL'),5000);child.once('exit',()=>{clearTimeout(timer);resolve();});child.kill('SIGTERM');});
 };
+const closeBrowser = () => {
+    if (socket?.readyState === WebSocket.OPEN) {
+        socket.onmessage = null;
+        socket.send(JSON.stringify({id:0,method:'Browser.close'}));
+    }
+    socket?.close();
+};
 for (const signal of ['SIGINT', 'SIGTERM']) {
     process.once(signal, async () => {
-        socket?.close();
+        closeBrowser();
         await Promise.allSettled([stop(browser), stop(server)]);
         process.exit(130);
     });
@@ -230,7 +237,7 @@ try {
     await evaluate('document.querySelector("#loadout-new-name").value="Portrait collection";document.querySelector(".drawer-new button").click()');
     await wait('document.querySelectorAll(".loadout-member").length===1&&!document.querySelector("#loadout-copy").disabled');
     await screenshot('loadout-client-download');
-    await evaluate('window.drawerIdentity=document.querySelector(".drawer");document.querySelector("#loadout-name").value="Unsaved collection draft";document.querySelector("#loadout-name").dispatchEvent(new Event("input"));document.querySelector("#loadout-name").focus();document.querySelector("#loadout-name").setSelectionRange(1,5)');
+    await evaluate('document.querySelector("#loadout-rename").click();window.drawerIdentity=document.querySelector(".drawer");document.querySelector("#loadout-name").value="Unsaved collection draft";document.querySelector("#loadout-name").dispatchEvent(new Event("input"));document.querySelector("#loadout-name").focus();document.querySelector("#loadout-name").setSelectionRange(1,5)');
     await pause(1500);
     assert(await evaluate('window.drawerIdentity===document.querySelector(".drawer")'));
     assert.equal(await evaluate('document.querySelector("#loadout-name").value'),'Unsaved collection draft');
@@ -352,6 +359,6 @@ try {
     await writeFile(join(scratch,'verification.json'),JSON.stringify({passed:true,checks:['fresh-route','explicit-empty-query','empty-catalog-action','owner-access','invalid-path-recovery','empty-folder','sharing-form-polling-focus','folder-form-position-during-background-indexing','URL-validation','live-sharing-address-without-restart','listener-and-server-preserved','live-cached-clone-command','pending-vs-active','project-add-and-review','deep-link-reload','token-not-persisted','restart-config-and-resources','existing-node-index','loadout-client-script','loadout-stable-drawer','loadout-input-focus','classification-owner-recovery','classification-draft-focus','classification-confirm-counts','classification-rescan-restart','classification-clear-and-reinfer','classification-reject-cancel','classification-noise-preserved','project-without-model-controls','remove-last-source'],screenshots},null,2));
     process.stdout.write(JSON.stringify({passed:true,scratch})+'\n');
 } finally {
-    socket?.close();await stop(browser);await stop(server);
+    closeBrowser();await stop(browser);await stop(server);
     await writeFile(join(scratch,'server.log'),serverLog);
 }

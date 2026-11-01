@@ -352,14 +352,18 @@ inspector lists RELATED LOADOUTS. Opening either a collection row or a related l
 its stable drawer; `#/loadout/<id>` supports reload and sharing.
 
 The toolbar LOADOUTS button opens a chooser. ADD TO LOADOUT or L opens that chooser for the
-current or selected models; choose a collection and confirm ADD TO THIS LOADOUT, or CREATE
+current or selected models; choose a collection and confirm ADD, or CREATE
 one with a name. Models append without role-slot replacement. The editor provides explicit
-SAVE NAME, SAVE PATH and REMOVE actions. DELETE LOADOUT requires a named confirmation and
+RENAME reveals a SAVE/CANCEL editor. Each model defaults to one condensed disclosure row;
+its filename and size stay visible, while source details, SAVE PATH and REMOVE expand on
+click or keyboard activation. Full filename and destination are available in its tooltip.
+The picker and NEW share one row; count, bytes, RENAME and DELETE share the management strip.
+Form inputs and buttons align at equal heights. DELETE requires a named confirmation and
 preserves original files. CRUD updates patch the mounted drawer rather than recreating it
 or replaying its animation. Preserve drafts, focus, selection and body scroll.
 
-DOWNLOAD ON YOUR COMPUTER shows a client destination root, member-relative paths, and a
-PowerShell/POSIX script preview with COPY DOWNLOAD SCRIPT and SAVE SCRIPT. Scripts request
+The compact download footer shows a client destination root, script format, COPY SCRIPT and
+SAVE SCRIPT. Folder layout, help and PowerShell/POSIX script previews expand on demand. Scripts request
 only the selected files through `hf`, preserve existing client files with a warning, and
 stop on transfer failure. The UI reports script readiness, never download completion.
 Unavailable members, destination collisions and unsupported multi-file shard artifacts
@@ -389,9 +393,10 @@ footer).
 Detail: `[` and `]` cycle FILES, REFS, CARD, COMPAT, USAGE; `L` opens the collection chooser for the opened file and adds it to
 a chosen collection; `Esc` returns to the index.
 
-Drawer: the header name field renames on Enter or blur; NEW starts a loadout named as typed
-or `loadout-N`; a loadout row switches on click; DELETE arms, CONFIRM removes; the row's `×`
-removes a line.
+Drawer: Tab reaches the collection selector, NEW and management actions. RENAME opens an
+explicit SAVE/CANCEL editor. Enter or Space on a member summary expands or collapses its
+source, editable destination and REMOVE action. DELETE opens a named confirmation; CANCEL
+returns focus to its invoking control. Background updates preserve expanded rows and drafts.
 
 Mouse: row click sets cursor, double-click opens, facet click toggles its token in the
 query, shelf click replaces the query, column header click sorts, tab click switches.

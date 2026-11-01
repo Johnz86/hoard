@@ -129,6 +129,15 @@ async function renameCollection(app, field) {
         if (field.value === value) delete field.dataset.dirty;
         toast("Loadout name saved");
     });
+    if (!app.state.loadoutError && field.value === value && !field.dataset.dirty) {
+        const form = document.getElementById("loadout-rename-form");
+        if (!form || !form.contains(field)) return;
+        const focused = form.contains(document.activeElement);
+        form.hidden = true;
+        const button = document.getElementById("loadout-rename");
+        button.setAttribute("aria-expanded", "false");
+        if (focused) button.focus({ preventScroll: true });
+    }
 }
 
 async function savePath(app, item, field) {
@@ -177,14 +186,21 @@ function labeledField(label, id, value = "") {
 
 function createShell(app, root) {
     const name = labeledField("LOADOUT NAME", "loadout-name");
+    const rename = () => {
+        const form = root.querySelector(".loadout-rename");
+        form.hidden = !form.hidden;
+        root.querySelector("#loadout-rename").setAttribute("aria-expanded", String(!form.hidden));
+        if (!form.hidden) name.field.focus({ preventScroll: true });
+    };
     const fresh = labeledField("NEW LOADOUT", "loadout-new-name");
     fresh.field.placeholder = "Name this collection";
     const create = () => createCollection(app, fresh.field);
     fresh.field.addEventListener("keydown", event => {
         if (event.key === "Enter") { event.preventDefault(); create(); }
     });
-    const downloadRoot = labeledField("DESTINATION ON YOUR COMPUTER", "loadout-download-root",
+    const downloadRoot = labeledField("DESTINATION", "loadout-download-root",
         settings.loadoutDownloadRoot || "./models");
+    downloadRoot.field.title = "Folder on your computer; for ComfyUI, use its models folder";
     downloadRoot.field.addEventListener("input", () => {
         updateSettings({ loadoutDownloadRoot: downloadRoot.field.value });
         renderDownload(app, root);
@@ -196,7 +212,7 @@ function createShell(app, root) {
         } }, el("option", { value: "powershell", text: "Windows PowerShell" }),
         el("option", { value: "shell", text: "Linux / macOS shell" }));
     format.value = settings.loadoutScriptFormat || "powershell";
-    const chooser = el("select", { id: "loadout-chooser", class: "field",
+    const chooser = el("select", { id: "loadout-chooser", class: "field", "aria-label": "Current loadout",
         onChange: () => chooseCollection(app, chooser.value) });
     const confirmDelete = el("div", { class: "loadout-delete-confirm", hidden: true },
         el("p", { class: "loadout-delete-message" }),
@@ -212,66 +228,94 @@ function createShell(app, root) {
             el("button", { id: "loadout-close", class: "btn btn-close", type: "button", text: "CLOSE",
                 onClick: () => app.closeDrawer() })),
         el("div", { class: "drawer-body" },
-            el("p", { class: "loadout-help", text: "Group models from anywhere in the Index. Download only this collection to your computer." }),
-            el("label", { for: "loadout-chooser", class: "rail-title", text: "CURRENT LOADOUT" }), chooser,
+            el("div", { class: "loadout-toolbar" }, chooser,
+                action("NEW", () => {
+                    const form = root.querySelector(".loadout-create");
+                    form.hidden = !form.hidden;
+                    root.querySelector("#loadout-new").setAttribute("aria-expanded", String(!form.hidden));
+                    if (!form.hidden) fresh.field.focus({ preventScroll: true });
+                }, { id: "loadout-new", "aria-controls": "loadout-create", "aria-expanded": "false" })),
             el("div", { class: "loadout-read-status", role: "status", "aria-live": "polite" }),
             el("div", { class: "loadout-error", role: "status", "aria-live": "polite" }),
             el("div", { class: "loadout-owner" }),
             action("RETRY", () => loadLoadout(app), { id: "loadout-read-retry", hidden: true }),
-            el("details", { class: "loadout-create", open: !app.state.loadout },
-                el("summary", { text: "NEW LOADOUT" }),
-                el("div", { class: "drawer-new" }, fresh.label, fresh.field, action("CREATE", create))),
+            el("section", { id: "loadout-create", class: "loadout-create", hidden: !!app.state.loadout },
+                el("div", { class: "drawer-new" }, fresh.label,
+                    el("div", { class: "loadout-new-form" }, fresh.field, action("CREATE", create)))),
             el("div", { class: "loadout-pending", hidden: true },
-                el("p", { class: "loadout-pending-label" }),
-                action("ADD TO THIS LOADOUT", () => addPending(app), { id: "loadout-add-pending" }),
+                el("span", { class: "loadout-pending-label" }),
+                action("ADD", () => addPending(app), { id: "loadout-add-pending", title: "Add selected models to this loadout" }),
                 action("CANCEL", () => { app.state.loadoutPendingModels = []; renderDrawer(app); })),
             el("section", { class: "loadout-editor", hidden: true },
-                name.label,
-                el("div", { class: "loadout-name-form" }, name.field,
-                    action("SAVE NAME", () => renameCollection(app, name.field))),
-                el("div", { class: "loadout-member-summary rail-title" }),
-                el("div", { class: "loadout-members" }),
-                action("DELETE LOADOUT", () => {
-                    app.state.loadoutDeleting = app.state.loadoutId;
-                    renderDrawer(app);
-                    root.querySelector(".loadout-delete-confirm button").focus();
-                }, { id: "loadout-delete" }), confirmDelete)),
+                el("div", { class: "loadout-management" },
+                    el("span", { class: "loadout-member-summary rail-title" }),
+                    action("RENAME", rename, { id: "loadout-rename", "aria-expanded": "false", "aria-controls": "loadout-rename-form" }),
+                    action("DELETE", () => {
+                        app.state.loadoutDeleting = app.state.loadoutId;
+                        renderDrawer(app);
+                        root.querySelector(".loadout-delete-confirm button").focus();
+                    }, { id: "loadout-delete", title: "Delete this loadout; model files are kept" })),
+                el("div", { id: "loadout-rename-form", class: "loadout-rename", hidden: true }, name.label,
+                    el("div", { class: "loadout-name-form" }, name.field,
+                        action("SAVE", () => renameCollection(app, name.field)),
+                        action("CANCEL", () => {
+                            name.field.value = app.state.loadout?.name || "";
+                            delete name.field.dataset.dirty;
+                            rename();
+                            root.querySelector("#loadout-rename").focus({ preventScroll: true });
+                        }))),
+                confirmDelete, el("div", { class: "loadout-members" }))),
         el("div", { class: "drawer-foot" },
-            el("div", { class: "rail-title", text: "DOWNLOAD ON YOUR COMPUTER" }),
-            downloadRoot.label, downloadRoot.field,
-            el("p", { class: "loadout-help", text: "Paths below are relative to this folder on the client. For ComfyUI, use its models folder. Nothing is copied on the server." }),
-            el("label", { for: "loadout-script-format", class: "rail-title", text: "SCRIPT FOR" }), format,
-            el("div", { class: "loadout-download-status", role: "status", "aria-live": "polite" }),
-            el("details", { class: "loadout-layout", hidden: true },
-                el("summary", { text: "PREVIEW FOLDER LAYOUT" }),
-                el("pre", { class: "code-box loadout-layout-text" })),
-            el("details", { class: "loadout-script-review" },
-                el("summary", { text: "REVIEW DOWNLOAD SCRIPT" }),
-                el("pre", { class: "code-box loadout-script" })),
+            el("div", { class: "loadout-destination-row" }, downloadRoot.label, downloadRoot.field),
             el("div", { class: "loadout-download-actions" },
-                action("COPY DOWNLOAD SCRIPT", () => copyScript(app, root), { id: "loadout-copy", class: "btn btn-primary" }),
+                el("label", { for: "loadout-script-format", class: "loadout-visually-hidden", text: "Script format" }), format,
+                action("COPY SCRIPT", () => copyScript(app, root), { id: "loadout-copy", class: "btn btn-primary", title: "Copy download script to run on your computer" }),
                 action("SAVE SCRIPT", () => saveScript(), { id: "loadout-save-script" }),
-                action("RETRY SCRIPT", () => { scriptKey = ""; renderDownload(app, root); },
-                    { id: "loadout-retry-script", hidden: true }))));
+                action("RETRY", () => { scriptKey = ""; renderDownload(app, root); },
+                    { id: "loadout-retry-script", hidden: true })),
+            el("div", { class: "loadout-download-status", role: "status", "aria-live": "polite" }),
+            el("div", { class: "loadout-preview-options" },
+                el("details", { class: "loadout-layout", hidden: true },
+                    el("summary", { text: "FOLDER LAYOUT" }),
+                    el("pre", { class: "code-box loadout-layout-text" })),
+                el("details", { class: "loadout-script-review" },
+                    el("summary", { text: "SCRIPT" }),
+                    el("pre", { class: "code-box loadout-script" })),
+                el("details", { class: "loadout-help-details" },
+                    el("summary", { text: "HELP" }),
+                    el("p", { class: "loadout-help", text: "Group models from the Index and download this collection on your computer. Use your ComfyUI models folder as the destination. Run the script where hf is installed. Existing files are preserved without validation. Model files on the server stay in place." })))));
     mount(root, el("div", { class: "scrim", onClick: () => app.closeDrawer() }, shell));
 }
 
 function memberRow(app, item) {
     const path = labeledField("DOWNLOAD PATH", `loadout-path-${encodeURIComponent(item.repo + ":" + item.path)}`);
-    const row = el("div", { class: `loadout-member ${roleClass(item.role)}` });
+    const row = el("details", { class: `loadout-member ${roleClass(item.role)}` });
     row.item = item;
     path.field.addEventListener("input", () => {
         if (path.field.value === row.item.destination) delete path.field.dataset.dirty;
+        updateMemberNotice(row);
         renderDownload(app, document.getElementById("drawer-root"));
     });
     mount(row,
-        el("div", { class: "loadout-member-head" }, el("span", { class: "role-mark" }),
+        el("summary", { class: "loadout-member-head" }, el("span", { class: "role-mark" }),
             el("span", { class: "loadout-member-name" }),
-            action("REMOVE", () => removeMember(app, row.item), { "aria-label": `Remove ${item.name} from loadout` })),
-        el("div", { class: "loadout-member-source mono-dim" }),
-        path.label, el("div", { class: "loadout-path-form" }, path.field,
-            action("SAVE PATH", () => savePath(app, row.item, path.field))));
+            el("span", { class: "loadout-member-unavailable", text: "UNAVAILABLE", hidden: true }),
+            el("span", { class: "loadout-member-size" })),
+        el("div", { class: "loadout-member-detail" },
+            el("div", { class: "loadout-member-source mono-dim" }),
+            path.label, el("div", { class: "loadout-path-form" }, path.field,
+                action("SAVE PATH", () => savePath(app, row.item, path.field))),
+            action("REMOVE", () => removeMember(app, row.item), { class: "btn loadout-action loadout-remove", "aria-label": `Remove ${item.name} from loadout` })));
     return row;
+}
+
+function updateMemberNotice(row) {
+    const dirty = !!row.querySelector("input").dataset.dirty;
+    const unavailable = row.item.resolution?.status !== "present";
+    const notice = row.querySelector(".loadout-member-unavailable");
+    notice.hidden = !dirty && !unavailable;
+    notice.classList.toggle("is-unsaved", dirty && !unavailable);
+    setText(notice, [dirty ? "UNSAVED" : "", unavailable ? "UNAVAILABLE" : ""].filter(Boolean).join(" · "));
 }
 
 function renderMembers(app, root, reset) {
@@ -291,10 +335,13 @@ function renderMembers(app, root, reset) {
         }
         row.item = item;
         setText(row.querySelector(".loadout-member-name"), item.name);
+        setText(row.querySelector(".loadout-member-size"), item.size_human);
+        row.querySelector("summary").title = `${item.name}\n${roleCode(item)} · ${item.repo}\nDownload: ${item.destination}`;
         setText(row.querySelector(".loadout-member-source"),
-            `${roleCode(item)} · ${item.repo} · ${item.size_human} · ${item.resolution?.status === "present" ? "available" : "unavailable"}`);
+            `${roleCode(item)} · ${item.repo} · ${item.size_human} · ${item.resolution?.status === "present" ? "available" : "unavailable"}\n${item.path}`);
         const field = row.querySelector("input");
         if (!field.dataset.dirty && field.value !== item.destination) field.value = item.destination;
+        updateMemberNotice(row);
         row.querySelectorAll("button").forEach(button => { button.disabled = app.state.loadoutBusy; });
     }
     for (const [key, row] of existing) if (!wanted.has(key)) row.remove();
@@ -329,7 +376,8 @@ export function renderDrawer(app) {
     if (reset) {
         delete name.dataset.dirty;
         app.state.loadoutDeleting = null;
-        if (doc && !root.querySelector("#loadout-new-name").value) root.querySelector(".loadout-create").open = false;
+        if (doc && !root.querySelector("#loadout-new-name").value) root.querySelector(".loadout-create").hidden = true;
+        root.querySelector(".loadout-rename").hidden = true;
     }
     if (!name.dataset.dirty && name.value !== (doc?.name || "")) name.value = doc?.name || "";
     const chooser = root.querySelector("#loadout-chooser");
@@ -344,13 +392,16 @@ export function renderDrawer(app) {
     }
     if (chooser.value !== (app.state.loadoutId || "")) chooser.value = app.state.loadoutId || "";
     chooser.disabled = app.state.loadoutBusy || app.state.loadoutLoading;
+    chooser.title = doc?.name || "Choose a loadout";
+    root.querySelector("#loadout-new").setAttribute("aria-expanded", String(!root.querySelector(".loadout-create").hidden));
+    root.querySelector("#loadout-rename").setAttribute("aria-expanded", String(!root.querySelector(".loadout-rename").hidden));
     root.querySelector(".loadout-editor").hidden = !doc;
     root.querySelector(".loadout-read-status").textContent = app.state.loadoutLoading ? "Reading loadout…" : "";
     root.querySelector(".loadout-error").textContent = app.state.loadoutError || "";
     root.querySelector("#loadout-read-retry").hidden = !app.state.loadoutError || !!doc;
     const pending = app.state.loadoutPendingModels?.length || 0;
     root.querySelector(".loadout-pending").hidden = !pending;
-    root.querySelector(".loadout-pending-label").textContent = `${pending} selected model${pending === 1 ? "" : "s"}. Choose a loadout, or create one below.`;
+    root.querySelector(".loadout-pending-label").textContent = `${pending} selected model${pending === 1 ? "" : "s"}`;
     renderMembers(app, root, reset);
     root.dataset.loadoutId = id;
     root.querySelectorAll(".loadout-action").forEach(button => { button.disabled = !!app.state.loadoutBusy; });
@@ -389,7 +440,7 @@ function renderDownload(app, root) {
     const dirty = !!root.querySelector(".loadout-member input[data-dirty]");
     const status = root.querySelector(".loadout-download-status");
     status.textContent = dirty ? "Save download path changes before copying a script." : scriptError || (scriptLoading ? "Preparing download script…" : scriptResult
-        ? "Ready to run on your computer. Existing files are skipped, not validated."
+        ? "Run on your computer · existing files are kept, not validated."
         : "Add models to prepare a download script.");
     status.classList.toggle("is-error", !!scriptError);
     setText(root.querySelector(".loadout-script"), scriptResult?.text || "");

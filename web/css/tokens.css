@@ -30,7 +30,7 @@
   --drawer: 520px;
   --table-min: 1010px;
   --shell-min: 1180px;
-  --table-cols: 54px minmax(0, 1fr) 100px 96px 62px 76px 84px 104px 92px;
+  --table-cols: 76px minmax(0, 1fr) 100px 96px 62px 76px 84px 104px 92px;
 
   --bg: oklch(0.955 0.006 85);
   --panel: oklch(0.985 0.004 85);
