@@ -6,8 +6,8 @@ allowed-tools: Read, Grep, Glob, Bash
 
 You are **read-only**. Change nothing: no edits, no commits, no `cargo fmt`, no fixes however
 small, and no new rows in `docs/reference/native-catalog.md` - a number you take goes in your report.
-Everything you write goes under the scratchpad directory the harness names in your system
-prompt. Finish by confirming `git status --short` is exactly what it was when you started.
+Keep transient reports in a unique task-owned system temporary directory. No harness-provided
+scratchpad is assumed; follow `CONTRIBUTING.md#temporary-work-and-cleanup`. Finish by confirming `git status --short` is exactly what it was when you started.
 
 Read `.claude/skills/hoard-catalog/SKILL.md` first; most findings here turn on a native_db or
 Tantivy semantic that is not visible in the calling code. When you need a number rather than

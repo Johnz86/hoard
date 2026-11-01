@@ -18,6 +18,11 @@ Enter or Space, to reveal its source and DOWNLOAD PATH relative to the client fo
 SAVE PATH changes that path, and REMOVE removes membership only. DELETE
 requires confirmation and leaves every original model file untouched.
 
+Adding from an Index result preserves that result's selected source copy. New download paths
+keep subfolders within recognized model categories, so `diffusion_models/moss/model.safetensors`
+stays separate from `diffusion_models/portrait/model.safetensors`. Existing saved download
+paths are never changed automatically. Collection search also matches members' source paths.
+
 In the download footer, set the destination to the client folder that should hold
 the collection. For ComfyUI this is its `models` folder. Keep these relative paths for the
 user-provided Qwen Image 2.1 example:

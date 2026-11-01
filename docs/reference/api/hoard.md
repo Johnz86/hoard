@@ -60,7 +60,13 @@ on the next request. Existing `rows`, `total`, `next_cursor` and `cursor` retain
 contract. RESOURCE role/format facets include Git, node counts include both kinds, and shared
 size/state/source queries apply consistently. `role:git` is presentation, not a stored Role.
 
-A row's `prefix` is what the UI prints in `--dim` before the name, so the repository a name
+A row includes `entry_id`, repository-relative `relative_path`, `source` and `display_name`.
+`name` remains the canonical content identity label. For loose single-file models,
+`display_name` is the selected relative path, including subfolders and local filename aliases.
+Repository models and shard sets retain their canonical display labels. Name sorting follows
+the displayed label. `path` remains the existing human-readable filesystem path.
+
+A row's `prefix` is what the UI prints in `--dim` before `display_name`, so the repository a name
 was chosen from is always on screen. It is derived in Rust from the row's qualified `repo`,
 never from `org`: it is `org/` when the name is the repository's own name, and
 `org/repository/` when the name is a path inside the repository or the artifact's own file
@@ -152,11 +158,23 @@ names; typing one more letter narrows the expansion back under the cap. The limi
 is that a word is matched from its start: a run from the middle of one unbroken word does not
 match, so `souls` finds `loxsSoulsMixPerfectDoll_v30` and `oulsmix` and `ulsMixPer` do not.
 
-A name, an org, a base, the trigger words and the tensor keys are matched from the start of a
+A filename alias, relative path, source, repository reference, canonical name, org, base,
+trigger words and tensor keys are matched from the start of a
 word this way. A revision's card is not: it is a field of its own, cut by the same tokenizer,
 and a free-text word is matched against it whole, so `wan 2.2` finds the Wan files and no
 card that says `want`, and a phrase is matched whole word for whole word in the card and as a
 phrase prefix in the name. A word matching either side answers the row.
+
+Path and alias matching runs over entry documents and collapses matching locations to one
+artifact. The selected row describes a matching location. On startup, older derived search
+schemas are rebuilt from catalog metadata; this does not rescan sources, rehash model files,
+change model identities or rewrite saved loadouts.
+
+Artifact detail and pull-command reads accept an optional `entry=e_N` query parameter.
+Repository detail/files/card/compat requests accept the same parameter alongside `artifact`.
+An explicit entry must belong to the requested artifact. Artifact reads refuse an invalid
+selection instead of silently falling back to another copy. Omitting it retains preferred-copy
+behavior. Entry listings include their `entry_id` and `relative_path` for location-aware callers.
 
 A row carries `shard_total`, how many files the set declared at scan time, `null` for a
 single file and for a set nothing declared a total for. `shard_count` counts the files
@@ -431,10 +449,14 @@ rest being counted.
 - `POST /api/v1/loadouts/{id}/members { "artifact_ids": [...] }` adds 1–1000 indexed
   models atomically. All roles append without replacing existing members; duplicate repo/path
   pairs are idempotent. The response is the resolved collection view.
+  Optional `entry_ids: { "a_N": "e_N" }` selects each requested model's source entry;
+  selections are validated against artifact ownership before saving the collection.
 - `POST /api/v1/loadouts/{id}/items { "artifact_id", "destination" }` adds one model;
   the optional destination is a portable path relative to the client root. The legacy
   `weight` and `on_second_host` keys are accepted, but role slots no longer replace or branch
   collections. The response retains `replaced: null` and a human-readable `notice`.
+  Optional `entry_id` selects the source copy. New default destinations preserve relative
+  subfolders inside recognized model categories. Existing saved destinations remain unchanged.
 - `PUT /api/v1/loadouts/{id}/items { "repo", "path", "destination" }` edits a member's
   client path without changing classification or the model file. Traversal, absolute paths,
   Windows reserved names and nonportable characters are rejected. `DELETE` on the same route

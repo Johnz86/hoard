@@ -74,20 +74,20 @@ export const search = (params) => get("/search", params);
 export const projects = (params) => get("/projects", params);
 export const parseQuery = (q) => get("/search/parse", { q });
 
-export const artifact = (id) => get(`/artifacts/${segment(id)}`);
+export const artifact = (id, entry) => get(`/artifacts/${segment(id)}`, { entry });
 export const artifactCompat = (id, limit) => get(`/artifacts/${segment(id)}/compat`, { limit });
-export const pullCommand = (id) => get(`/artifacts/${segment(id)}/pull-command`);
+export const pullCommand = (id, entry) => get(`/artifacts/${segment(id)}/pull-command`, { entry });
 export const confirmClassification = (id, body) => post(`/triage/${segment(id)}/confirm`, body);
 export const rejectClassification = (id) => post(`/triage/${segment(id)}/reject`);
 export const clearClassification = (id) => del(`/artifacts/${segment(id)}/override`);
 
-export const repo = (type, org, name, artifact) => get(repoBase(type, org, name), { artifact });
-export const repoFiles = (type, org, name, revision, artifact) =>
-    get(`${repoBase(type, org, name)}/files`, { revision, artifact });
-export const repoReadme = (type, org, name, revision, artifact) =>
-    get(`${repoBase(type, org, name)}/readme`, { revision, artifact });
-export const repoCompat = (type, org, name, revision, artifact) =>
-    get(`${repoBase(type, org, name)}/compat`, { revision, artifact });
+export const repo = (type, org, name, artifact, entry) => get(repoBase(type, org, name), { artifact, entry });
+export const repoFiles = (type, org, name, revision, selection = {}) =>
+    get(`${repoBase(type, org, name)}/files`, { revision, ...selection });
+export const repoReadme = (type, org, name, revision, selection = {}) =>
+    get(`${repoBase(type, org, name)}/readme`, { revision, ...selection });
+export const repoCompat = (type, org, name, revision, selection = {}) =>
+    get(`${repoBase(type, org, name)}/compat`, { revision, ...selection });
 export const repoUsage = (type, org, name) => get(`${repoBase(type, org, name)}/usage`);
 
 export const shelves = () => get("/shelves");
@@ -117,8 +117,12 @@ export const setup = () => get("/setup");
 export const saveSetup = (body) => put("/setup", body);
 
 
-export const addLoadoutMembers = (id, artifactIds) =>
-    post(`/loadouts/${segment(id)}/members`, { artifact_ids: artifactIds });
+export const addLoadoutMembers = (id, models) =>
+    post(`/loadouts/${segment(id)}/members`, {
+        artifact_ids: models.map(model => typeof model === "string" ? model : model.artifact_id),
+        entry_ids: Object.fromEntries(models.filter(model => model.entry_id)
+            .map(model => [model.artifact_id, model.entry_id]))
+    });
 export const editLoadoutMember = (id, item, destination) =>
     put(`/loadouts/${segment(id)}/items`, { repo: item.repo, path: item.path, destination });
 export const removeLoadoutMember = (id, item) =>

@@ -57,7 +57,7 @@ export function addToCollection(app, row) {
     const selected = app.state.selection.has(app.rowKey(row))
         ? app.state.rows.filter(item => item.artifact_id && app.state.selection.has(app.rowKey(item)))
         : [row];
-    app.state.loadoutPendingModels = [...new Set(selected.map(item => item.artifact_id))];
+    app.state.loadoutPendingModels = selected.map(({ artifact_id, entry_id }) => ({ artifact_id, entry_id }));
     app.openDrawer();
 }
 

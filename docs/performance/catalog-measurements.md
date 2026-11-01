@@ -12,8 +12,8 @@ are contextual observations rather than reproducible release evidence. Current s
 ## Memory verification, 2026-09-08
 
 Commit `51418ad` delivered **continuous hashing and metered index commits**. Its measurements
-exclude the later follow-ups, grouped discovery, and usage changes. The full memory redesign
-is not complete; these two improvements have attributable evidence and pass the measured gates.
+exclude the later follow-ups, grouped discovery, and usage changes. At that measured commit the broader redesign
+was incomplete; these two improvements had attributable evidence and passed its measured gates.
 
 The baseline is `bdf2964f954f2612c5a2a0ab4d33b9361aef8e00`. The selected production code
 recovers hashing and indexing from `fef969a`, with comment cleanup and constant relocation.
@@ -146,7 +146,8 @@ preservation of history, overrides, shelves, and pins. Usage rekeying, reindex c
 and writer changes are deferred; the linked-event fixture produced 1,954 refresh changes
 in both columns and does not establish a coalescing benefit. Delayed-writer/backpressure
 experiments were not completed, so no usage implementation is retained on their basis.
-Source-wide retirement bookkeeping and pending usage-batch memory remain unresolved.
+Source-wide retirement bookkeeping and usage-batch memory were unresolved at that measured
+revision. This historical result is not a statement of the current implementation or backlog.
 No user's catalog was opened by any experiment. Lost results from the first interrupted
 session are excluded. Temporary checkouts and generated data have been removed.
 

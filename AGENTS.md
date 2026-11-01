@@ -2,6 +2,13 @@
 
 This document provides guidelines for maintaining high-quality Rust code. These rules MUST be followed by all AI coding agents and contributors.
 
+## Project context
+
+Start with [CONTRIBUTING.md](CONTRIBUTING.md) and the [documentation index](docs/README.md).
+Current contracts and repeatable task entry points take precedence over historical reports,
+prototype screens and old plans. Preserve existing working-tree changes; temporary evidence
+and cleanup rules are in [Contributing](CONTRIBUTING.md#temporary-work-and-cleanup).
+
 ## Your Core Principles
 
 All code you write MUST be fully optimized.

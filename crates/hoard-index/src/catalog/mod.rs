@@ -238,7 +238,7 @@ impl Catalog {
             None => Self::scan_fresh(&directory, node, config, &mut progress)?,
         };
         let status = catalog.status()?;
-        if !status.search_built {
+        if !status.search_built || !catalog.search_schema_current()? {
             catalog.rebuild_search(|count| progress("building the search index", count))?;
         } else if status.pending_changes > 0 {
             catalog.refresh_search(|count| progress("refreshing the search index", count))?;

@@ -109,14 +109,15 @@ pub(crate) fn resolve(value: &str) -> Option<&'static str> {
     [HUB_REPO, GIT_CLONE, UNPLACED]
         .into_iter()
         .find(|label| label.eq_ignore_ascii_case(value))
-        .or_else(|| folder_of(value))
+        .or_else(|| model_directory(value))
 }
 
 fn folder_layout(folder: &str) -> &'static str {
-    folder_of(folder).unwrap_or(UNPLACED)
+    model_directory(folder).unwrap_or(UNPLACED)
 }
 
-fn folder_of(folder: &str) -> Option<&'static str> {
+/// The canonical model-category folder for a supported, case-insensitive spelling.
+pub fn model_directory(folder: &str) -> Option<&'static str> {
     LAYOUT_FOLDERS
         .iter()
         .find(|(spelling, _, _)| spelling.eq_ignore_ascii_case(folder))
@@ -126,6 +127,14 @@ fn folder_of(folder: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_directories_share_the_source_layout_aliases() {
+        assert_eq!(model_directory("Stable-diffusion"), Some("checkpoints"));
+        assert_eq!(model_directory("UNET"), Some("diffusion_models"));
+        assert_eq!(model_directory("clip"), Some("text_encoders"));
+        assert_eq!(model_directory("moss"), None);
+    }
 
     fn loose(folder: &str) -> &'static str {
         classify(Some(SourceKind::Loose), folder)

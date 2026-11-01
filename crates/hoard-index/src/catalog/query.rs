@@ -33,10 +33,6 @@ pub(super) struct QueryFields<'a> {
     pub(super) text: TextAnalyzer,
 }
 
-/// Whether answering this query needs one document per entry collapsed to its artifact, or
-/// whether primary documents alone carry every field it filters and orders on. Only `node`,
-/// `state`, `source`, `repo`, `rev` and `hash` vary between the entries of one artifact, and
-/// a `compat:` token joins them whenever its target resolves by repository.
 pub(super) fn needs_collapse(
     tokens: &[Token],
     context: &CompileContext,
@@ -71,7 +67,8 @@ fn filters_on_an_entry(tokens: &[Token], context: &CompileContext, depth: usize)
             | TokenKind::Source
             | TokenKind::Repo
             | TokenKind::Revision
-            | TokenKind::Hash => true,
+            | TokenKind::Hash
+            | TokenKind::Text => true,
             TokenKind::Shelf => shelf_filters_on_an_entry(token, context, depth)?,
             TokenKind::Compat => context
                 .compat
@@ -85,8 +82,7 @@ fn filters_on_an_entry(tokens: &[Token], context: &CompileContext, depth: usize)
             | TokenKind::Size
             | TokenKind::Used
             | TokenKind::Trigger
-            | TokenKind::Org
-            | TokenKind::Text => false,
+            | TokenKind::Org => false,
         };
         if entry_level {
             return Ok(true);

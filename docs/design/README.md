@@ -5,6 +5,7 @@ resources across disks and machines while keeping original files authoritative.
 
 - [Product scope](product-scope.md) defines supported workflows and limits.
 - [UI specification](ui-spec.md) defines current surfaces, spacing, typography and interactions.
+- [Loadout contract](loadouts.md) defines model collections, condensed editing and client acquisition.
 - [UI change workflow](../contributing/ui-changes.md) defines baseline and acceptance checks.
 - [Prototype references](prototypes/README.md) retain the original visual source files.
 

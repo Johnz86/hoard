@@ -261,13 +261,33 @@ impl Catalog {
     /// The artifact's preferred entry as a row: the highest availability preference, and on
     /// a tie the lowest entry id, which is what the search index also collapses to.
     pub fn artifact_row(&self, id: ArtifactId) -> Result<Option<SearchRow>> {
+        self.artifact_row_at(id, None)
+    }
+
+    /// Resolves a selected entry belonging to this artifact; an omitted entry selects the
+    /// preferred copy. An unknown entry or one belonging to another artifact returns none.
+    pub fn artifact_row_at(
+        &self,
+        id: ArtifactId,
+        selected: Option<EntryId>,
+    ) -> Result<Option<SearchRow>> {
         let snapshot = self.database.r_transaction()?;
         let names = self.node_names(&snapshot)?;
         let mut reader = Reader::new(&snapshot, &names);
         let Some(record) = reader.record(id.get())? else {
             return Ok(None);
         };
-        reader.row(&record)
+        match selected {
+            None => reader.row(&record),
+            Some(selected) => {
+                let entry: Option<Entry> = snapshot.get().primary(selected.get())?;
+                let Some(entry) = entry.filter(|entry| entry.artifact_id == Some(id.get())) else {
+                    return Ok(None);
+                };
+                let last_used = last_used_in(&snapshot, id.get())?;
+                reader.row_of(&record, &entry, last_used).map(Some)
+            }
+        }
     }
 
     /// The artifact one content hash names, through the grammar so a hash a caller typed is

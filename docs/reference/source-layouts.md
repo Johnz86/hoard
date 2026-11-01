@@ -46,5 +46,10 @@ Typed aliases resolve to the same canonical query value, so `layout:unet` select
 uses a separate marker classification: two distinctive neighboring folders identify a tool
 models root. Not every recognized category is distinctive enough to serve as that marker.
 
+Recognized ComfyUI and A1111 trees keep one repository per top-level category, including
+categories whose models all live in subfolders. Removing the last file directly inside a
+category does not reinterpret that category as a publisher or rename its repositories.
+Nested paths are preserved inside the category repository.
+
 Layout is useful placement evidence, not a replacement for tensor/header inference. Keep
 role, source kind, model family and layout separate in storage, search and presentation.

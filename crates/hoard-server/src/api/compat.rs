@@ -2,7 +2,7 @@ use jiff::Timestamp;
 use serde::Serialize;
 
 use hoard_core::{
-    ArtifactId, CompatRule, CompatSubject, RepoId, Role, State, compatible, format_size,
+    ArtifactId, CompatRule, CompatSubject, EntryId, RepoId, Role, State, compatible, format_size,
 };
 use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, QueryRequest};
@@ -25,6 +25,8 @@ const CANDIDATE_LIMIT: u32 = 1_000;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CompatRowView {
     pub artifact_id: ArtifactId,
+    pub entry_id: EntryId,
+    pub display_name: String,
     pub role: Role,
     pub role_code: String,
     pub org: Option<String>,
@@ -44,6 +46,8 @@ impl From<&SearchRow> for CompatRowView {
     fn from(row: &SearchRow) -> Self {
         Self {
             artifact_id: row.artifact_id,
+            entry_id: row.entry_id,
+            display_name: row.display_name().to_owned(),
             role: row.role,
             role_code: row.role.code().to_owned(),
             org: row.org.clone(),
@@ -55,7 +59,7 @@ impl From<&SearchRow> for CompatRowView {
             state: row.state,
             state_label: state_label(row.state, row.pull_progress, None),
             pull_progress: row.pull_progress,
-            prefix: row_prefix(&row.repo, &row.name),
+            prefix: row_prefix(&row.repo, row.display_name()),
         }
     }
 }

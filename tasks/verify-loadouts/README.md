@@ -27,6 +27,12 @@ cancels then confirms deletion while preserving model files. It checks related l
 detail, inline owner-access recovery, unsaved-path download blocking and saved PowerShell
 encoding. It captures both themes at 1180/1600px, including the shared Index in both densities,
 table/cards and inspector on/off, and checks overflow and download-button visibility.
+
+Path-consistency coverage uses two same-named models in different category subfolders and
+a renamed copy shared between sources. It verifies folder/alias discovery, displayed names
+and sorting, location-aware pull requests and repository reloads, adding the selected copy
+from detail, and real downloads into distinct nested client folders. Removing the last
+top-level model verifies stable category repositories and unchanged saved destinations.
 An additional collection of twenty distinct model fixtures measures collapsed row height
 and visible capacity at 1000/768/720px, tests native keyboard disclosure, compares input/button
 heights and checks the gap between the LOADOUT role and the next table column.
@@ -37,3 +43,8 @@ Successful runs print the evidence directory containing screenshots, a verificat
 download logs and server logs. Failed runs retain evidence for diagnosis. Run the broader
 [first-run journey](../verify-first-run/README.md), project acquisition verification and
 [Rust/release checks](../../CONTRIBUTING.md#verification) before handing off a UI change.
+
+Review retained evidence, then remove the printed temporary directory when diagnosis is
+complete. Preserve findings in the relevant contract or regression check rather than keeping
+old fixture catalogs and captures as development context. See the
+[cleanup policy](../../CONTRIBUTING.md#temporary-work-and-cleanup).

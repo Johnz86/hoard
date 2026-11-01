@@ -22,3 +22,5 @@ pub mod triage;
 pub mod watch;
 
 pub use error::{IndexError, Result};
+
+pub use layout::model_directory;

@@ -326,14 +326,14 @@ fn every_sort_key_orders_the_page_and_paging_is_stable() -> Result<()> {
         offset: 0,
         context: &context,
     })?;
-    let names: Vec<&str> = by_name.rows.iter().map(|row| row.name.as_str()).collect();
+    let names: Vec<&str> = by_name.rows.iter().map(SearchRow::display_name).collect();
     assert_eq!(
         names,
         [
-            "a-style.safetensors",
-            "b-style.safetensors",
-            "c-style.safetensors",
             "data.csv",
+            "loras/a-style.safetensors",
+            "loras/b-style.safetensors",
+            "loras/c-style.safetensors",
             "tiny.jsonl"
         ]
     );
@@ -433,7 +433,7 @@ fn a_boundary_absent_from_a_segment_maps_to_the_next_term() -> Result<()> {
         2,
         "the refresh commits the new artifact into a segment of its own"
     );
-    let mut held = catalog.sort_bounds(SortKey::Name, "middle.safetensors")?;
+    let mut held = catalog.sort_bounds(SortKey::Name, "loras/middle.safetensors")?;
     held.sort_unstable();
     assert_eq!(
         held,
@@ -447,7 +447,7 @@ fn a_boundary_absent_from_a_segment_maps_to_the_next_term() -> Result<()> {
         vec![(1, false, 1), (2, false, 2)],
         "a term above every term maps to the term count of each segment"
     );
-    let mut between = catalog.sort_bounds(SortKey::Name, "keep.safetensors")?;
+    let mut between = catalog.sort_bounds(SortKey::Name, "loras/keep.safetensors")?;
     between.sort_unstable();
     assert_eq!(
         between,

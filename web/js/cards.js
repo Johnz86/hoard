@@ -24,7 +24,7 @@ function card(app, item, index) {
                 text: stateText(item.state, item.pull_progress)
             })
         ),
-        el("div", { class: "card-name", text: item.name }),
+        el("div", { class: "card-name", text: item.display_name || item.name, title: `${item.prefix || ""}${item.display_name || item.name}` }),
         el("div", {
             class: "card-meta",
             text: item.loadout_id ? `${item.items} models · ${sizeText(item)} · ${item.node}`

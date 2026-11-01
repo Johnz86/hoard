@@ -31,6 +31,11 @@ functional behavior and visual/interaction consistency.
 - Keep typed form values, focus, confirmation, selection and scroll stable through polling
   and rerenders. Exercise navigation while requests are pending, not only after they finish.
   Cancel/Escape returns to a sensible control; returning from detail preserves loaded pages.
+- Test a pending save that finishes after its drawer closes or reopens. Update only the
+  original mounted editor, retain newer drafts and never focus detached controls.
+- Measure useful capacity with a populated collection and a short viewport. Closed model
+  rows stay condensed; details and edit/remove actions remain accessible by click and keyboard.
+  Compare adjacent input/button heights and role/name column gaps, not just screenshots.
 - Verify resource totals, facets and saved-shelf counts against the displayed list. Test
   mixed-resource ordering and pagination so resources cannot disappear, repeat or be skipped.
 - For removal, verify the visible action and the full lifecycle: persistent intent, queued
@@ -48,6 +53,9 @@ functional behavior and visual/interaction consistency.
   A clone advertisement or copied command does not prove that cloning works. If another
   reviewer or agent is involved, give them both the feature journey and the broader design
   contract so both kinds of acceptance are covered.
+- Exercise nested folders, duplicate basenames and renamed copies across sources. The label,
+  name sort, matched location, copied command, repository link and loadout destination must
+  describe the same selection. Preserve deliberate client-path edits during rescans.
 - Use synthetic fixtures, temporary catalogs and ephemeral loopback ports. Keep production
   services and live sources untouched. Limit build/hash/test concurrency on the shared
   machine, and stop only the processes created for verification.

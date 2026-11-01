@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 
@@ -8,8 +9,9 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use hoard_core::{
-    ArtifactId, DownloadPath, JobId, Loadout, LoadoutId, LoadoutPin, LoadoutSlot, LoadoutViolation,
-    PinResolution, RepoId, Role, State as ArtifactState, format_size, numbered_loadout_name,
+    ArtifactId, DownloadPath, EntryId, JobId, Loadout, LoadoutId, LoadoutPin, LoadoutSlot,
+    LoadoutViolation, PinResolution, RepoId, Role, State as ArtifactState, format_size,
+    numbered_loadout_name,
 };
 use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, JobProgress, LoadoutRecord, NewProjection};
@@ -17,7 +19,7 @@ use hoard_index::row::SearchRow;
 use hoard_net::identity::NodeIdentity;
 use hoard_net::{PullRequest, Puller, PullerConfig};
 
-use crate::api::artifacts::artifact_id;
+use crate::api::artifacts::{artifact_id, selected_row};
 use crate::api::common::{
     PullArtifact, authorize, blocking, hf_arguments, row_prefix, shell_quoted,
 };
@@ -183,6 +185,8 @@ pub enum CreateBody {
 pub struct ItemBody {
     pub artifact_id: String,
     #[serde(default)]
+    pub entry_id: Option<EntryId>,
+    #[serde(default)]
     pub weight: Option<f32>,
     #[serde(default)]
     pub destination: Option<DownloadPath>,
@@ -221,6 +225,7 @@ pub struct DeletedLoadout {
 struct Pinning {
     id: LoadoutId,
     artifact: ArtifactId,
+    entry: Option<EntryId>,
     weight: Option<f32>,
     destination: Option<DownloadPath>,
     node_name: String,
@@ -350,6 +355,7 @@ pub async fn add_item(
     let pinning = Pinning {
         id: loadout_id(&id)?,
         artifact: artifact_id(&body.artifact_id)?,
+        entry: body.entry_id,
         weight: body.weight,
         destination: body.destination,
         node_name: state.node_name().to_owned(),
@@ -362,6 +368,8 @@ pub async fn add_item(
 #[derive(Debug, Clone, Deserialize)]
 pub struct AddMembers {
     artifact_ids: Vec<String>,
+    #[serde(default)]
+    entry_ids: HashMap<ArtifactId, EntryId>,
 }
 
 pub async fn add_members(
@@ -390,7 +398,8 @@ pub async fn add_members(
             .map(|(_, pin)| (pin.repo.qualified(), pin.path.clone()))
             .collect();
         for artifact in ids {
-            let row = require_model_row(&catalog, artifact)?;
+            let row =
+                require_model_row(&catalog, artifact, body.entry_ids.get(&artifact).copied())?;
             if !held.insert((row.repo.clone(), row.path.clone())) {
                 continue;
             }
@@ -959,8 +968,12 @@ fn require_catalog_row(catalog: &Catalog, id: ArtifactId) -> Result<SearchRow, I
         .ok_or_else(|| IndexError::not_found("artifact", id.to_string()))
 }
 
-fn require_model_row(catalog: &Catalog, id: ArtifactId) -> Result<SearchRow, IndexError> {
-    let row = require_catalog_row(catalog, id)?;
+fn require_model_row(
+    catalog: &Catalog,
+    id: ArtifactId,
+    entry: Option<EntryId>,
+) -> Result<SearchRow, IndexError> {
+    let row = selected_row(catalog, id, entry)?;
     if row.role == Role::Ds {
         return Err(IndexError::Query(format!(
             "{} is a dataset and cannot be pinned to a model loadout",
@@ -1098,28 +1111,20 @@ fn item_of(
 }
 
 fn default_destination(pin: &LoadoutPin, role: Role) -> Result<DownloadPath, IndexError> {
-    let folders = [
-        "diffusion_models",
-        "unet",
-        "text_encoders",
-        "clip",
-        "vae",
-        "loras",
-        "checkpoints",
-        "controlnet",
-        "upscale_models",
-        "embeddings",
-        "clip_vision",
-    ];
-    let folder = pin
-        .path
-        .rsplit('/')
-        .skip(1)
-        .chain(std::iter::once(pin.repo.name()))
-        .find(|part| folders.contains(part));
-    let folder = match folder {
-        Some("unet") => "diffusion_models",
-        Some("clip") => "text_encoders",
+    let located = hoard_index::model_directory(pin.repo.name())
+        .map(|folder| (folder, pin.path.as_str()))
+        .or_else(|| {
+            let mut remaining = pin.path.as_str();
+            let mut located = None;
+            while let Some((folder, rest)) = remaining.split_once('/') {
+                if let Some(folder) = hoard_index::model_directory(folder) {
+                    located = Some((folder, rest));
+                }
+                remaining = rest;
+            }
+            located
+        });
+    let folder = match located.map(|(folder, _)| folder) {
         Some(folder) => folder,
         None => match role {
             Role::Llm => "llm",
@@ -1129,7 +1134,7 @@ fn default_destination(pin: &LoadoutPin, role: Role) -> Result<DownloadPath, Ind
     };
     Ok(DownloadPath::parse(&format!(
         "{folder}/{}",
-        file_name(&pin.path)
+        located.map_or_else(|| file_name(&pin.path), |(_, relative)| relative)
     ))?)
 }
 
@@ -1140,7 +1145,7 @@ fn pin_for(row: &SearchRow, repo: RepoId, slot: LoadoutSlot, weight: Option<f32>
     pin.role = Some(row.role);
     pin.sha = row.revision_sha;
     pin.sha256 = row.blob_sha256;
-    pin.name = Some(row.name.clone());
+    pin.name = Some(row.display_name().to_owned());
     pin.base = (!row.base.is_empty()).then(|| row.base.clone());
     match slot {
         FACTOR_SLOT => pin.factor = weight,
@@ -1152,12 +1157,12 @@ fn pin_for(row: &SearchRow, repo: RepoId, slot: LoadoutSlot, weight: Option<f32>
 /// Pins one row into a loadout, answering what the line displaced or which loadout it
 /// started. A line the loadout already holds is answered without a write.
 fn pin_into(catalog: &Catalog, pinning: Pinning) -> Result<PinnedView, IndexError> {
-    let row = require_model_row(catalog, pinning.artifact)?;
+    let row = require_model_row(catalog, pinning.artifact, pinning.entry)?;
     let mut document = stored(catalog, pinning.id)?.parse()?;
     let slot = LoadoutSlot::for_role(row.role).unwrap_or(LoadoutSlot::File);
     let repo = RepoId::parse_qualified(&row.repo)?;
     if document.holds_line(&repo, &row.path) {
-        let notice = format!("{} is already in {}", row.name, document.name);
+        let notice = format!("{} is already in {}", row.display_name(), document.name);
         return Ok(PinnedView {
             loadout: view_of(catalog, pinning.id, &pinning.node_name)?,
             replaced: None,
@@ -1171,7 +1176,7 @@ fn pin_into(catalog: &Catalog, pinning: Pinning) -> Result<PinnedView, IndexErro
     });
     document.add_file(row.role, pin);
     catalog.update_loadout(pinning.id, &document.to_toml()?)?;
-    let notice = format!("Added {} to {}", row.name, document.name);
+    let notice = format!("Added {} to {}", row.display_name(), document.name);
     Ok(PinnedView {
         loadout: view_of(catalog, pinning.id, &pinning.node_name)?,
         replaced: None,
@@ -1247,6 +1252,48 @@ mod tests {
 
     use super::*;
     use crate::testing::{RowFacts, search_row};
+
+    #[test]
+    fn default_client_paths_preserve_category_relative_folders_and_aliases() {
+        for (repository, path, expected) in [
+            (
+                "comfy/diffusion_models",
+                "moss/model.safetensors",
+                "diffusion_models/moss/model.safetensors",
+            ),
+            (
+                "comfy/diffusion_models",
+                "moss/vae/model.safetensors",
+                "diffusion_models/moss/vae/model.safetensors",
+            ),
+            (
+                "comfy/Stable-diffusion",
+                "portrait/model.safetensors",
+                "checkpoints/portrait/model.safetensors",
+            ),
+            (
+                "comfy/VAE",
+                "nested/model.safetensors",
+                "vae/nested/model.safetensors",
+            ),
+            (
+                "publisher/model",
+                "vae/nested/model.safetensors",
+                "vae/nested/model.safetensors",
+            ),
+        ] {
+            let pin = LoadoutPin::new(
+                RepoId::parse_ref(RepoType::Models, repository).expect("repo"),
+                path,
+            );
+            assert_eq!(
+                default_destination(&pin, Role::Ckpt)
+                    .expect("portable path")
+                    .as_str(),
+                expected
+            );
+        }
+    }
 
     fn row(node: &str, sha256: Option<Sha256>) -> SearchRow {
         search_row(RowFacts {

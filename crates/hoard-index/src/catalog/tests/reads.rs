@@ -1,6 +1,66 @@
 use super::*;
 
 #[test]
+fn path_search_resolves_aliases_without_duplicating_content() -> Result<()> {
+    let (_directory, catalog) = fixture()?;
+    let artifact = seeded_artifact(0x99, "canonical-model", None, seeded_facts());
+    let original = seeded_revision(
+        seeded_repo("publisher/canonical-model", RepoType::Models),
+        0x99,
+        vec![seeded_entry(
+            "weights.safetensors",
+            1024,
+            Some(artifact.clone()),
+        )],
+    );
+    let copy = seeded_revision(
+        SeedRepository {
+            source: "comfy".to_owned(),
+            kind: SourceKind::Loose,
+            tool_layout: Some("comfyui".to_owned()),
+            ..seeded_repo("comfy/diffusion_models", RepoType::Models)
+        },
+        0x98,
+        vec![seeded_entry(
+            "moss/local_alias.safetensors",
+            1024,
+            Some(artifact),
+        )],
+    );
+    catalog.seed(&[original, copy])?;
+    catalog.rebuild_search(|_| {})?;
+    let alias = search(&catalog, "local_alias")?;
+    assert_eq!(alias.total, 1);
+    let row = &alias.rows[0];
+    assert_eq!(row.path, "moss/local_alias.safetensors");
+    assert_eq!(row.name, "canonical-model");
+    for query in [
+        "moss",
+        "diffusion_models",
+        "source:comfy local_alias",
+        "moss/local_alias.safetensors",
+    ] {
+        let found = search(&catalog, query)?;
+        assert_eq!(found.total, 1, "{query}");
+        assert_eq!(found.rows[0].artifact_id, row.artifact_id);
+    }
+    assert_eq!(search(&catalog, "canonical-model")?.total, 1);
+    assert_eq!(
+        catalog
+            .artifact_row_at(row.artifact_id, Some(row.entry_id))?
+            .expect("selected row")
+            .path,
+        row.path
+    );
+    assert!(
+        catalog
+            .artifact_row_at(row.artifact_id, Some(EntryId::new(i64::MAX)))?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
 fn a_row_is_assembled_from_its_entry_and_artifact() -> Result<()> {
     let (_directory, catalog) = fixture()?;
     catalog.rebuild_search(|_| {})?;
@@ -56,10 +116,14 @@ fn the_grammar_sorts_facets_and_counts_like_the_index_screen() -> Result<()> {
     })?;
     assert_eq!(by_name.total, 3);
     assert_eq!(by_name.nodes, 1);
-    let names: Vec<&str> = by_name.rows.iter().map(|row| row.name.as_str()).collect();
+    let names: Vec<&str> = by_name.rows.iter().map(SearchRow::display_name).collect();
     assert_eq!(
         names,
-        ["a-style.safetensors", "b-style.safetensors", "data.csv"]
+        [
+            "data.csv",
+            "loras/a-style.safetensors",
+            "loras/b-style.safetensors"
+        ]
     );
     let roles: Vec<(&str, u64)> = by_name
         .facets

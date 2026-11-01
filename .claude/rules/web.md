@@ -20,3 +20,10 @@ paths:
   in `localStorage` inside try/catch.
 - All data comes from `/api/v1`; the UI never parses the query grammar or Markdown itself.
 - Fonts and CSS are served from the binary; no runtime requests to third-party hosts.
+
+- Render the server's `display_name` and retain `entry_id` through source-sensitive actions
+  and deep links. Canonical `name`, selected `relative_path` and client destination differ.
+- Keep collection rows condensed, with native disclosures for details and edits. Verify
+  capacity in short viewports, paired control heights and role/name column spacing.
+- Patch mounted editors and preserve drafts/focus/scroll; asynchronous completion must check
+  that the original editor still owns its controls after close/reopen.

@@ -16,42 +16,29 @@ the scratchpad and measures both runs back to back. Never compare a fresh run ag
 number already written in `docs/performance/catalog-measurements.md`; quote that number as history and say
 which machine and commit it came from.
 
-State the commit for every column. A table without commits is not reproducible. **Cite a
-commit that is on `master`**: a wave's per-task checkpoints are squashed away when it lands, so
-a hash from the wave branch names nothing afterwards. The before column is the gate commit; the
-after column is the wave commit itself, named by its subject until it has a hash.
+State a reachable source revision for every measured column. For an uncommitted candidate,
+record the base revision and patch/binary identity instead of inventing a future commit.
+Do not assume a branch name, checkpoint policy or squash workflow.
 
 ## Process hygiene while measuring
 
 - Every command in the foreground. Never start or leave a background process.
 - A server under test runs under `timeout` **in the same shell command** as the curls that
-  hit it, so it cannot outlive the measurement. Confirm with
-  `pgrep -af 'target/release/hoard'` afterwards and report that it found nothing.
+  hit it, or use a task harness that shuts down its owned processes. Verify those PIDs exited;
+  unrelated services may legitimately remain running.
 - Benchmarks and the scale harness run **one at a time, and nothing else runs beside them**.
   A `cargo build`, a `cargo test` or a second harness competing for the disk and the page
   cache voids the numbers. If you are reviewing while someone else measures, wait; if you are
   measuring, do every build before the first timed run.
 - Never set `RUSTFLAGS` and never `target-cpu=native`.
-- **This workstation is heterogeneous, and an unpinned latency reading carries a 1.68 factor
-  from core placement alone.** It has ten Cortex-X925 at 3.90 GHz on CPUs 5-9 and 15-19 and
-  ten Cortex-A725 at 2.81 GHz on CPUs 0-4 and 10-14. The scheduler places a run on either
-  class, so repeated unpinned readings of the same work are bimodal rather than noisy: at 1M
-  the same midpoint query measured 76.3 ms on the fast class and 127.9 ms on the slow one.
-  Two readings that differ by less than that factor are not a difference. **Pin a latency
-  comparison to one class** and say which:
-
-  ```sh
-  taskset -c 5-9,15-19 <the timed command>    # the ten Cortex-X925
-  taskset -c 0-4,10-14 <the timed command>    # the ten Cortex-A725
-  ```
-
-  This is what a concurrency reading of 632 ms at `0935fde` turned out to be: not a lock and
-  not bandwidth, but eight queries landing across both classes. The curve that settled it is
-  in `docs/performance/catalog-measurements.md` under "Query latency against concurrent thread count".
-- Everything temporary - synthetic trees, scratch clones, the before and after files - goes
-  under the scratchpad directory the harness names in your system prompt, never inside the
-  repository. Delete a large tree when you are done with it. `git status` must be clean when
-  you are done.
+- On heterogeneous hardware, record CPU topology and pin matched latency comparisons to
+  the same core class. Historical core-placement measurements live in
+  `docs/performance/catalog-measurements.md`; do not assume their CPU IDs, clock speeds or
+  ratios describe the current machine.
+- Keep synthetic trees, scratch clones, client caches and result files in unique task-owned
+  system temporary directories. No harness-provided scratchpad is assumed. Preserve compact,
+  dated evidence where requested, then clean owned resources using
+  `CONTRIBUTING.md#temporary-work-and-cleanup`. Preserve pre-existing working-tree changes.
 
 Use `tasks/benchmark-catalog/README.md` for the current entry point and isolation rules.
 

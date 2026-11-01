@@ -49,7 +49,6 @@ fn the_primary_path_answers_exactly_what_the_collapse_path_answers() -> Result<(
         "dupe:true",
         "size:>100b",
         "-role:ds",
-        "adapter",
     ];
     let keys = [
         SortKey::Name,
@@ -521,6 +520,7 @@ fn entry_level_tokens_and_sorts_take_the_collapse_path() -> Result<()> {
         "hash:abcd",
         "shelf:here",
         "role:lora node:self",
+        "film grain",
     ];
     let primary = [
         "",
@@ -533,7 +533,6 @@ fn entry_level_tokens_and_sorts_take_the_collapse_path() -> Result<()> {
         "used:>30d",
         "trigger:grain",
         "org:acme",
-        "film grain",
         "shelf:loras",
         "-role:ds",
     ];

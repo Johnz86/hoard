@@ -47,7 +47,7 @@ only and is cleared on reload. Browsing and downloading do not require that writ
 
 ## Find and review
 
-Open Index. Models and Git projects share the same table, cards and inspector. Click a row
+Open Index. Models, Git projects and loadouts share the same table, cards and inspector. Click a row
 for facts; double-click or press Enter to open it. Search for a project by name, committed
 README text or file path, or use `role:git` to show Git projects. A project does not need
 model files to appear.
@@ -64,6 +64,18 @@ Project details offer README, FILES and REFS. Follow relative documentation link
 text and choose a revision before copying a project link or clone command. Escape returns
 from a file preview to the file list, then to Index. A search with no matches offers
 **CLEAR SEARCH**; it does not restart setup or discard your folders.
+
+## Model paths and collections
+
+For loose model files, the Index shows the selected relative path, including folders such as
+`diffusion_models/moss/`. Search accepts folder names and local filename aliases as well as
+model names. Identical content stored under different names remains one model; the inspector
+lists its locations, and commands use the matching copy. Repository models retain their
+canonical model names. Add `source:comfy` or `repo:diffusion_models` to narrow a search.
+
+Loadouts are named collections of selected models across folders. Find one by name, by a
+member filename/path or through RELATED LOADOUTS on a model. The [collection guide](loadouts.md)
+explains creating, editing and downloading them into a receiving computer's model folder.
 
 ## Share from this node
 

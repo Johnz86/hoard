@@ -147,18 +147,18 @@ search bar above the rail is the one place a query is typed.
 ROLE rows show Checkpoint, ControlNet, Upscaler, Embedding, Dataset, Projector, and
 Unclassified in full; LoRA, VAE, and LLM keep their familiar acronyms. Clicking a row still
 uses its short search code, and the search bar accepts both short and full names.
-The proposal also shows a DISK PRESSURE mini bar chart with
-`311 GB reclaimable — 47 duplicate blobs`.
+DISK PRESSURE shows server-derived reclaimable bytes and duplicate counts; displayed
+values come from the current catalog.
 
 Results header (`--panel`): `N ARTIFACTS · M NODES · SORT KEY ↑` at left, view tabs
-TABLE / CARDS (TREE and DISK are listed in the proposal, not built) at right.
+TABLE / CARDS at right. TREE and DISK views are not implemented.
 
 Table (`min-width: 1010px`), sticky header, nine columns:
 
 | # | Header | Width | Align | Cell |
 | --- | --- | --- | --- | --- |
-| 1 | ROLE | 54px | left | 3x13px role color bar + 10px role code in `--muted` |
-| 2 | NAME | 1fr | left | the row's `prefix` in `--dim` then name in `--text`, ellipsis |
+| 1 | ROLE | 76px | left | 3x13px role color bar + 10px role code in `--muted` |
+| 2 | NAME | 1fr | left | the row's `prefix` in `--dim` then `display_name` in `--text`, ellipsis |
 | 3 | BASE | 100px | left | `--muted` |
 | 4 | FORMAT | 96px | left | `--muted` |
 | 5 | PREC | 62px | left | `--muted` |
@@ -208,6 +208,26 @@ Keep draft input, focus, text selection and inspector scroll through unrelated r
 Switching to another artifact starts a fresh review. Escape closes the review and focuses its
 summary; Enter/Space on summaries retain native behavior. Classification requires the same
 node write token as other catalog changes.
+
+## Model paths and identity
+
+The Index retains content-based model identity while displaying the selected loose file's
+repository-relative path, including subfolders. Repository model names and shard-set labels
+remain canonical. Name sorting uses the same label the row shows. Tooltips expose the full
+label without expanding condensed rows; cards and compatibility lists use the same label.
+Search matches relative paths, every indexed filename alias, source and repository names.
+Matching entries collapse to one artifact; the displayed path is a matching location.
+
+The selected entry travels through inspector reads, repository deep links, copied pull
+commands and loadout additions. An explicitly missing or mismatched entry is refused rather
+than silently selecting another copy. Older requests without a location use the preferred copy.
+New collection destinations preserve subfolders under known model categories. Saved paths
+remain explicit and unchanged. Recognized ComfyUI/A1111 category repositories stay stable
+when all their weights are nested in subfolders.
+
+Verification covers nested-only categories, same-name models in separate folders, renamed
+duplicate content, filtered-source actions, selected-entry validation, sorting/pagination,
+saved-path preservation and upgrading an existing derived search index without a rescan.
 
 ## Sources view
 
@@ -353,8 +373,7 @@ its stable drawer; `#/loadout/<id>` supports reload and sharing.
 
 The toolbar LOADOUTS button opens a chooser. ADD TO LOADOUT or L opens that chooser for the
 current or selected models; choose a collection and confirm ADD, or CREATE
-one with a name. Models append without role-slot replacement. The editor provides explicit
-RENAME reveals a SAVE/CANCEL editor. Each model defaults to one condensed disclosure row;
+one with a name. Models append without role-slot replacement. RENAME reveals a SAVE/CANCEL editor. Each model defaults to one condensed disclosure row;
 its filename and size stay visible, while source details, SAVE PATH and REMOVE expand on
 click or keyboard activation. Full filename and destination are available in its tooltip.
 The picker and NEW share one row; count, bytes, RENAME and DELETE share the management strip.
@@ -387,8 +406,7 @@ Global: `Esc` blurs the search field, else closes the drawer, else leaves detail
 
 Index: `j`/`↓` and `k`/`↑` move the cursor (clamped), `Enter` opens, `Space` toggles
 selection, `L` opens the collection chooser for the cursor model or selected models,
-`Y` yanks the pull command (or opens a collection's download controls), `?` shows the key sheet (proposal
-footer).
+`Y` yanks the pull command (or opens a collection's download controls), `?` shows the key sheet.
 
 Detail: `[` and `]` cycle FILES, REFS, CARD, COMPAT, USAGE; `L` opens the collection chooser for the opened file and adds it to
 a chosen collection; `Esc` returns to the index.
@@ -403,36 +421,14 @@ query, shelf click replaces the query, column header click sorts, tab click swit
 
 ## Query grammar
 
-Tokenizer: split on whitespace, quoted strings kept whole (`trigger:"film grain"`).
-`key:value` when a colon is present, otherwise free text. Leading `-` negates a token.
-Leading `~` forces fuzzy matching over everything indexed. Comma inside a value is OR.
+The [Hoard search API](../reference/api/hoard.md#search) owns grammar, aliases and matching
+semantics. The UI renders the server's parsed tokens, warnings and facet/shelf counts; it
+never implements another query parser. Free text includes model paths and filename aliases,
+while Git projects also search their indexed file paths and committed documentation.
 
-| Key | Semantics |
-| --- | --- |
-| `role:` | alias table: checkpoint/ckpt/base/model/complete/cmp/backbone/bb, lora/lycoris/locon/adapter/ip-adapter/ipa, controlnet/ctrl/control/motion, upscaler/upsc/upscale/esrgan, vae, embedding/emb/textualinversion, llm/language model/text, dataset/ds/data, proj/projector/mmproj/vision-projector, ?/unknown/unclassified/triage |
-| `base:` | architecture family, compared with spaces and dots stripped (`sdxl`, `sd15`, `flux`, `wan`, `llama`, `qwen`) |
-| `fmt:` / `format:` | container: safetensors, gguf, diffusers, pth, pt, parquet, jsonl.gz |
-| `prec:` / `precision:` | fp16, bf16, fp32, fp8, int8, nvfp4, nf4, q4_k_m, q8_0, ... |
-| `node:` | which machine holds the bytes |
-| `layout:` | the ComfyUI or A1111 folder the entry's repository was filed under (`checkpoints`, `diffusion_models`, `text_encoders`, `loras`, `controlnet`, `vae`, `upscale_models`, ...), or `hub repo`, `git clone`, `(unplaced)`; folds a folder spelling onto its canonical layout the way `role:` folds its aliases |
-| `state:` | served, local, pulling, stale, remote, triage |
-| `rev:` / `tag:` | revision, branch or tag name |
-| `dupe:true` | blobs whose bytes exist as more than one file |
-| `compat:<repo>` | directional compatibility against that repo |
-| `size:<400mb` / `size:>10gb` | comparison with kb/mb/gb/tb units, default mb |
-| `used:>30d` | last access age (proposal) |
-| `trigger:"phrase"` | exact phrase in trigger words or model card (proposal) |
-| free text | word-prefix match over name, org, base, trigger words, tensor keys and the card; `~` for fuzzy |
-
-Facets compute their counts with their own key removed from the query so a click never
-produces zero. Shelves in the prototype: `triage queue` = `role:?`, `sdxl · lora · small` =
-`role:lora base:sdxl size:<400mb`, `flux workhorse` = `base:flux`, `quantised llm` =
-`role:llm fmt:gguf`, `cold + duplicate` = `dupe:true`, `everything on laptop` =
-`node:laptop`, in that order.
-
-The SHELVES dropdown lists them in the same order, with name, query, and count. COUNT is
-the shelf's own count, shown as `—` when the shelf was not counted. Only a user-created
-shelf carries the remove button.
+Facet counts exclude their own active key, and clicks use the server-provided token/query.
+Saved shelves use the same grammar and count distinct resources. Built-in shelves come from
+the catalog; user-created shelves can be added and removed through the existing controls.
 
 ## Compatibility rule
 

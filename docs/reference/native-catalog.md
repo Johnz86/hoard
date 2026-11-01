@@ -17,10 +17,15 @@ Git-project search adds no persisted record or format bump. `Catalog::git_reposi
 `repository_by_id` expose existing source/repository metadata. The server builds a transient
 `hoard_index::projects::ProjectIndex` over names, paths and bounded committed README text,
 streams documents into a single in-memory Tantivy writer, and shares the resulting immutable
-index between readers. A finished scan invalidates that cache. Artifact search and its
-published on-disk Tantivy directory keep their existing layout and counters.
+index between readers. A finished scan invalidates that cache. Project search does not
+change the persisted artifact catalog or its search counters.
 
 The [compatibility policy](../../CLAUDE.md#compatibility) defines persisted-format changes.
+
+Derived search schemas have a separate lifecycle. `Catalog::open_or_scan` compares the
+published Tantivy schema with `Fields::build()` and rebuilds a mismatch from catalog metadata.
+This preserves source records, user-maintained state, hashes and allocated IDs; it is not a
+catalog format bump or source rescan. See [search-schema upgrades](../operations/deployment.md#search-schema-upgrades).
 
 ## Layout
 
@@ -550,16 +555,18 @@ one-document-per-artifact proposal missed: `node:laptop AND state:local` must ma
 satisfying both predicates, and the preferred row must be chosen from the entries that
 matched rather than fixed before filtering.
 
-A document writes the artifact's name, org, base, trigger words and tensor keys into `text`
-and the revision's card, when the card covers the entry, into `card`. Both fields are cut by
+A document writes the canonical name, entry-relative path, source and repository names, org,
+base, trigger words and tensor keys into the word-prefix field (`Fields::text`, currently
+`path_text_v1`). The revision's card, when it covers the entry, goes into `card`. Both fields are cut by
 the `hoard_words` tokenizer, so one analyzer serves both sides of a query; they are separate
-fields because a free-text word is matched from its start against `text` and whole against
+fields because a free-text word is matched from its start against the path/name field and whole against
 `card`, which is what keeps `wan` from finding a card that says `want`.
 
 One document per artifact carries a `primary` mark: the entry a row would be assembled from,
-which is the highest availability preference and on a tie the lowest entry id. A query that
-filters and sorts only on fields every entry of an artifact agrees on is intersected with
-that mark and needs no collapse.
+which is the highest availability preference and on a tie the lowest entry id. Queries
+without entry-sensitive filters use that mark unless sorting on revision, node or state.
+Name sorting alone can use the mark: its name column already describes the preferred copy's
+display label. Free text uses matching entries instead because paths and aliases can differ.
 
 A query that does collapse walks every matching entry document instead, and folds them as it
 goes. The documents of one artifact are added as one writer group, which tantivy flushes into
@@ -608,7 +615,8 @@ far end is cut from the reversed order, so the deepest window a rank selection s
 the match.
 
 A query naming `node`, `state`, `source`, `repo`, `rev` or `hash`, or sorting on revision,
-node or state, still collapses, because those fields differ between the entries of one
+node or state, still collapses. Free text also collapses: relative paths and filename aliases
+can differ between copies. These fields differ between the entries of one
 artifact. It runs the same selections over folded rows, so its memory is the page and the
 sample exactly as the primary path's is; the fold costs one open row per segment.
 
@@ -662,7 +670,14 @@ never invents one, and the candidate set is bounded, so the searches one query p
 rail do not grow with the number of bases the catalog holds. A collapsed query counts a
 bucket by folding the artifact id alone, with no tallies and no row.
 
-Free text indexes names, organizations, bases, triggers, tensor key prefixes and the body of
+Name sorting uses the selected loose file's relative path, while repository models and shard
+sets retain canonical labels. `SearchRow::display_name` and the search sort column follow
+the same rule. The API carries canonical `name` separately from `display_name`, `relative_path`
+and `entry_id`. `Catalog::artifact_row_at` validates entry ownership; explicit location-aware
+reads and actions must not silently return another copy.
+
+Free text indexes relative paths, filename aliases, sources, repositories, canonical names,
+organizations, bases, triggers, tensor key prefixes and the body of
 the shallowest README in each revision, into the entries that README's directory covers.
 Tantivy uses one writer thread with a 32 MiB indexing budget; nothing larger than a unit is
 held in memory or in an open transaction.

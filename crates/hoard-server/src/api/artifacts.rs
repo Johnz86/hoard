@@ -6,16 +6,16 @@ use axum::http::HeaderMap;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use hoard_core::{ArtifactId, Base, Evidence, RepoId, Role, Sha256, SubRole, format_size};
+use hoard_core::{ArtifactId, Base, EntryId, Evidence, RepoId, Role, Sha256, SubRole, format_size};
 use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, EntryDetail, Listed};
 use hoard_index::config::SourceKind;
 use hoard_index::row::SearchRow;
 
 use crate::api::common::{
-    EntryView, Fact, PLUGS_INTO_LIMIT, PullArtifact, PullCommands, PullSubject, RowView, authorize,
-    blocking, clamp_limit, companion_of, companion_role, entry_views, facts, is_category_bin,
-    pull_commands, shown_path,
+    EntrySelection, EntryView, Fact, PLUGS_INTO_LIMIT, PullArtifact, PullCommands, PullSubject,
+    RowView, authorize, blocking, clamp_limit, companion_of, companion_role, entry_views, facts,
+    is_category_bin, pull_commands, shown_path,
 };
 use crate::api::compat::{CompatRowView, CompatView, compat_for};
 use crate::error::{ApiError, ApiResult};
@@ -141,12 +141,13 @@ struct Inspection {
 pub async fn detail(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(selection): Query<EntrySelection>,
 ) -> ApiResult<Json<ArtifactView>> {
     let id = artifact_id(&id)?;
     let host = state.node_name().to_owned();
     let now = Timestamp::now();
     let catalog = Arc::clone(state.catalog());
-    let inspected = blocking(move || inspect(&catalog, id, now)).await?;
+    let inspected = blocking(move || inspect(&catalog, id, selection.entry, now)).await?;
     let loadouts = crate::api::loadout_search::related(&state, id).await?;
     Ok(Json(ArtifactView {
         loadouts,
@@ -161,8 +162,13 @@ pub async fn detail(
     }))
 }
 
-fn inspect(catalog: &Catalog, id: ArtifactId, now: Timestamp) -> Result<Inspection, IndexError> {
-    let row = require_row(catalog, id)?;
+fn inspect(
+    catalog: &Catalog,
+    id: ArtifactId,
+    entry: Option<EntryId>,
+    now: Timestamp,
+) -> Result<Inspection, IndexError> {
+    let row = selected_row(catalog, id, entry)?;
     let plugs = compat_for(catalog, &row, PLUGS_INTO_LIMIT, now)?;
     let usage = catalog.artifact_usage(id)?;
     let detail = catalog.artifact_detail(id)?;
@@ -204,11 +210,12 @@ pub async fn compat(
 pub async fn pull_command(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(selection): Query<EntrySelection>,
 ) -> ApiResult<Json<PullCommands>> {
     let id = artifact_id(&id)?;
     let catalog = Arc::clone(state.catalog());
     let subject = blocking(move || {
-        let row = require_row(&catalog, id)?;
+        let row = selected_row(&catalog, id, selection.entry)?;
         let repo = RepoId::parse_qualified(&row.repo)?;
         let record = catalog.repository(&repo)?;
         let rows = match (&record, companion_role(row.role)) {
@@ -328,9 +335,20 @@ pub async fn blob_detail(
 /// The artifact one identity names, or the 404 the routes answer with when the catalog
 /// holds no such row.
 fn require_row(catalog: &Catalog, id: ArtifactId) -> Result<SearchRow, IndexError> {
+    selected_row(catalog, id, None)
+}
+
+pub(crate) fn selected_row(
+    catalog: &Catalog,
+    id: ArtifactId,
+    entry: Option<EntryId>,
+) -> Result<SearchRow, IndexError> {
     catalog
-        .artifact_row(id)?
-        .ok_or_else(|| IndexError::not_found("artifact", id.to_string()))
+        .artifact_row_at(id, entry)?
+        .ok_or_else(|| match entry {
+            Some(entry) => IndexError::not_found("artifact entry", format!("{id}/{entry}")),
+            None => IndexError::not_found("artifact", id.to_string()),
+        })
 }
 
 /// Reads `a_17` or a bare row id out of a path segment.

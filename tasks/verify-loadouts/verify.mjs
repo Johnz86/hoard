@@ -161,8 +161,8 @@ try {
     assert.equal(doc.items.length,4);
     assert.equal(doc.items.filter(item=>item.role==='llm').length,2);
     for(const item of doc.items){
-        const folder=names.find(([,name])=>name===item.name)[0].split('/')[0];
-        assert.equal(item.destination,folder+'/'+item.name);
+        const [folder,name]=names.find(([,name])=>name===item.path.split('/').at(-1));
+        assert.equal(item.destination,folder+'/'+name);
     }
     assert(!(await evaluate('!!document.querySelector(".drawer-apply")')));
     await evaluate('document.querySelector("#loadout-rename").click();document.querySelector(".loadout-member").open=true;document.querySelector(".drawer-body").style.maxHeight="200px";window.collectionShell=document.querySelector(".drawer");window.collectionInput=document.querySelector("#loadout-name");window.pathInput=document.querySelector(".loadout-member input");window.pathDraft="diffusion_models/unsaved.safetensors";window.pathInput.value=window.pathDraft;window.pathInput.dispatchEvent(new Event("input"));window.pathInput.focus();window.pathInput.setSelectionRange(2,8);document.querySelector(".drawer-body").scrollTop=80;window.collectionScroll=document.querySelector(".drawer-body").scrollTop');
@@ -190,13 +190,13 @@ try {
     await wait('!document.querySelector("#loadout-copy").disabled');
     const script=await readApi('/loadouts/'+collection.id+'/download?'+new URLSearchParams({format:'shell',root:clientRoot}));
     const scriptPath=join(scratch,'download.sh');await writeFile(scriptPath,script.text);
-    const runScript=async()=>{
-        const output=await new Promise((resolve,reject)=>{const child=spawn('sh',[scriptPath],{env:{...env,HF_HUB_DISABLE_TELEMETRY:'1',HF_DEBUG:'1'},stdio:['ignore','pipe','pipe']});let log='';child.stdout.on('data',d=>log+=d);child.stderr.on('data',d=>log+=d);child.on('error',reject);child.on('exit',code=>resolve({code,log}));});
+    const runScript=async(scriptFile=scriptPath)=>{
+        const output=await new Promise((resolve,reject)=>{const child=spawn('sh',[scriptFile],{env:{...env,HF_HUB_DISABLE_TELEMETRY:'1',HF_DEBUG:'1'},stdio:['ignore','pipe','pipe']});let log='';child.stdout.on('data',d=>log+=d);child.stderr.on('data',d=>log+=d);child.on('error',reject);child.on('exit',code=>resolve({code,log}));});
         await writeFile(join(scratch,'download-attempt.log'),output.log);
         assert.equal(output.code,0,output.log);return output.log;
     };
     const downloadLog=await runScript();await writeFile(join(scratch,'download.log'),downloadLog);
-    for(const item of doc.items)assert.deepEqual(await readFile(join(clientRoot,item.destination)),fixtures.get(item.name));
+    for(const item of doc.items)assert.deepEqual(await readFile(join(clientRoot,item.destination)),fixtures.get(item.path.split('/').at(-1)));
     await assert.rejects(access(join(clientRoot,'unrelated.safetensors')));
     await writeFile(join(clientRoot,doc.items[0].destination),'existing client model');
     const repeatLog=await runScript();assert(repeatLog.includes('Preserved existing file'));
@@ -232,7 +232,7 @@ try {
     assert(savedBytes,'downloaded PowerShell script missing');
     assert.deepEqual(savedBytes.subarray(0,3),Buffer.from([0xef,0xbb,0xbf]));
     assert.equal(savedBytes.subarray(3).toString('utf8'),savedScript.text);
-    await evaluate('document.querySelectorAll(".loadout-member").forEach(row=>row.open=row.item.name.startsWith("qwen3.5_9b"));document.querySelector(".drawer-body").scrollTop=0');
+    await evaluate('document.querySelectorAll(".loadout-member").forEach(row=>row.open=row.item.name.includes("qwen3.5_9b"));document.querySelector(".drawer-body").scrollTop=0');
     assert(await evaluate('document.querySelector(".loadout-member[open] .loadout-member-source").textContent.includes("nested/qwen3.5_9b")'));
     await screenshot('collection-model-expanded');
     await evaluate('document.querySelectorAll(".loadout-member").forEach(row=>row.open=false)');
@@ -348,8 +348,83 @@ try {
     await wait('!document.querySelector("#view-index .related-loadout")');
     assert.deepEqual((await readApi("/artifacts/"+ids[0])).loadouts,[]);
     for(const [folder,name] of names)assert.deepEqual(await readFile(join(fixtureRoot,folder,name)),fixtures.get(name));
+    const originalAudit=join(scratch,'original-audit');await mkdir(originalAudit);
+    const aliasBytes=Buffer.from(fixtures.values().next().value);aliasBytes[aliasBytes.length-1]=94;
+    await writeFile(join(originalAudit,'a_original.safetensors'),aliasBytes);
+    await writeApi('/sources',{name:'original-audit',path:originalAudit,kind:'loose'});
+    let originalRow;
+    for(let i=0;i<150;i++){originalRow=(await readApi('/search?q=source:original-audit')).resources[0];if(originalRow)break;await pause(100);}
+    assert(originalRow);
+    const auditRoot=join(scratch,'path-audit-models');
+    for(const folder of ['loras','vae','text_encoders','diffusion_models/moss','diffusion_models/portrait'])await mkdir(join(auditRoot,folder),{recursive:true});
+    await writeFile(join(auditRoot,'text_encoders/clip_alias_path_audit.safetensors'),aliasBytes);
+    const auditFiles=new Map();
+    for(const [index,path] of ['diffusion_models/moss/model.safetensors','diffusion_models/portrait/model.safetensors','diffusion_models/anchor.safetensors'].entries()){
+        const bytes=Buffer.from(aliasBytes);bytes[bytes.length-1]=index+95;auditFiles.set(path,bytes);await writeFile(join(auditRoot,path),bytes);
+    }
+    await writeApi('/sources',{name:'paths-audit',path:auditRoot,kind:'loose'});
+    let auditRows=[];
+    for(let i=0;i<150;i++){auditRows=(await readApi('/search?q=source:paths-audit')).resources;if(auditRows.length===4)break;await pause(100);}
+    assert.equal(auditRows.length,4);
+    const alias=(await readApi('/search?q=source:paths-audit%20clip_alias_path_audit')).resources[0];
+    assert.equal(alias.artifact_id,originalRow.artifact_id);
+    assert.equal(alias.display_name,'clip_alias_path_audit.safetensors');
+    assert.equal(alias.relative_path,'clip_alias_path_audit.safetensors');
+    assert.equal(alias.name,'a_original.safetensors');
+    await navigate('/index?q='+encodeURIComponent('source:paths-audit clip_alias_path_audit'));
+    await wait('document.querySelectorAll(".trow").length===1&&document.querySelector(".trow .cell-name").textContent.includes("clip_alias_path_audit")');
+    await screenshot('path-audit-alias-inspector');
+    await wait('!!document.querySelector("#add-to-loadout")');
+    await evaluate('window.auditFetch=window.fetch;window.auditPull="";window.fetch=(input,options)=>{if(String(input).includes("/pull-command"))window.auditPull=String(input);return window.auditFetch(input,options)};[...document.querySelectorAll(".inspector-actions button")].find(button=>button.textContent.includes("YANK")).click()');
+    await wait('window.auditPull.includes("entry=")');
+    assert.equal(new URL(await evaluate('window.auditPull'),origin).searchParams.get('entry'),alias.entry_id);
+    await evaluate('window.fetch=window.auditFetch;document.querySelector(".trow").dispatchEvent(new MouseEvent("dblclick",{bubbles:true}))');
+    await wait('document.querySelector(".file-row.is-opened")?.textContent.includes("clip_alias_path_audit")');
+    assert.equal(new URLSearchParams((await evaluate('location.hash')).split('?')[1]).get('entry'),alias.entry_id);
+    await send('Page.reload');
+    await wait('document.querySelector(".file-row.is-opened")?.textContent.includes("clip_alias_path_audit")');
+    assert((await evaluate('document.querySelector(".detail-rail").textContent')).includes('paths-audit/text_encoders'));
+    await evaluate('document.querySelector(".detail-head .btn:not(.btn-back)").click()');
+    await wait('!!document.querySelector("#loadout-new-name")');
+    await evaluate('document.querySelector(".loadout-owner [name=owner_token]").value="synthetic-owner-token";document.querySelector(".loadout-owner form").requestSubmit();document.querySelector("#loadout-new-name").value="Selected local alias";document.querySelector(".drawer-new button").click()');
+    await wait('document.querySelectorAll(".loadout-member").length===1&&!document.querySelector("#loadout-copy").disabled');
+    const aliasCollection=(await readApi('/loadouts')).find(row=>row.name==='Selected local alias');
+    const aliasDocument=await readApi('/loadouts/'+aliasCollection.id);
+    assert.equal(aliasDocument.items[0].repo,'models/paths-audit/text_encoders');
+    assert.equal(aliasDocument.items[0].path,'clip_alias_path_audit.safetensors');
+    await evaluate('document.querySelector("#loadout-close").click()');
+    await navigate('/index?q='+encodeURIComponent('source:paths-audit repo:diffusion_models'));
+    await wait('document.querySelectorAll(".trow").length===3');
+    const shown=await evaluate('[...document.querySelectorAll(".trow .cell-name")].map(row=>row.textContent)');
+    assert(shown.some(name=>name.endsWith('moss/model.safetensors')));
+    assert(shown.some(name=>name.endsWith('portrait/model.safetensors')));
+    assert.deepEqual(shown,[...shown].sort());
+    await screenshot('path-audit-nested-index');
+    await evaluate('document.querySelectorAll(".trow").forEach(row=>{if(row.textContent.includes("moss/model")||row.textContent.includes("portrait/model")){row.click();window.dispatchEvent(new KeyboardEvent("keydown",{key:" ",bubbles:true}))}});document.querySelector("#add-to-loadout").click()');
+    await wait('document.querySelector(".loadout-pending-label")?.textContent.includes("2 selected")');
+    await evaluate('document.querySelector("#loadout-new").click();document.querySelector("#loadout-new-name").value="Nested path collection";document.querySelector(".drawer-new button").click()');
+    await wait('document.querySelectorAll(".loadout-member").length===2&&!document.querySelector("#loadout-copy").disabled');
+    await screenshot('path-audit-collection');
+    const nestedCollection=(await readApi('/loadouts')).find(row=>row.name==='Nested path collection');
+    const nestedDocument=await readApi('/loadouts/'+nestedCollection.id);
+    assert.equal(new Set(nestedDocument.items.map(row=>row.destination)).size,2);
+    const auditClient=join(scratch,'nested-client-models');
+    const auditScript=await readApi('/loadouts/'+nestedCollection.id+'/download?'+new URLSearchParams({format:'shell',root:auditClient}));
+    const auditScriptFile=join(scratch,'nested-download.sh');await writeFile(auditScriptFile,auditScript.text);
+    await writeFile(join(scratch,'nested-download.log'),await runScript(auditScriptFile));
+    for(const item of nestedDocument.items)assert.deepEqual(await readFile(join(auditClient,item.destination)),auditFiles.get(item.destination));
+    await assert.rejects(access(join(auditClient,'diffusion_models/model.safetensors')));
+    await unlink(join(auditRoot,'diffusion_models/anchor.safetensors'));
+    const rescan=await writeApi('/scan',{source:'paths-audit',hash:'now'});
+    for(let i=0;i<150;i++){if((await readApi('/jobs/'+rescan.job_id)).finished)break;await pause(100);}
+    const retained=(await readApi('/search?q=source:paths-audit%20repo:diffusion_models')).resources;
+    assert.equal(retained.length,2);assert(retained.every(row=>row.repo==='models/paths-audit/diffusion_models'));
+    assert.deepEqual((await readApi('/loadouts/'+nestedCollection.id)).items.map(row=>row.destination),nestedDocument.items.map(row=>row.destination));
+    await evaluate('document.querySelector("#loadout-close").click()');
+    await writeApi('/loadouts/'+nestedCollection.id,undefined,'DELETE');
+    await writeApi('/loadouts/'+aliasCollection.id,undefined,'DELETE');
     assert.equal(exceptions.length,0,JSON.stringify(exceptions));
-    await writeFile(join(scratch,'verification.json'),JSON.stringify({passed:true,screenshots,checks:['four-file-Qwen-collection','twenty-model-condensed-capacity','collapsed-unsaved-path-notice','pending-rename-close-recovery','native-keyboard-disclosure','matching-control-heights','loadout-role-column-gap','two-encoders-retained','multi-selection-add','stable-shell-inputs-focus-scroll','explicit-rename-and-path-save','unsafe-path-recovery','real-hf-client-download','nested-source-flattening','only-selected-files','existing-client-files-preserved','server-originals-preserved','no-server-projections','search-by-name-and-member','loadout-role-filter','related-collection-discovery','deep-link-reload','related-collection-in-model-detail','32-index-layout-combinations','owner-access-recovery','remove-and-readd-member','unsaved-path-blocks-copy','powershell-script-save-utf8-bom','delete-cancel-and-confirm']},null,2));
+    await writeFile(join(scratch,'verification.json'),JSON.stringify({passed:true,screenshots,checks:['four-file-Qwen-collection','nested-path-discovery-and-display','filename-alias-search','selected-entry-commands-and-reload','selected-entry-loadout-add','distinct-nested-client-destinations','category-repository-stability','twenty-model-condensed-capacity','collapsed-unsaved-path-notice','pending-rename-close-recovery','native-keyboard-disclosure','matching-control-heights','loadout-role-column-gap','two-encoders-retained','multi-selection-add','stable-shell-inputs-focus-scroll','explicit-rename-and-path-save','unsafe-path-recovery','real-hf-client-download','nested-source-preservation','only-selected-files','existing-client-files-preserved','server-originals-preserved','no-server-projections','search-by-name-and-member','loadout-role-filter','related-collection-discovery','deep-link-reload','related-collection-in-model-detail','32-index-layout-combinations','owner-access-recovery','remove-and-readd-member','unsaved-path-blocks-copy','powershell-script-save-utf8-bom','delete-cancel-and-confirm']},null,2));
     process.stdout.write(JSON.stringify({passed:true,scratch})+'\n');
 } finally {
     closeBrowser();await stop(browser);await stop(server);

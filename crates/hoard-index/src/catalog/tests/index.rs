@@ -1,6 +1,54 @@
 use super::*;
 
 #[test]
+fn an_old_search_schema_is_rebuilt_without_rescanning_sources() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let config = IndexConfig {
+        data_dir: directory.path().join("data"),
+        ..IndexConfig::default()
+    };
+    let catalog = Catalog::open_or_scan(&config, "workstation", |_, _| {})?;
+    catalog.seed(&[seeded_revision(
+        seeded_repo("comfy/models", RepoType::Models),
+        0x77,
+        vec![seeded_entry(
+            "moss/alias.safetensors",
+            1024,
+            Some(seeded_artifact(0x77, "canonical", None, seeded_facts())),
+        )],
+    )])?;
+    catalog.rebuild_search(|_| {})?;
+    let before = search(&catalog, "alias")?.rows[0].clone();
+    let old_directory = catalog
+        .manifest()?
+        .search_directory
+        .expect("published index");
+    let metadata = catalog.directory.join(&old_directory).join("meta.json");
+    drop(catalog);
+    let text = fs::read_to_string(&metadata)?;
+    assert!(text.contains("path_text_v1"));
+    fs::write(metadata, text.replace("path_text_v1", "text"))?;
+    let mut phases = Vec::new();
+    let catalog = Catalog::open_or_scan(&config, "workstation", |phase, _| {
+        phases.push(phase.to_owned())
+    })?;
+    assert!(
+        phases
+            .iter()
+            .any(|phase| phase == "building the search index")
+    );
+    assert!(phases.iter().all(|phase| !phase.contains("scanning")));
+    assert_ne!(
+        catalog.manifest()?.search_directory.as_deref(),
+        Some(old_directory.as_str())
+    );
+    let after = search(&catalog, "alias")?.rows[0].clone();
+    assert_eq!(before.artifact_id, after.artifact_id);
+    assert_eq!(before.entry_id, after.entry_id);
+    Ok(())
+}
+
+#[test]
 fn an_unpublished_build_leaves_the_previous_index_serving() -> Result<()> {
     let (_directory, catalog) = fixture()?;
     catalog.rebuild_search(|_| {})?;

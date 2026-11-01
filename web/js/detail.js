@@ -12,7 +12,7 @@ const FILE_STATE_LABEL = { present: "PRESENT", deduped: "DEDUPED", lfs_ptr: "LFS
 let revealed = null;
 
 function key(detail) {
-    return `${detail.type}/${detail.org}/${detail.name}@${detail.rev || ""}#${detail.aid || ""}`;
+    return `${detail.type}/${detail.org}/${detail.name}@${detail.rev || ""}#${detail.aid || ""}@${detail.entry || ""}`;
 }
 
 async function fetchInto(app, slot, loader) {
@@ -37,17 +37,17 @@ async function fetchInto(app, slot, loader) {
 
 export function loadDetail(app) {
     const detail = app.state.detail;
-    fetchInto(app, "repo", () => api.repo(detail.type, detail.org, detail.name, detail.aid));
-    if (detail.aid) fetchInto(app, "artifact", () => api.artifact(detail.aid));
+    fetchInto(app, "repo", () => api.repo(detail.type, detail.org, detail.name, detail.aid, detail.entry));
+    if (detail.aid) fetchInto(app, "artifact", () => api.artifact(detail.aid, detail.entry));
     loadTab(app);
 }
 
 export function loadTab(app) {
     const detail = app.state.detail;
-    const { type, org, name, rev, aid } = detail;
-    if (detail.tab === "FILES") fetchInto(app, "files", () => api.repoFiles(type, org, name, rev, aid));
-    if (detail.tab === "CARD") fetchInto(app, "readme", () => api.repoReadme(type, org, name, rev, aid));
-    if (detail.tab === "COMPAT") fetchInto(app, "compat", () => api.repoCompat(type, org, name, rev, aid));
+    const { type, org, name, rev, aid, entry } = detail;
+    if (detail.tab === "FILES") fetchInto(app, "files", () => api.repoFiles(type, org, name, rev, { artifact: aid, entry }));
+    if (detail.tab === "CARD") fetchInto(app, "readme", () => api.repoReadme(type, org, name, rev, { artifact: aid, entry }));
+    if (detail.tab === "COMPAT") fetchInto(app, "compat", () => api.repoCompat(type, org, name, rev, { artifact: aid, entry }));
     if (detail.tab === "USAGE") fetchInto(app, "usage", () => api.repoUsage(type, org, name));
 }
 
@@ -74,7 +74,7 @@ function header(app, repo) {
             class: "btn",
             type: "button",
             text: "+ LOADOUT",
-            onClick: () => app.addToLoadout({ artifact_id: detail.aid || repo.artifact_id })
+            onClick: () => app.addToLoadout({ artifact_id: detail.aid || repo.artifact_id, entry_id: detail.entry })
         })
     );
 }
@@ -208,7 +208,7 @@ function compatTab(app) {
                     "span",
                     { class: "compat-name" },
                     item.prefix ? el("span", { class: "cell-org", text: item.prefix }) : null,
-                    item.name
+                    item.display_name || item.name
                 ),
                 el("span", { class: "compat-detail", text: dash(item.detail) }),
                 el("span", { class: "compat-size", text: sizeText(item) }),

@@ -7,7 +7,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use hoard_core::{
-    ArtifactFormat, ArtifactId, CommitSha, FileState, RepoId, RepoRowId, RepoType, Role,
+    ArtifactFormat, ArtifactId, CommitSha, EntryId, FileState, RepoId, RepoRowId, RepoType, Role,
     State as ArtifactState, format_size,
 };
 use hoard_index::IndexError;
@@ -53,6 +53,7 @@ pub struct ListParams {
 pub struct RevisionParams {
     pub revision: Option<String>,
     pub artifact: Option<String>,
+    pub entry: Option<EntryId>,
 }
 
 impl RevisionParams {
@@ -94,11 +95,16 @@ fn opened_for(
 ) -> Result<Opened, IndexError> {
     let row = params
         .opened()
-        .map(|id| catalog.artifact_row(id))
+        .map(|id| catalog.artifact_row_at(id, params.entry))
         .transpose()?
         .flatten()
         .filter(|row| row.repo == record.repo.qualified())
         .filter(|row| catalog.resolve_revision(record, &row.revision).is_some());
+    if let Some(entry) = params.entry
+        && row.is_none()
+    {
+        return Err(IndexError::not_found("artifact entry", entry.to_string()));
+    }
     Ok(Opened {
         revision: params
             .named()
@@ -182,6 +188,7 @@ pub struct RepoView {
 /// One file of a revision as the FILES tab lists it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FileRow {
+    pub entry_id: EntryId,
     pub path: String,
     pub kind: &'static str,
     pub size: u64,
@@ -426,9 +433,12 @@ pub async fn files(
             .count()
             == 1;
         let shown = opened.row.as_ref().map(|row| row.artifact_id);
+        let selected = params
+            .entry
+            .filter(|_| opened.row.as_ref().is_some_and(|row| !row.is_set()));
         let mut rows: Vec<FileRow> = entries
             .iter()
-            .map(|item| file_row(item, single, shown))
+            .map(|item| file_row(item, single, shown, selected))
             .collect();
         rows.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(FilesView {
@@ -440,15 +450,23 @@ pub async fn files(
     Ok(Json(view))
 }
 
-fn file_row(item: &EntryDetail, single: bool, opened: Option<ArtifactId>) -> FileRow {
+fn file_row(
+    item: &EntryDetail,
+    single: bool,
+    opened: Option<ArtifactId>,
+    selected: Option<EntryId>,
+) -> FileRow {
     let state = file_state(item.present, item.lfs_pointer, item.deduped);
     FileRow {
+        entry_id: item.entry_id,
         kind: file_kind(&item.rel_path, item.artifact_id.is_some(), single),
         size: item.size,
         size_human: format_size(item.size),
         state,
         state_label: state.label(),
-        opened: item.artifact_id.is_some() && item.artifact_id == opened,
+        opened: item.artifact_id.is_some()
+            && item.artifact_id == opened
+            && selected.is_none_or(|entry| entry == item.entry_id),
         artifact_id: item.artifact_id,
         path: item.rel_path.clone(),
     }

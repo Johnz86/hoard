@@ -90,6 +90,7 @@ function emptyDetail() {
         rev: "",
         tab: "FILES",
         aid: null,
+        entry: null,
         repo: null,
         artifact: null,
         files: null,
@@ -212,6 +213,7 @@ function buildHash() {
         params.set("tab", detail.tab);
         if (detail.rev) params.set("rev", detail.rev);
         if (detail.aid) params.set("aid", detail.aid);
+        if (detail.entry) params.set("entry", detail.entry);
         const path = [detail.type, detail.org, detail.name].map(encodeURIComponent).join("/");
         return `#/repo/${path}?${params.toString()}`;
     }
@@ -294,12 +296,14 @@ function readHash() {
         detail.tab = TABS.includes(params.get("tab")) ? params.get("tab") : "FILES";
         detail.rev = params.get("rev") || "";
         detail.aid = params.get("aid");
+        detail.entry = params.get("entry");
         const same =
             state.detail.type === detail.type &&
             state.detail.org === detail.org &&
             state.detail.name === detail.name &&
             state.detail.rev === detail.rev &&
-            (state.detail.aid || null) === (detail.aid || null);
+            (state.detail.aid || null) === (detail.aid || null) &&
+            (state.detail.entry || null) === (detail.entry || null);
         if (same) {
             state.detail.tab = detail.tab;
         } else {
@@ -478,8 +482,8 @@ function scheduleInspector() {
     if (!row || !row.artifact_id) return;
     inspectorTimer = setTimeout(async () => {
         try {
-            const detail = await api.artifact(row.artifact_id);
-            if (cursorRow() && cursorRow().artifact_id === row.artifact_id) {
+            const detail = await api.artifact(row.artifact_id, row.entry_id);
+            if (cursorRow()?.artifact_id === row.artifact_id && cursorRow()?.entry_id === row.entry_id) {
                 state.cursorArtifact = detail;
                 paintInspector();
             }
@@ -632,6 +636,7 @@ function openRow(row) {
     if (row.project_id) return openProject(row.project_id);
     const params = new URLSearchParams({ tab: "FILES" });
     if (row.artifact_id) params.set("aid", row.artifact_id);
+    if (row.entry_id) params.set("entry", row.entry_id);
     navigate(`#/repo/${repoPathOf(row)}?${params.toString()}`);
 }
 
@@ -643,7 +648,7 @@ async function openArtifact(item) {
     }
     if (!item.artifact_id) return;
     try {
-        openRow(await api.artifact(item.artifact_id));
+        openRow(await api.artifact(item.artifact_id, item.entry_id));
     } catch (error) {
         toast(`cannot open artifact · ${error.message}`);
     }
@@ -651,7 +656,7 @@ async function openArtifact(item) {
 
 function detailArtifact() {
     const detail = state.detail;
-    return { artifact_id: detail.aid || (detail.repo && detail.repo.artifact_id) };
+    return { artifact_id: detail.aid || (detail.repo && detail.repo.artifact_id), entry_id: detail.entry };
 }
 
 function addToLoadout(row) {
@@ -675,7 +680,7 @@ async function yank(row) {
     if (row?.project_id) return copyCommand(row.clone_command);
     if (!row || !row.artifact_id) return;
     try {
-        const command = await api.pullCommand(row.artifact_id);
+        const command = await api.pullCommand(row.artifact_id, row.entry_id);
         await copyCommand(command.hf);
     } catch (error) {
         toast(`yank failed · ${error.message}`);

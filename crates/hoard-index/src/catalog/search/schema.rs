@@ -64,12 +64,6 @@ pub(in crate::catalog) struct Fields {
     pub(in crate::catalog) card: Field,
     /// The column the name sort orders by, written lowercased so that the order a reader
     /// sees is the one they expect rather than the byte order capitals impose.
-    ///
-    /// Known limitation: nothing forces an existing index to be rewritten, so a catalog
-    /// built before this was lowercased keeps case-sensitive order for every artifact a
-    /// later pass does not touch, and mixes the two orders until one does. It self-heals as
-    /// records are re-logged, and the cost of being wrong is the order of a page rather than
-    /// a wrong answer, so `FORMAT_VERSION` is deliberately not bumped for it.
     pub(in crate::catalog) name: Field,
     pub(in crate::catalog) base_label: Field,
     pub(in crate::catalog) revision_sha: Field,
@@ -124,7 +118,7 @@ impl Fields {
             entry: schema.add_i64_field("entry_id", FAST),
             preference: schema.add_i64_field("preference", FAST),
             size: schema.add_u64_field("size", FAST | INDEXED),
-            text: schema.add_text_field("text", text_options()),
+            text: schema.add_text_field("path_text_v1", text_options()),
             card: schema.add_text_field("card", text_options()),
             name: schema.add_text_field("name", column_only.clone()),
             base_label: schema.add_text_field(BASE_LABEL_COLUMN, column_only),
@@ -202,7 +196,16 @@ impl Fields {
         if let Some(hash) = &entry.git_sha1 {
             document.add_text(self.keywords[HASH_FIELD], hash.to_hex());
         }
-        document.add_text(self.name, artifact.name.to_ascii_lowercase());
+        document.add_text(
+            self.name,
+            crate::row::location_name(
+                &artifact.name,
+                &entry.rel_path,
+                layout,
+                artifact.shard_count.unwrap_or(1) > 1 || artifact.incomplete,
+            )
+            .to_ascii_lowercase(),
+        );
         document.add_text(
             self.base_label,
             inferred.base_label.as_deref().unwrap_or_default(),
@@ -223,6 +226,9 @@ impl Fields {
         }
         for value in [
             artifact.name.as_str(),
+            entry.rel_path.as_str(),
+            repository.source.as_str(),
+            repo.as_str(),
             artifact.org.as_deref().unwrap_or_default(),
             inferred.base.as_str(),
             inferred.trigger.as_deref().unwrap_or_default(),

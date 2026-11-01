@@ -7,8 +7,8 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use hoard_core::{
-    ArtifactFormat, ArtifactId, Base, CommitSha, Precision, RepoId, RepoType, Role, Sha256, State,
-    SubRole, format_size,
+    ArtifactFormat, ArtifactId, Base, CommitSha, EntryId, Precision, RepoId, RepoType, Role,
+    Sha256, State, SubRole, format_size,
 };
 use hoard_index::IndexError;
 use hoard_index::catalog::{EntryDetail, Listed, RepositoryDetail};
@@ -186,6 +186,10 @@ pub fn sort_key(sort: Option<&str>, dir: Option<&str>) -> String {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RowView {
     pub artifact_id: ArtifactId,
+    pub entry_id: EntryId,
+    pub relative_path: String,
+    pub display_name: String,
+    pub source: Option<String>,
     pub blob_sha256: Option<Sha256>,
     pub role: Role,
     pub sub_role: Option<SubRole>,
@@ -223,7 +227,7 @@ pub struct RowView {
     pub role_code: String,
     pub dupe: bool,
     pub triage: bool,
-    /// What a row prints before its name so the repository a name was chosen from is always
+    /// What a row prints before its display name so the selected repository is always
     /// visible: `org/` when the name is the repository's own, else `org/repository/`.
     pub prefix: String,
 }
@@ -248,6 +252,10 @@ impl From<&SearchRow> for RowView {
     fn from(row: &SearchRow) -> Self {
         Self {
             artifact_id: row.artifact_id,
+            entry_id: row.entry_id,
+            relative_path: row.path.clone(),
+            display_name: row.display_name().to_owned(),
+            source: row.source.clone(),
             blob_sha256: row.blob_sha256,
             role: row.role,
             sub_role: row.sub_role,
@@ -282,9 +290,14 @@ impl From<&SearchRow> for RowView {
             role_code: row.role.code().to_owned(),
             dupe: row.dupe,
             triage: row.triage,
-            prefix: row_prefix(&row.repo, &row.name),
+            prefix: row_prefix(&row.repo, row.display_name()),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EntrySelection {
+    pub entry: Option<EntryId>,
 }
 
 /// The namespace of a qualified `type/org/name`, falling back to models.
@@ -298,6 +311,8 @@ pub fn repo_type_of(qualified: &str) -> RepoType {
 /// One path of an artifact as the ENTRIES and PATHS ON DISK lists show it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EntryView {
+    pub entry_id: EntryId,
+    pub relative_path: String,
     pub repo: String,
     pub revision: String,
     pub path: String,
@@ -316,6 +331,8 @@ pub fn entry_views(entries: &[EntryDetail], host: &str) -> Vec<EntryView> {
     entries
         .iter()
         .map(|entry| EntryView {
+            entry_id: entry.entry_id,
+            relative_path: entry.rel_path.clone(),
             repo: entry.repo.clone(),
             revision: entry.revision.clone(),
             path: entry

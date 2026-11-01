@@ -39,7 +39,7 @@ One line per file in `crates/hoard-index/src/catalog/`:
   in, artifact names, per-file hashes.
 - `search/mod.rs` `QueryRequest`, `QueryPage`, `RefreshReport` and what the catalog imports.
 - `search/schema.rs` `Fields`, the keyword and column constants, the document one entry writes.
-- `search/tokens.rs` the word tokenizer the `text` field and every free-text query are cut by,
+- `search/tokens.rs` the word tokenizer the path/name field and every free-text query are cut by,
   registered on every index the catalog creates or opens.
 - `search/build.rs` the rebuild, the metered writer, per-entry documents, the directory publish.
 - `search/refresh.rs` `refresh_search`, the change log and its cursor, the published directory.
@@ -133,9 +133,11 @@ are the facts that have caught agents out:
 - One document **per entry**, not per artifact: `node:laptop AND state:local` must match one
   entry satisfying both, and the preferred row must be chosen from the entries that matched.
 - One document per artifact carries the **`primary` flag**: the entry a row would be
-  assembled from. A query whose tokens and sort key touch only fields every entry of an
-  artifact agrees on is intersected with that mark and needs no collapse. `node`, `state`,
-  `source`, `repo`, `rev` and `hash`, and sorting on revision, node or state, still collapse.
+  assembled from. Queries without entry-sensitive filters or revision/node/state sorting
+  use that mark. Name sorting alone can use its preferred-copy display label. `node`, `state`,
+  `source`, `repo`, `rev`, `hash` and free text, and sorting on revision, node or state, still
+  collapse. Paths and filename aliases are entry-level text; a canonical-name-only primary
+  document cannot answer all alias searches.
 - The collectors keep **term ordinals**, not terms. Ordinals are lexicographic inside a
   segment and meaningless across segments, so a cross-segment order merges on spelled terms.
 - The outbox is the `SearchChange` table plus `Manifest.search_seq`. `refresh_search` replays
@@ -149,6 +151,15 @@ are the facts that have caught agents out:
   otherwise leave its directory for good. An unpublished build leaves the previous one
   serving.
 - The writer is one thread with a 32 MiB budget.
+
+- Derived search-schema mismatches rebuild from existing catalog metadata during
+  `open_or_scan`; they do not require a persisted-record format bump or source rehash.
+- Canonical content identity and selected location are separate. `artifact_row_at` validates
+  explicit entry ownership. Preserve matching locations through API reads, repository links,
+  commands and loadout additions; see `docs/reference/api/hoard.md`.
+- Name sorting follows `SearchRow::display_name`: relative paths for loose single files,
+  canonical labels for repository models and shard sets. Known tool categories stay stable
+  when their files are nested; category mapping is shared through `model_directory`.
 
 ## Before you change anything here
 

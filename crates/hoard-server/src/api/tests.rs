@@ -23,6 +23,7 @@ use hoard_index::discover::RefKind;
 
 mod loadouts;
 mod opened;
+mod paths;
 mod projects;
 mod resources;
 mod setup;
@@ -935,6 +936,8 @@ async fn an_artifact_lists_its_evidence_entries_duplicates_and_usage() {
     assert_eq!(
         body["entries"][0],
         json!({
+            "entry_id": "e_4",
+            "relative_path": "film-grain-35mm.safetensors",
             "repo": "models/kohya/film-grain-35mm",
             "revision": "main",
             "path": "/mnt/vault/loras/film-grain-35mm.safetensors",
@@ -1291,6 +1294,7 @@ async fn a_repository_files_tab_names_every_kind_and_state() {
         rows[0],
         json!({
             "path": "README.md",
+            "entry_id": "e_2",
             "kind": "card",
             "size": CARD.len(),
             "size_human": "84 B",

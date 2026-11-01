@@ -14,7 +14,7 @@ export function factRows(facts) {
 }
 
 function plugLabel(plug) {
-    const name = `${plug.prefix || ""}${plug.name}`;
+    const name = `${plug.prefix || ""}${plug.display_name || plug.name}`;
     return `${String(plug.role || "").toLowerCase()} · ${name}`;
 }
 
@@ -32,8 +32,9 @@ export function renderRelatedLoadouts(app, collections, context = "inspector") {
 export function renderInspector(app) {
     const row = app.cursorRow();
     const detail = app.state.cursorArtifact;
-    const facts = detail && detail.artifact_id === (row && row.artifact_id) ? detail.facts : null;
-    const plugs = detail && detail.artifact_id === (row && row.artifact_id) ? detail.plugs_into : null;
+    const matching = !!detail && detail.artifact_id === row?.artifact_id && detail.entry_id === row?.entry_id;
+    const facts = matching ? detail.facts : null;
+    const plugs = matching ? detail.plugs_into : null;
 
     if (!row) {
         return el(
@@ -49,7 +50,7 @@ export function renderInspector(app) {
         return el("aside", { class: "inspector r-loadout" },
             el("div", { class: "rail-title", text: "INSPECTOR" }),
             el("div", { class: "inspector-role" }, el("span", { class: "role-mark" }), "LOADOUT"),
-            el("div", { class: "inspector-name", text: row.name }),
+            el("div", { class: "inspector-name", text: row.display_name || row.name, title: row.name }),
             el("div", { class: "fact-list" }, factRows([
                 { key: "type", value: "Model collection" }, { key: "models", value: row.items },
                 { key: "selected size", value: row.size_human }, { key: "shared by", value: row.node }
@@ -66,7 +67,7 @@ export function renderInspector(app) {
                 el("div", { class: "rail-title", text: "INSPECTOR" }),
                 el("div", { class: "inspector-role" }, el("span", { class: "role-mark role-mark-lg" }),
                     el("span", { class: "role-code", text: "GIT" })),
-                el("div", { class: "inspector-name", text: row.name }),
+                el("div", { class: "inspector-name", text: row.display_name || row.name, title: row.name }),
                 el("div", { class: "inspector-path", text: row.source })),
             el("div", { class: "fact-list" }, factRows([
                 { key: "type", value: "Git project" }, { key: "source", value: row.source },
@@ -93,7 +94,7 @@ export function renderInspector(app) {
                 el("span", { class: "role-mark role-mark-lg" }),
                 el("span", { class: "role-code", text: roleCode(row) })
             ),
-            el("div", { class: "inspector-name", text: row.name }),
+            el("div", { class: "inspector-name", text: row.display_name || row.name, title: row.name }),
             el("div", { class: "inspector-path", text: row.path || "" })
         ),
         el(
@@ -126,8 +127,8 @@ export function renderInspector(app) {
                 onClick: () => app.yank(row)
             })
         ),
-        renderRelatedLoadouts(app, detail?.artifact_id === row.artifact_id ? detail.loadouts : null),
-        detail?.artifact_id === row.artifact_id ? renderClassification(app, detail) : null,
+        renderRelatedLoadouts(app, matching ? detail.loadouts : null),
+        matching ? renderClassification(app, detail) : null,
         el(
             "div",
             null,

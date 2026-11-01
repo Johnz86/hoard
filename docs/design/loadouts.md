@@ -16,24 +16,25 @@ Membership does not copy files, launch inference, configure a tool, or write ser
 3. The toolbar LOADOUTS button opens the collection chooser. Create a collection with NEW;
    duplicate/blank names produce an inline error and retain the entered name. Select a
    current collection. ADD TO LOADOUT or L opens a chooser for the current model or selected
-   models; confirm ADD TO THIS LOADOUT, or create a named collection to add them to. Adding a
+   models; confirm ADD, or create a named collection to add them to. Adding a
    second VAE, checkpoint or encoder appends it; exact duplicate members are idempotent.
 4. The drawer starts with one compact collection selector and NEW action. The member count,
    selected bytes, RENAME and DELETE share a management strip. RENAME reveals the name
    editor with explicit SAVE/CANCEL; an existing name is not repeated in a permanent field.
-   Each model occupies one condensed row: role marker, truncated filename, size and native
+   Each model occupies one condensed row: role marker, relative file label, size and native
    disclosure. Click or keyboard activation expands its full source, role, availability,
    editable relative download path, SAVE PATH and REMOVE action. Tooltips expose the full
    filename and destination without expansion; no essential action requires hovering.
    Removing membership never removes model files. All model roles are supported. Existing
    legacy loadouts remain readable and editable.
-5. DOWNLOAD ON YOUR COMPUTER replaces server-side Apply. Show the exact relative directory
-   tree, total selected bytes and unavailable members. The client root defaults to `./models`
+5. The download footer exposes the client destination and script actions. Layout/script
+   disclosures show the exact relative directory tree, selected bytes and unavailable members. The client root defaults to `./models`
    (run from ComfyUI), and is editable; Windows users may enter an absolute path. Choose
    PowerShell or POSIX shell, then COPY SCRIPT or SAVE SCRIPT. The generated script
    uses the existing `hf` CLI against this server and requests only the collection's pinned
-   files. Destination paths are explicit, not inferred again at download time. No background
-   server apply job or second node is involved.
+   files. New default paths preserve category-relative subfolders and the selected source
+   filename. Existing saved destinations stay explicit and unchanged. Destination paths are
+   not inferred again at download time. Downloading runs on the client.
 6. Scripts stage each file beneath the chosen root, stop on download failure, and move a
    completed file into its previewed destination. Existing destination files are preserved
    and reported as skipped; no silent overwrite or claim of checksum validation. Rerunning
@@ -42,7 +43,7 @@ Membership does not copy files, launch inference, configure a tool, or write ser
    Unhashed files and multi-shard artifacts also block generation with an explanation;
    scripts currently acquire individual model files. Unsaved path edits disable copying
    and saving the script until the path is saved or restored.
-7. DELETE LOADOUT uses an inline confirmation naming the collection. CANCEL restores focus;
+7. DELETE uses an inline confirmation naming the collection. CANCEL restores focus;
    confirmation removes only the collection, its search result and related-membership links.
    The next collection or an empty chooser appears. Original files remain available.
 
@@ -74,40 +75,20 @@ without losing edits. Collapse new-collection creation when a collection is alre
 Folder-layout and script previews expand on demand; saved PowerShell scripts use a UTF-8 BOM
 for Windows PowerShell compatibility.
 
-## Implementation sequence and boundaries
+## Boundaries and verification
 
-Implement the collection document and portable path validation first, retaining legacy TOML
-read support. Add resolved views, member editing, related membership and client script
-generation. Extend the shared resource search/merge and facet/shelf arithmetic, then replace
-the drawer and wire Index/inspector discovery. Finally exercise browser journeys and actual
-downloads with an isolated node before adding the requested real collection.
+Legacy loadout TOML remains readable and editable. Server projection APIs remain available
+for existing callers; the collection UI uses client download scripts. Collection membership
+does not run inference, configure applications, certify compatibility or require another node.
+Scripts currently acquire individual model files; multi-shard artifacts are explicitly blocked.
 
-Keep generic server projection APIs available to existing callers, but remove them from the
-collection UI. Exclude inference workflows, automatic upstream model acquisition, additional
-nodes, authentication redesign, archive streaming and network configuration changes.
+The [loadout verification task](../../tasks/verify-loadouts/README.md) owns the repeatable
+collection journey, real client transfers, nested-path/alias cases and condensed-capacity review.
+The [first-run task](../../tasks/verify-first-run/README.md) covers the surrounding source,
+sharing and classification flows. The [UI review workflow](../contributing/ui-changes.md)
+defines the shared layout matrix. Rust catalog/API tests cover ownership validation,
+search/schema recovery, stable repository grouping and path safety.
 
-## Observable acceptance criteria
-
-- Create Qwen Image 2.1 Text to Video containing exactly the four requested files, including
-  both encoders. Paths are `diffusion_models/qwen_image_2.1_int8_convrot.safetensors`,
-  `text_encoders/qwen3vl_8b_int8_convrot.safetensors`,
-  `text_encoders/qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot.safetensors`, and
-  `vae/qwen_image_2.1_vae_bf16.safetensors` beneath the client root. This name is supplied by
-  the user; membership alone does not certify an inference workflow or video capability.
-- Find the collection by name and member filename, filter to loadouts, open it through a
-  member's inspector, and reload its deep link. Sort and page mixed resources without
-  omissions/duplicates. Counts agree with displayed results and saved shelves.
-- Add several files of the same role; remove one; rename; change a download path; confirm
-  delete; cancel delete; retry rejected writes; reload and restart. No original file changes.
-- Execute the generated shell script against real isolated HF endpoints with four synthetic
-  files spread across repositories/nested paths. Verify exact final paths and bytes, no
-  unrelated models, repeat-download preservation and failure on unavailable members. Review
-  PowerShell quoting, path safety and matching command targets.
-- Observe no drawer remount/animation restart, lost drafts/focus/selection, or scroll resets
-  during edits, Index refreshes, delayed requests and failures. Exercise keyboard and mouse.
-- Review 1180/1600px, both themes/densities, table/cards and inspector on/off. Existing model
-  classification, Git project acquisition, sources and sharing journeys continue to work.
-- With twenty members, collapsed rows remain single-line and many fit above the footer;
-  measure visible capacity at 1000px and 720px viewport heights. Verify disclosure using
-  keyboard and mouse, matching form-control heights, full filename/path access and a gap
-  after the LOADOUT role label.
+Keep these checks as behavior contracts rather than a completed implementation checklist.
+The [user guide](../user-guide/loadouts.md) provides a four-file example; synthetic fixtures
+verify file acquisition and never establish the example's inference capabilities.

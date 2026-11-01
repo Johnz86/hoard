@@ -22,10 +22,17 @@ single representation. `Catalog::open_or_scan` rebuilds an incompatible catalog 
 it does not migrate user-maintained catalog state. Document that operational consequence.
 Changing this policy is an explicit project decision, not an incidental implementation choice.
 
+Derived search schemas are separate from persisted record formats. `open_or_scan` checks
+the search schema and rebuilds an older one from catalog metadata. Follow
+[the upgrade contract](docs/operations/deployment.md#search-schema-upgrades); a search-only
+change must not discard user data through a catalog format bump.
+
 ## Implementation contracts
 
 - Respect the dependency direction: core, index, mirror, network, server, binary.
 - Use the lowest crate that can own the behavior; lower crates never depend on axum.
+- Preserve the identity/location/destination distinctions and regression cases in
+  [Lessons to preserve](CONTRIBUTING.md#lessons-to-preserve).
 - Catalog access outside `hoard-index` uses `Catalog`, inside `spawn_blocking` in async paths.
 - Catalog entry writers update derived counters and the search outbox with their records.
   Read `.claude/skills/hoard-catalog/SKILL.md` before editing catalog writers.
@@ -49,6 +56,10 @@ Update the owning current reference and task instructions with behavior/path cha
 Do not create handoffs, delivery diaries or completed-phase documents. Keep dated performance
 results separate from current contracts. Planning notes and transient evidence belong outside
 the checkout; Git retains implementation history.
+
+Use [temporary-work cleanup](CONTRIBUTING.md#temporary-work-and-cleanup) before handoff.
+Preserve the caller's uncommitted changes and normal release build. Optional playbooks do
+not assume a clean tree, a particular branch name or a system-provided scratchpad directory.
 
 Optional `.claude/` skills and agents support planning, implementation, verification and
 performance review. They do not replace the user's scope or imply authorization for extra

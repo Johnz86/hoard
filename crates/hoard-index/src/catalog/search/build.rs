@@ -24,6 +24,14 @@ const FIELD_VALUE_BYTES: usize = 8;
 pub(in crate::catalog) const INDEX_FLUSH_BYTES: usize = 128 * 1024 * 1024;
 
 impl Catalog {
+    pub(in crate::catalog) fn search_schema_current(&self) -> Result<bool> {
+        let Some(directory) = self.manifest()?.search_directory else {
+            return Ok(false);
+        };
+        let index = Index::open_in_dir(self.directory.join(directory))?;
+        Ok(index.schema() == Fields::build().0)
+    }
+
     /// Builds a fresh index using only native records and publishes it after a durable commit.
     /// An interrupted rebuild publishes nothing, so the last usable index keeps answering.
     /// The callback receives the number of entries indexed.

@@ -159,7 +159,10 @@ pub(super) fn plan(
         |file: walker::Accepted<'_>| shape.lock().record(&file.rel_path),
     )?;
     let shape = shape.into_inner();
-    let organizations = shape.organizations();
+    let mut organizations = shape.organizations();
+    if matches!(layout, Some(ToolLayout::ComfyUi | ToolLayout::A1111)) {
+        organizations.retain(|folder| crate::layout::model_directory(folder).is_none());
+    }
     let units = shape.units(org, &root_name, &organizations);
     Ok(LoosePlan {
         source_org: org.to_owned(),
@@ -615,6 +618,57 @@ mod tests {
         let entry = &loras.revisions[0].entries[1];
         assert!(entry.present());
         assert!(entry.abs_path.as_ref().is_some_and(|path| path.is_file()));
+    }
+
+    #[test]
+    fn nested_only_comfy_categories_keep_their_repository_identity() {
+        let directory = TempDir::new().expect("temporary models");
+        comfy_tree(directory.path());
+        write(
+            directory.path(),
+            "diffusion_models/anchor.safetensors",
+            b"anchor",
+        );
+        write(
+            directory.path(),
+            "diffusion_models/moss/model.safetensors",
+            b"nested",
+        );
+        let before = discover(
+            directory.path(),
+            "comfy",
+            true,
+            &WalkOptions::default(),
+            &NoiseFilter::default(),
+        )
+        .expect("discovery");
+        fs::remove_file(directory.path().join("diffusion_models/anchor.safetensors"))
+            .expect("remove anchor");
+        let after = discover(
+            directory.path(),
+            "comfy",
+            true,
+            &WalkOptions::default(),
+            &NoiseFilter::default(),
+        )
+        .expect("discovery");
+        let category = |repos: &[DiscoveredRepo]| {
+            repos
+                .iter()
+                .find(|repo| repo.repo.name() == "diffusion_models")
+                .map(|repo| repo.repo.clone())
+        };
+        assert_eq!(category(&before), category(&after));
+        let category = after
+            .iter()
+            .find(|repo| repo.repo.name() == "diffusion_models")
+            .expect("category remains");
+        assert_eq!(category.repo.qualified(), "models/comfy/diffusion_models");
+        assert_eq!(category.tool_layout.as_deref(), Some("comfyui"));
+        assert_eq!(
+            category.revisions[0].entries[0].rel_path,
+            "moss/model.safetensors"
+        );
     }
 
     #[test]

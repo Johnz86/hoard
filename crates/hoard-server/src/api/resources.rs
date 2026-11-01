@@ -14,7 +14,7 @@ use crate::state::AppState;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum ResourceRow {
-    Artifact(ArtifactResource),
+    Artifact(Box<ArtifactResource>),
     Project(ProjectResource),
     Loadout(crate::api::loadout_search::LoadoutResource),
 }
@@ -137,10 +137,10 @@ pub(crate) async fn find(
             .skip(offset)
             .take(request.limit as usize)
             .map(|row| {
-                ResourceRow::Artifact(ArtifactResource {
+                ResourceRow::Artifact(Box::new(ArtifactResource {
                     row: RowView::from(&row),
                     resource_kind: "artifact",
-                })
+                }))
             })
             .collect()
     } else {
@@ -217,7 +217,7 @@ pub(crate) fn project_key(row: &ProjectRow, key: SortKey) -> SortValue {
 fn artifact_key(row: &SearchRow, key: SortKey) -> SortValue {
     match key {
         SortKey::Role => SortValue::Text(row.role.as_str().to_owned()),
-        SortKey::Name => SortValue::Text(row.name.to_ascii_lowercase()),
+        SortKey::Name => SortValue::Text(row.display_name().to_ascii_lowercase()),
         SortKey::Base => SortValue::Text(row.base.as_str().to_owned()),
         SortKey::Format => SortValue::Text(row.format.as_str().to_owned()),
         SortKey::Precision => SortValue::Text(
@@ -267,10 +267,10 @@ fn merge(input: MergeSources, sort: SortSpec, offset: usize, limit: usize) -> Ve
         .map(|row| {
             (
                 artifact_key(&row, sort.key),
-                ResourceRow::Artifact(ArtifactResource {
+                ResourceRow::Artifact(Box::new(ArtifactResource {
                     row: RowView::from(&row),
                     resource_kind: "artifact",
-                }),
+                })),
             )
         })
         .collect::<Vec<_>>();

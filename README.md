@@ -23,9 +23,10 @@ settings. This command listens locally; network sharing requires a reachable add
 
 ## What you can do
 
-- Search models and Git projects in one Index, with facets, saved shelves and an inspector.
+- Search models, Git projects and named loadouts in one Index, with facets, shelves and an inspector.
 - Read committed project documentation, inspect files and revisions, and copy clone commands.
-- Identify model roles and compatibility; assemble loadouts and project them into tool layouts.
+- Find models by nested path or filename alias and inspect their selected source copy.
+- Group models into loadouts and prepare client downloads with editable destination paths.
 - Add or remove indexed folders without moving or deleting their original files.
 - Discover peers, exchange resource indexes and acquire resources over the network.
 

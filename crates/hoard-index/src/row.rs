@@ -70,6 +70,12 @@ pub struct SearchRow {
 }
 
 impl SearchRow {
+    /// The selected relative filename for loose single files, or the canonical model
+    /// name for repository resources and shard sets.
+    pub fn display_name(&self) -> &str {
+        location_name(&self.name, &self.path, &self.layout, self.is_set())
+    }
+
     /// Whether the artifact is a shard set, whole or not: more than one file present, or
     /// fewer present than declared. A set is pulled by its globs; a single file by its path.
     pub fn is_set(&self) -> bool {
@@ -77,8 +83,56 @@ impl SearchRow {
     }
 }
 
+pub(crate) fn location_name<'a>(
+    name: &'a str,
+    path: &'a str,
+    layout: &str,
+    grouped: bool,
+) -> &'a str {
+    if grouped || matches!(layout, "hub repo" | "git clone") {
+        name
+    } else {
+        path
+    }
+}
+
 fn single_shard() -> u32 {
     1
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::location_name;
+
+    #[test]
+    fn loose_files_show_the_selected_path_and_repository_models_keep_their_names() {
+        assert_eq!(
+            location_name(
+                "canonical",
+                "moss/local.safetensors",
+                "diffusion_models",
+                false
+            ),
+            "moss/local.safetensors"
+        );
+        assert_eq!(
+            location_name("canonical", "weights.safetensors", "hub repo", false),
+            "canonical"
+        );
+        assert_eq!(
+            location_name("canonical", "weights.safetensors", "git clone", false),
+            "canonical"
+        );
+        assert_eq!(
+            location_name(
+                "shard set",
+                "model-00001.safetensors",
+                "diffusion_models",
+                true
+            ),
+            "shard set"
+        );
+    }
 }
 
 /// One facet bucket: a value, how many artifacts carry it, and whether the query selects it.

@@ -6,8 +6,8 @@ Hoard is one Rust binary per node. It does three jobs over one shared index:
    headers, infer role and base from tensors, deduplicate by content hash, answer the search
    grammar with facets and directional compatibility, and keep a triage queue for what it
    cannot place.
-2. **Serve** three faces on the LAN: the HuggingFace Hub HTTP API (`HF_ENDPOINT`), git over
-   HTTP with LFS, and a symlink projection into tool layouts. Repos not held locally are
+2. **Serve** the web/JSON interface, HuggingFace Hub HTTP API (`HF_ENDPOINT`) and Git over
+   HTTP with LFS. Legacy tool projection endpoints remain available to API callers. Repos not held locally are
    proxied from `huggingface.co` and block-cached, following the contract of the Python
    reference `olah`.
 3. **Federate**: nodes discover each other, gossip index digests, and pull from each other
@@ -76,8 +76,8 @@ Not chosen and why:
 
 ## Frontend stack
 
-Git projects are first-class resources alongside inferred artifacts. Main search includes
-project matches, Sources links to projects discovered in each Git folder, and neutral
+Git projects and named loadouts are first-class resources alongside inferred artifacts.
+Main search includes project and collection matches, Sources links to projects discovered in each Git folder, and neutral
 project pages expose committed README/files, revision selection and clone/share controls.
 Project identity uses the catalog row ID rather than a Hub model/dataset classification.
 The project APIs read Git objects on blocking workers with bounded previews; canonical
@@ -88,11 +88,12 @@ The project APIs read Git objects on blocking workers with bounded previews; can
   light-first with dark overrides; `web/css/hoard.css` styles components with those tokens.
 - Space Grotesk and Space Mono vendored as woff2 under `web/fonts/` with local `@font-face`.
 - Vanilla ES modules in `web/js/`, no bundler. JS renders JSON from `/api/v1/*` and handles
-  keyboard and mouse input; nothing that could be unit tested lives in JS.
+  keyboard, mouse input and interaction state. Domain computation stays in Rust; browser
+  journeys verify rendering, drafts and asynchronous updates.
 - `web/js/setup.js` presents server-derived first-run state, actionable empty results and
   sharing configuration inside Sources. `/api/v1/setup` counts all resources independently
-  of the current query. Managed node settings in `node.json` apply after restart; local
-  command URLs fall back to loopback while discovery retains wildcard-to-hostname resolution.
+  of the current query. Sharing-address updates in `node.json` apply immediately; only a
+  node-name change waits for restart. Local command URLs fall back to loopback while discovery retains wildcard-to-hostname resolution.
 
 ## Crate layout
 

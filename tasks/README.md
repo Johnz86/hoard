@@ -15,3 +15,8 @@ root from their own file paths, so they do not depend on the caller's working di
 Keep fixtures and temporary catalogs outside the repository. Published media belongs in
 `docs/media/introduction/`; durable recording inputs live with their task. Add new tasks here
 rather than collecting unrelated executables in a generic directory.
+
+After reviewing a run, remove its temporary evidence directory when no longer needed.
+Keep durable findings in the owning documentation and published outputs in their documented
+locations. Verify owned browser/server processes have exited before deleting profiles or
+catalogs; follow [temporary work and cleanup](../CONTRIBUTING.md#temporary-work-and-cleanup).

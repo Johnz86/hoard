@@ -45,6 +45,22 @@ not provide.
 
 ## Diagnostics and maintenance
 
+### Search-schema upgrades
+
+Restart Hoard after installing a rebuilt release binary so the running backend and embedded
+UI match the checkout. At startup, `Catalog::open_or_scan` compares the derived search schema
+with the current one. An older search index is rebuilt from existing catalog metadata,
+without rereading model weights or discarding shelves, loadouts, verdicts, hashes or IDs.
+This is separate from the persisted catalog-format rebuild described above.
+
+A rescan discovers filesystem changes; a search rebuild indexes metadata already in the
+catalog. Diagnose which layer is missing before choosing either operation. A file that was
+scanned but cannot be recognized by its folder or alias needs path/search investigation,
+not a move or rename of the original weights. Keep the same configuration and data directory
+when restarting so Hoard opens the existing catalog.
+
+### Routine diagnostics
+
 - `/healthz` reports server, upstream and watcher health; use service logs for detailed errors.
 - `hoard doctor` inspects the configured catalog and reports lock, format and integrity issues.
 - Catalog commands require exclusive ownership. Stop the service before maintenance instead

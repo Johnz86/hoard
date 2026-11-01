@@ -54,6 +54,10 @@ impl CachedLoadouts {
                 text.push(' ');
                 text.push_str(&item.name);
                 text.push(' ');
+                text.push_str(&item.path);
+                text.push(' ');
+                text.push_str(&item.repo);
+                text.push(' ');
                 text.push_str(item.destination.as_str());
             }
             let summary = summary(&view);

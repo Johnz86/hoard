@@ -10,15 +10,18 @@ serves bytes through protocols clients already use.
 | --- | --- | --- |
 | Set up a node | Empty arrival guides folder selection and sharing configuration | [Getting started](../user-guide/getting-started.md) |
 | Index folders | Git, Hugging Face caches and loose folders; incremental scans and watching | [Catalog](../reference/native-catalog.md) |
-| Find resources | Shared model/project results, query grammar, facets and saved shelves | [Hoard API](../reference/api/hoard.md) |
+| Find resources | Shared model/project/loadout results, path and alias search, facets and saved shelves | [Hoard API](../reference/api/hoard.md) |
 | Review a project | Committed README, documentation links, file previews and refs | [UI specification](ui-spec.md) |
 | Acquire resources | Git cloning, Hub-compatible downloads and peer pulls | [Hub compatibility](../reference/api/hugging-face.md) |
-| Assemble model sets | Directional compatibility, named loadouts and filesystem projections | [Hoard API](../reference/api/hoard.md) |
+| Assemble model sets | Named collections of selected files, related-loadout discovery and client download scripts | [Loadout contract](loadouts.md) |
 | Manage sources | Persistent removal preserves original files; history cleanup is separate | [Getting started](../user-guide/getting-started.md) |
 
 A Git project is a resource, not a model classification. Internal Hub namespaces do not define
 its presentation. Model compatibility and loadout controls apply only where meaningful.
 Search is the primary discovery interface; Sources manages what a node indexes and shares.
+Model compatibility is a separate inferred relationship. Collection membership groups files
+without certifying inference compatibility or requiring a second node. Legacy projection
+endpoints remain available to API callers and are outside the collection UI.
 
 ## Boundaries
 

@@ -9,13 +9,13 @@ and superseded plans belong in Git, not in the current documentation.
 - [Introduction video](user-guide/introduction.md): narrated walkthrough, captions and transcript.
 - [Configuration](user-guide/configuration.md): settings, persistence and access boundaries.
 - [Deployment and maintenance](operations/deployment.md): listeners, backups, upgrades and diagnostics.
-
 - [Model collections](user-guide/loadouts.md): group selected models and download them to a client.
 
 ## Understand the system
 
 - [Product scope](design/product-scope.md): supported workflows and intentional limits.
 - [UI specification](design/ui-spec.md): current layouts, terminology and keyboard behavior.
+- [Loadout interaction contract](design/loadouts.md): condensed collection editing and client paths.
 - [Architecture](reference/architecture.md): crate boundaries, runtime stack and data flow.
 - [Native catalog](reference/native-catalog.md): persistence, writes, indexing and recovery.
 - [Source layouts](reference/source-layouts.md): folder aliases and placement versus inferred roles.
@@ -27,6 +27,8 @@ and superseded plans belong in Git, not in the current documentation.
 ## Contribute and run tasks
 
 - [Contributing](../CONTRIBUTING.md): development and verification.
+- [Lessons to preserve](../CONTRIBUTING.md#lessons-to-preserve): identity, paths, UI state and acquisition.
+- [Temporary-work cleanup](../CONTRIBUTING.md#temporary-work-and-cleanup): owned resources and durable evidence.
 - [UI change review](contributing/ui-changes.md): baselines and broader application acceptance.
 - [Task catalog](../tasks/README.md): documentation checks, first-run verification, recording and benchmarks.
 
