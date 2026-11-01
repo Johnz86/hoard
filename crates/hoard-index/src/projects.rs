@@ -27,6 +27,7 @@ pub struct ProjectDocument {
 }
 
 pub struct ProjectIndex {
+    kind: &'static str,
     reader: IndexReader,
     text: Field,
     source_exact: Field,
@@ -55,6 +56,14 @@ pub struct ProjectMatches {
 impl ProjectIndex {
     /// Builds a transient index in input order; returned slots refer to that order.
     pub fn build(documents: impl IntoIterator<Item = Result<ProjectDocument>>) -> Result<Self> {
+        Self::build_kind(documents, "git")
+    }
+
+    /// Uses the shared query grammar for a non-artifact resource kind.
+    pub fn build_kind(
+        documents: impl IntoIterator<Item = Result<ProjectDocument>>,
+        kind: &'static str,
+    ) -> Result<Self> {
         let mut schema = Schema::builder();
         let options = TextOptions::default().set_indexing_options(
             TextFieldIndexing::default()
@@ -97,6 +106,7 @@ impl ProjectIndex {
             writer.commit()?;
         }
         Ok(Self {
+            kind,
             reader: index.reader()?,
             text,
             source_exact,
@@ -194,7 +204,7 @@ impl ProjectIndex {
 
     fn token_query(&self, token: &Token) -> Result<Box<dyn Query>> {
         if matches!(token.kind, TokenKind::Role | TokenKind::Format) {
-            return Ok(if token.values.iter().any(|value| value == "git") {
+            return Ok(if token.values.iter().any(|value| value == self.kind) {
                 Box::new(AllQuery)
             } else {
                 Box::new(EmptyQuery)

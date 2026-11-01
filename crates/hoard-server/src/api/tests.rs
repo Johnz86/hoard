@@ -1566,7 +1566,7 @@ async fn loadout_items_are_pinned_removed_and_exported() {
             .expect("text")
             .contains("name = \"empty-set\"")
     );
-    assert!(toml["text"].as_str().expect("text").contains("[host]"));
+    assert!(toml["text"].as_str().expect("text").contains("[[files]]"));
 
     let script = get(
         &world.state,

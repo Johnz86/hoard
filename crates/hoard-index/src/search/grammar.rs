@@ -286,7 +286,9 @@ fn split_values(body: &str, quoted: bool) -> Vec<&str> {
 fn normalize(kind: TokenKind, value: &str) -> (String, Option<String>) {
     let trimmed = value.trim();
     let lowered = trimmed.to_ascii_lowercase();
-    if lowered == "git" && matches!(kind, TokenKind::Role | TokenKind::Format) {
+    if matches!(lowered.as_str(), "git" | "loadout")
+        && matches!(kind, TokenKind::Role | TokenKind::Format)
+    {
         return (lowered, None);
     }
     match kind {

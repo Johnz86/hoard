@@ -32,6 +32,10 @@ pub struct LoadoutPin {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<Base>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<Role>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<DownloadPath>,
 }
 
 impl LoadoutPin {
@@ -45,6 +49,8 @@ impl LoadoutPin {
             factor: None,
             name: None,
             base: None,
+            role: None,
+            destination: None,
         }
     }
 
@@ -70,6 +76,7 @@ impl LoadoutPin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadoutSlot {
+    File,
     Host,
     Adapter,
     Vae,
@@ -81,6 +88,7 @@ pub enum LoadoutSlot {
 impl LoadoutSlot {
     pub const fn as_str(self) -> &'static str {
         match self {
+            LoadoutSlot::File => "file",
             LoadoutSlot::Host => "host",
             LoadoutSlot::Adapter => "adapter",
             LoadoutSlot::Vae => "vae",
@@ -93,6 +101,7 @@ impl LoadoutSlot {
     /// The role an artifact in this slot must carry.
     pub const fn role(self) -> Role {
         match self {
+            LoadoutSlot::File => Role::Unk,
             LoadoutSlot::Host => Role::Ckpt,
             LoadoutSlot::Adapter => Role::Lora,
             LoadoutSlot::Vae => Role::Vae,
@@ -122,10 +131,12 @@ impl fmt::Display for LoadoutSlot {
     }
 }
 
-/// A checkpoint plus its adapters at weights, portable as a text file.
+/// A named collection of models. Legacy single-role slots remain readable for old documents.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Loadout {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<LoadoutPin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<LoadoutPin>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -165,6 +176,7 @@ impl Loadout {
     /// Every pin with the slot it occupies, in the order the drawer lists them.
     pub fn pins(&self) -> Vec<(LoadoutSlot, &LoadoutPin)> {
         let mut pins = Vec::with_capacity(self.len());
+        pins.extend(self.files.iter().map(|pin| (LoadoutSlot::File, pin)));
         pins.extend(self.host.iter().map(|pin| (LoadoutSlot::Host, pin)));
         pins.extend(self.adapters.iter().map(|pin| (LoadoutSlot::Adapter, pin)));
         pins.extend(
@@ -183,7 +195,8 @@ impl Loadout {
     }
 
     pub fn len(&self) -> usize {
-        self.host.iter().len()
+        self.files.len()
+            + self.host.iter().len()
             + self.adapters.len()
             + self.controlnets.len()
             + self.vae.iter().len()
@@ -202,6 +215,7 @@ impl Loadout {
             HoardError::InvalidLoadout(format!("role {role} cannot be pinned in a loadout"))
         })?;
         let replaced = match slot {
+            LoadoutSlot::File => None,
             LoadoutSlot::Host => self.host.replace(pin),
             LoadoutSlot::Vae => self.vae.replace(pin),
             LoadoutSlot::Upscaler => self.upscaler.replace(pin),
@@ -225,19 +239,24 @@ impl Loadout {
     /// by its repository and path together, so the same file name under two repositories is
     /// two lines.
     pub fn holds_line(&self, repo: &RepoId, path: &str) -> bool {
-        self.host
+        self.files
             .iter()
-            .chain(self.adapters.iter())
-            .chain(self.controlnets.iter())
-            .chain(self.vae.iter())
-            .chain(self.upscaler.iter())
-            .chain(self.embeddings.iter())
+            .chain(
+                self.host
+                    .iter()
+                    .chain(self.adapters.iter())
+                    .chain(self.controlnets.iter())
+                    .chain(self.vae.iter())
+                    .chain(self.upscaler.iter())
+                    .chain(self.embeddings.iter()),
+            )
             .any(|pin| is_line(pin, repo, path))
     }
 
     /// Drops every pin of this repository's file, returning how many were removed.
     pub fn remove_line(&mut self, repo: &RepoId, path: &str) -> usize {
         let before = self.len();
+        self.files.retain(|pin| !is_line(pin, repo, path));
         self.host.take_if(|pin| is_line(pin, repo, path));
         self.vae.take_if(|pin| is_line(pin, repo, path));
         self.upscaler.take_if(|pin| is_line(pin, repo, path));
@@ -250,6 +269,9 @@ impl Loadout {
     /// Compatibility violations: every adapter must resolve against the host under the
     /// same directional rule the COMPAT tab uses.
     pub fn violations(&self) -> Vec<LoadoutViolation> {
+        if !self.files.is_empty() {
+            return Vec::new();
+        }
         let Some(host) = self.host.as_ref() else {
             return if self.is_empty() {
                 Vec::new()
@@ -280,6 +302,78 @@ impl Loadout {
                     })
             })
             .collect()
+    }
+
+    pub fn pin_mut(&mut self, repo: &RepoId, path: &str) -> Option<&mut LoadoutPin> {
+        self.files
+            .iter_mut()
+            .chain(self.host.iter_mut())
+            .chain(self.adapters.iter_mut())
+            .chain(self.controlnets.iter_mut())
+            .chain(self.vae.iter_mut())
+            .chain(self.upscaler.iter_mut())
+            .chain(self.embeddings.iter_mut())
+            .find(|pin| is_line(pin, repo, path))
+    }
+
+    /// Adds an arbitrary model without replacing other models of the same role.
+    pub fn add_file(&mut self, role: Role, mut pin: LoadoutPin) {
+        if self.holds_line(&pin.repo, &pin.path) {
+            return;
+        }
+        pin.role = Some(role);
+        self.files.push(pin);
+    }
+}
+
+/// A portable file path relative to the client download root, never an absolute path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct DownloadPath(String);
+
+impl DownloadPath {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn parse(value: &str) -> Result<Self, HoardError> {
+        Self::try_from(value.to_owned())
+    }
+}
+
+fn valid_download_path(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('/').all(|part| {
+            let stem = part
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_uppercase();
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && !part.ends_with([' ', '.'])
+                && part.chars().count() <= 255
+                && !part
+                    .chars()
+                    .any(|ch| ch.is_control() || "\\\\:<>\"|?*".contains(ch))
+                && !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+                && !(stem.len() == 4
+                    && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                    && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+        })
+}
+
+impl TryFrom<String> for DownloadPath {
+    type Error = HoardError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if !valid_download_path(&value) {
+            return Err(HoardError::InvalidLoadout(format!(
+                "{value:?} must be a portable relative file path without traversal or reserved names"
+            )));
+        }
+        Ok(Self(value))
     }
 }
 
@@ -365,6 +459,59 @@ mod tests {
         let mut pin = LoadoutPin::new(repo(name), format!("{name}.safetensors"));
         pin.base = Some(Base::new(base));
         pin
+    }
+
+    #[test]
+    fn arbitrary_collection_members_append_and_remain_editable() {
+        let mut collection = Loadout::new("collection");
+        let first = pin("first", "any");
+        let second = pin("second", "any");
+        collection.add_file(Role::Vae, first.clone());
+        collection.add_file(Role::Vae, second.clone());
+        collection.add_file(Role::Vae, first.clone());
+        collection.add_file(Role::Unk, pin("unclassified", "any"));
+        assert_eq!(collection.len(), 3);
+        assert!(collection.violations().is_empty());
+        let target = DownloadPath::parse("vae/edited.safetensors").expect("valid path");
+        collection
+            .pin_mut(&first.repo, &first.path)
+            .expect("member")
+            .destination = Some(target.clone());
+        assert!(collection.pin_mut(&repo("absent"), "absent").is_none());
+        let recovered = Loadout::parse(&collection.to_toml().expect("serialize")).expect("parse");
+        assert_eq!(recovered, collection);
+        assert_eq!(recovered.files[0].destination, Some(target));
+        assert_eq!(collection.remove_line(&first.repo, &first.path), 1);
+        assert_eq!(collection.len(), 2);
+    }
+
+    #[test]
+    fn download_paths_are_portable_relative_files() {
+        for path in [
+            "vae/model.safetensors",
+            "text_encoders/two words.safetensors",
+            "models/日本語.safetensors",
+        ] {
+            assert_eq!(DownloadPath::parse(path).expect("valid").as_str(), path);
+        }
+        for path in [
+            "",
+            "/absolute",
+            "../escape",
+            "a/../escape",
+            "a//b",
+            "a/./b",
+            "C:/escape",
+            "a\\b",
+            "AUX.txt",
+            "folder/COM1.bin",
+            "trailing.",
+            "trailing ",
+            "line\nfeed",
+            "wild*.bin",
+        ] {
+            assert!(DownloadPath::parse(path).is_err(), "{path:?}");
+        }
     }
 
     #[test]

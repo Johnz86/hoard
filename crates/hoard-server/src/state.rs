@@ -104,6 +104,7 @@ pub struct AppState {
 
 struct Inner {
     config: HoardConfig,
+    loadout_index: Mutex<Option<Arc<crate::api::loadout_search::CachedLoadouts>>>,
     project_index: Mutex<Option<Arc<crate::api::project_search::CachedProjects>>>,
     source_update: tokio::sync::Mutex<()>,
     mirror_config: Arc<MirrorConfig>,
@@ -130,6 +131,12 @@ impl std::fmt::Debug for AppState {
 }
 
 impl AppState {
+    pub(crate) fn loadout_index(
+        &self,
+    ) -> &Mutex<Option<Arc<crate::api::loadout_search::CachedLoadouts>>> {
+        &self.inner.loadout_index
+    }
+
     pub(crate) fn project_index(
         &self,
     ) -> &Mutex<Option<Arc<crate::api::project_search::CachedProjects>>> {
@@ -175,6 +182,7 @@ impl AppState {
             inner: Arc::new(Inner {
                 config,
                 project_index: Mutex::new(None),
+                loadout_index: Mutex::new(None),
                 source_update: tokio::sync::Mutex::new(()),
                 mirror_config,
                 usage: UsageSink::spawn(

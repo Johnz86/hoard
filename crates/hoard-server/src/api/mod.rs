@@ -9,6 +9,8 @@ pub mod common;
 pub mod compat;
 pub mod jobs;
 pub mod link;
+pub(crate) mod loadout_download;
+pub(crate) mod loadout_search;
 pub mod loadouts;
 pub mod nodes;
 pub(crate) mod project_search;
@@ -96,13 +98,23 @@ pub fn routes() -> Router<AppState> {
                 .delete(loadouts::delete),
         )
         .route("/api/v1/loadouts/profiles", get(loadouts::profiles))
-        .route("/api/v1/loadouts/{id}/items", post(loadouts::add_item))
+        .route(
+            "/api/v1/loadouts/{id}/items",
+            post(loadouts::add_item)
+                .put(loadouts::edit_member)
+                .delete(loadouts::remove_member),
+        )
         .route(
             "/api/v1/loadouts/{id}/items/{artifact_id}",
             delete(loadouts::remove_item),
         )
+        .route("/api/v1/loadouts/{id}/members", post(loadouts::add_members))
         .route("/api/v1/loadouts/{id}/validate", post(loadouts::validate))
         .route("/api/v1/loadouts/{id}/apply", post(loadouts::apply))
+        .route(
+            "/api/v1/loadouts/{id}/download",
+            get(loadout_download::script),
+        )
         .route("/api/v1/loadouts/{id}/export", get(loadouts::export))
         .route("/api/v1/link", post(link::link))
         .route(

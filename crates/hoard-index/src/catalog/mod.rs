@@ -24,6 +24,7 @@ mod userdata;
 mod verdict;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use native_db::{Builder, Database, Models};
@@ -131,6 +132,7 @@ pub struct CatalogStatus {
 /// The native filesystem catalog: everything Hoard knows about a file, and the only store
 /// the server, the mirror and every command read and write.
 pub struct Catalog {
+    loadout_generation: AtomicU64,
     database: Database<'static>,
     directory: PathBuf,
     search_cache: RwLock<Option<OpenIndex>>,
@@ -190,6 +192,7 @@ impl Catalog {
         }
         let database = builder().open(models()?, directory.join("catalog.redb"))?;
         let catalog = Self {
+            loadout_generation: AtomicU64::new(0),
             database,
             directory: directory.to_path_buf(),
             search_cache: RwLock::new(None),

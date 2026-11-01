@@ -165,114 +165,29 @@ async fn a_partial_apply_fails_but_records_successful_links_and_preserves_confli
 }
 
 #[tokio::test]
-async fn a_second_host_replaces_the_first_and_the_answer_names_it() {
+async fn different_hosts_append_without_branching_and_duplicates_are_idempotent() {
     let world = seeded();
-    let night = started(&world, "night").await;
-
-    let first = post(
-        &world.state,
-        &format!("/api/v1/loadouts/{night}/items"),
-        json!({ "artifact_id": world.ckpt.to_string() }),
-    )
-    .await;
-    assert_eq!(first["replaced"], json!(null));
-    assert!(
-        first["notice"]
-            .as_str()
-            .expect("notice")
-            .starts_with("+ sdxl-base-1.0 pinned at "),
-        "{}",
-        first["notice"]
-    );
-
-    let second = post(
-        &world.state,
-        &format!("/api/v1/loadouts/{night}/items"),
-        json!({ "artifact_id": world.llm.to_string() }),
-    )
-    .await;
-    assert_eq!(second["id"], json!(night));
-    assert_eq!(second["items"].as_array().expect("items").len(), 1);
-    assert_eq!(second["items"][0]["name"], "llama-3-8b");
+    let id = started(&world, "collection").await;
+    for artifact in [world.ckpt, world.llm, world.lora, world.llm] {
+        let response = post(
+            &world.state,
+            &format!("/api/v1/loadouts/{id}/items"),
+            json!({ "artifact_id": artifact.to_string(), "on_second_host": "branch" }),
+        )
+        .await;
+        assert_eq!(response["id"], id);
+        assert_eq!(response["replaced"], Value::Null);
+    }
+    let document = get(&world.state, &format!("/api/v1/loadouts/{id}")).await;
+    assert_eq!(document["items"].as_array().expect("items").len(), 3);
     assert_eq!(
-        second["replaced"],
-        json!({ "slot": "host", "name": "sdxl-base-1.0" })
+        get(&world.state, "/api/v1/loadouts")
+            .await
+            .as_array()
+            .expect("loadouts")
+            .len(),
+        1
     );
-    assert_eq!(
-        second["notice"],
-        "replaced checkpoint sdxl-base-1.0 with llama-3-8b"
-    );
-
-    let again = post(
-        &world.state,
-        &format!("/api/v1/loadouts/{night}/items"),
-        json!({ "artifact_id": world.llm.to_string() }),
-    )
-    .await;
-    assert_eq!(again["notice"], "llama-3-8b is already in night");
-    assert_eq!(again["items"].as_array().expect("items").len(), 1);
-    assert_eq!(again["replaced"], json!(null));
-
-    let listing = get(&world.state, "/api/v1/loadouts").await;
-    assert_eq!(listing.as_array().expect("rows").len(), 1);
-}
-
-#[tokio::test]
-async fn a_second_host_branches_into_a_loadout_named_after_it() {
-    let world = seeded();
-    let night = started(&world, "night").await;
-    post(
-        &world.state,
-        &format!("/api/v1/loadouts/{night}/items"),
-        json!({ "artifact_id": world.ckpt.to_string() }),
-    )
-    .await;
-
-    let branched = post(
-        &world.state,
-        &format!("/api/v1/loadouts/{night}/items"),
-        json!({ "artifact_id": world.llm.to_string(), "on_second_host": "branch" }),
-    )
-    .await;
-    let branch_id = branched["id"].as_str().expect("id").to_owned();
-    assert_ne!(branch_id, night);
-    assert_eq!(branched["name"], "llama-3-8b");
-    assert_eq!(branched["items"].as_array().expect("items").len(), 1);
-    assert_eq!(branched["items"][0]["slot"], "host");
-    assert_eq!(branched["replaced"], json!(null));
-    assert_eq!(
-        branched["notice"],
-        "new loadout \"llama-3-8b\": checkpoint pinned"
-    );
-
-    let kept = get(&world.state, &format!("/api/v1/loadouts/{night}")).await;
-    assert_eq!(kept["items"].as_array().expect("items").len(), 1);
-    assert_eq!(kept["items"][0]["name"], "sdxl-base-1.0");
-
-    let listing = get(&world.state, "/api/v1/loadouts").await;
-    assert_eq!(listing.as_array().expect("rows").len(), 2);
-    assert_eq!(listing[0]["name"], "llama-3-8b");
-    assert_eq!(listing[1]["name"], "night");
-
-    let twice = post(
-        &world.state,
-        &format!("/api/v1/loadouts/{night}/items"),
-        json!({ "artifact_id": world.llm.to_string(), "on_second_host": "branch" }),
-    )
-    .await;
-    assert_eq!(twice["name"], "llama-3-8b-2");
-    let listing = get(&world.state, "/api/v1/loadouts").await;
-    assert_eq!(listing.as_array().expect("rows").len(), 3);
-
-    let adapter = post(
-        &world.state,
-        &format!("/api/v1/loadouts/{branch_id}/items"),
-        json!({ "artifact_id": world.lora.to_string(), "on_second_host": "branch" }),
-    )
-    .await;
-    assert_eq!(adapter["id"], json!(branch_id));
-    assert_eq!(adapter["items"].as_array().expect("items").len(), 2);
-    assert_eq!(adapter["replaced"], json!(null));
 }
 
 #[tokio::test]
@@ -468,4 +383,157 @@ async fn profile_preview_is_absolute_and_does_not_create_destinations() {
         );
         assert!(!destination.exists());
     }
+}
+
+#[tokio::test]
+async fn collections_are_searchable_related_editable_and_deleted_without_server_projections() {
+    let world = seeded();
+    let id = started(&world, "Qwen collection").await;
+    let items = post(&world.state, &format!("/api/v1/loadouts/{id}/members"),
+        json!({ "artifact_ids": [world.ckpt.to_string(), world.llm.to_string(), world.lora.to_string(), world.llm.to_string()] })).await;
+    assert_eq!(items["items"].as_array().expect("items").len(), 3);
+    let results = get(&world.state, "/api/v1/search?q=role%3Aloadout").await;
+    assert_eq!(results["resource_total"], 1);
+    assert_eq!(results["resources"][0]["name"], "Qwen collection");
+    assert_eq!(results["resources"][0]["items"], 3);
+    let related = get(&world.state, &format!("/api/v1/artifacts/{}", world.llm)).await;
+    assert_eq!(related["loadouts"][0]["id"], id);
+    let item = &items["items"][2];
+    let edit = json!({ "repo": item["repo"], "path": item["path"], "destination": "text_encoders/encoder.safetensors" });
+    let (status, edited) = call(
+        &world.state,
+        Method::PUT,
+        &format!("/api/v1/loadouts/{id}/items"),
+        Some(edit),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        edited["items"][2]["destination"],
+        "text_encoders/encoder.safetensors"
+    );
+    let (status, _) = call(
+        &world.state,
+        Method::PUT,
+        &format!("/api/v1/loadouts/{id}/items"),
+        Some(json!({ "repo": item["repo"], "path": item["path"], "destination": "../escape" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, missing_hash) = call(
+        &world.state,
+        Method::GET,
+        &format!("/api/v1/loadouts/{id}/download"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        missing_hash["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("content hash")
+    );
+    let (status, _) = call(
+        &world.state,
+        Method::DELETE,
+        &format!("/api/v1/loadouts/{id}/items/{}", world.llm),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let script = get(
+        &world.state,
+        &format!("/api/v1/loadouts/{id}/download?format=powershell&root=E%3A%5CModels"),
+    )
+    .await;
+    let text = script["text"].as_str().expect("script");
+    assert!(text.contains("text_encoders/encoder.safetensors"));
+    assert!(
+        script["layout"]
+            .as_str()
+            .expect("layout")
+            .contains("  text_encoders/\n    encoder.safetensors")
+    );
+    assert!(text.contains("$root = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath('E:\\Models')"));
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("Get-HoardModel "))
+            .count(),
+        2
+    );
+    assert!(!world.state.projection_root().exists());
+    call(
+        &world.state,
+        Method::DELETE,
+        &format!("/api/v1/loadouts/{id}"),
+        None,
+    )
+    .await;
+    let results = get(&world.state, "/api/v1/search?q=role%3Aloadout").await;
+    assert_eq!(results["resource_total"], 0);
+    let related = get(&world.state, &format!("/api/v1/artifacts/{}", world.llm)).await;
+    assert_eq!(related["loadouts"], json!([]));
+}
+
+#[tokio::test]
+async fn client_downloads_reject_colliding_paths_and_can_remove_unavailable_members() {
+    let world = seeded();
+    let id = started(&world, "paths").await;
+    let items = post(
+        &world.state,
+        &format!("/api/v1/loadouts/{id}/members"),
+        json!({ "artifact_ids": [world.ckpt.to_string(), world.llm.to_string()] }),
+    )
+    .await;
+    for item in items["items"].as_array().expect("items") {
+        let (status, _) = call(&world.state, Method::PUT, &format!("/api/v1/loadouts/{id}/items"),
+            Some(json!({ "repo": item["repo"], "path": item["path"], "destination": "models/same.safetensors" }))).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, payload) = call(
+        &world.state,
+        Method::GET,
+        &format!("/api/v1/loadouts/{id}/download"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("Two models")
+    );
+    let mut document = hoard_core::Loadout::new("missing member");
+    let repo = RepoId::new(RepoType::Models, Some("example".to_owned()), "missing");
+    document.add_file(
+        Role::Unk,
+        hoard_core::LoadoutPin::new(repo.clone(), "absent.safetensors"),
+    );
+    let id = world
+        .state
+        .catalog()
+        .create_loadout(&document)
+        .expect("create");
+    let (status, _) = call(
+        &world.state,
+        Method::GET,
+        &format!("/api/v1/loadouts/{id}/download"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, result) = call(
+        &world.state,
+        Method::DELETE,
+        &format!(
+            "/api/v1/loadouts/{id}/items?repo={}&path=absent.safetensors",
+            repo.qualified()
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["items"], json!([]));
 }

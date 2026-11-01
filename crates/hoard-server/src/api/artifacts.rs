@@ -34,6 +34,7 @@ pub struct LimitParams {
 /// evidence behind them, every path, and what plugs into it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ArtifactView {
+    pub loadouts: Vec<crate::api::loadouts::LoadoutSummary>,
     #[serde(flatten)]
     pub row: RowView,
     pub facts: Vec<Fact>,
@@ -146,7 +147,9 @@ pub async fn detail(
     let now = Timestamp::now();
     let catalog = Arc::clone(state.catalog());
     let inspected = blocking(move || inspect(&catalog, id, now)).await?;
+    let loadouts = crate::api::loadout_search::related(&state, id).await?;
     Ok(Json(ArtifactView {
+        loadouts,
         facts: facts(&inspected.row, inspected.listing.as_ref()),
         evidence: inspected.evidence,
         entries: entry_views(&inspected.entries, &host),

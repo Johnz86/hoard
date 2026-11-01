@@ -107,7 +107,7 @@ Top bar (`--panel`, 11px 16px padding, 1px `--rule` bottom):
 padding, active has `--rule` border, `--bg` fill, `--amb` text), search field (flex 1,
 34px tall, `--bg` fill, border `--rule` or `--amb` when focused, amber glyph, mono 12.5px
 input, CLEAR affordance when non-empty, hint `/` or `ESC` at right), node pulse
-`4 NODES` in green with a 6px pulsing dot, `LOADOUT n` button in amber outline.
+`4 NODES` in green with a 6px pulsing dot, `LOADOUTS` button in amber outline.
 
 The leading icon in the search field opens the SHELVES list beneath the field's left edge.
 Clicking inside the text field only edits the query. The second row is hidden when the query
@@ -340,81 +340,41 @@ line shown. DERIVED
 FACTS list (same shape as inspector facts, plus `first seen`, `pulls on lan`); PATHS ON
 DISK list (`path · node`, symlinks shown as `laptop · symlink`).
 
-## Loadout drawer
+## Loadout collections
 
-Right-anchored 520px panel over a scrim, `hoardIn` animation. Header: `loadout` 19px sans
-700, then the current loadout's name in an amber mono field, borderless until it is focused,
-and `none` as a plain amber slug when the node holds no loadout; CLOSE button. Enter in that
-field, or leaving it, sends the name as typed and the server refuses a blank one. Rows grid
-`52px minmax(0,1fr) 78px 60px 22px`: role, name, rev in `--dim`, weight in `--amb`
-(lora `0.55`, ctrl `0.70`, upsc `2.0×`, others `—`), remove `×`. Below the rows a `LOADOUTS`
-block lists every loadout on the node in a grid `minmax(0,1fr) 64px 72px`: the name (amber on
-the current one, click switches to it), `n items` dimmed, and `DELETE`, which reads `CONFIRM`
-in amber after one click and removes the loadout on the second. Below that a NEW form: a
-field placeheld `name, or blank for loadout-N` and a NEW button; Enter in the field does the
-same. Empty states: `EMPTY LOADOUT <name> / a checkpoint and the adapters you use with it /
-select artifacts in the index and press L, or start another with NEW below` when a loadout is
-current, and `NO LOADOUT YET / a checkpoint and the adapters you use with it / press L on a
-row to start one, or NEW below` when none is; the middle line says what a loadout is for.
-`L` with no loadout creates `loadout-1` and pins into it; `L` on a checkpoint while the
-current loadout has one starts a loadout named after the file and pins it there. The current
-loadout is remembered in the settings record.
+Loadouts are named collections of arbitrary models for selective downloads to the client.
+Their complete interaction and acceptance contract is in [Model collections and client
+ downloads](loadouts.md). The existing drawer and Index renderers remain the shared surfaces.
 
-The existing footer contains, in order:
+Collections appear as LOADOUT rows in mixed Index search and `role:loadout` results, with
+member count and selected byte size. Searching also matches member filenames. A model's
+inspector lists RELATED LOADOUTS. Opening either a collection row or a related link shows
+its stable drawer; `#/loadout/<id>` supports reload and sharing.
 
-1. A labeled native TOOL LAYOUT select: ComfyUI, A1111, llama, supplied by the server.
-2. DESTINATION ON `<node>`, with the server's absolute profile-root path as wrapping,
-   selectable text. Explain that these are Hoard-managed model links in role subfolders;
-   originals stay on disk. The path is read-only and refers to the server, not the browser.
-3. The existing terminal-style availability/job-status box, naming the selected layout.
-4. An amber `APPLY <layout> TO <node>` button.
+The toolbar LOADOUTS button opens a chooser. ADD TO LOADOUT or L opens that chooser for the
+current or selected models; choose a collection and confirm ADD TO THIS LOADOUT, or CREATE
+one with a name. Models append without role-slot replacement. The editor provides explicit
+SAVE NAME, SAVE PATH and REMOVE actions. DELETE LOADOUT requires a named confirmation and
+preserves original files. CRUD updates patch the mounted drawer rather than recreating it
+or replaying its animation. Preserve drafts, focus, selection and body scroll.
 
-The selection is remembered per loadout in this browser. A new loadout defaults to ComfyUI;
-an obsolete saved profile falls back to the server's default. Choosing a layout changes only
-the preview and preference; it does not start a job, create directories or modify files.
-The selector stays present when there is no loadout; applying requires a loaded, nonempty
-loadout and valid profile metadata. Custom paths and remote target selection are excluded.
-
-| State | Layout/destination | Apply and status |
-| --- | --- | --- |
-| Reading layouts | Disabled selector and loading destination | Disabled; no guessed path |
-| Layout read failed | Inline error and RETRY; disabled selector | Disabled; retry preserves drafts |
-| No loadout or empty loadout | Known layouts and read-only destination remain visible | Disabled; prompt to add models |
-| Ready | Enabled selector; path updates immediately | Selected layout and availability preview |
-| Start request pending / job running | Selector locked to that job's layout and destination | Disabled; actual job phase in amber |
-| Polling unavailable | Keep the job's layout and destination | Disabled; explain status is unavailable and keep checking |
-| Succeeded | Selector enabled; result belongs to the applied layout | `Last apply complete`, actual phase in green |
-| Failed / cancelled | Selector enabled; retain layout and destination | Explicit error/cancellation; allow retry |
-
-Capture profile, node and destination when an apply starts and reconcile them with the
-server's start response. Poll that returned job until it finishes; accepting the start
-request is not completion. Switching loadouts never transfers job status or profile choices.
-Selecting a different profile after completion shows its availability preview, not a previous
-profile's success. Switching back may show the last job when it used that profile.
-
-Profile changes and polling update only the footer; do not replace a focused native select
-or its options during polling. Preserve name drafts, text selection, focused controls and
-drawer-body scroll during unrelated rerenders. Enter/Space and arrow keys retain native
-select/button behavior. Opening focuses CLOSE; closing by CLOSE, scrim or Escape returns
-focus to the invoking control, normally LOADOUT. A previously focused inspector field regains
-its focus and text selection. Existing Escape behavior first blurs an input/select before closing the
-drawer. Closing never cancels an apply. An error's RETRY action returns focus to the layout
-select when metadata becomes available. Do not steal focus when a background job finishes.
-
-Acceptance checks cover each layout's actual symlinks and destination, existing-file conflict
-preservation, repeat apply, profile/request snapshots during loadout switching, metadata
-failure/retry, obsolete preferences, empty states, owner-access errors, job polling recovery,
-keyboard operation and draft/focus/scroll preservation. Review the footer at 1180/1600px in
-both themes with representative long paths. Existing project, classification and source
-journeys must continue to pass. Reload preserves the profile preference but clears job tracking.
+DOWNLOAD ON YOUR COMPUTER shows a client destination root, member-relative paths, and a
+PowerShell/POSIX script preview with COPY DOWNLOAD SCRIPT and SAVE SCRIPT. Scripts request
+only the selected files through `hf`, preserve existing client files with a warning, and
+stop on transfer failure. The UI reports script readiness, never download completion.
+Unavailable members, destination collisions and unsupported multi-file shard artifacts
+block script preparation. A path may be edited independently of the model's classification.
+No server-side Apply, tool-layout selector, projection root or target-node control appears
+in this collection journey. Generic server projection APIs remain separate for existing
+callers. Existing legacy loadout documents remain readable; the catalog format is unchanged.
 
 Toast: bottom center, `--panel2` fill, 3px amber left border, mono 12px, 2.4 s, used for
-`+ name pinned at v3`, `replaced vae X with Y`, `new loadout "X": checkpoint pinned`,
-`new loadout "X"`, `renamed to X`, `removed loadout X`, `copied: git clone ...`,
+`Loadout created`, `Models added to loadout`, `Loadout name saved`,
+`Download path saved`, `Loadout deleted; model files kept`, `copied: git clone ...`,
 `served name → http://hoard.lan/org/name`, `checked out ...`,
 `apply complete on laptop` only after the job succeeds, or its failure/cancellation.
-Every pin toast is the server's own
-`notice`, so the drawer decides nothing about what a pin did.
+Collection notifications describe saved membership or prepared client scripts; they never
+claim that a download finished.
 
 ## Keyboard map
 
@@ -422,12 +382,12 @@ Global: `Esc` blurs the search field, else closes the drawer, else leaves detail
 `/` focuses search (prevent default). Keys are ignored while typing in an input.
 
 Index: `j`/`↓` and `k`/`↑` move the cursor (clamped), `Enter` opens, `Space` toggles
-selection, `L` pins the cursor row into the current loadout and a second checkpoint starts a
-loadout named after it, `Y` yanks the pull command, `?` shows the key sheet (proposal
+selection, `L` opens the collection chooser for the cursor model or selected models,
+`Y` yanks the pull command (or opens a collection's download controls), `?` shows the key sheet (proposal
 footer).
 
-Detail: `[` and `]` cycle FILES, REFS, CARD, COMPAT, USAGE; `L` pins the opened file into
-the current loadout; `Esc` returns to the index.
+Detail: `[` and `]` cycle FILES, REFS, CARD, COMPAT, USAGE; `L` opens the collection chooser for the opened file and adds it to
+a chosen collection; `Esc` returns to the index.
 
 Drawer: the header name field renames on Enter or blur; NEW starts a loadout named as typed
 or `loadout-N`; a loadout row switches on click; DELETE arms, CONFIRM removes; the row's `×`

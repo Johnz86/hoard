@@ -27,10 +27,11 @@ function card(app, item, index) {
         el("div", { class: "card-name", text: item.name }),
         el("div", {
             class: "card-meta",
-            text: item.project_id ? `${item.revision} · ${sizeText(item)} · ${item.node}`
+            text: item.loadout_id ? `${item.items} models · ${sizeText(item)} · ${item.node}`
+                : item.project_id ? `${item.revision} · ${sizeText(item)} · ${item.node}`
                 : `${line} · ${dash(item.precision)} · ${sizeText(item)}`
         }),
-        el("div", { class: "card-trigger", text: item.project_id ? item.source : dash(item.trigger) })
+        el("div", { class: "card-trigger", text: item.loadout_id ? "Review collection and download" : item.project_id ? item.source : dash(item.trigger) })
     );
 }
 

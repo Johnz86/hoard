@@ -428,27 +428,42 @@ rest being counted.
 - `DELETE /api/v1/loadouts/{id}` answers `{ "id", "deleted" }`; an unknown id is 404. An
   apply already running against that loadout fails at its next read of it, because a job row
   names the loadout only in its subject.
-- `POST /api/v1/loadouts/{id}/items { "artifact_id", "weight", "on_second_host" }`,
-  `DELETE .../items/{artifact_id}`. `on_second_host` is `replace` (the default) or `branch`:
-  `branch` on a line that would displace a host starts a new loadout named after the file,
-  by its name without a letter extension, numbered `-2`, `-3` when that name is taken, and
-  pins the line there instead. The answer is the loadout view of whichever loadout now holds
-  the line, plus `replaced` - `{ "slot", "name" }` for a host, VAE or upscaler line that was
-  occupied, otherwise `null` - and `notice`, the one line the drawer prints:
-  `+ sdxl-base-1.0 pinned at v3`, `replaced vae old-vae with sdxl-vae`,
-  `new loadout "cyberrealisticPony_v160": checkpoint pinned`, or
-  `sdxl-vae is already in night` for a line the loadout already holds, which writes nothing.
-  A weight change is `DELETE` then `POST`, because a re-pinned line is answered rather than
-  rewritten. A line is identified by its repository and path together, so the same file name
-  under two repositories is two lines: both pin, and `DELETE .../items/{artifact_id}` removes
-  only the line whose repository the named artifact sits in.
+- `POST /api/v1/loadouts/{id}/members { "artifact_ids": [...] }` adds 1–1000 indexed
+  models atomically. All roles append without replacing existing members; duplicate repo/path
+  pairs are idempotent. The response is the resolved collection view.
+- `POST /api/v1/loadouts/{id}/items { "artifact_id", "destination" }` adds one model;
+  the optional destination is a portable path relative to the client root. The legacy
+  `weight` and `on_second_host` keys are accepted, but role slots no longer replace or branch
+  collections. The response retains `replaced: null` and a human-readable `notice`.
+- `PUT /api/v1/loadouts/{id}/items { "repo", "path", "destination" }` edits a member's
+  client path without changing classification or the model file. Traversal, absolute paths,
+  Windows reserved names and nonportable characters are rejected. `DELETE` on the same route
+  with `repo` and `path` query parameters removes membership, including unresolved members.
+  The legacy `DELETE .../items/{artifact_id}` remains available for indexed members.
+- `GET /api/v1/loadouts/{id}/download?format=powershell|shell&root=...` returns
+  `{ "filename", "text", "layout" }`: a client script and readable folder preview. Default
+  root is `./models`; default format is PowerShell. Only the pinned model files are requested,
+  against the current public endpoint and resolved revisions. Scripts stage beneath the client
+  root, stop on failure and preserve existing destinations with a warning, without validating
+  their contents. Empty collections, unavailable/unhashed files, destination collisions and
+  multi-file shard artifacts return 409. This read never starts a server apply or writes files.
+- New TOML documents store arbitrary `[[files]]` pins with `repo`, `path`, `role` and optional
+  `destination`, commit/content hashes and display metadata. Legacy host/adapter/VAE slots
+  remain readable and editable without a catalog-format change.
+- Collections participate in `/api/v1/search` as `resource_kind: "loadout"` rows with
+  `loadout_id`, member count and selected byte size. `role:loadout` filters them; name and
+  member filenames are searchable. Mixed ordering, pagination, facets and shelf counts include
+  them. Artifact detail exposes a `loadouts` array linking back to related collections.
 - `hoard loadout import` is the one path that replaces by name: reading a document whose name
   a loadout already holds overwrites that loadout, where every route above refuses with 409.
-- `POST /api/v1/loadouts/{id}/validate`: compat violations.
-- `GET /api/v1/loadouts/profiles`: local node name, `default_profile`, and supported
+- `POST /api/v1/loadouts/{id}/validate`: legacy document compatibility violations; collection
+  membership does not certify model compatibility.
+- `GET /api/v1/loadouts/profiles`: legacy server projection metadata, separate from client
+  collection downloads. Returns local node name, `default_profile`, and supported
   `profiles` with `id`, display `label`, and absolute `destination`. Reading this metadata
   creates no directories. Destinations are Hoard-managed folders on the server.
-- `POST /api/v1/loadouts/{id}/apply { "node", "profile" }`: starts a job, answering
+- `POST /api/v1/loadouts/{id}/apply { "node", "profile" }`: legacy server projection API,
+  absent from the collection UI. Starts a server-side job, answering
   the resolved `profile` and absolute local `destination` (null for a remote availability
   report), alongside
   `{ "job_id", "node", "apply_preview" }` with the same `apply_preview` shape as loadout

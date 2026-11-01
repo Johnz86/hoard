@@ -1,5 +1,3 @@
-use std::cmp::Ordering;
-
 use hoard_core::RepoRowId;
 use hoard_index::catalog::QueryPage;
 use hoard_index::row::SearchRow;
@@ -18,6 +16,7 @@ use crate::state::AppState;
 pub enum ResourceRow {
     Artifact(ArtifactResource),
     Project(ProjectResource),
+    Loadout(crate::api::loadout_search::LoadoutResource),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -110,7 +109,11 @@ pub(crate) async fn find(
         .ok_or_else(|| ApiError::bad_request("resource cursor exceeds the supported range"))?;
     let projects =
         project_search::sorted_prefix(state, request.raw.clone(), request.sort, window).await?;
-    let total = legacy.total.saturating_add(projects.total);
+    let (loadouts, loadout_total) =
+        crate::api::loadout_search::sorted_prefix(state, request.raw.clone(), request.sort, window)
+            .await?;
+    let other_total = projects.total.saturating_add(loadout_total);
+    let total = legacy.total.saturating_add(other_total);
     if u64::from(request.offset) >= total {
         return Ok(ResourcePage {
             rows: Vec::new(),
@@ -118,23 +121,40 @@ pub(crate) async fn find(
             next_cursor: None,
         });
     }
-    let artifacts = if projects.total == 0 && legacy_offset == request.offset {
+    let artifacts = if other_total == 0 && legacy_offset == request.offset {
         legacy.rows.clone()
     } else {
         artifact_prefix(state, &request, legacy, legacy_offset, window).await?
     };
-    let offset = if projects.total == 0 && legacy_offset == request.offset {
+    let offset = if other_total == 0 && legacy_offset == request.offset {
         0
     } else {
         request.offset as usize
     };
-    let rows = merge(
-        artifacts,
-        projects.rows,
-        request.sort,
-        offset,
-        request.limit as usize,
-    );
+    let rows = if other_total == 0 {
+        artifacts
+            .into_iter()
+            .skip(offset)
+            .take(request.limit as usize)
+            .map(|row| {
+                ResourceRow::Artifact(ArtifactResource {
+                    row: RowView::from(&row),
+                    resource_kind: "artifact",
+                })
+            })
+            .collect()
+    } else {
+        merge(
+            MergeSources {
+                artifacts,
+                projects: projects.rows,
+                loadouts,
+            },
+            request.sort,
+            offset,
+            request.limit as usize,
+        )
+    };
     Ok(ResourcePage {
         next_cursor: next_cursor(
             request.offset,
@@ -219,51 +239,84 @@ fn artifact_key(row: &SearchRow, key: SortKey) -> SortValue {
     }
 }
 
-fn merge(
+pub(crate) fn loadout_key(
+    row: &crate::api::loadout_search::LoadoutResource,
+    key: SortKey,
+) -> SortValue {
+    match key {
+        SortKey::Role | SortKey::Format => SortValue::Text("loadout".to_owned()),
+        SortKey::Name => SortValue::Text(row.name.to_lowercase()),
+        SortKey::Node => SortValue::Text(row.node.clone()),
+        SortKey::State => SortValue::Text("local".to_owned()),
+        SortKey::Size => SortValue::Number(row.size),
+        SortKey::Used | SortKey::Ident => SortValue::Number(0),
+        SortKey::Base | SortKey::Precision | SortKey::Revision => SortValue::Text(String::new()),
+    }
+}
+
+struct MergeSources {
     artifacts: Vec<SearchRow>,
     projects: Vec<ProjectRow>,
-    sort: SortSpec,
-    offset: usize,
-    limit: usize,
-) -> Vec<ResourceRow> {
-    let mut artifacts = artifacts
+    loadouts: Vec<crate::api::loadout_search::LoadoutResource>,
+}
+
+fn merge(input: MergeSources, sort: SortSpec, offset: usize, limit: usize) -> Vec<ResourceRow> {
+    let artifacts = input
+        .artifacts
         .into_iter()
-        .map(|row| (artifact_key(&row, sort.key), row))
-        .peekable();
-    let mut projects = projects
-        .into_iter()
-        .map(|row| (project_key(&row, sort.key), row))
-        .peekable();
-    let mut rows = Vec::with_capacity(limit);
-    let take_artifact = |left: &SortValue, right: &SortValue| {
-        let order = left.cmp(right);
-        let order = if sort.descending {
-            order.reverse()
-        } else {
-            order
-        };
-        order != Ordering::Greater
-    };
-    for position in 0..offset.saturating_add(limit) {
-        let artifact = match (artifacts.peek(), projects.peek()) {
-            (Some((left, _)), Some((right, _))) => take_artifact(left, right),
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
-            (None, None) => break,
-        };
-        if artifact {
-            if let Some((_, row)) = artifacts.next()
-                && position >= offset
-            {
-                rows.push(ResourceRow::Artifact(ArtifactResource {
+        .map(|row| {
+            (
+                artifact_key(&row, sort.key),
+                ResourceRow::Artifact(ArtifactResource {
                     row: RowView::from(&row),
                     resource_kind: "artifact",
-                }));
-            }
-        } else if let Some((_, row)) = projects.next()
+                }),
+            )
+        })
+        .collect::<Vec<_>>();
+    let projects = input
+        .projects
+        .into_iter()
+        .map(|row| {
+            (
+                project_key(&row, sort.key),
+                ResourceRow::Project(ProjectResource::from(row)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let loadouts = input
+        .loadouts
+        .into_iter()
+        .map(|row| (loadout_key(&row, sort.key), ResourceRow::Loadout(row)))
+        .collect::<Vec<_>>();
+    let mut sources = [
+        artifacts.into_iter().peekable(),
+        projects.into_iter().peekable(),
+        loadouts.into_iter().peekable(),
+    ];
+    let mut rows = Vec::with_capacity(limit);
+    for position in 0..offset.saturating_add(limit) {
+        let next = sources
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, source)| source.peek().map(|(key, _)| (index, key)))
+            .min_by(|(left_index, left), (right_index, right)| {
+                let order = left.cmp(right);
+                (if sort.descending {
+                    order.reverse()
+                } else {
+                    order
+                })
+                .then_with(|| left_index.cmp(right_index))
+            })
+            .map(|(index, _)| index);
+        let Some(next) = next else {
+            break;
+        };
+        if let Some((_, row)) = sources[next].next()
             && position >= offset
         {
-            rows.push(ResourceRow::Project(ProjectResource::from(row)));
+            rows.push(row);
         }
     }
     rows

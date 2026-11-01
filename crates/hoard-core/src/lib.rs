@@ -23,8 +23,8 @@ pub use id::{
     RepoType, RevisionId, Sha256, ShelfId, SourceId,
 };
 pub use loadout::{
-    DEFAULT_LOADOUT_STEM, Loadout, LoadoutPin, LoadoutSlot, LoadoutViolation, PinResolution,
-    Placed, free_loadout_name, loadout_stem, numbered_loadout_name,
+    DEFAULT_LOADOUT_STEM, DownloadPath, Loadout, LoadoutPin, LoadoutSlot, LoadoutViolation,
+    PinResolution, Placed, free_loadout_name, loadout_stem, numbered_loadout_name,
 };
 pub use role::{Base, Role, SubRole};
 pub use state::{FileState, State};

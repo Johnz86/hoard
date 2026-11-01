@@ -6,13 +6,9 @@ position, sharing settings, restart, shared links and removal of the last source
 Sharing checks include immediate address changes, continued access through the original
 listener without restarting, refreshed cached clone commands, and node-name-only restart
 requirements. Address-only saves are captured at both widths and themes.
-It also covers a first model loadout: real link creation, pending-job status, duplicate-submit
-prevention, polling recovery, draft/focus preservation, switching/reopening the drawer, and
-a conflicting file followed by retry. It verifies ComfyUI, A1111 and llama destinations
-and real links, profile-specific job results, saved preferences after reload, metadata failure
-and retry focus, and footer screenshots at 1180/1600px in both themes. Job polling is temporarily controlled in the browser
-to exercise running and unavailable states deterministically; apply and filesystem results
-use the real isolated server.
+It also covers creating a named model collection, preparing a client download script and
+preserving the drawer shell, draft input and focus. The [loadout task](../verify-loadouts/README.md)
+owns the full collection discovery, editing, removal and real client download journey.
 Classification coverage uses an additional unclassified model to verify owner-access recovery,
 draft/focus preservation, confirmation, matching triage/search/shelf totals, persistence through
 rescan and restart, clearing and re-inference, and confirmed noise rejection without file loss.

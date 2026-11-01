@@ -18,6 +18,17 @@ function plugLabel(plug) {
     return `${String(plug.role || "").toLowerCase()} · ${name}`;
 }
 
+export function renderRelatedLoadouts(app, collections, context = "inspector") {
+    return el("div", { class: "related-loadouts" },
+        el("div", { class: "rail-title", text: "RELATED LOADOUTS" }),
+        collections?.length ? collections.map(collection => el("button", {
+            id: `${context}-related-${collection.id}`, class: "btn related-loadout", type: "button",
+            text: `${collection.name} (${collection.items})`,
+            onClick: () => app.openCollection(collection.id)
+        })) : el("div", { class: "mono-dim", text: collections
+            ? "Not in a loadout yet" : "Reading related loadouts…" }));
+}
+
 export function renderInspector(app) {
     const row = app.cursorRow();
     const detail = app.state.cursorArtifact;
@@ -32,6 +43,21 @@ export function renderInspector(app) {
             el("div", { class: "inspector-name", text: "—" }),
             el("div", { class: "inspector-path", text: "no match" })
         );
+    }
+
+    if (row.loadout_id) {
+        return el("aside", { class: "inspector r-loadout" },
+            el("div", { class: "rail-title", text: "INSPECTOR" }),
+            el("div", { class: "inspector-role" }, el("span", { class: "role-mark" }), "LOADOUT"),
+            el("div", { class: "inspector-name", text: row.name }),
+            el("div", { class: "fact-list" }, factRows([
+                { key: "type", value: "Model collection" }, { key: "models", value: row.items },
+                { key: "selected size", value: row.size_human }, { key: "shared by", value: row.node }
+            ])),
+            el("p", { class: "loadout-help", text: "Review the files and download paths, then copy a script to run on your computer." }),
+            el("div", { class: "inspector-actions" },
+                el("button", { class: "btn btn-primary", type: "button", text: "OPEN LOADOUT",
+                    onClick: () => app.openCollection(row.loadout_id) })));
     }
 
     if (row.project_id) {
@@ -89,6 +115,7 @@ export function renderInspector(app) {
             el("button", {
                 class: "btn",
                 type: "button",
+                id: "add-to-loadout",
                 text: "ADD TO LOADOUT",
                 onClick: () => app.addToLoadout(row)
             }),
@@ -99,6 +126,7 @@ export function renderInspector(app) {
                 onClick: () => app.yank(row)
             })
         ),
+        renderRelatedLoadouts(app, detail?.artifact_id === row.artifact_id ? detail.loadouts : null),
         detail?.artifact_id === row.artifact_id ? renderClassification(app, detail) : null,
         el(
             "div",

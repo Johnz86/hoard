@@ -4,7 +4,8 @@ const DEFAULTS = {
     density: "Condensed",
     roleColorMode: "Color-coded",
     showInspector: true,
-    loadoutProfiles: {},
+    loadoutDownloadRoot: "./models",
+    loadoutScriptFormat: "powershell",
     loadoutId: null
 };
 

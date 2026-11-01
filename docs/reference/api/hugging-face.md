@@ -15,6 +15,9 @@ Clients point at hoard with `HF_ENDPOINT=http://<host>:7099` (the default Hoard 
   - `/{repo_type}/{org}/{repo}` and `/{repo_type}/{org_repo}` (canonical)
   - `/{org}/{repo}` (implies `models`)
   - `/{repo}` single segment (implies `models`, no org)
+- File resolve routes preserve the existing explicit namespace interpretation. When a
+  two-part reference looks typed but that repository is absent, an indexed model organization
+  with the same name (for example `models/collection`) is used instead.
 - `{revision}`: branch, tag or 40-hex commit sha. Every response that touched a revision
   carries `x-repo-commit: <resolved sha>`.
 - Path segments are cleaned: `\` becomes `/`, repeated `/` collapse, any `..` component is

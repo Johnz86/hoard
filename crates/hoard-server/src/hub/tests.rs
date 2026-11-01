@@ -1083,3 +1083,30 @@ async fn offline_metadata_is_the_documented_repo_not_found() {
     assert_eq!(answer.header("x-error-code"), Some("RepoNotFound"));
     assert_eq!(answer.json(), json!({ "error": "Repository not found" }));
 }
+
+#[tokio::test]
+async fn a_model_organization_named_models_is_not_lost_to_the_namespace_prefix() {
+    let world = seeded();
+    let mut repository = seed_repo(world._dir.path(), RepoType::Models, "models/collection");
+    repository.revisions.push(seed_revision(
+        REVISION,
+        vec![SeedEntry {
+            git_sha1: Some(CommitSha::from_bytes(SMALL_GIT_SHA1)),
+            ..seed_entry(world._dir.path(), SMALL_PATH, SMALL_SIZE as u64)
+        }],
+    ));
+    world
+        .state
+        .catalog()
+        .seed(&[repository])
+        .expect("seed reserved organization");
+    for prefix in ["models/collection", "models/models/collection"] {
+        let answer = get(
+            &world.state,
+            &format!("/{prefix}/resolve/main/{SMALL_PATH}"),
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::OK, "{prefix}: {:?}", answer.body);
+        assert_eq!(answer.body.as_ref(), World::small_bytes());
+    }
+}

@@ -99,16 +99,6 @@ export const loadout = (id) => get(`/loadouts/${segment(id)}`);
 export const createLoadout = (name) => post("/loadouts", name ? { name } : {});
 export const renameLoadout = (id, name) => put(`/loadouts/${segment(id)}`, { name });
 export const deleteLoadout = (id) => del(`/loadouts/${segment(id)}`);
-export const addLoadoutItem = (id, artifactId) =>
-    post(`/loadouts/${segment(id)}/items`, {
-        artifact_id: artifactId,
-        weight: null,
-        on_second_host: "branch"
-    });
-export const removeLoadoutItem = (id, artifactId) =>
-    del(`/loadouts/${segment(id)}/items/${segment(artifactId)}`);
-export const applyLoadout = (id, node, profile) =>
-    post(`/loadouts/${segment(id)}/apply`, { node, profile: profile ?? null });
 
 export const nodes = () => get("/nodes");
 export const sources = () => get("/sources");
@@ -126,4 +116,12 @@ export const saveSettings = (body) => put("/settings", body);
 export const setup = () => get("/setup");
 export const saveSetup = (body) => put("/setup", body);
 
-export const loadoutProfiles = () => get("/loadouts/profiles");
+
+export const addLoadoutMembers = (id, artifactIds) =>
+    post(`/loadouts/${segment(id)}/members`, { artifact_ids: artifactIds });
+export const editLoadoutMember = (id, item, destination) =>
+    put(`/loadouts/${segment(id)}/items`, { repo: item.repo, path: item.path, destination });
+export const removeLoadoutMember = (id, item) =>
+    del(`/loadouts/${segment(id)}/items?${new URLSearchParams({repo: item.repo, path: item.path})}`);
+export const loadoutDownload = (id, format, root) =>
+    get(`/loadouts/${segment(id)}/download`, { format, root });

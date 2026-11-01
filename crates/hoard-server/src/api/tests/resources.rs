@@ -196,3 +196,74 @@ async fn size_filters_compare_the_bytes_shown_for_both_resource_kinds() {
     let negated = get(&state, "/api/v1/search?q=-size:%3C35b&sort=size").await;
     assert_eq!(resource_names(&negated), ["echo", "Bravo", "alpha"]);
 }
+
+#[tokio::test]
+async fn loadouts_share_resource_pagination_facets_and_shelf_counts() {
+    let (_directory, state) = resource_world();
+    for name in ["Bravo", "Collection", "Zulu"] {
+        state
+            .catalog()
+            .create_loadout(&hoard_core::Loadout::new(name))
+            .expect("create collection");
+    }
+    let mut uri = "/api/v1/search?limit=2".to_owned();
+    let mut found = Vec::new();
+    loop {
+        let response = get(&state, &uri).await;
+        assert_eq!(response["resource_total"], 9);
+        found.extend(
+            response["resources"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|row| {
+                    (
+                        row["name"].as_str().expect("name").to_owned(),
+                        row["resource_kind"].as_str().expect("kind").to_owned(),
+                    )
+                }),
+        );
+        match response["resource_next_cursor"].as_str() {
+            Some(cursor) => uri = format!("/api/v1/search?limit=2&resource_cursor={cursor}"),
+            None => break,
+        }
+    }
+    assert_eq!(
+        found
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "alpha",
+            "Bravo",
+            "Bravo",
+            "charlie",
+            "Collection",
+            "Delta",
+            "echo",
+            "Foxtrot",
+            "Zulu"
+        ]
+    );
+    assert_eq!(found[1].1, "git");
+    assert_eq!(found[2].1, "loadout");
+    let response = get(&state, "/api/v1/search?q=role:loadout").await;
+    assert_eq!(response["resource_total"], 3);
+    assert_eq!(response["facets"]["node"][0]["count"], 3);
+    let response = get(&state, "/api/v1/search?q=role:llm").await;
+    assert_eq!(response["resource_total"], 3);
+    state
+        .catalog()
+        .create_shelf("collections", "role:loadout", 99)
+        .expect("shelf");
+    let shelves = get(&state, "/api/v1/shelves").await;
+    assert_eq!(
+        shelves
+            .as_array()
+            .expect("shelves")
+            .iter()
+            .find(|shelf| shelf["name"] == "collections")
+            .expect("collection shelf")["count"],
+        3
+    );
+}

@@ -1,6 +1,6 @@
 import * as api from "./api.js";
 import { el, dash, errorPanel, fmtDay, fmtRate, highlightUrl, loadingPanel, sizeText, stateText } from "./dom.js";
-import { factRows } from "./inspector.js";
+import { factRows, renderRelatedLoadouts } from "./inspector.js";
 import { renderCard } from "./readme.js";
 import { roleClass, roleCode, stateClass } from "./table.js";
 
@@ -38,6 +38,7 @@ async function fetchInto(app, slot, loader) {
 export function loadDetail(app) {
     const detail = app.state.detail;
     fetchInto(app, "repo", () => api.repo(detail.type, detail.org, detail.name, detail.aid));
+    if (detail.aid) fetchInto(app, "artifact", () => api.artifact(detail.aid));
     loadTab(app);
 }
 
@@ -305,6 +306,7 @@ function rightRail(app, repo) {
             el("div", { class: "rail-title", text: "DERIVED FACTS" }),
             el("div", { class: "fact-list" }, factRows(repo.facts))
         ),
+        app.state.detail.aid ? renderRelatedLoadouts(app, app.state.detail.artifact?.loadouts, "detail") : null,
         el(
             "div",
             null,

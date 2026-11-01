@@ -18,7 +18,7 @@ export function roleClass(role) {
 
 export function roleCode(row) {
     const role = String(row.role || "unk").toLowerCase();
-    return role === "unk" ? "?" : role.toUpperCase();
+    return row.role_code || (role === "unk" ? "?" : role.toUpperCase());
 }
 
 export function stateClass(state) {

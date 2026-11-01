@@ -8,6 +8,7 @@ root from their own file paths, so they do not depend on the caller's working di
 | --- | --- | --- |
 | [Check documentation](check-documentation/README.md) | `node tasks/check-documentation/check.mjs` | Local links, anchors, task entry points and obsolete path references |
 | [Verify first run](verify-first-run/README.md) | `node tasks/verify-first-run/verify.mjs` | Isolated browser acceptance for setup, configuration and empty states |
+| [Verify loadouts](verify-loadouts/README.md) | `node tasks/verify-loadouts/verify.mjs` | Collection discovery, stable editing and real client downloads |
 | [Record introduction](record-introduction/README.md) | `node tasks/record-introduction/record.mjs` | Real UI walkthrough synchronized to the supplied narration |
 | [Benchmark catalog](benchmark-catalog/README.md) | Rust scale harness | Serial, isolated performance measurements |
 

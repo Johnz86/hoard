@@ -16,7 +16,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header}
 use axum::response::{IntoResponse, Response};
 use futures::TryStreamExt;
 
-use hoard_core::{ArtifactId, CommitSha, RepoId, RepoRowId, Sha256};
+use hoard_core::{ArtifactId, CommitSha, RepoId, RepoRowId, RepoType, Sha256};
 use hoard_index::catalog::{Catalog, Dedupe};
 use hoard_mirror::MirrorError;
 use hoard_mirror::git::LfsLocation;
@@ -39,7 +39,7 @@ pub(crate) async fn resolve(
     RoutePath(params): RoutePath<PathParams>,
     headers: HeaderMap,
 ) -> HubResult<Response> {
-    let repo = repo_of(&params)?;
+    let repo = file_repository(&state, &params).await?;
     let path = path_of(&params)?;
     let auth = authorization(&headers);
     let head = method == Method::HEAD;
@@ -64,6 +64,27 @@ pub(crate) async fn resolve(
         Served::new(&repo, path, head, client),
         &headers,
     )
+    .await
+}
+
+async fn file_repository(state: &AppState, params: &PathParams) -> HubResult<RepoId> {
+    let repo = repo_of(params)?;
+    let (Some(head), Some(tail)) = (params.get("p1"), params.get("p2")) else {
+        return Ok(repo);
+    };
+    if params.contains_key("p3")
+        || params.contains_key("repo_type")
+        || head.parse::<RepoType>().is_err()
+    {
+        return Ok(repo);
+    }
+    let organization = RepoId::new(RepoType::Models, Some(head.clone()), tail.clone());
+    on_catalog(state.catalog(), move |catalog| {
+        if catalog.repository(&repo)?.is_none() && catalog.repository(&organization)?.is_some() {
+            return Ok(organization);
+        }
+        Ok(repo)
+    })
     .await
 }
 

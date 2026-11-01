@@ -85,11 +85,19 @@ pub async fn list(State(state): State<AppState>) -> ApiResult<Json<Vec<ShelfView
         rows.iter().map(|row| row.query.clone()).collect(),
     )
     .await?;
-    for (row, count) in rows.iter_mut().zip(projects) {
+    let loadouts = crate::api::loadout_search::query_counts(
+        &state,
+        rows.iter().map(|row| row.query.clone()).collect(),
+    )
+    .await?;
+    for ((row, count), loadouts) in rows.iter_mut().zip(projects).zip(loadouts) {
         row.count = row
             .count
             .zip(count)
-            .map(|(artifacts, projects)| artifacts.saturating_add(projects));
+            .zip(loadouts)
+            .map(|((artifacts, projects), loadouts)| {
+                artifacts.saturating_add(projects).saturating_add(loadouts)
+            });
     }
     Ok(Json(rows))
 }

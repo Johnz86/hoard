@@ -8,9 +8,8 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use hoard_core::{
-    ArtifactId, JobId, Loadout, LoadoutId, LoadoutPin, LoadoutSlot, LoadoutViolation,
-    PinResolution, RepoId, Role, State as ArtifactState, format_size, free_loadout_name,
-    loadout_stem, numbered_loadout_name,
+    ArtifactId, DownloadPath, JobId, Loadout, LoadoutId, LoadoutPin, LoadoutSlot, LoadoutViolation,
+    PinResolution, RepoId, Role, State as ArtifactState, format_size, numbered_loadout_name,
 };
 use hoard_index::IndexError;
 use hoard_index::catalog::{Catalog, JobProgress, LoadoutRecord, NewProjection};
@@ -31,13 +30,12 @@ const APPLY_KIND: &str = "apply";
 const FACTOR_SLOT: LoadoutSlot = LoadoutSlot::Upscaler;
 /// The tool layout an apply writes when none is named.
 const DEFAULT_PROFILE: Profile = Profile::ComfyUi;
-/// What a pin's notice names as the revision when the row carries none.
-const UNREVISIONED: &str = "content hash";
 
 /// One line of the loadout drawer, with whether the target node can satisfy it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LoadoutItem {
     pub slot: LoadoutSlot,
+    pub destination: DownloadPath,
     pub role: Role,
     pub role_code: String,
     pub artifact_id: Option<ArtifactId>,
@@ -57,7 +55,18 @@ pub struct LoadoutItem {
     pub state: Option<ArtifactState>,
     pub resolution: PinResolution,
     #[serde(skip)]
-    hf_arguments: String,
+    pub(crate) hf_arguments: String,
+    #[serde(skip)]
+    pub(crate) download_source: Option<DownloadSource>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DownloadSource {
+    pub repo: RepoId,
+    pub path: String,
+    pub revision: String,
+    pub multi_file: bool,
+    pub hash_ready: bool,
 }
 
 /// What applying the loadout to a node would do.
@@ -170,23 +179,13 @@ pub enum CreateBody {
     Unnamed(NoBody),
 }
 
-/// What `POST /api/v1/loadouts/{id}/items` does when the line is a host and the loadout
-/// already has one: replace it, or start a new loadout named after the file and pin there.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HostPolicy {
-    #[default]
-    Replace,
-    Branch,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct ItemBody {
     pub artifact_id: String,
     #[serde(default)]
     pub weight: Option<f32>,
     #[serde(default)]
-    pub on_second_host: HostPolicy,
+    pub destination: Option<DownloadPath>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -223,7 +222,7 @@ struct Pinning {
     id: LoadoutId,
     artifact: ArtifactId,
     weight: Option<f32>,
-    policy: HostPolicy,
+    destination: Option<DownloadPath>,
     node_name: String,
 }
 
@@ -352,11 +351,120 @@ pub async fn add_item(
         id: loadout_id(&id)?,
         artifact: artifact_id(&body.artifact_id)?,
         weight: body.weight,
-        policy: body.on_second_host,
+        destination: body.destination,
         node_name: state.node_name().to_owned(),
     };
     let catalog = Arc::clone(state.catalog());
     let view = blocking_or_conflict(move || pin_into(&catalog, pinning)).await?;
+    Ok(Json(view))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddMembers {
+    artifact_ids: Vec<String>,
+}
+
+pub async fn add_members(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<AddMembers>,
+) -> ApiResult<Json<LoadoutView>> {
+    authorize(&state, &headers)?;
+    if body.artifact_ids.is_empty() || body.artifact_ids.len() > 1000 {
+        return Err(ApiError::bad_request("Select between 1 and 1000 models"));
+    }
+    let id = loadout_id(&id)?;
+    let ids = body
+        .artifact_ids
+        .iter()
+        .map(|id| artifact_id(id))
+        .collect::<ApiResult<Vec<_>>>()?;
+    let node = state.node_name().to_owned();
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        let mut document = stored(&catalog, id)?.parse()?;
+        let mut held: std::collections::HashSet<_> = document
+            .pins()
+            .into_iter()
+            .map(|(_, pin)| (pin.repo.qualified(), pin.path.clone()))
+            .collect();
+        for artifact in ids {
+            let row = require_model_row(&catalog, artifact)?;
+            if !held.insert((row.repo.clone(), row.path.clone())) {
+                continue;
+            }
+            let repo = RepoId::parse_qualified(&row.repo)?;
+            let mut pin = pin_for(&row, repo, LoadoutSlot::File, None);
+            pin.destination = Some(default_destination(&pin, row.role)?);
+            document.files.push(pin);
+        }
+        catalog.update_loadout(id, &document.to_toml()?)?;
+        view_of(&catalog, id, &node)
+    })
+    .await?;
+    Ok(Json(view))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemberKey {
+    repo: String,
+    path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EditMember {
+    repo: String,
+    path: String,
+    destination: String,
+}
+
+pub async fn edit_member(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<EditMember>,
+) -> ApiResult<Json<LoadoutView>> {
+    authorize(&state, &headers)?;
+    let id = loadout_id(&id)?;
+    let destination = DownloadPath::parse(&body.destination)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let node = state.node_name().to_owned();
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        let mut document = stored(&catalog, id)?.parse()?;
+        let repo = RepoId::parse_qualified(&body.repo)?;
+        let pin = document
+            .pin_mut(&repo, &body.path)
+            .ok_or_else(|| IndexError::not_found("loadout member", body.path.clone()))?;
+        pin.destination = Some(destination);
+        catalog.update_loadout(id, &document.to_toml()?)?;
+        view_of(&catalog, id, &node)
+    })
+    .await?;
+    Ok(Json(view))
+}
+
+pub async fn remove_member(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(key): Query<MemberKey>,
+    headers: HeaderMap,
+) -> ApiResult<Json<LoadoutView>> {
+    authorize(&state, &headers)?;
+    let id = loadout_id(&id)?;
+    let node = state.node_name().to_owned();
+    let catalog = Arc::clone(state.catalog());
+    let view = blocking(move || {
+        let mut document = stored(&catalog, id)?.parse()?;
+        let repo = RepoId::parse_qualified(&key.repo)?;
+        if document.remove_line(&repo, &key.path) == 0 {
+            return Err(IndexError::not_found("loadout member", key.path));
+        }
+        catalog.update_loadout(id, &document.to_toml()?)?;
+        view_of(&catalog, id, &node)
+    })
+    .await?;
     Ok(Json(view))
 }
 
@@ -851,7 +959,22 @@ fn require_catalog_row(catalog: &Catalog, id: ArtifactId) -> Result<SearchRow, I
         .ok_or_else(|| IndexError::not_found("artifact", id.to_string()))
 }
 
-fn view_of(catalog: &Catalog, id: LoadoutId, node_name: &str) -> Result<LoadoutView, IndexError> {
+fn require_model_row(catalog: &Catalog, id: ArtifactId) -> Result<SearchRow, IndexError> {
+    let row = require_catalog_row(catalog, id)?;
+    if row.role == Role::Ds {
+        return Err(IndexError::Query(format!(
+            "{} is a dataset and cannot be pinned to a model loadout",
+            row.name
+        )));
+    }
+    Ok(row)
+}
+
+pub(crate) fn view_of(
+    catalog: &Catalog,
+    id: LoadoutId,
+    node_name: &str,
+) -> Result<LoadoutView, IndexError> {
     let record = stored(catalog, id)?;
     let document = record.parse()?;
     let mut items = Vec::with_capacity(document.len());
@@ -899,7 +1022,12 @@ fn item_of(
     node_name: &str,
 ) -> Result<LoadoutItem, IndexError> {
     let candidates = catalog.resolve_pin(pin)?;
-    let held = candidates.iter().find(|row| holds_whole(row, node_name));
+    let held = candidates
+        .iter()
+        .find(|row| {
+            holds_whole(row, node_name) && row.repo == pin.repo.qualified() && row.path == pin.path
+        })
+        .or_else(|| candidates.iter().find(|row| holds_whole(row, node_name)));
     let elsewhere = candidates
         .iter()
         .find(|row| row.node != node_name && row.blob_sha256.is_some());
@@ -925,11 +1053,32 @@ fn item_of(
     let arguments = hf_arguments(&pin.repo, Some(&artifact));
     Ok(LoadoutItem {
         hf_arguments: arguments,
+        download_source: held
+            .map(|row| {
+                Ok::<_, IndexError>(DownloadSource {
+                    repo: RepoId::parse_qualified(&row.repo)?,
+                    path: row.path.clone(),
+                    revision: row
+                        .revision_sha
+                        .map_or_else(|| row.revision.clone(), |sha| sha.to_hex()),
+                    multi_file: row.shard_count > 1,
+                    hash_ready: row.blob_sha256.is_some()
+                        || (row.size < hoard_mirror::local::index_repo::LFS_THRESHOLD
+                            && catalog.entries_of(row.artifact_id)?.iter().any(|entry| {
+                                entry.entry_id == row.entry_id && entry.git_sha1.is_some()
+                            })),
+                })
+            })
+            .transpose()?,
         prefix: row.map_or_else(String::new, |_| {
             row_prefix(&pin.repo.qualified(), pin.display_name())
         }),
         slot,
-        role: row.map_or(slot.role(), |row| row.role),
+        destination: pin
+            .destination
+            .clone()
+            .map_or_else(|| default_destination(pin, slot.role()), Ok)?,
+        role: row.map_or(pin.role.unwrap_or(slot.role()), |row| row.role),
         role_code: row.map_or(slot.role(), |row| row.role).code().to_owned(),
         artifact_id: row.map(|row| row.artifact_id),
         name: pin.display_name().to_owned(),
@@ -948,10 +1097,47 @@ fn item_of(
     })
 }
 
+fn default_destination(pin: &LoadoutPin, role: Role) -> Result<DownloadPath, IndexError> {
+    let folders = [
+        "diffusion_models",
+        "unet",
+        "text_encoders",
+        "clip",
+        "vae",
+        "loras",
+        "checkpoints",
+        "controlnet",
+        "upscale_models",
+        "embeddings",
+        "clip_vision",
+    ];
+    let folder = pin
+        .path
+        .rsplit('/')
+        .skip(1)
+        .chain(std::iter::once(pin.repo.name()))
+        .find(|part| folders.contains(part));
+    let folder = match folder {
+        Some("unet") => "diffusion_models",
+        Some("clip") => "text_encoders",
+        Some(folder) => folder,
+        None => match role {
+            Role::Llm => "llm",
+            Role::Emb => "text_encoders",
+            role => link::comfy_directory(role),
+        },
+    };
+    Ok(DownloadPath::parse(&format!(
+        "{folder}/{}",
+        file_name(&pin.path)
+    ))?)
+}
+
 /// The pin an artifact becomes: hashed identity first so the same document resolves on any
 /// node, with the repository and path as the fallback.
 fn pin_for(row: &SearchRow, repo: RepoId, slot: LoadoutSlot, weight: Option<f32>) -> LoadoutPin {
     let mut pin = LoadoutPin::new(repo, row.path.clone());
+    pin.role = Some(row.role);
     pin.sha = row.revision_sha;
     pin.sha256 = row.blob_sha256;
     pin.name = Some(row.name.clone());
@@ -966,11 +1152,9 @@ fn pin_for(row: &SearchRow, repo: RepoId, slot: LoadoutSlot, weight: Option<f32>
 /// Pins one row into a loadout, answering what the line displaced or which loadout it
 /// started. A line the loadout already holds is answered without a write.
 fn pin_into(catalog: &Catalog, pinning: Pinning) -> Result<PinnedView, IndexError> {
-    let row = require_catalog_row(catalog, pinning.artifact)?;
+    let row = require_model_row(catalog, pinning.artifact)?;
     let mut document = stored(catalog, pinning.id)?.parse()?;
-    let slot = LoadoutSlot::for_role(row.role).ok_or_else(|| {
-        IndexError::Query(format!("role {} cannot be pinned in a loadout", row.role))
-    })?;
+    let slot = LoadoutSlot::for_role(row.role).unwrap_or(LoadoutSlot::File);
     let repo = RepoId::parse_qualified(&row.repo)?;
     if document.holds_line(&repo, &row.path) {
         let notice = format!("{} is already in {}", row.name, document.name);
@@ -980,74 +1164,19 @@ fn pin_into(catalog: &Catalog, pinning: Pinning) -> Result<PinnedView, IndexErro
             notice,
         });
     }
-    let pin = pin_for(&row, repo, slot, pinning.weight);
-    let branching = match pinning.policy {
-        HostPolicy::Branch => slot == LoadoutSlot::Host && document.host.is_some(),
-        HostPolicy::Replace => false,
-    };
-    if branching {
-        return branch_into(catalog, &row, pin, &pinning.node_name);
-    }
-    let placed = document.add(row.role, pin)?;
-    catalog.update_loadout(pinning.id, &document.to_toml()?)?;
-    let replaced = placed.replaced.map(|old| Replaced {
-        slot: placed.slot,
-        name: old.display_name().to_owned(),
+    let mut pin = pin_for(&row, repo, slot, pinning.weight);
+    pin.destination = Some(match pinning.destination {
+        Some(destination) => destination,
+        None => default_destination(&pin, row.role)?,
     });
-    let notice = match &replaced {
-        Some(old) => format!(
-            "replaced {} {} with {}",
-            slot_noun(placed.slot),
-            old.name,
-            row.name
-        ),
-        None => format!("+ {} pinned at {}", row.name, revision_label(&row)),
-    };
+    document.add_file(row.role, pin);
+    catalog.update_loadout(pinning.id, &document.to_toml()?)?;
+    let notice = format!("Added {} to {}", row.name, document.name);
     Ok(PinnedView {
         loadout: view_of(catalog, pinning.id, &pinning.node_name)?,
-        replaced,
-        notice,
-    })
-}
-
-/// Starts a loadout named after the file whose pin would have displaced a host, and pins
-/// the file there rather than over the host the caller already had.
-fn branch_into(
-    catalog: &Catalog,
-    row: &SearchRow,
-    pin: LoadoutPin,
-    node_name: &str,
-) -> Result<PinnedView, IndexError> {
-    let taken = catalog.list_loadouts()?;
-    let name = free_loadout_name(
-        taken.iter().map(|record| record.name.as_str()),
-        loadout_stem(&row.name),
-    );
-    let mut started = Loadout::new(name);
-    started.add(row.role, pin)?;
-    let id = catalog.create_loadout(&started)?;
-    let notice = format!(
-        "new loadout {:?}: {} pinned",
-        started.name,
-        slot_noun(LoadoutSlot::Host)
-    );
-    Ok(PinnedView {
-        loadout: view_of(catalog, id, node_name)?,
         replaced: None,
         notice,
     })
-}
-
-/// The word a notice calls a slot: `checkpoint`, `vae`, `upscaler`.
-fn slot_noun(slot: LoadoutSlot) -> String {
-    slot.role().label().to_ascii_lowercase()
-}
-
-fn revision_label(row: &SearchRow) -> &str {
-    match row.revision.is_empty() {
-        true => UNREVISIONED,
-        false => &row.revision,
-    }
 }
 
 /// Blocking catalog work whose refusals are conflicts rather than server errors.
@@ -1164,6 +1293,7 @@ mod tests {
     fn linked_item(name: &str, abs_path: Option<&str>) -> LoadoutItem {
         LoadoutItem {
             slot: LoadoutSlot::Adapter,
+            destination: DownloadPath::parse("loras/test.safetensors").expect("destination"),
             role: Role::Lora,
             role_code: Role::Lora.code().to_owned(),
             artifact_id: None,
@@ -1179,6 +1309,7 @@ mod tests {
             size_human: "0 B".to_owned(),
             state: None,
             resolution: PinResolution::Missing,
+            download_source: None,
             hf_arguments: String::new(),
         }
     }

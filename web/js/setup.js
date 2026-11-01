@@ -80,7 +80,7 @@ function sharingForm(app) {
             el("button", { class: "btn btn-tiny", type: "submit", text: "SAVE SETTINGS" })));
 }
 
-function ownerAccess(app) {
+export function renderOwnerAccess(app) {
     if (!app.state.setup.write_token_required) return el("p", { class: "setup-note", text: "No write token is configured. Anyone who can reach this node can change its catalog. HOARD_NODE_TOKEN restricts changes; browsing and downloads remain public." });
     const input = el("input", { class: "field", name: "owner_token", type: "password",
         autocomplete: "off", "aria-label": "Owner write token", placeholder: "Node write token", required: true });
@@ -91,7 +91,8 @@ function ownerAccess(app) {
         input.value = "";
         app.state.ownerTokenSet = true;
         status.textContent = "Token set for this tab. Retry your change to verify access.";
-        input.closest("details").querySelector("summary").textContent = "SHARING & SETUP";
+        const summary = input.closest("details").querySelector("summary");
+        summary.textContent = summary.dataset.ownerTitle || "SHARING & SETUP";
     } }, el("p", { class: "setup-note", text: "Browsing and downloads are public. Enter HOARD_NODE_TOKEN to make changes. It stays in this tab's memory and is cleared on reload." }),
         el("div", { class: "owner-access-fields" }, input,
             el("button", { class: "btn btn-tiny", type: "submit", text: "USE TOKEN" })), status);
@@ -108,7 +109,7 @@ export function renderSharing(app) {
         el("div", { class: "sharing-active" },
             el("p", { class: "sharing-status", role: "status", text: sharingStatus(setup) }),
             el("p", { class: "mono-dim sharing-address", text: `ACTIVE ADDRESS ${setup.public_url} · LISTENING ${setup.bind}` })),
-        sharingForm(app), ownerAccess(app));
+        sharingForm(app), renderOwnerAccess(app));
 }
 
 export function paintSetup(app, view) {

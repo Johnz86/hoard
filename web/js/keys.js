@@ -110,7 +110,7 @@ export function initKeys(app) {
             app.showKeySheet();
             return;
         }
-        if (app.state.keySheet) return;
+        if (app.state.keySheet || app.state.drawerOpen) return;
 
         const key = event.key.toLowerCase();
 

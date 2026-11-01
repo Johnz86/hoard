@@ -5,7 +5,7 @@ import { el, errorPanel, loadingPanel, mount, toast, copyText } from "./dom.js";
 import { renderFacets } from "./facets.js";
 import { renderInspector } from "./inspector.js";
 import { initKeys, renderKeySheet } from "./keys.js";
-import { loadApplyProfiles, loadLoadout, loadoutItems, renderDrawer } from "./loadout.js";
+import { addToCollection, loadLoadout, renderDrawer } from "./loadout.js";
 import { loadNodes, renderNodePulse } from "./nodes.js";
 import { loadJobs, loadSources } from "./jobs.js";
 import { paintSourcesView } from "./sources.js";
@@ -65,15 +65,16 @@ const state = {
     ownerTokenSet: false,
     recentJobsOpen: false,
     loadoutId: null,
-    loadoutCreating: null,
     loadouts: null,
     loadoutDeleting: null,
     loadout: null,
     loadoutError: null,
-    loadoutApplies: new Map(),
-    loadoutProfiles: null,
-    loadoutProfilesLoading: false,
-    loadoutProfilesError: null,
+    loadoutBusy: false,
+    loadoutLoading: false,
+    loadoutPendingModels: [],
+    loadoutIndexDirty: false,
+    loadoutTotal: 0,
+    loadoutReturnHash: null,
     drawerOpen: false,
     drawerReturnFocus: null,
     keySheet: false,
@@ -90,6 +91,7 @@ function emptyDetail() {
         tab: "FILES",
         aid: null,
         repo: null,
+        artifact: null,
         files: null,
         readme: null,
         compat: null,
@@ -133,13 +135,13 @@ const app = {
     },
     openSources: () => navigate("#/sources"),
     refreshSetup: () => loadSetup(app),
+    collectionChanged: () => {
+        state.loadoutIndexDirty = true;
+        delete state.detail.loaded.artifact;
+        state.detail.artifact = null;
+    },
     addToLoadout,
-    removeFromLoadout,
-    switchLoadout,
-    newLoadout,
-    renameLoadout,
-    armDelete,
-    deleteLoadout,
+    openCollection,
     yank,
     copyCommand,
     openDrawer,
@@ -175,6 +177,9 @@ function selfNodeName() {
 }
 
 function resultLine() {
+    if (state.loadoutTotal) {
+        return `${state.total} ARTIFACTS · ${state.projects.total} GIT PROJECTS · ${state.loadoutTotal} LOADOUTS`;
+    }
     return state.projects.total
         ? `${state.total} ARTIFACTS · ${state.projects.total} GIT PROJECTS`
         : `${state.total} ARTIFACTS · ${state.nodeCount} NODES`;
@@ -250,6 +255,17 @@ function readHash() {
     const params = new URLSearchParams(search || "");
     const parts = path.split("/").filter(Boolean);
     const head = parts[0] || "index";
+    if (head === "loadout" && parts[1]) {
+        state.view = "index";
+        state.loadoutReturnHash = buildIndexHash();
+        if (!state.rows.length && !state.searching) runSearch();
+        openCollection(decodeURIComponent(parts[1]));
+        return;
+    }
+    if (state.drawerOpen && state.loadoutReturnHash) {
+        state.drawerOpen = false;
+        state.loadoutReturnHash = null;
+    }
     if (head === "project" && parts[1]) {
         const id = decodeURIComponent(parts[1]);
         const revision = params.get("rev") || "";
@@ -370,13 +386,27 @@ async function runSearch(selected) {
     state.searchError = null;
     render();
     try {
-        const data = await api.search({
+        const wanted = selected ? Math.max(SEARCH_LIMIT, state.rows.length) : SEARCH_LIMIT;
+        const params = {
             q: query,
             sort: state.sort,
             dir: state.sort ? state.dir : null,
-            limit: SEARCH_LIMIT
-        });
+            limit: Math.min(1000, wanted)
+        };
+        const data = await api.search(params);
+        let rows = data.resources || data.rows || [];
+        let next = data.resource_next_cursor;
+        while (rows.length < wanted && next) {
+            if (version !== searchVersion) return;
+            const more = await api.search({ ...params, resource_cursor: next,
+                limit: Math.min(1000, wanted - rows.length) });
+            rows = rows.concat(more.resources || []);
+            next = more.resource_next_cursor;
+        }
+        data.resources = rows;
+        data.resource_next_cursor = next;
         if (version !== searchVersion) return;
+        state.loadoutTotal = data.loadout_total || 0;
         state.rows = data.resources || data.rows || [];
         state.resourcesNext = data.resource_next_cursor || null;
         state.projects = data.projects || { rows: [], total: 0 };
@@ -439,7 +469,7 @@ function cursorRow() {
 }
 
 function rowKey(row) {
-    return row && (row.artifact_id || row.project_id);
+    return row && (row.artifact_id || row.project_id || row.loadout_id);
 }
 
 function scheduleInspector() {
@@ -598,6 +628,7 @@ function cancelSourceRemoval() {
 
 function openRow(row) {
     if (!row) return;
+    if (row.loadout_id) return openCollection(row.loadout_id);
     if (row.project_id) return openProject(row.project_id);
     const params = new URLSearchParams({ tab: "FILES" });
     if (row.artifact_id) params.set("aid", row.artifact_id);
@@ -623,103 +654,24 @@ function detailArtifact() {
     return { artifact_id: detail.aid || (detail.repo && detail.repo.artifact_id) };
 }
 
-async function addToLoadout(row) {
-    if (row?.project_id) {
-        toast("Select a model artifact to add to a loadout.");
-        return;
-    }
-    if (!row || !row.artifact_id) {
-        toast("nothing under the cursor to pin");
-        return;
-    }
-    if (!state.loadoutId) {
-        try {
-            state.loadoutCreating = state.loadoutCreating || api.createLoadout(null);
-            const created = await state.loadoutCreating;
-            state.loadoutId = created.id;
-            updateSettings({ loadoutId: created.id });
-        } catch (error) {
-            toast(`cannot start a loadout · ${error.message}`);
-            return;
-        } finally {
-            state.loadoutCreating = null;
-        }
-    }
-    try {
-        const answer = await api.addLoadoutItem(state.loadoutId, row.artifact_id);
-        state.loadoutId = answer.id;
-        updateSettings({ loadoutId: answer.id });
-        toast(answer.notice);
-        await loadLoadout(app);
-    } catch (error) {
-        toast(`pin failed · ${error.message}`);
-    }
+function addToLoadout(row) {
+    addToCollection(app, row);
 }
 
-function switchLoadout(id) {
-    if (!id) return;
-    state.loadoutId = id;
-    state.loadoutDeleting = null;
-    state.loadout = null;
-    updateSettings({ loadoutId: id });
-    loadLoadout(app);
-}
-
-async function newLoadout(name) {
-    try {
-        const created = await api.createLoadout(name || null);
-        toast(`new loadout "${created.name}"`);
-        switchLoadout(created.id);
-    } catch (error) {
-        toast(`cannot start a loadout · ${error.message}`);
-    }
-}
-
-async function renameLoadout(name) {
-    if (!state.loadoutId) return;
-    try {
-        const view = await api.renameLoadout(state.loadoutId, name);
-        toast(`renamed to ${view.name}`);
-    } catch (error) {
-        toast(`rename failed · ${error.message}`);
-    }
-    await loadLoadout(app);
-}
-
-function armDelete(id) {
-    state.loadoutDeleting = id;
-    render();
-}
-
-async function deleteLoadout(id) {
-    if (state.loadoutDeleting !== id) return;
-    const row = (state.loadouts || []).find((entry) => entry.id === id);
-    try {
-        await api.deleteLoadout(id);
-        toast(`removed loadout ${row ? row.name : id}`);
-    } catch (error) {
-        toast(`remove failed · ${error.message}`);
-    }
-    state.loadoutDeleting = null;
-    if (id === state.loadoutId) {
-        state.loadoutId = null;
+function openCollection(id) {
+    if (state.loadoutBusy) { toast("Wait for the loadout to finish saving."); return; }
+    if (state.loadoutId !== id) {
+        state.loadoutId = id;
         state.loadout = null;
-        updateSettings({ loadoutId: null });
     }
-    await loadLoadout(app);
-}
-
-async function removeFromLoadout(item) {
-    if (!state.loadoutId || !item.artifact_id) return;
-    try {
-        await api.removeLoadoutItem(state.loadoutId, item.artifact_id);
-        await loadLoadout(app);
-    } catch (error) {
-        toast(`remove failed · ${error.message}`);
-    }
+    if (!state.drawerOpen) openDrawer();
+    else loadLoadout(app, id);
+    if (!state.loadoutReturnHash) state.loadoutReturnHash = buildHash();
+    history.replaceState(null, "", `#/loadout/${encodeURIComponent(id)}`);
 }
 
 async function yank(row) {
+    if (row?.loadout_id) return openCollection(row.loadout_id);
     if (row?.project_id) return copyCommand(row.clone_command);
     if (!row || !row.artifact_id) return;
     try {
@@ -737,6 +689,7 @@ async function copyCommand(text) {
 }
 
 function openDrawer() {
+    if (state.drawerOpen) { renderDrawer(app); return; }
     const active = document.activeElement;
     state.drawerReturnFocus = {
         id: active?.id || "loadout-btn",
@@ -745,16 +698,35 @@ function openDrawer() {
     };
     state.drawerOpen = true;
     render();
-    if (!state.loadout) loadLoadout(app);
-    loadApplyProfiles(app);
+    loadLoadout(app);
+
     document.querySelector(".drawer .btn-close")?.focus();
 }
 
 function closeDrawer() {
+    const previous = state.drawerReturnFocus;
     state.drawerOpen = false;
     state.loadoutDeleting = null;
+    state.loadoutPendingModels = [];
+    if (state.loadoutReturnHash) {
+        history.replaceState(null, "", state.loadoutReturnHash);
+        state.loadoutReturnHash = null;
+    }
     render();
-    const previous = state.drawerReturnFocus;
+    if (state.loadoutIndexDirty) {
+        state.loadoutIndexDirty = false;
+        runSearch(rowKey(cursorRow())).then(() => {
+            if (!state.drawerOpen && document.activeElement === document.body) {
+                (document.getElementById(previous?.id) || document.getElementById("loadout-btn"))
+                    .focus({ preventScroll: true });
+            }
+        });
+        loadShelves(app);
+        if (state.view === "detail" && state.detail.aid) {
+            delete state.detail.loaded.artifact;
+            loadDetail(app);
+        }
+    }
     const target = document.getElementById(previous?.id) || document.getElementById("loadout-btn");
     target.focus({ preventScroll: true });
     if (previous?.selection && target.setSelectionRange) {
@@ -866,7 +838,7 @@ function routeMatches(route) {
 
 function paintLoadoutButton() {
     const button = document.getElementById("loadout-btn");
-    button.textContent = `LOADOUT ${loadoutItems(app).length}`;
+    button.textContent = "LOADOUTS";
 }
 
 function paintFooter() {
@@ -876,8 +848,8 @@ function paintFooter() {
         ["J/K", "move"],
         ["↵", "open"],
         ["SPC", "select"],
-        ...(!cursorRow()?.project_id ? [["L", "loadout"]] : []),
-        ["Y", cursorRow()?.project_id ? "clone" : "yank"],
+        ...(cursorRow()?.artifact_id ? [["L", "add to loadout"]] : []),
+        ["Y", cursorRow()?.loadout_id ? "download" : cursorRow()?.project_id ? "clone" : "yank"],
         ["/", "search"],
         ["?", "keys"]
     ];

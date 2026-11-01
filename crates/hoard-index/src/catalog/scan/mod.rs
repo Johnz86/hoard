@@ -169,6 +169,7 @@ impl Catalog {
         match created {
             Ok(database) => {
                 let catalog = Self {
+                    loadout_generation: std::sync::atomic::AtomicU64::new(0),
                     database,
                     directory,
                     search_cache: std::sync::RwLock::new(None),

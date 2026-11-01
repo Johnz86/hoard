@@ -10,6 +10,8 @@ and superseded plans belong in Git, not in the current documentation.
 - [Configuration](user-guide/configuration.md): settings, persistence and access boundaries.
 - [Deployment and maintenance](operations/deployment.md): listeners, backups, upgrades and diagnostics.
 
+- [Model collections](user-guide/loadouts.md): group selected models and download them to a client.
+
 ## Understand the system
 
 - [Product scope](design/product-scope.md): supported workflows and intentional limits.

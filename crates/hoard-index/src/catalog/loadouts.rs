@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use jiff::Timestamp;
 use serde::Serialize;
 
@@ -55,6 +57,10 @@ fn name_taken(name: &str) -> IndexError {
 }
 
 impl Catalog {
+    pub fn loadout_generation(&self) -> u64 {
+        self.loadout_generation.load(Ordering::Acquire)
+    }
+
     /// Stores a new loadout under the name its document carries. A name another loadout
     /// already holds is refused with [`HoardError::InvalidLoadout`], never merged.
     pub fn create_loadout(&self, loadout: &Loadout) -> Result<LoadoutId> {
@@ -76,6 +82,7 @@ impl Catalog {
             updated_at: at,
         })?;
         transaction.commit()?;
+        self.loadout_generation.fetch_add(1, Ordering::Release);
         Ok(LoadoutId::new(id))
     }
 
@@ -100,6 +107,7 @@ impl Catalog {
         };
         transaction.upsert(renamed.clone())?;
         transaction.commit()?;
+        self.loadout_generation.fetch_add(1, Ordering::Release);
         LoadoutRecord::try_from(renamed)
     }
 
@@ -124,6 +132,7 @@ impl Catalog {
             updated_at: at,
         })?;
         transaction.commit()?;
+        self.loadout_generation.fetch_add(1, Ordering::Release);
         Ok(LoadoutId::new(id))
     }
 
@@ -138,6 +147,7 @@ impl Catalog {
             ..stored
         })?;
         transaction.commit()?;
+        self.loadout_generation.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -152,6 +162,7 @@ impl Catalog {
             None => false,
         };
         transaction.commit()?;
+        self.loadout_generation.fetch_add(1, Ordering::Release);
         Ok(deleted)
     }
 

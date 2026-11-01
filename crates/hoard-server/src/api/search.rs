@@ -86,6 +86,7 @@ pub struct SearchResponse {
     pub resource_total: u64,
     pub resource_next_cursor: Option<String>,
     pub projects: crate::api::project_search::ProjectList,
+    pub loadout_total: u64,
     pub query: ParsedQuery,
     pub facets: FacetsView,
     pub rows: Vec<RowView>,
@@ -140,12 +141,20 @@ pub async fn search(
     )
     .await?;
     let project_facets = crate::api::project_search::facet_counts(&state, raw.clone()).await?;
-    let counted = resource_facets(&page.facets, &page.query, project_facets);
+    let loadout_facets = crate::api::loadout_search::facet_counts(&state, raw.clone()).await?;
+    let mut counted = resource_facets(&page.facets, &page.query, project_facets);
+    add_loadout_facets(&mut counted, &page.query, loadout_facets);
+    let projects = crate::api::project_search::find(&state, raw, None, 0, limit).await?;
+    let loadout_total = resources
+        .total
+        .saturating_sub(page.total)
+        .saturating_sub(projects.total);
     Ok(Json(SearchResponse {
+        loadout_total,
         resources: resources.rows,
         resource_total: resources.total,
         resource_next_cursor: resources.next_cursor,
-        projects: crate::api::project_search::find(&state, raw, None, 0, limit).await?,
+        projects,
         facets: facets(&counted, &page.query),
         rows: page.rows.iter().map(RowView::from).collect(),
         next_cursor: next_cursor(offset, limit, walked(&page), page.total, &key),
@@ -156,6 +165,53 @@ pub async fn search(
         sort: applied_sort,
         dir: applied_dir,
     }))
+}
+
+fn add_loadout_facets(
+    counted: &mut Facets,
+    query: &ParsedQuery,
+    counts: crate::api::project_search::ProjectFacetCounts,
+) {
+    for (buckets, count) in [
+        (&mut counted.role, counts.role),
+        (&mut counted.format, counts.format),
+    ] {
+        if count > 0 {
+            buckets.push(FacetBucket {
+                value: "loadout".to_owned(),
+                label: Some("Loadout".to_owned()),
+                count,
+                active: false,
+                members: Vec::new(),
+            });
+            buckets.sort_unstable_by(|left, right| {
+                right
+                    .count
+                    .cmp(&left.count)
+                    .then_with(|| left.value.cmp(&right.value))
+            });
+        }
+    }
+    for (node, count) in counts.nodes {
+        if let Some(bucket) = counted.node.iter_mut().find(|bucket| bucket.value == node) {
+            bucket.count = bucket.count.saturating_add(count);
+        } else {
+            counted.node.push(FacetBucket {
+                value: node,
+                label: None,
+                count,
+                active: false,
+                members: Vec::new(),
+            });
+        }
+    }
+    counted.node.sort_unstable_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    counted.mark_query(query);
 }
 
 fn resource_facets(

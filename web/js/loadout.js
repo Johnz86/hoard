@@ -1,401 +1,422 @@
 import * as api from "./api.js";
-import { el, errorPanel, fmtRate, loadingPanel, mount, toast } from "./dom.js";
+import { el, mount, toast, copyText, fmtBytes } from "./dom.js";
 import { roleClass, roleCode } from "./table.js";
+import { renderOwnerAccess } from "./setup.js";
 import { settings, updateSettings } from "./theme.js";
 
-export async function loadApplyProfiles(app, retry = false) {
-    if (app.state.loadoutProfilesLoading || (app.state.loadoutProfiles && !retry)) return;
-    app.state.loadoutProfilesLoading = true;
-    app.state.loadoutProfilesError = null;
-    paintApplyStatus(app);
+let readVersion = 0;
+let scriptVersion = 0;
+let scriptTimer = null;
+let scriptKey = "";
+let scriptResult = null;
+let scriptError = null;
+let scriptLoading = false;
+
+function loadoutItems(app) {
+    return app.state.loadout?.items || [];
+}
+
+export async function loadLoadout(app, wanted = app.state.loadoutId || settings.loadoutId) {
+    const version = ++readVersion;
+    app.state.loadoutLoading = true;
+    app.state.loadoutError = null;
+    renderDrawer(app);
     try {
-        const info = await api.loadoutProfiles();
-        if (!info.node || !info.profiles?.length ||
-            info.profiles.some(profile => !profile.id || !profile.label || !profile.destination) ||
-            !info.profiles.some(profile => profile.id === info.default_profile)) {
-            throw new Error("The server did not provide tool layouts.");
-        }
-        app.state.loadoutProfiles = info;
-    } catch {
-        app.state.loadoutProfiles = null;
-        app.state.loadoutProfilesError = "Could not read tool layouts. Check the connection, then retry.";
-    }
-    app.state.loadoutProfilesLoading = false;
-    paintApplyStatus(app);
-    if (retry && app.state.loadoutProfiles) {
-        document.getElementById("loadout-profile")?.focus();
-    }
-}
-
-function selectedProfile(app) {
-    const info = app.state.loadoutProfiles;
-    if (!info) return null;
-    const apply = app.state.loadoutApplies.get(app.state.loadoutId);
-    const wanted = apply?.state === "running" ? apply.profile
-        : settings.loadoutProfiles?.[app.state.loadoutId];
-    return info.profiles.find(profile => profile.id === wanted)
-        || info.profiles.find(profile => profile.id === info.default_profile);
-}
-
-function canApply(app) {
-    return Boolean(app.state.loadout?.id === app.state.loadoutId && app.state.loadout
-        && !app.state.loadoutError && loadoutItems(app).length
-        && selectedProfile(app) && !app.state.loadoutProfilesLoading
-        && !app.state.loadoutProfilesError
-        && app.state.loadoutApplies.get(app.state.loadoutId)?.state !== "running");
-}
-
-export async function loadLoadout(app) {
-    try {
-        const list = await api.loadouts();
-        const rows = Array.isArray(list) ? list : list.loadouts || [];
+        const rows = await api.loadouts();
+        const current = rows.find(row => row.id === wanted) || (wanted ? null : rows[0]) || null;
+        const doc = current ? await api.loadout(current.id) : null;
+        if (version !== readVersion) return;
         app.state.loadouts = rows;
-        const wanted = app.state.loadoutId || settings.loadoutId;
-        const current = rows.find((row) => row.id === wanted) || rows[0] || null;
-        app.state.loadoutId = current ? current.id : null;
+        app.state.loadoutId = current?.id || null;
+        app.state.loadout = doc;
+        if (wanted && !current) app.state.loadoutError = "This loadout is no longer available. Choose another collection or create one.";
         updateSettings({ loadoutId: app.state.loadoutId });
-        app.state.loadout = current ? await api.loadout(current.id) : null;
-        app.state.loadoutError = null;
     } catch (error) {
-        app.state.loadoutError = error;
+        if (version !== readVersion) return;
+        app.state.loadoutError = error.message;
     }
+    if (version !== readVersion) return;
+    app.state.loadoutLoading = false;
     app.render();
 }
 
-export function loadoutItems(app) {
-    const doc = app.state.loadout;
-    if (!doc) return [];
-    return doc.items || (doc.document && doc.document.items) || [];
+function chooseCollection(app, id) {
+    if (app.state.loadoutBusy || id === app.state.loadoutId) return;
+    app.state.loadoutId = id || null;
+    app.state.loadout = null;
+    app.state.loadoutDeleting = null;
+    updateSettings({ loadoutId: app.state.loadoutId });
+    loadLoadout(app, id);
 }
 
-function weightLabel(item) {
-    if (item.weight_label) return item.weight_label;
-    if (item.weight === null || item.weight === undefined) return "—";
-    return String(item.weight);
-}
-
-function applyLine(app, items) {
-    const latest = app.state.loadoutApplies.get(app.state.loadoutId);
-    const apply = latest?.profile === selectedProfile(app)?.id ? latest : null;
-    if (apply) {
-        if (apply.pollError) return `Status unavailable · ${apply.pollError} · checking again…`;
-        if (apply.state === "done") return `Last apply complete · ${apply.phase}`;
-        if (apply.state === "failed") return `Apply failed · ${apply.error}`;
-        if (apply.state === "cancelled") return "Apply cancelled · some links may already exist";
-        return `Applying · ${apply.phase}`;
+export function addToCollection(app, row) {
+    if (!row?.artifact_id) {
+        toast("Select models to add to a loadout.");
+        return;
     }
-    if (!items.length) return "Pin an artifact before applying.";
-    const preview = (app.state.loadout && app.state.loadout.apply_preview) || null;
-    if (!preview) return `→ ${items.length} pinned`;
-    const rate = preview.rate_bps ? ` (${fmtRate(preview.rate_bps)})` : "";
-    return `→ ${preview.present ?? 0} present, ${preview.pulling ?? 0} pulling over LAN${rate}`;
+    const selected = app.state.selection.has(app.rowKey(row))
+        ? app.state.rows.filter(item => item.artifact_id && app.state.selection.has(app.rowKey(item)))
+        : [row];
+    app.state.loadoutPendingModels = [...new Set(selected.map(item => item.artifact_id))];
+    app.openDrawer();
 }
 
-function emptyState(name) {
-    return el(
-        "div",
-        { class: "drawer-empty" },
-        name ? "EMPTY LOADOUT " : "NO LOADOUT YET",
-        name ? el("span", { class: "amber", text: name }) : null,
-        el("br"),
-        "a checkpoint and the adapters you use with it",
-        el("br"),
-        name ? "select artifacts in the index and press " : "press ",
-        el("span", { class: "amber", text: "L" }),
-        name ? ", or start another with " : " on a row to start one, or ",
-        el("span", { class: "amber", text: "NEW" }),
-        " below"
-    );
+async function mutate(app, work) {
+    if (app.state.loadoutBusy) return;
+    const focused = document.activeElement;
+    ++readVersion;
+    app.state.loadoutLoading = false;
+    app.state.loadoutBusy = true;
+    app.state.loadoutError = null;
+    app.state.loadoutAuthRequired = false;
+    renderDrawer(app);
+    try {
+        await work();
+        updateSettings({ loadoutId: app.state.loadoutId });
+    } catch (error) {
+        app.state.loadoutError = error.message;
+        app.state.loadoutAuthRequired = error.status === 401 || error.status === 403;
+    }
+    try {
+        app.state.loadouts = await api.loadouts();
+    } catch (error) {
+        app.state.loadoutError ||= error.message;
+    }
+    app.collectionChanged();
+    app.state.loadoutBusy = false;
+    app.render();
+    if (document.activeElement === document.body && focused?.isConnected && !focused.disabled && focused.getClientRects().length) {
+        focused.focus({ preventScroll: true });
+    }
 }
 
-function itemRows(app, items) {
-    return items.map((item) =>
-        el(
-            "div",
-            { class: `drawer-row ${roleClass(item.role)}` },
-            el(
-                "span",
-                { class: "cell-role" },
-                el("span", { class: "role-mark" }),
-                el("span", { class: "role-code", text: roleCode(item) })
-            ),
-            el(
-                "span",
-                { class: "drawer-name" },
-                item.prefix ? el("span", { class: "cell-org", text: item.prefix }) : null,
-                item.name
-            ),
-            el("span", { class: "drawer-rev", text: item.revision || item.rev || "—" }),
-            el("span", { class: "drawer-weight", text: weightLabel(item) }),
-            el("span", {
-                class: "drawer-x",
-                text: "×",
-                title: "remove",
-                onClick: () => app.removeFromLoadout(item)
-            })
-        )
-    );
+async function addPending(app) {
+    const ids = app.state.loadoutPendingModels || [];
+    if (!app.state.loadoutId || !ids.length) return;
+    await mutate(app, async () => {
+        app.state.loadout = await api.addLoadoutMembers(app.state.loadoutId, ids);
+        app.state.loadoutPendingModels = [];
+        toast("Models added to loadout");
+    });
 }
 
-function pinnedBlock(app, items) {
-    if (app.state.loadoutError) return errorPanel(app.state.loadoutError, () => loadLoadout(app));
-    if (!app.state.loadouts) return loadingPanel("reading loadouts…");
-    if (!app.state.loadoutId) return emptyState(null);
-    if (!app.state.loadout) return loadingPanel("reading loadout…");
-    if (!items.length) return emptyState(app.state.loadout.name);
-    return itemRows(app, items);
-}
-
-function listBlock(app) {
-    const rows = app.state.loadouts || [];
-    if (!rows.length) return null;
-    return el(
-        "div",
-        { class: "drawer-list" },
-        el("div", { class: "rail-title", text: "LOADOUTS" }),
-        rows.map((row) => {
-            const armed = app.state.loadoutDeleting === row.id;
-            const current = row.id === app.state.loadoutId ? " is-current" : "";
-            return el(
-                "div",
-                { class: `drawer-list-row${current}` },
-                el("span", {
-                    class: "link",
-                    text: row.name,
-                    onClick: () => app.switchLoadout(row.id)
-                }),
-                el("span", { class: "mono-dim", text: `${row.items} items` }),
-                el("span", {
-                    class: armed ? "drawer-confirm" : "row-x",
-                    text: armed ? "CONFIRM" : "DELETE",
-                    onClick: () => (armed ? app.deleteLoadout(row.id) : app.armDelete(row.id))
-                })
-            );
-        })
-    );
-}
-
-function newForm(app) {
-    const field = el("input", {
-        id: "loadout-new-name",
-        class: "field",
-        type: "text",
-        placeholder: "name, or blank for loadout-N",
-        spellcheck: "false",
-        onKeyDown: (event) => {
-            if (event.key === "Enter") app.newLoadout(field.value);
+async function createCollection(app, field) {
+    const name = field.value.trim();
+    if (!name) {
+        app.state.loadoutError = "Enter a name for this loadout.";
+        renderDrawer(app);
+        field.focus();
+        return;
+    }
+    await mutate(app, async () => {
+        const created = await api.createLoadout(name);
+        app.state.loadoutId = created.id;
+        app.state.loadout = created;
+        if (field.value.trim() === name) field.value = "";
+        const ids = app.state.loadoutPendingModels || [];
+        if (ids.length) {
+            app.state.loadout = await api.addLoadoutMembers(created.id, ids);
+            app.state.loadoutPendingModels = [];
         }
+        toast("Loadout created");
     });
-    return el(
-        "div",
-        { class: "drawer-new" },
-        field,
-        el("button", {
-            class: "btn",
-            type: "button",
-            text: "NEW",
-            onClick: () => app.newLoadout(field.value)
-        })
-    );
 }
 
-function nameField(app) {
-    const doc = app.state.loadout;
-    if (!doc) return el("span", { class: "drawer-slug", text: "none" });
-    return el("input", {
-        id: "loadout-name",
-        class: "field drawer-rename",
-        type: "text",
-        value: doc.name,
-        spellcheck: "false",
-        onChange: (event) => app.renameLoadout(event.target.value)
+async function renameCollection(app, field) {
+    const value = field.value;
+    await mutate(app, async () => {
+        app.state.loadout = await api.renameLoadout(app.state.loadoutId, value);
+        if (field.value === value) delete field.dataset.dirty;
+        toast("Loadout name saved");
     });
+}
+
+async function savePath(app, item, field) {
+    const value = field.value;
+    await mutate(app, async () => {
+        app.state.loadout = await api.editLoadoutMember(app.state.loadoutId, item, value);
+        if (field.value === value) delete field.dataset.dirty;
+        toast("Download path saved");
+    });
+}
+
+async function removeMember(app, item) {
+    await mutate(app, async () => {
+        app.state.loadout = await api.removeLoadoutMember(app.state.loadoutId, item);
+        toast("Model removed from loadout; original file kept");
+    });
+}
+
+async function deleteCollection(app) {
+    await mutate(app, async () => {
+        await api.deleteLoadout(app.state.loadoutId);
+        app.state.loadout = null;
+        app.state.loadoutId = null;
+        app.state.loadoutDeleting = null;
+        app.state.drawerReturnFocus = { id: "loadout-btn", selection: null };
+        if (location.hash.startsWith("#/loadout/")) history.replaceState(null, "", "#/index");
+        toast("Loadout deleted; model files kept");
+    });
+    if (!app.state.loadoutId && !app.state.loadoutError) await loadLoadout(app, null);
+}
+
+function setText(node, value) {
+    if (node.textContent !== value) node.textContent = value;
+}
+
+function action(text, handler, extra = {}) {
+    return el("button", { class: "btn loadout-action", type: "button", text,
+        onClick: handler, ...extra });
+}
+
+function labeledField(label, id, value = "") {
+    const field = el("input", { id, class: "field", type: "text", value, spellcheck: "false",
+        onInput: () => { field.dataset.dirty = "true"; } });
+    return { field, label: el("label", { for: id, class: "rail-title", text: label }) };
+}
+
+function createShell(app, root) {
+    const name = labeledField("LOADOUT NAME", "loadout-name");
+    const fresh = labeledField("NEW LOADOUT", "loadout-new-name");
+    fresh.field.placeholder = "Name this collection";
+    const create = () => createCollection(app, fresh.field);
+    fresh.field.addEventListener("keydown", event => {
+        if (event.key === "Enter") { event.preventDefault(); create(); }
+    });
+    const downloadRoot = labeledField("DESTINATION ON YOUR COMPUTER", "loadout-download-root",
+        settings.loadoutDownloadRoot || "./models");
+    downloadRoot.field.addEventListener("input", () => {
+        updateSettings({ loadoutDownloadRoot: downloadRoot.field.value });
+        renderDownload(app, root);
+    });
+    const format = el("select", { id: "loadout-script-format", class: "field",
+        onChange: () => {
+            updateSettings({ loadoutScriptFormat: format.value });
+            renderDownload(app, root);
+        } }, el("option", { value: "powershell", text: "Windows PowerShell" }),
+        el("option", { value: "shell", text: "Linux / macOS shell" }));
+    format.value = settings.loadoutScriptFormat || "powershell";
+    const chooser = el("select", { id: "loadout-chooser", class: "field",
+        onChange: () => chooseCollection(app, chooser.value) });
+    const confirmDelete = el("div", { class: "loadout-delete-confirm", hidden: true },
+        el("p", { class: "loadout-delete-message" }),
+        action("DELETE LOADOUT", () => deleteCollection(app), { class: "btn loadout-action btn-danger" }),
+        action("CANCEL", () => {
+            app.state.loadoutDeleting = null;
+            renderDrawer(app);
+            document.getElementById("loadout-delete").focus();
+        }));
+    const shell = el("div", { class: "drawer", onClick: event => event.stopPropagation() },
+        el("div", { class: "drawer-head" },
+            el("span", { class: "drawer-title", text: "loadouts" }),
+            el("button", { id: "loadout-close", class: "btn btn-close", type: "button", text: "CLOSE",
+                onClick: () => app.closeDrawer() })),
+        el("div", { class: "drawer-body" },
+            el("p", { class: "loadout-help", text: "Group models from anywhere in the Index. Download only this collection to your computer." }),
+            el("label", { for: "loadout-chooser", class: "rail-title", text: "CURRENT LOADOUT" }), chooser,
+            el("div", { class: "loadout-read-status", role: "status", "aria-live": "polite" }),
+            el("div", { class: "loadout-error", role: "status", "aria-live": "polite" }),
+            el("div", { class: "loadout-owner" }),
+            action("RETRY", () => loadLoadout(app), { id: "loadout-read-retry", hidden: true }),
+            el("details", { class: "loadout-create", open: !app.state.loadout },
+                el("summary", { text: "NEW LOADOUT" }),
+                el("div", { class: "drawer-new" }, fresh.label, fresh.field, action("CREATE", create))),
+            el("div", { class: "loadout-pending", hidden: true },
+                el("p", { class: "loadout-pending-label" }),
+                action("ADD TO THIS LOADOUT", () => addPending(app), { id: "loadout-add-pending" }),
+                action("CANCEL", () => { app.state.loadoutPendingModels = []; renderDrawer(app); })),
+            el("section", { class: "loadout-editor", hidden: true },
+                name.label,
+                el("div", { class: "loadout-name-form" }, name.field,
+                    action("SAVE NAME", () => renameCollection(app, name.field))),
+                el("div", { class: "loadout-member-summary rail-title" }),
+                el("div", { class: "loadout-members" }),
+                action("DELETE LOADOUT", () => {
+                    app.state.loadoutDeleting = app.state.loadoutId;
+                    renderDrawer(app);
+                    root.querySelector(".loadout-delete-confirm button").focus();
+                }, { id: "loadout-delete" }), confirmDelete)),
+        el("div", { class: "drawer-foot" },
+            el("div", { class: "rail-title", text: "DOWNLOAD ON YOUR COMPUTER" }),
+            downloadRoot.label, downloadRoot.field,
+            el("p", { class: "loadout-help", text: "Paths below are relative to this folder on the client. For ComfyUI, use its models folder. Nothing is copied on the server." }),
+            el("label", { for: "loadout-script-format", class: "rail-title", text: "SCRIPT FOR" }), format,
+            el("div", { class: "loadout-download-status", role: "status", "aria-live": "polite" }),
+            el("details", { class: "loadout-layout", hidden: true },
+                el("summary", { text: "PREVIEW FOLDER LAYOUT" }),
+                el("pre", { class: "code-box loadout-layout-text" })),
+            el("details", { class: "loadout-script-review" },
+                el("summary", { text: "REVIEW DOWNLOAD SCRIPT" }),
+                el("pre", { class: "code-box loadout-script" })),
+            el("div", { class: "loadout-download-actions" },
+                action("COPY DOWNLOAD SCRIPT", () => copyScript(app, root), { id: "loadout-copy", class: "btn btn-primary" }),
+                action("SAVE SCRIPT", () => saveScript(), { id: "loadout-save-script" }),
+                action("RETRY SCRIPT", () => { scriptKey = ""; renderDownload(app, root); },
+                    { id: "loadout-retry-script", hidden: true }))));
+    mount(root, el("div", { class: "scrim", onClick: () => app.closeDrawer() }, shell));
+}
+
+function memberRow(app, item) {
+    const path = labeledField("DOWNLOAD PATH", `loadout-path-${encodeURIComponent(item.repo + ":" + item.path)}`);
+    const row = el("div", { class: `loadout-member ${roleClass(item.role)}` });
+    row.item = item;
+    path.field.addEventListener("input", () => {
+        if (path.field.value === row.item.destination) delete path.field.dataset.dirty;
+        renderDownload(app, document.getElementById("drawer-root"));
+    });
+    mount(row,
+        el("div", { class: "loadout-member-head" }, el("span", { class: "role-mark" }),
+            el("span", { class: "loadout-member-name" }),
+            action("REMOVE", () => removeMember(app, row.item), { "aria-label": `Remove ${item.name} from loadout` })),
+        el("div", { class: "loadout-member-source mono-dim" }),
+        path.label, el("div", { class: "loadout-path-form" }, path.field,
+            action("SAVE PATH", () => savePath(app, row.item, path.field))));
+    return row;
+}
+
+function renderMembers(app, root, reset) {
+    const container = root.querySelector(".loadout-members");
+    if (reset) container.replaceChildren();
+    const existing = new Map([...container.children].map(row => [row.dataset.key, row]));
+    const items = loadoutItems(app);
+    const wanted = new Set();
+    for (const item of items) {
+        const key = `${item.repo}\n${item.path}`;
+        wanted.add(key);
+        let row = existing.get(key);
+        if (!row) {
+            row = memberRow(app, item);
+            row.dataset.key = key;
+            container.append(row);
+        }
+        row.item = item;
+        setText(row.querySelector(".loadout-member-name"), item.name);
+        setText(row.querySelector(".loadout-member-source"),
+            `${roleCode(item)} · ${item.repo} · ${item.size_human} · ${item.resolution?.status === "present" ? "available" : "unavailable"}`);
+        const field = row.querySelector("input");
+        if (!field.dataset.dirty && field.value !== item.destination) field.value = item.destination;
+        row.querySelectorAll("button").forEach(button => { button.disabled = app.state.loadoutBusy; });
+    }
+    for (const [key, row] of existing) if (!wanted.has(key)) row.remove();
+    root.querySelector(".loadout-member-summary").textContent = items.length
+        ? `${items.length} MODELS · ${fmtBytes(items.reduce((sum, item) => sum + item.size, 0))}`
+        : "EMPTY COLLECTION · ADD MODELS FROM THE INDEX";
 }
 
 export function renderDrawer(app) {
     const root = document.getElementById("drawer-root");
     if (!app.state.drawerOpen) {
-        root.replaceChildren();
+        if (root.childElementCount) root.replaceChildren();
+        clearTimeout(scriptTimer);
         return;
     }
+    if (!root.querySelector(".drawer")) {
+        createShell(app, root);
+        root.dataset.loadoutId = "";
+        scriptKey = "";
+    }
+    const owner = root.querySelector(".loadout-owner");
+    if (app.state.setup?.write_token_required && !owner.childElementCount) {
+        owner.append(el("details", null,
+            el("summary", { text: "OWNER ACCESS", dataset: { ownerTitle: "OWNER ACCESS" } }),
+            renderOwnerAccess(app)));
+    }
+    if (app.state.loadoutAuthRequired && owner.firstElementChild) owner.firstElementChild.open = true;
     const doc = app.state.loadout;
-    const items = loadoutItems(app);
-    const sameLoadout = root.dataset.loadoutId === (app.state.loadoutId || "");
-    const active = root.contains(document.activeElement) ? document.activeElement : null;
-    const focused = sameLoadout || active?.id === "loadout-close" ? active : null;
-    const focusId = focused?.id;
-    const selection = focused?.tagName === "INPUT"
-        ? [focused.selectionStart, focused.selectionEnd] : null;
-    const draft = focused?.value;
-    const newName = sameLoadout ? root.querySelector("#loadout-new-name")?.value : null;
-    const scroll = sameLoadout ? root.querySelector(".drawer-body")?.scrollTop : 0;
-
-    mount(
-        root,
-        el(
-            "div",
-            { class: "scrim", onClick: () => app.closeDrawer() },
-            el(
-                "div",
-                { class: "drawer", onClick: (event) => event.stopPropagation() },
-                el(
-                    "div",
-                    { class: "drawer-head" },
-                    el("span", { class: "drawer-title", text: "loadout" }),
-                    nameField(app),
-                    el("button", {
-                        id: "loadout-close",
-                        class: "btn btn-close",
-                        type: "button",
-                        text: "CLOSE",
-                        onClick: () => app.closeDrawer()
-                    })
-                ),
-                el(
-                    "div",
-                    { class: "drawer-body" },
-                    pinnedBlock(app, items),
-                    listBlock(app),
-                    newForm(app)
-                ),
-                el(
-                    "div",
-                    { class: "drawer-foot" },
-                    el("label", { for: "loadout-profile", class: "rail-title", text: "TOOL LAYOUT" }),
-                    el("select", {
-                        id: "loadout-profile", class: "field drawer-profile",
-                        "aria-describedby": "loadout-destination",
-                        onChange: (event) => {
-                            if (app.state.loadoutApplies.get(app.state.loadoutId)?.state === "running") return;
-                            const saved = settings.loadoutProfiles;
-                            const profiles = saved && typeof saved === "object" && !Array.isArray(saved)
-                                ? saved : {};
-                            updateSettings({ loadoutProfiles: {
-                                ...profiles, [app.state.loadoutId]: event.target.value
-                            } });
-                            paintApplyStatus(app);
-                        }
-                    }),
-                    el("div", { id: "loadout-destination", class: "drawer-destination" }),
-                    el("div", { class: "drawer-profile-error", role: "status" }),
-                    el("button", {
-                        id: "loadout-profile-retry",
-                        class: "btn drawer-profile-retry", type: "button", text: "RETRY LAYOUTS",
-                        onClick: () => loadApplyProfiles(app, true)
-                    }),
-                    el(
-                        "div",
-                        { class: "code-box" },
-                        el("div", { class: "code-comment drawer-apply-target" }),
-                        el("div", { class: "drawer-apply-status", role: "status",
-                            style: { overflowWrap: "anywhere" },
-                            "aria-live": "polite" })
-                    ),
-                    el("button", {
-                        id: "loadout-apply",
-                        class: "btn btn-primary btn-wide drawer-apply",
-                        type: "button",
-                        text: "APPLY",
-                        disabled: !doc,
-                        onClick: () => applyNow(app)
-                    })
-                )
-            )
-        )
-    );
-    root.dataset.loadoutId = app.state.loadoutId || "";
-    if (newName !== null && newName !== undefined) {
-        root.querySelector("#loadout-new-name").value = newName;
+    const id = doc?.id || "";
+    const reset = root.dataset.loadoutId !== id;
+    const name = root.querySelector("#loadout-name");
+    if (reset) {
+        delete name.dataset.dirty;
+        app.state.loadoutDeleting = null;
+        if (doc && !root.querySelector("#loadout-new-name").value) root.querySelector(".loadout-create").open = false;
     }
-    paintApplyStatus(app);
-    root.querySelector(".drawer-body").scrollTop = scroll || 0;
-    const restored = focusId && document.getElementById(focusId);
-    if (restored && !restored.disabled) {
-        if (selection) restored.value = draft;
-        restored.focus({ preventScroll: true });
-        if (selection) restored.setSelectionRange(...selection);
+    if (!name.dataset.dirty && name.value !== (doc?.name || "")) name.value = doc?.name || "";
+    const chooser = root.querySelector("#loadout-chooser");
+    const rows = app.state.loadouts || [];
+    const placeholder = rows.length > 0 && !rows.some(row => row.id === app.state.loadoutId);
+    const options = JSON.stringify([rows.map(row => [row.id, row.name, row.items]), placeholder]);
+    if (chooser.dataset.options !== options) {
+        chooser.replaceChildren(...(placeholder ? [el("option", { value: "", text: "Choose a loadout" })] : []), ...(rows.length ? rows.map(row => el("option", {
+            value: row.id, text: `${row.name} (${row.items})`
+        })) : [el("option", { value: "", text: "No loadouts yet" })]));
+        chooser.dataset.options = options;
     }
+    if (chooser.value !== (app.state.loadoutId || "")) chooser.value = app.state.loadoutId || "";
+    chooser.disabled = app.state.loadoutBusy || app.state.loadoutLoading;
+    root.querySelector(".loadout-editor").hidden = !doc;
+    root.querySelector(".loadout-read-status").textContent = app.state.loadoutLoading ? "Reading loadout…" : "";
+    root.querySelector(".loadout-error").textContent = app.state.loadoutError || "";
+    root.querySelector("#loadout-read-retry").hidden = !app.state.loadoutError || !!doc;
+    const pending = app.state.loadoutPendingModels?.length || 0;
+    root.querySelector(".loadout-pending").hidden = !pending;
+    root.querySelector(".loadout-pending-label").textContent = `${pending} selected model${pending === 1 ? "" : "s"}. Choose a loadout, or create one below.`;
+    renderMembers(app, root, reset);
+    root.dataset.loadoutId = id;
+    root.querySelectorAll(".loadout-action").forEach(button => { button.disabled = !!app.state.loadoutBusy; });
+    root.querySelector("#loadout-add-pending").disabled = !doc || app.state.loadoutBusy;
+    root.querySelector(".loadout-delete-confirm").hidden = app.state.loadoutDeleting !== id;
+    root.querySelector(".loadout-delete-message").textContent = `Delete “${doc?.name || ""}”? Model files will stay on disk.`;
+    root.querySelector("#loadout-delete").hidden = app.state.loadoutDeleting === id;
+    renderDownload(app, root);
 }
 
-function paintApplyStatus(app) {
-    const root = document.getElementById("drawer-root");
-    const status = root.querySelector(".drawer-apply-status");
-    const button = root.querySelector(".drawer-apply");
-    if (!status || !button) return;
-    const latest = app.state.loadoutApplies.get(app.state.loadoutId);
-    const profile = selectedProfile(app);
-    const apply = latest?.profile === profile?.id ? latest : null;
-    const info = app.state.loadoutProfiles;
-    const select = root.querySelector(".drawer-profile");
-    const placeholder = app.state.loadoutProfilesError ? "Layouts unavailable" : "Loading layouts…";
-    if (select.profileOptions !== info || (!info && select.options[0]?.text !== placeholder)) {
-        select.replaceChildren(...(info ? info.profiles.map(option => el("option", {
-            value: option.id, text: option.label
-        })) : [el("option", { text: placeholder, value: "" })]));
-        select.profileOptions = info;
-    }
-    if (select.value !== (profile?.id || "")) select.value = profile?.id || "";
-    select.disabled = !app.state.loadout || !info || app.state.loadoutProfilesLoading
-        || latest?.state === "running";
-    const node = apply?.state === "running" ? apply.node : info?.node;
-    const destination = apply?.state === "running" ? apply.destination : profile?.destination;
-    const destinationRoot = root.querySelector(".drawer-destination");
-    const destinationText = profile
-        ? `DESTINATION ON ${node}\n${destination}\nLinks in role subfolders. Originals stay in place. This folder is on the server.`
-        : app.state.loadoutProfilesError ? "Server destination unavailable."
-            : "Reading the server destination…";
-    if (destinationRoot.textContent !== destinationText) destinationRoot.textContent = destinationText;
-    root.querySelector(".drawer-profile-error").textContent = app.state.loadoutProfilesError || "";
-    root.querySelector(".drawer-profile-retry").hidden = !app.state.loadoutProfilesError;
-    root.querySelector(".drawer-apply-target").textContent = profile
-        ? `${profile.label} · ${node}` : "Tool layout unavailable";
-    const line = applyLine(app, loadoutItems(app));
-    if (status.textContent !== line) status.textContent = line;
-    status.style.color = apply?.state === "failed" ? "var(--red)"
-        : apply?.pollError || apply?.state === "running" || apply?.state === "cancelled"
-            ? "var(--amb)" : "var(--green)";
-    button.disabled = !canApply(app);
-    button.textContent = apply?.state === "running" ? "APPLYING…"
-        : profile ? `APPLY ${profile.label} TO ${node}` : "APPLY";
-}
-
-async function applyNow(app) {
-    if (!canApply(app)) return;
-    const id = app.state.loadoutId;
-    const profile = selectedProfile(app);
-    const node = app.state.loadoutProfiles.node;
-    const apply = { state: "running", phase: "queuing job…", error: null, pollError: null,
-        profile: profile.id, node, destination: profile.destination };
-    const hadFocus = document.activeElement?.classList.contains("drawer-apply");
-    app.state.loadoutApplies.set(id, apply);
-    paintApplyStatus(app);
-    if (hadFocus) document.getElementById("loadout-close")?.focus();
-    try {
-        const started = await api.applyLoadout(id, node, profile.id);
-        apply.profile = started.profile;
-        apply.node = started.node;
-        apply.destination = started.destination;
-        apply.phase = "job queued";
-        while (apply.state === "running") {
+function renderDownload(app, root) {
+    const doc = app.state.loadout;
+    const folder = root.querySelector("#loadout-download-root").value;
+    const format = root.querySelector("#loadout-script-format").value;
+    const next = JSON.stringify([doc?.id, doc?.updated_at, folder, format]);
+    if (scriptKey !== next) {
+        scriptKey = next;
+        scriptResult = null;
+        scriptError = null;
+        scriptLoading = !!doc?.items.length;
+        clearTimeout(scriptTimer);
+        const version = ++scriptVersion;
+        if (scriptLoading) scriptTimer = setTimeout(async () => {
             try {
-                const job = await api.job(started.job_id);
-                apply.state = job.state;
-                apply.phase = job.phase || "job queued";
-                apply.error = job.error;
-                apply.pollError = null;
+                const result = await api.loadoutDownload(doc.id, format, folder);
+                if (version !== scriptVersion) return;
+                scriptResult = result;
             } catch (error) {
-                apply.pollError = error.message;
+                if (version !== scriptVersion) return;
+                scriptError = error.message;
             }
-            paintApplyStatus(app);
-            if (apply.state === "running") {
-                await new Promise((resolve) => setTimeout(resolve, 1000));
-            }
-        }
-        toast(`apply ${apply.state === "done" ? "complete" : apply.state} on ${node}`);
-    } catch (error) {
-        apply.state = "failed";
-        apply.error = error.message;
-        toast(`apply failed on ${node}`);
+            scriptLoading = false;
+            if (app.state.drawerOpen) renderDownload(app, document.getElementById("drawer-root"));
+        }, 250);
     }
-    paintApplyStatus(app);
+    const dirty = !!root.querySelector(".loadout-member input[data-dirty]");
+    const status = root.querySelector(".loadout-download-status");
+    status.textContent = dirty ? "Save download path changes before copying a script." : scriptError || (scriptLoading ? "Preparing download script…" : scriptResult
+        ? "Ready to run on your computer. Existing files are skipped, not validated."
+        : "Add models to prepare a download script.");
+    status.classList.toggle("is-error", !!scriptError);
+    setText(root.querySelector(".loadout-script"), scriptResult?.text || "");
+    root.querySelector(".loadout-layout").hidden = !scriptResult;
+    setText(root.querySelector(".loadout-layout-text"), scriptResult?.layout || "");
+    root.querySelector("#loadout-copy").disabled = !scriptResult || dirty || !!app.state.loadoutBusy;
+    root.querySelector("#loadout-save-script").disabled = !scriptResult || dirty || !!app.state.loadoutBusy;
+    root.querySelector("#loadout-retry-script").hidden = !scriptError;
+}
+
+async function copyScript(app, root) {
+    if (!scriptResult) return;
+    const ok = await copyText(scriptResult.text);
+    if (ok) toast("Download script copied; run it on your computer");
+    else {
+        root.querySelector(".loadout-script-review").open = true;
+        app.state.loadoutError = "Clipboard unavailable. Select the script to copy, or use SAVE SCRIPT.";
+        renderDrawer(app);
+    }
+}
+
+function saveScript() {
+    if (!scriptResult) return;
+    const prefix = scriptResult.filename.endsWith(".ps1") ? "\uFEFF" : "";
+    const blob = new Blob([prefix, scriptResult.text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = el("a", { href: url, download: scriptResult.filename });
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
