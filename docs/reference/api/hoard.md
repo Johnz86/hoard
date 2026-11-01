@@ -445,7 +445,12 @@ rest being counted.
 - `hoard loadout import` is the one path that replaces by name: reading a document whose name
   a loadout already holds overwrites that loadout, where every route above refuses with 409.
 - `POST /api/v1/loadouts/{id}/validate`: compat violations.
+- `GET /api/v1/loadouts/profiles`: local node name, `default_profile`, and supported
+  `profiles` with `id`, display `label`, and absolute `destination`. Reading this metadata
+  creates no directories. Destinations are Hoard-managed folders on the server.
 - `POST /api/v1/loadouts/{id}/apply { "node", "profile" }`: starts a job, answering
+  the resolved `profile` and absolute local `destination` (null for a remote availability
+  report), alongside
   `{ "job_id", "node", "apply_preview" }` with the same `apply_preview` shape as loadout
   detail, resolved before the pull runs. This response confirms job creation, not completion;
   read `GET /api/v1/jobs/{job_id}` for the outcome. A local apply fails if any required link

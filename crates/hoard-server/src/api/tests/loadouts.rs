@@ -17,33 +17,62 @@ async fn a_successful_apply_creates_and_records_its_link_and_can_be_repeated() {
     )
     .await;
 
-    for _ in 0..2 {
-        let job = post(
-            &world.state,
-            &format!("/api/v1/loadouts/{id}/apply"),
-            json!({ "profile": "comfyui" }),
-        )
-        .await;
-        let finished = settle(&world.state, job["job_id"].as_str().expect("job id")).await;
+    for (profile, folder) in [
+        ("comfyui", "checkpoints"),
+        ("a1111", "Stable-diffusion"),
+        ("llama", "models"),
+    ] {
+        for _ in 0..2 {
+            let job = post(
+                &world.state,
+                &format!("/api/v1/loadouts/{id}/apply"),
+                json!({ "profile": profile }),
+            )
+            .await;
+            assert_eq!(job["profile"], profile);
+            assert_eq!(
+                job["destination"],
+                world
+                    .state
+                    .projection_root()
+                    .join(profile)
+                    .to_string_lossy()
+                    .as_ref()
+            );
+            let finished = settle(&world.state, job["job_id"].as_str().expect("job id")).await;
 
-        assert_eq!(finished["state"], "done");
-        assert_eq!(finished["error"], Value::Null);
-        assert!(
-            finished["phase"]
-                .as_str()
-                .expect("phase")
-                .starts_with("1 links written")
-        );
-        let projections = world
-            .state
-            .catalog()
-            .projections_for_artifact(world.ckpt)
-            .expect("projections");
-        assert_eq!(projections.len(), 1);
-        assert_eq!(
-            std::fs::read_link(&projections[0].link_path).expect("link exists"),
-            Path::new(&projections[0].target_path)
-        );
+            assert_eq!(finished["state"], "done");
+            assert_eq!(finished["error"], Value::Null);
+            assert!(
+                finished["phase"]
+                    .as_str()
+                    .expect("phase")
+                    .starts_with("1 links written")
+            );
+            let projections = world
+                .state
+                .catalog()
+                .projections_for_artifact(world.ckpt)
+                .expect("projections");
+            let projection = projections
+                .iter()
+                .find(|row| {
+                    Path::new(&row.link_path).parent()
+                        == Some(
+                            world
+                                .state
+                                .projection_root()
+                                .join(profile)
+                                .join(folder)
+                                .as_path(),
+                        )
+                })
+                .expect("correct layout");
+            assert_eq!(
+                std::fs::read_link(&projection.link_path).expect("link exists"),
+                Path::new(&projection.target_path)
+            );
+        }
     }
 }
 
@@ -59,36 +88,33 @@ async fn an_apply_with_a_blocked_destination_fails_and_preserves_the_file() {
     .await;
     let root = world.state.projection_root();
     std::fs::create_dir_all(&root).expect("projection root");
-    let obstruction = root.join("comfyui");
-    std::fs::write(&obstruction, b"existing user file").expect("obstruction");
+    for profile in ["comfyui", "a1111", "llama"] {
+        let obstruction = root.join(profile);
+        std::fs::write(&obstruction, b"existing user file").expect("obstruction");
 
-    let job = post(
-        &world.state,
-        &format!("/api/v1/loadouts/{id}/apply"),
-        json!({ "profile": "comfyui" }),
-    )
-    .await;
-    let finished = settle(&world.state, job["job_id"].as_str().expect("job id")).await;
+        let job = post(
+            &world.state,
+            &format!("/api/v1/loadouts/{id}/apply"),
+            json!({ "profile": profile }),
+        )
+        .await;
+        let finished = settle(&world.state, job["job_id"].as_str().expect("job id")).await;
 
-    assert_eq!(finished["state"], "failed");
-    assert!(
-        finished["error"]
-            .as_str()
-            .expect("error")
-            .contains("comfyui")
-    );
-    assert_eq!(
-        std::fs::read(obstruction).expect("file preserved"),
-        b"existing user file"
-    );
-    assert!(
-        world
-            .state
-            .catalog()
-            .list_projections(None)
-            .expect("projections")
-            .is_empty()
-    );
+        assert_eq!(finished["state"], "failed");
+        assert!(finished["error"].as_str().expect("error").contains(profile));
+        assert_eq!(
+            std::fs::read(obstruction).expect("file preserved"),
+            b"existing user file"
+        );
+        assert!(
+            world
+                .state
+                .catalog()
+                .list_projections(None)
+                .expect("projections")
+                .is_empty()
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -417,4 +443,29 @@ async fn a_loadout_is_renamed_and_deleted_and_a_taken_name_is_refused() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn profile_preview_is_absolute_and_does_not_create_destinations() {
+    let world = seeded();
+    let info = get(&world.state, "/api/v1/loadouts/profiles").await;
+    assert_eq!(info["default_profile"], "comfyui");
+    assert_eq!(info["node"], world.state.node_name());
+    let rows = info["profiles"].as_array().expect("profiles");
+    assert_eq!(rows.len(), 3);
+    for (row, (id, label)) in rows.iter().zip([
+        ("comfyui", "ComfyUI"),
+        ("a1111", "A1111"),
+        ("llama", "llama"),
+    ]) {
+        assert_eq!(row["id"], id);
+        assert_eq!(row["label"], label);
+        let destination = Path::new(row["destination"].as_str().expect("destination"));
+        assert!(destination.is_absolute());
+        assert_eq!(
+            destination,
+            std::path::absolute(world.state.projection_root().join(id)).expect("absolute path")
+        );
+        assert!(!destination.exists());
+    }
 }

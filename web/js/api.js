@@ -125,3 +125,5 @@ export const settings = () => get("/settings");
 export const saveSettings = (body) => put("/settings", body);
 export const setup = () => get("/setup");
 export const saveSetup = (body) => put("/setup", body);
+
+export const loadoutProfiles = () => get("/loadouts/profiles");

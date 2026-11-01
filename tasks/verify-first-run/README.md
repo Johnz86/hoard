@@ -8,7 +8,9 @@ listener without restarting, refreshed cached clone commands, and node-name-only
 requirements. Address-only saves are captured at both widths and themes.
 It also covers a first model loadout: real link creation, pending-job status, duplicate-submit
 prevention, polling recovery, draft/focus preservation, switching/reopening the drawer, and
-a conflicting file followed by retry. Job polling is temporarily controlled in the browser
+a conflicting file followed by retry. It verifies ComfyUI, A1111 and llama destinations
+and real links, profile-specific job results, saved preferences after reload, metadata failure
+and retry focus, and footer screenshots at 1180/1600px in both themes. Job polling is temporarily controlled in the browser
 to exercise running and unavailable states deterministically; apply and filesystem results
 use the real isolated server.
 Classification coverage uses an additional unclassified model to verify owner-access recovery,

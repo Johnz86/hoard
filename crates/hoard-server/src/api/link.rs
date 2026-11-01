@@ -41,6 +41,14 @@ impl Profile {
         }
     }
 
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::ComfyUi => "ComfyUI",
+            Self::A1111 => "A1111",
+            Self::Llama => "llama",
+        }
+    }
+
     /// Reads what a request named, ignoring case and surrounding space.
     pub fn parse(raw: &str) -> ApiResult<Self> {
         let wanted = raw.trim().to_ascii_lowercase();

@@ -34,7 +34,8 @@ await new Promise(resolve => reserve.close(resolve));
 assert.notEqual(port,8080);
 const origin = `http://127.0.0.1:${port}`;
 const config = join(scratch,'hoard.toml');
-await writeFile(config, `[server]\nbind="127.0.0.1:${port}"\npublic_url="${origin}"\ndata_dir="${scratch}/data"\n[node]\nname="first-run"\ndiscovery="none"\n[index]\nhash_policy="never"\nhash_threads=2\nwatch=true\nreconcile_interval_secs=0\n[mirror]\noffline=true\n`);
+const dataDir = join(scratch,'data','managed-model-links-'+'long-path-'.repeat(10));
+await writeFile(config, `[server]\nbind="127.0.0.1:${port}"\npublic_url="${origin}"\ndata_dir="${dataDir}"\n[node]\nname="first-run"\ndiscovery="none"\n[index]\nhash_policy="never"\nhash_threads=2\nwatch=true\nreconcile_interval_secs=0\n[mirror]\noffline=true\n`);
 let server, browser, socket;
 let serverLog = '';
 const exceptions = [];
@@ -98,10 +99,10 @@ try {
         throw new Error('Timed out: '+expression+'\n'+await evaluate('document.body.innerText'));
     };
     await send('Runtime.enable'); await send('Page.enable');
-    const press=async(key,code=key)=>{await send('Input.dispatchKeyEvent',{type:'keyDown',key,code,...(key==='Enter'?{windowsVirtualKeyCode:13,text:'\r'}:{})});await send('Input.dispatchKeyEvent',{type:'keyUp',key,code,...(key==='Enter'?{windowsVirtualKeyCode:13}:{})});};
+    const press=async(key,code=key)=>{await send('Input.dispatchKeyEvent',{type:'keyDown',key,code,...(key==='Enter'?{windowsVirtualKeyCode:13,text:'\r'}:key==='ArrowDown'?{windowsVirtualKeyCode:40}:key==='ArrowUp'?{windowsVirtualKeyCode:38}:{})});await send('Input.dispatchKeyEvent',{type:'keyUp',key,code,...(key==='Enter'?{windowsVirtualKeyCode:13}:{})});};
     const navigate=async hash=>evaluate('location.hash='+JSON.stringify(hash));
     let screenshots=0;
-    const screenshot=async name=>{await evaluate('document.fonts.ready');const shot=await send('Page.captureScreenshot',{format:'png'});await writeFile(join(scratch,name+'.png'),Buffer.from(shot.data,'base64'));screenshots++;};
+    const screenshot=async name=>{await evaluate('document.fonts.ready');await pause(250);const shot=await send('Page.captureScreenshot',{format:'png'});await writeFile(join(scratch,name+'.png'),Buffer.from(shot.data,'base64'));screenshots++;};
     await send('Page.navigate',{url:origin+'/'});
     await wait('location.hash==="#/sources"&&!!document.querySelector("#source-welcome")');
     assert.equal((await(await fetch(origin+'/api/v1/setup')).json()).first_run,true);
@@ -226,14 +227,20 @@ try {
     await press('Escape','Escape');
     await evaluate('document.querySelector(".inspector-actions button:nth-child(2)").click()');
     await wait('document.querySelector("#loadout-btn").textContent.includes("1")');
-    await evaluate('document.querySelector("#loadout-btn").click()');
-    await wait('!!document.querySelector(".drawer-apply")');
+    await evaluate('document.querySelector("#loadout-btn").focus();document.querySelector("#loadout-btn").click()');
+    await wait('!!document.querySelector(".drawer-apply")&&!document.querySelector(".drawer-apply").disabled');
+    await evaluate('document.querySelector(".drawer-profile").focus()');
+    await press('ArrowDown');
+    await wait('document.querySelector(".drawer-profile").value==="a1111"');
+    await press('ArrowUp');
+    await wait('document.querySelector(".drawer-profile").value==="comfyui"');
     await screenshot('loadout-before');
     const loadoutName=await evaluate('document.querySelector(".drawer-rename").value');
     await evaluate('window.applyStatusMode="running";window.applyPosts=0;window.applyFetch=window.fetch;window.fetch=async(input,options)=>{if(String(input).endsWith("/apply")&&options?.method==="POST")window.applyPosts++;const response=await window.applyFetch(input,options);if(String(input).includes("/api/v1/jobs/")&&options?.method==="GET"){if(window.applyStatusMode==="offline")throw new TypeError("synthetic polling outage");const job=await response.json();if(window.applyStatusMode==="running"){job.state="running";job.phase="writing model links";job.finished=null;}return new Response(JSON.stringify(job),{status:response.status});}return response;}');
     await evaluate('document.querySelector(".drawer-apply").click()');
     await wait('document.querySelector(".drawer-apply-status").textContent.includes("writing model links")');
     assert(await evaluate('document.querySelector(".drawer-apply").disabled'));
+    assert(await evaluate('document.querySelector(".drawer-profile").disabled'));
     await evaluate('document.querySelector(".drawer-apply").click()');
     assert.equal(await evaluate('window.applyPosts'),1);
     await evaluate('document.querySelector(".drawer-rename").value="Unsaved draft";document.querySelector(".drawer-rename").focus()');
@@ -250,17 +257,20 @@ try {
     await evaluate('document.querySelector(".drawer-new input").value="Other loadout";document.querySelector(".drawer-new button").click()');
     await wait('document.querySelector(".drawer-rename")?.value==="Other loadout"');
     assert(!(await evaluate('document.querySelector(".drawer-apply-status").textContent.includes("Applying")')));
+    assert(await evaluate('document.querySelector(".drawer-apply").disabled'));
+    await evaluate('{const select=document.querySelector(".drawer-profile");select.value="a1111";select.dispatchEvent(new Event("change"));}');
     await evaluate('[...document.querySelectorAll(".drawer-list-row .link")].find(e=>e.textContent==='+JSON.stringify(loadoutName)+').click()');
     await wait('document.querySelector(".drawer-rename")?.value==='+JSON.stringify(loadoutName));
     assert(await evaluate('document.querySelector(".drawer-apply").disabled'));
-    await evaluate('document.querySelector(".drawer-head button").click();document.querySelector("#loadout-btn").click()');
+    await evaluate('document.querySelector(".drawer-head button").click();document.querySelector("#loadout-btn").focus();document.querySelector("#loadout-btn").click()');
     await wait('document.querySelector(".drawer-apply-status").textContent.includes("Applying")');
     await evaluate('window.applyStatusMode="real"');
     await wait('document.querySelector(".drawer-apply-status").textContent.includes("Last apply complete")');
     assert(!(await evaluate('document.querySelector(".drawer-apply").disabled')));
-    const modelLink=join(scratch,'data/profiles/comfyui/loras/portrait-light.safetensors');
+    const modelLink=join(dataDir,'profiles/comfyui/loras/portrait-light.safetensors');
     assert.deepEqual(await readFile(modelLink),modelBytes);
     await screenshot('loadout-success');
+    assert.equal(await evaluate('document.querySelector(".drawer-profile").value'),'comfyui');
     await evaluate('window.fetch=window.applyFetch');
     await unlink(modelLink);await writeFile(modelLink,'existing user model');
     await evaluate('document.querySelector(".drawer-apply").click()');
@@ -274,6 +284,55 @@ try {
     await wait('document.querySelector(".drawer-apply-status").textContent.includes("Last apply complete")');
     assert.deepEqual(await readFile(modelLink),modelBytes);
     assert.deepEqual(await readFile(join(models,'portrait-light.safetensors')),modelBytes);
+    for (const [profile, folder] of [['comfyui','loras'],['a1111','Lora'],['llama','models']]) {
+        await evaluate(`{const select=document.querySelector('.drawer-profile');select.focus();select.value=${JSON.stringify(profile)};select.dispatchEvent(new Event('change'));}`);
+        if(profile!=="comfyui")assert(!(await evaluate('document.querySelector(".drawer-apply-status").textContent.includes("Last apply complete")')));
+        assert((await evaluate('document.querySelector(".drawer-destination").textContent')).includes(join(dataDir,'profiles',profile)));
+        assert.equal(await evaluate('document.activeElement.id'),'loadout-profile');
+        for (const width of [1180,1600]) {
+            await send('Emulation.setDeviceMetricsOverride',{width,height:1000,deviceScaleFactor:1,mobile:false});
+            for (const theme of ['light','dark']) {
+                await evaluate(`document.documentElement.setAttribute('data-theme',${JSON.stringify(theme)})`);
+                assert(await evaluate('document.querySelector(".drawer-apply").getBoundingClientRect().right<=innerWidth'));
+                assert(await evaluate('document.querySelector(".drawer-destination").scrollWidth<=document.querySelector(".drawer-destination").clientWidth'));
+                await screenshot(`loadout-${profile}-${width}-${theme}`);
+            }
+        }
+        await evaluate('document.querySelector(".drawer-apply").click()');
+        await wait('document.querySelector(".drawer-apply-status").textContent.includes("Last apply complete")');
+        assert.deepEqual(await readFile(join(dataDir,'profiles',profile,folder,'portrait-light.safetensors')),modelBytes);
+    }
+    await evaluate('document.querySelector(".drawer-head button").click()');
+    assert.equal(await evaluate('document.activeElement.id'),'loadout-btn');
+    const profileReloadOrigin=await evaluate("performance.timeOrigin");
+    await send('Page.reload');
+    await wait(`performance.timeOrigin!==${profileReloadOrigin}&&document.querySelector("#loadout-btn")?.textContent.includes("1")`);
+    await evaluate(`window.metadataFetch=window.fetch;window.fetch=async(input,options)=>String(input).endsWith('/loadouts/profiles')?new Response(JSON.stringify({message:'synthetic layout outage'}),{status:503}):window.metadataFetch(input,options);document.querySelector('#loadout-btn').click()`);
+    await wait('document.querySelector(".drawer-profile-retry")?.hidden===false');
+    assert(await evaluate('document.querySelector(".drawer-apply").disabled'));
+    assert(await evaluate('document.querySelector(".drawer-profile").disabled'));
+    assert.equal(await evaluate('document.querySelector(".drawer-profile").selectedOptions[0].text'),'Layouts unavailable');
+    await screenshot('loadout-layout-error');
+    await evaluate(`window.fetch=async(input,options)=>{if(String(input).endsWith('/loadouts/profiles'))await new Promise(resolve=>window.finishMetadata=resolve);return window.metadataFetch(input,options)};document.querySelector('.drawer-profile-retry').click()`);
+    await wait('typeof window.finishMetadata==="function"');
+    assert(await evaluate('document.querySelector(".drawer-apply").disabled'));
+    await evaluate('document.querySelector("#loadout-new-name").value="Keep this draft";document.querySelector("#loadout-new-name").focus();window.finishMetadata();window.fetch=window.metadataFetch');
+    await wait('!document.querySelector(".drawer-profile").disabled');
+    assert.equal(await evaluate('document.querySelector(".drawer-profile").value'),'llama');
+    assert.equal(await evaluate('document.activeElement.id'),'loadout-profile');
+    assert.equal(await evaluate('document.querySelector("#loadout-new-name").value'),'Keep this draft');
+    await evaluate('document.querySelector(".drawer-apply").click()');
+    await wait('document.querySelector(".drawer-apply-status").textContent.includes("Apply failed")');
+    assert(!(await evaluate('document.querySelector(".drawer-apply").disabled')));
+    await screenshot('loadout-owner-required');
+    await evaluate(`import('/js/theme.js').then(m=>m.updateSettings({loadoutProfiles:{...m.settings.loadoutProfiles,[m.settings.loadoutId]:'obsolete-layout'}}))`);
+    const obsoleteReloadOrigin=await evaluate("performance.timeOrigin");
+    await send('Page.reload');
+    await wait(`performance.timeOrigin!==${obsoleteReloadOrigin}&&document.querySelector("#loadout-btn")?.textContent.includes("1")`);
+    await evaluate('document.querySelector("#loadout-btn").click()');
+    await wait('!!document.querySelector(".drawer-profile")&&!document.querySelector(".drawer-profile").disabled');
+    assert.equal(await evaluate('document.querySelector(".drawer-profile").value'),'comfyui');
+    await press('Escape','Escape');
     await press('Escape','Escape');
     const readApi=async path=>(await fetch(origin+'/api/v1'+path)).json();
     const assertTriage=async count=>{
@@ -386,7 +445,7 @@ try {
     assert.equal((await(await fetch(origin+'/api/v1/setup')).json()).first_run,true);
     await access(join(source,'README.md'));
     assert.equal(exceptions.length,0,JSON.stringify(exceptions));
-    await writeFile(join(scratch,'verification.json'),JSON.stringify({passed:true,checks:['fresh-route','explicit-empty-query','empty-catalog-action','owner-access','invalid-path-recovery','empty-folder','sharing-form-polling-focus','folder-form-position-during-background-indexing','URL-validation','live-sharing-address-without-restart','listener-and-server-preserved','live-cached-clone-command','pending-vs-active','project-add-and-review','deep-link-reload','token-not-persisted','restart-config-and-resources','existing-node-index','loadout-job-status','loadout-polling-recovery','loadout-input-focus','loadout-switch-and-reopen','loadout-real-links','loadout-failure-and-retry','classification-owner-recovery','classification-draft-focus','classification-confirm-counts','classification-rescan-restart','classification-clear-and-reinfer','classification-reject-cancel','classification-noise-preserved','project-without-model-controls','remove-last-source'],screenshots},null,2));
+    await writeFile(join(scratch,'verification.json'),JSON.stringify({passed:true,checks:['fresh-route','explicit-empty-query','empty-catalog-action','owner-access','invalid-path-recovery','empty-folder','sharing-form-polling-focus','folder-form-position-during-background-indexing','URL-validation','live-sharing-address-without-restart','listener-and-server-preserved','live-cached-clone-command','pending-vs-active','project-add-and-review','deep-link-reload','token-not-persisted','restart-config-and-resources','existing-node-index','loadout-job-status','loadout-polling-recovery','loadout-input-focus','loadout-switch-and-reopen','loadout-real-links','loadout-failure-and-retry','loadout-profile-destinations','loadout-profile-persistence','loadout-profile-metadata-retry','loadout-obsolete-profile-fallback','loadout-empty-disabled','loadout-owner-error','loadout-long-path-layout','classification-owner-recovery','classification-draft-focus','classification-confirm-counts','classification-rescan-restart','classification-clear-and-reinfer','classification-reject-cancel','classification-noise-preserved','project-without-model-controls','remove-last-source'],screenshots},null,2));
     process.stdout.write(JSON.stringify({passed:true,scratch})+'\n');
 } finally {
     socket?.close();await stop(browser);await stop(server);

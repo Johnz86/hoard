@@ -358,17 +358,55 @@ current, and `NO LOADOUT YET / a checkpoint and the adapters you use with it / p
 row to start one, or NEW below` when none is; the middle line says what a loadout is for.
 `L` with no loadout creates `loadout-1` and pins into it; `L` on a checkpoint while the
 current loadout has one starts a loadout named after the file and pins it there. The current
-loadout is remembered in the settings record. Footer: terminal box
-`$ hoard apply night-exterior-v3 --node laptop` with the availability preview in green
-(`→ 3 present, 2 pulling over LAN (1.2 GB/s)`), and an amber `APPLY TO LAPTOP` button.
-Starting an apply disables that loadout's button and displays `Applying` with the actual
-job phase in amber. Poll the returned job until it finishes; acceptance of the start request
-is not completion. A successful job displays `Last apply complete` with its reported phase
-in green. A failed job displays `Apply failed` and its error in red; cancellation is explicit.
-Terminal states enable the button for another apply. Polling failures display `Status
-unavailable` and keep checking with the button disabled. Update only the footer so polling
-preserves draft input, focus and drawer scroll. Status belongs to its loadout and survives
-closing or switching drawers within the current tab; reloading the page clears tracking.
+loadout is remembered in the settings record.
+
+The existing footer contains, in order:
+
+1. A labeled native TOOL LAYOUT select: ComfyUI, A1111, llama, supplied by the server.
+2. DESTINATION ON `<node>`, with the server's absolute profile-root path as wrapping,
+   selectable text. Explain that these are Hoard-managed model links in role subfolders;
+   originals stay on disk. The path is read-only and refers to the server, not the browser.
+3. The existing terminal-style availability/job-status box, naming the selected layout.
+4. An amber `APPLY <layout> TO <node>` button.
+
+The selection is remembered per loadout in this browser. A new loadout defaults to ComfyUI;
+an obsolete saved profile falls back to the server's default. Choosing a layout changes only
+the preview and preference; it does not start a job, create directories or modify files.
+The selector stays present when there is no loadout; applying requires a loaded, nonempty
+loadout and valid profile metadata. Custom paths and remote target selection are excluded.
+
+| State | Layout/destination | Apply and status |
+| --- | --- | --- |
+| Reading layouts | Disabled selector and loading destination | Disabled; no guessed path |
+| Layout read failed | Inline error and RETRY; disabled selector | Disabled; retry preserves drafts |
+| No loadout or empty loadout | Known layouts and read-only destination remain visible | Disabled; prompt to add models |
+| Ready | Enabled selector; path updates immediately | Selected layout and availability preview |
+| Start request pending / job running | Selector locked to that job's layout and destination | Disabled; actual job phase in amber |
+| Polling unavailable | Keep the job's layout and destination | Disabled; explain status is unavailable and keep checking |
+| Succeeded | Selector enabled; result belongs to the applied layout | `Last apply complete`, actual phase in green |
+| Failed / cancelled | Selector enabled; retain layout and destination | Explicit error/cancellation; allow retry |
+
+Capture profile, node and destination when an apply starts and reconcile them with the
+server's start response. Poll that returned job until it finishes; accepting the start
+request is not completion. Switching loadouts never transfers job status or profile choices.
+Selecting a different profile after completion shows its availability preview, not a previous
+profile's success. Switching back may show the last job when it used that profile.
+
+Profile changes and polling update only the footer; do not replace a focused native select
+or its options during polling. Preserve name drafts, text selection, focused controls and
+drawer-body scroll during unrelated rerenders. Enter/Space and arrow keys retain native
+select/button behavior. Opening focuses CLOSE; closing by CLOSE, scrim or Escape returns
+focus to the invoking control, normally LOADOUT. A previously focused inspector field regains
+its focus and text selection. Existing Escape behavior first blurs an input/select before closing the
+drawer. Closing never cancels an apply. An error's RETRY action returns focus to the layout
+select when metadata becomes available. Do not steal focus when a background job finishes.
+
+Acceptance checks cover each layout's actual symlinks and destination, existing-file conflict
+preservation, repeat apply, profile/request snapshots during loadout switching, metadata
+failure/retry, obsolete preferences, empty states, owner-access errors, job polling recovery,
+keyboard operation and draft/focus/scroll preservation. Review the footer at 1180/1600px in
+both themes with representative long paths. Existing project, classification and source
+journeys must continue to pass. Reload preserves the profile preference but clears job tracking.
 
 Toast: bottom center, `--panel2` fill, 3px amber left border, mono 12px, 2.4 s, used for
 `+ name pinned at v3`, `replaced vae X with Y`, `new loadout "X": checkpoint pinned`,

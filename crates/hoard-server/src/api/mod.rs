@@ -95,6 +95,7 @@ pub fn routes() -> Router<AppState> {
                 .put(loadouts::rename)
                 .delete(loadouts::delete),
         )
+        .route("/api/v1/loadouts/profiles", get(loadouts::profiles))
         .route("/api/v1/loadouts/{id}/items", post(loadouts::add_item))
         .route(
             "/api/v1/loadouts/{id}/items/{artifact_id}",

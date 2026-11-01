@@ -3,6 +3,48 @@ import { el, errorPanel, fmtRate, loadingPanel, mount, toast } from "./dom.js";
 import { roleClass, roleCode } from "./table.js";
 import { settings, updateSettings } from "./theme.js";
 
+export async function loadApplyProfiles(app, retry = false) {
+    if (app.state.loadoutProfilesLoading || (app.state.loadoutProfiles && !retry)) return;
+    app.state.loadoutProfilesLoading = true;
+    app.state.loadoutProfilesError = null;
+    paintApplyStatus(app);
+    try {
+        const info = await api.loadoutProfiles();
+        if (!info.node || !info.profiles?.length ||
+            info.profiles.some(profile => !profile.id || !profile.label || !profile.destination) ||
+            !info.profiles.some(profile => profile.id === info.default_profile)) {
+            throw new Error("The server did not provide tool layouts.");
+        }
+        app.state.loadoutProfiles = info;
+    } catch {
+        app.state.loadoutProfiles = null;
+        app.state.loadoutProfilesError = "Could not read tool layouts. Check the connection, then retry.";
+    }
+    app.state.loadoutProfilesLoading = false;
+    paintApplyStatus(app);
+    if (retry && app.state.loadoutProfiles) {
+        document.getElementById("loadout-profile")?.focus();
+    }
+}
+
+function selectedProfile(app) {
+    const info = app.state.loadoutProfiles;
+    if (!info) return null;
+    const apply = app.state.loadoutApplies.get(app.state.loadoutId);
+    const wanted = apply?.state === "running" ? apply.profile
+        : settings.loadoutProfiles?.[app.state.loadoutId];
+    return info.profiles.find(profile => profile.id === wanted)
+        || info.profiles.find(profile => profile.id === info.default_profile);
+}
+
+function canApply(app) {
+    return Boolean(app.state.loadout?.id === app.state.loadoutId && app.state.loadout
+        && !app.state.loadoutError && loadoutItems(app).length
+        && selectedProfile(app) && !app.state.loadoutProfilesLoading
+        && !app.state.loadoutProfilesError
+        && app.state.loadoutApplies.get(app.state.loadoutId)?.state !== "running");
+}
+
 export async function loadLoadout(app) {
     try {
         const list = await api.loadouts();
@@ -33,7 +75,8 @@ function weightLabel(item) {
 }
 
 function applyLine(app, items) {
-    const apply = app.state.loadoutApplies.get(app.state.loadoutId);
+    const latest = app.state.loadoutApplies.get(app.state.loadoutId);
+    const apply = latest?.profile === selectedProfile(app)?.id ? latest : null;
     if (apply) {
         if (apply.pollError) return `Status unavailable · ${apply.pollError} · checking again…`;
         if (apply.state === "done") return `Last apply complete · ${apply.phase}`;
@@ -41,6 +84,7 @@ function applyLine(app, items) {
         if (apply.state === "cancelled") return "Apply cancelled · some links may already exist";
         return `Applying · ${apply.phase}`;
     }
+    if (!items.length) return "Pin an artifact before applying.";
     const preview = (app.state.loadout && app.state.loadout.apply_preview) || null;
     if (!preview) return `→ ${items.length} pinned`;
     const rate = preview.rate_bps ? ` (${fmtRate(preview.rate_bps)})` : "";
@@ -133,6 +177,7 @@ function listBlock(app) {
 
 function newForm(app) {
     const field = el("input", {
+        id: "loadout-new-name",
         class: "field",
         type: "text",
         placeholder: "name, or blank for loadout-N",
@@ -158,6 +203,7 @@ function nameField(app) {
     const doc = app.state.loadout;
     if (!doc) return el("span", { class: "drawer-slug", text: "none" });
     return el("input", {
+        id: "loadout-name",
         class: "field drawer-rename",
         type: "text",
         value: doc.name,
@@ -174,8 +220,15 @@ export function renderDrawer(app) {
     }
     const doc = app.state.loadout;
     const items = loadoutItems(app);
-    const name = (doc && doc.name) || "none";
-    const node = app.selfNodeName();
+    const sameLoadout = root.dataset.loadoutId === (app.state.loadoutId || "");
+    const active = root.contains(document.activeElement) ? document.activeElement : null;
+    const focused = sameLoadout || active?.id === "loadout-close" ? active : null;
+    const focusId = focused?.id;
+    const selection = focused?.tagName === "INPUT"
+        ? [focused.selectionStart, focused.selectionEnd] : null;
+    const draft = focused?.value;
+    const newName = sameLoadout ? root.querySelector("#loadout-new-name")?.value : null;
+    const scroll = sameLoadout ? root.querySelector(".drawer-body")?.scrollTop : 0;
 
     mount(
         root,
@@ -191,6 +244,7 @@ export function renderDrawer(app) {
                     el("span", { class: "drawer-title", text: "loadout" }),
                     nameField(app),
                     el("button", {
+                        id: "loadout-close",
                         class: "btn btn-close",
                         type: "button",
                         text: "CLOSE",
@@ -207,26 +261,60 @@ export function renderDrawer(app) {
                 el(
                     "div",
                     { class: "drawer-foot" },
+                    el("label", { for: "loadout-profile", class: "rail-title", text: "TOOL LAYOUT" }),
+                    el("select", {
+                        id: "loadout-profile", class: "field drawer-profile",
+                        "aria-describedby": "loadout-destination",
+                        onChange: (event) => {
+                            if (app.state.loadoutApplies.get(app.state.loadoutId)?.state === "running") return;
+                            const saved = settings.loadoutProfiles;
+                            const profiles = saved && typeof saved === "object" && !Array.isArray(saved)
+                                ? saved : {};
+                            updateSettings({ loadoutProfiles: {
+                                ...profiles, [app.state.loadoutId]: event.target.value
+                            } });
+                            paintApplyStatus(app);
+                        }
+                    }),
+                    el("div", { id: "loadout-destination", class: "drawer-destination" }),
+                    el("div", { class: "drawer-profile-error", role: "status" }),
+                    el("button", {
+                        id: "loadout-profile-retry",
+                        class: "btn drawer-profile-retry", type: "button", text: "RETRY LAYOUTS",
+                        onClick: () => loadApplyProfiles(app, true)
+                    }),
                     el(
                         "div",
                         { class: "code-box" },
-                        el("div", { class: "code-comment", text: `$ hoard apply ${name} --node ${node}` }),
+                        el("div", { class: "code-comment drawer-apply-target" }),
                         el("div", { class: "drawer-apply-status", role: "status",
                             style: { overflowWrap: "anywhere" },
                             "aria-live": "polite" })
                     ),
                     el("button", {
+                        id: "loadout-apply",
                         class: "btn btn-primary btn-wide drawer-apply",
                         type: "button",
-                        text: `APPLY TO ${node.toUpperCase()}`,
+                        text: "APPLY",
                         disabled: !doc,
-                        onClick: () => applyNow(app, node)
+                        onClick: () => applyNow(app)
                     })
                 )
             )
         )
     );
+    root.dataset.loadoutId = app.state.loadoutId || "";
+    if (newName !== null && newName !== undefined) {
+        root.querySelector("#loadout-new-name").value = newName;
+    }
     paintApplyStatus(app);
+    root.querySelector(".drawer-body").scrollTop = scroll || 0;
+    const restored = focusId && document.getElementById(focusId);
+    if (restored && !restored.disabled) {
+        if (selection) restored.value = draft;
+        restored.focus({ preventScroll: true });
+        if (selection) restored.setSelectionRange(...selection);
+    }
 }
 
 function paintApplyStatus(app) {
@@ -234,24 +322,59 @@ function paintApplyStatus(app) {
     const status = root.querySelector(".drawer-apply-status");
     const button = root.querySelector(".drawer-apply");
     if (!status || !button) return;
-    const apply = app.state.loadoutApplies.get(app.state.loadoutId);
-    status.textContent = applyLine(app, loadoutItems(app));
+    const latest = app.state.loadoutApplies.get(app.state.loadoutId);
+    const profile = selectedProfile(app);
+    const apply = latest?.profile === profile?.id ? latest : null;
+    const info = app.state.loadoutProfiles;
+    const select = root.querySelector(".drawer-profile");
+    const placeholder = app.state.loadoutProfilesError ? "Layouts unavailable" : "Loading layouts…";
+    if (select.profileOptions !== info || (!info && select.options[0]?.text !== placeholder)) {
+        select.replaceChildren(...(info ? info.profiles.map(option => el("option", {
+            value: option.id, text: option.label
+        })) : [el("option", { text: placeholder, value: "" })]));
+        select.profileOptions = info;
+    }
+    if (select.value !== (profile?.id || "")) select.value = profile?.id || "";
+    select.disabled = !app.state.loadout || !info || app.state.loadoutProfilesLoading
+        || latest?.state === "running";
+    const node = apply?.state === "running" ? apply.node : info?.node;
+    const destination = apply?.state === "running" ? apply.destination : profile?.destination;
+    const destinationRoot = root.querySelector(".drawer-destination");
+    const destinationText = profile
+        ? `DESTINATION ON ${node}\n${destination}\nLinks in role subfolders. Originals stay in place. This folder is on the server.`
+        : app.state.loadoutProfilesError ? "Server destination unavailable."
+            : "Reading the server destination…";
+    if (destinationRoot.textContent !== destinationText) destinationRoot.textContent = destinationText;
+    root.querySelector(".drawer-profile-error").textContent = app.state.loadoutProfilesError || "";
+    root.querySelector(".drawer-profile-retry").hidden = !app.state.loadoutProfilesError;
+    root.querySelector(".drawer-apply-target").textContent = profile
+        ? `${profile.label} · ${node}` : "Tool layout unavailable";
+    const line = applyLine(app, loadoutItems(app));
+    if (status.textContent !== line) status.textContent = line;
     status.style.color = apply?.state === "failed" ? "var(--red)"
         : apply?.pollError || apply?.state === "running" || apply?.state === "cancelled"
             ? "var(--amb)" : "var(--green)";
-    button.disabled = !app.state.loadout || apply?.state === "running";
+    button.disabled = !canApply(app);
     button.textContent = apply?.state === "running" ? "APPLYING…"
-        : `APPLY TO ${app.selfNodeName().toUpperCase()}`;
+        : profile ? `APPLY ${profile.label} TO ${node}` : "APPLY";
 }
 
-async function applyNow(app, node) {
+async function applyNow(app) {
+    if (!canApply(app)) return;
     const id = app.state.loadoutId;
-    if (!id || app.state.loadoutApplies.get(id)?.state === "running") return;
-    const apply = { state: "running", phase: "queuing job…", error: null, pollError: null };
+    const profile = selectedProfile(app);
+    const node = app.state.loadoutProfiles.node;
+    const apply = { state: "running", phase: "queuing job…", error: null, pollError: null,
+        profile: profile.id, node, destination: profile.destination };
+    const hadFocus = document.activeElement?.classList.contains("drawer-apply");
     app.state.loadoutApplies.set(id, apply);
     paintApplyStatus(app);
+    if (hadFocus) document.getElementById("loadout-close")?.focus();
     try {
-        const started = await api.applyLoadout(id, node, "comfyui");
+        const started = await api.applyLoadout(id, node, profile.id);
+        apply.profile = started.profile;
+        apply.node = started.node;
+        apply.destination = started.destination;
         apply.phase = "job queued";
         while (apply.state === "running") {
             try {

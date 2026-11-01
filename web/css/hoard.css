@@ -1971,6 +1971,9 @@ input.field.drawer-rename:focus {
 }
 
 .drawer-foot {
+    flex-shrink: 0;
+    max-height: 65vh;
+    overflow-y: auto;
     padding: 16px 18px;
     border-top: 1px solid var(--rule);
 }
@@ -2463,3 +2466,36 @@ input.field.drawer-rename:focus {
 .owner-access-fields .btn { flex-shrink: 0; }
 .catalog-empty { flex: 1; }
 .setup-empty-actions { display: flex; gap: 12px; justify-content: center; margin-top: 20px; }
+
+.drawer-foot select.field {
+    width: 100%;
+    margin: 6px 0 10px;
+    padding: 7px 32px 7px 10px;
+    color: var(--text);
+    background-color: var(--bg);
+    border: 1px solid var(--rule);
+    border-radius: 0;
+    font: 12px var(--mono);
+}
+
+.drawer-destination {
+    white-space: pre-line;
+    overflow-wrap: anywhere;
+    font-size: 11px;
+    line-height: 1.6;
+    margin-bottom: 12px;
+}
+
+.drawer-profile-error {
+    color: var(--red);
+    overflow-wrap: anywhere;
+}
+
+.drawer-profile-retry {
+    margin-bottom: 12px;
+}
+
+button.drawer-apply {
+    white-space: normal;
+    overflow-wrap: anywhere;
+}

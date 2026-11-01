@@ -5,7 +5,7 @@ import { el, errorPanel, loadingPanel, mount, toast, copyText } from "./dom.js";
 import { renderFacets } from "./facets.js";
 import { renderInspector } from "./inspector.js";
 import { initKeys, renderKeySheet } from "./keys.js";
-import { loadLoadout, loadoutItems, renderDrawer } from "./loadout.js";
+import { loadApplyProfiles, loadLoadout, loadoutItems, renderDrawer } from "./loadout.js";
 import { loadNodes, renderNodePulse } from "./nodes.js";
 import { loadJobs, loadSources } from "./jobs.js";
 import { paintSourcesView } from "./sources.js";
@@ -71,7 +71,11 @@ const state = {
     loadout: null,
     loadoutError: null,
     loadoutApplies: new Map(),
+    loadoutProfiles: null,
+    loadoutProfilesLoading: false,
+    loadoutProfilesError: null,
     drawerOpen: false,
+    drawerReturnFocus: null,
     keySheet: false,
     prefsOpen: false,
     detail: emptyDetail()
@@ -733,15 +737,29 @@ async function copyCommand(text) {
 }
 
 function openDrawer() {
+    const active = document.activeElement;
+    state.drawerReturnFocus = {
+        id: active?.id || "loadout-btn",
+        selection: typeof active?.selectionStart === "number"
+            ? [active.selectionStart, active.selectionEnd] : null
+    };
     state.drawerOpen = true;
     render();
     if (!state.loadout) loadLoadout(app);
+    loadApplyProfiles(app);
+    document.querySelector(".drawer .btn-close")?.focus();
 }
 
 function closeDrawer() {
     state.drawerOpen = false;
     state.loadoutDeleting = null;
     render();
+    const previous = state.drawerReturnFocus;
+    const target = document.getElementById(previous?.id) || document.getElementById("loadout-btn");
+    target.focus({ preventScroll: true });
+    if (previous?.selection && target.setSelectionRange) {
+        target.setSelectionRange(...previous.selection);
+    }
 }
 
 function setDetailTab(tab) {

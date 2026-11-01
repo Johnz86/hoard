@@ -4,6 +4,7 @@ const DEFAULTS = {
     density: "Condensed",
     roleColorMode: "Color-coded",
     showInspector: true,
+    loadoutProfiles: {},
     loadoutId: null
 };
 

@@ -1,4 +1,4 @@
-use std::path::Path as StdPath;
+use std::path::{Path as StdPath, PathBuf};
 use std::sync::Arc;
 
 use axum::Json;
@@ -101,9 +101,50 @@ pub struct ValidationView {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ApplyStarted {
+    pub profile: Profile,
+    /// Absolute local destination; absent for a remote availability report.
+    pub destination: Option<PathBuf>,
     pub job_id: hoard_core::JobId,
     pub node: String,
     pub apply_preview: ApplyPreview,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ApplyProfile {
+    id: Profile,
+    label: &'static str,
+    destination: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LoadoutProfiles {
+    node: String,
+    default_profile: Profile,
+    profiles: Vec<ApplyProfile>,
+}
+
+fn profile_destination(state: &AppState, profile: Profile) -> ApiResult<PathBuf> {
+    let dir = link::projection_dir(state, profile, None)?;
+    Ok(std::path::absolute(&dir).map_err(|error| IndexError::io(&dir, error))?)
+}
+
+/// Describes local managed layouts without creating directories or changing files.
+pub async fn profiles(State(state): State<AppState>) -> ApiResult<Json<LoadoutProfiles>> {
+    let profiles = Profile::ALL
+        .into_iter()
+        .map(|profile| {
+            Ok(ApplyProfile {
+                id: profile,
+                label: profile.label(),
+                destination: profile_destination(&state, profile)?,
+            })
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    Ok(Json(LoadoutProfiles {
+        node: state.node_name().to_owned(),
+        default_profile: DEFAULT_PROFILE,
+        profiles,
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -396,13 +437,18 @@ pub async fn apply(
     })
     .await?;
     let view = view_for(&state, id, &node_name).await?;
-    let subject = format!("{} \u{2192} {node_name}", view.name);
+    let subject = format!("{} \u{2192} {node_name} ({})", view.name, profile.as_str());
+    let dir = link::projection_dir(&state, profile, None)?;
+    let local = target == state.node_name();
+    let destination = if local {
+        Some(profile_destination(&state, profile)?)
+    } else {
+        None
+    };
     let catalog = Arc::clone(state.catalog());
     let job_id = blocking(move || catalog.create_job(APPLY_KIND, Some(&subject))).await?;
 
     let preview = view.apply_preview.clone();
-    let dir = link::projection_dir(&state, profile, None)?;
-    let local = target == state.node_name();
     let background = state.clone();
     let settling = state.clone();
     tokio::spawn(async move {
@@ -415,6 +461,8 @@ pub async fn apply(
         settle_apply(&settling, job_id, running.await).await;
     });
     Ok(Json(ApplyStarted {
+        profile,
+        destination,
         job_id,
         node: target,
         apply_preview: view.apply_preview,
